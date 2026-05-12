@@ -20,6 +20,7 @@ mod security;
 mod mirror;
 mod announce;
 mod nat;
+mod auth;
 
 #[derive(Parser, Debug)]
 #[command(name = "monopsony-server", version)]
@@ -77,6 +78,10 @@ struct Args {
     /// Tracker announce interval in seconds (default: 1800 = 30min)
     #[arg(long, default_value = "1800")]
     tracker_interval: u64,
+
+    /// Authentication mode for HTTP proxy: open (default), token, mtls
+    #[arg(long, default_value = "open")]
+    auth_mode: String,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -197,8 +202,14 @@ async fn main() -> anyhow::Result<()> {
 
     let cache_dir_for_proxy = cache_dir.clone();
     let db_clone = db.clone();
+    let auth_mode: monopsony_common::config::AuthMode = args.auth_mode.parse()
+        .unwrap_or_else(|_| {
+            warn!("Invalid auth_mode '{}', defaulting to 'open'", args.auth_mode);
+            monopsony_common::config::AuthMode::Open
+        });
+    info!("Auth mode: {}", auth_mode);
     let proxy_handle = tokio::spawn(async move {
-        if let Err(e) = proxy::run_proxy(http_addr, cache_dir_for_proxy, db_clone).await {
+        if let Err(e) = proxy::run_proxy(http_addr, cache_dir_for_proxy, db_clone, auth_mode).await {
             error!("HTTP proxy error: {}", e);
         }
     });

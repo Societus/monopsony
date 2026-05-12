@@ -57,7 +57,7 @@ impl TrackerProcess {
         let binary = env!("CARGO_BIN_EXE_monopsony-tracker");
 
         let temp_dir =
-            std::env::temp_dir().join(format!("monopsony-tracker-smoke-{}", std::process::id()));
+            std::env::temp_dir().join(format!("monopsony-tracker-smoke-{}-{}", std::process::id(), port));
         std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
 
         let child = Command::new(binary)

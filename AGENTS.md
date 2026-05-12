@@ -7,7 +7,7 @@
 ```
 Monopsony is a centralized package caching proxy system - like Windows Update's LAN sharing but for all package managers across all OSes. A central server pre-fetches and caches packages from upstream repositories, and clients redirect their package managers through it via a local HTTP proxy.
 **Target scale:** SMB/office (20-200 clients, single server)
-**Git state:** Forgejo: base.societus.club/societus/monopsony.git. Local: ~/projects/monopsony. Sprint 4 complete.
+**Git state:** Forgejo: base.societus.club/societus/monopsony.git. Local: ~/projects/monopsony. **Sprint 5 complete. Tagged v0.1.0-rc1.**
 ## Build & Run
 ```
 bash
@@ -25,12 +25,13 @@ cargo test                     # Run tests
 
 | Crate | Status | Notes |
 |-------|--------|-------|
-| `monopsony-common` | Compiles (2 warnings) | Unused fields: `AptBackend.config_path`, `DnfBackend.config_path` |
-| `monopsony-client` | Compiles (3 warnings) | Dead code: `is_connected`/`client_id` methods on grpc_client, Mirror subcommand wired |
-| `monopsony-server` | Compiles (24 warnings) | Dead code: existing modules. Mirror: full stack wired (HTTP :3129, gRPC MirrorControl 5 RPCs, sync task). |
+| `monopsony-common` | Compiles clean | AuthMode enum, config validation (Option D) |
+| `monopsony-client` | Compiles (3 warnings) | Dead code: `is_connected`/`client_id` methods on grpc_client |
+| `monopsony-server` | Compiles clean | Mirror SSRF validation, body size limits, auth middleware scaffold |
+| `monopsony-tracker` | Compiles clean | HTTP API, graceful shutdown |
 
-Full workspace: `cargo check` passes with 0 errors, ~29 warnings (all dead_code/unused).
-Tests: 49 passed, 0 failed. Clippy: 0 warnings.
+Full workspace: `cargo check` passes, 0 errors, ~3 warnings (all dead_code/unused in client).
+Tests: 60 passed, 0 failed. Clippy: 0 warnings.
 ## Critical Issues
 
 None currently. All modules compile.

@@ -138,12 +138,20 @@ impl ProxyState {
     }
 }
 
-/// Create the HTTP proxy router with an optional rate limiter
-pub fn create_proxy_router(state: Arc<ProxyState>, rate_limiter: Option<Arc<RateLimiter>>) -> axum::Router {
+/// Create the HTTP proxy router with optional rate limiter and auth middleware
+pub fn create_proxy_router(
+    state: Arc<ProxyState>,
+    rate_limiter: Option<Arc<RateLimiter>>,
+    auth_state: Arc<crate::auth::AuthState>,
+) -> axum::Router {
     axum::Router::new()
         .route("/health", axum::routing::get(health_check))
         .route("/*path", axum::routing::any(handle_proxy_request))
         .route("/", axum::routing::any(handle_proxy_request))
+        .layer(axum::middleware::from_fn_with_state(
+            auth_state,
+            crate::auth::auth_middleware,
+        ))
         .with_state((state, rate_limiter))
 }
 
@@ -493,19 +501,26 @@ pub async fn run_proxy(
     addr: SocketAddr,
     cache_dir: PathBuf,
     db: Option<Arc<Database>>,
+    auth_mode: monopsony_common::config::AuthMode,
 ) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&cache_dir).await?;
     tokio::fs::create_dir_all(cache_dir.join("meta")).await?;
     tokio::fs::create_dir_all(cache_dir.join("other")).await?;
 
-    let state = Arc::new(ProxyState::new(cache_dir, db));
+    let state = Arc::new(ProxyState::new(cache_dir, db.clone()));
     
     // Create rate limiter and spawn cleanup task
     let limiter = crate::security::create_default_rate_limiter();
     let limiter_clone = limiter.clone();
     tokio::spawn(crate::security::run_rate_limiter_cleanup(limiter_clone, 120));
 
-    let app = create_proxy_router(state, Some(limiter));
+    // Create auth middleware state
+    let auth_state = Arc::new(crate::auth::AuthState {
+        auth_mode,
+        db,
+    });
+
+    let app = create_proxy_router(state, Some(limiter), auth_state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("HTTP proxy listening on {}", addr);

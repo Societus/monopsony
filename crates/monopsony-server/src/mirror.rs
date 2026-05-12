@@ -595,13 +595,23 @@ async fn serve_mirror_file(
 async fn proxy_to_upstream(upstream_url: &str, file_path: &str) -> Response {
     let url = format!("{}/{}", upstream_url.trim_end_matches('/'), file_path);
 
+    // SSRF validation
+    let parsed_url = match url::Url::parse(&url) {
+        Ok(u) => u,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Invalid URL").into_response(),
+    };
+    if crate::security::validate_url_host(&parsed_url).is_err() {
+        warn!("Mirror proxy blocked SSRF attempt: {}", url);
+        return (StatusCode::BAD_REQUEST, "Blocked URL").into_response();
+    }
+
     let client: Client<HttpConnector, BoxBody> =
         Client::builder(TokioExecutor::new()).build_http();
 
     let uri: hyper::Uri = match url.parse() {
         Ok(u) => u,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("Invalid URL: {}", e)).into_response();
+        Err(_) => {
+            return (StatusCode::BAD_REQUEST, "Invalid URL").into_response();
         }
     };
 
@@ -611,8 +621,8 @@ async fn proxy_to_upstream(upstream_url: &str, file_path: &str) -> Response {
         .body(empty_body())
     {
         Ok(req) => req,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, format!("Failed to build request: {}", e)).into_response();
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Internal error").into_response();
         }
     };
 
@@ -621,6 +631,13 @@ async fn proxy_to_upstream(upstream_url: &str, file_path: &str) -> Response {
             let status = resp.status();
             let (parts, body) = resp.into_parts();
             let bytes = body.collect().await.unwrap_or_default().to_bytes();
+
+            // Enforce max body size (4 GB for mirror files)
+            const MAX_MIRROR_PROXY_SIZE: usize = 4 * 1024 * 1024 * 1024;
+            if bytes.len() > MAX_MIRROR_PROXY_SIZE {
+                warn!("Mirror proxy response too large: {} bytes", bytes.len());
+                return (StatusCode::BAD_GATEWAY, "Response too large").into_response();
+            }
 
             let mut builder = Response::builder().status(status);
             for (name, value) in parts.headers.iter() {
@@ -631,12 +648,13 @@ async fn proxy_to_upstream(upstream_url: &str, file_path: &str) -> Response {
             builder.header("X-Mirror", "miss")
                 .body(axum::body::Body::from(bytes))
                 .unwrap_or_else(|_| {
-                    Response::new(axum::body::Body::from("Failed to build response"))
+                    Response::new(axum::body::Body::from("Internal error"))
                 })
                 .into_response()
         }
         Err(e) => {
-            (StatusCode::BAD_GATEWAY, format!("Upstream fetch failed: {}", e)).into_response()
+            error!("Mirror upstream fetch failed for {}: {}", file_path, e);
+            (StatusCode::BAD_GATEWAY, "Upstream unavailable").into_response()
         }
     }
 }
@@ -650,6 +668,13 @@ async fn sync_mirror(
     hash_policy: &str,
 ) -> Result<u64, String> {
     info!("Syncing mirror: {} -> {}", upstream_url, local_path.display());
+
+    // SSRF validation on upstream URL
+    let parsed_upstream = url::Url::parse(upstream_url)
+        .map_err(|e| format!("Invalid upstream URL: {}", e))?;
+    if let Err(e) = crate::security::validate_url_host(&parsed_upstream) {
+        return Err(format!("SSRF blocked: upstream URL {} — {}", upstream_url, e));
+    }
 
     // Create local directory
     tokio::fs::create_dir_all(local_path).await
@@ -839,12 +864,17 @@ async fn sync_single_file(
 
     let (parts, body) = response.into_parts();
 
-    // Check content length
-    let _content_length: u64 = parts.headers
+    // Pre-flight: reject obviously huge files via content-length header
+    const MAX_MIRROR_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4 GB
+    if let Some(cl) = parts.headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if cl > MAX_MIRROR_FILE_SIZE {
+            return Err(format!("File too large ({} bytes, max {})", cl, MAX_MIRROR_FILE_SIZE));
+        }
+    }
 
     // Collect body
     let bytes = body.collect().await
@@ -852,6 +882,11 @@ async fn sync_single_file(
         .to_bytes();
 
     let len = bytes.len() as u64;
+
+    // Double-check actual body size
+    if len > MAX_MIRROR_FILE_SIZE {
+        return Err(format!("Body too large ({} bytes, max {})", len, MAX_MIRROR_FILE_SIZE));
+    }
 
     // Hash verification: try to fetch .sha256 / .sha256sum from upstream
     if let Err(e) = verify_file_hash(client, url, &bytes, hash_policy).await {

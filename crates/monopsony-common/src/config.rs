@@ -3,6 +3,45 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// HTTP proxy authentication mode
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthMode {
+    /// No authentication (LAN trust model, default)
+    #[default]
+    Open,
+    /// API key via X-Monopsony-Key header
+    Token,
+    /// Mutual TLS client certificate auth (future)
+    Mtls,
+}
+
+impl std::fmt::Display for AuthMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthMode::Open => write!(f, "open"),
+            AuthMode::Token => write!(f, "token"),
+            AuthMode::Mtls => write!(f, "mtls"),
+        }
+    }
+}
+
+impl std::str::FromStr for AuthMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "open" => Ok(Self::Open),
+            "token" => Ok(Self::Token),
+            "mtls" => Ok(Self::Mtls),
+            other => Err(format!(
+                "invalid auth_mode '{}'. Expected: open, token, mtls",
+                other
+            )),
+        }
+    }
+}
+
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -22,6 +61,9 @@ pub struct HttpServerConfig {
     pub bind: String,
     /// Optional hostname for certificate SAN
     pub hostname: Option<String>,
+    /// Authentication mode: "open" (default), "token", "mtls"
+    #[serde(default)]
+    pub auth_mode: AuthMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -232,7 +274,15 @@ impl ServerConfig {
                 path: path.to_path_buf(),
                 source: e,
             })?;
-        Self::from_str_with_path(&content, path)
+        let config: Self = Self::from_str_with_path(&content, path)?;
+        config.validate().map_err(|errors| {
+            crate::Error::Config(format!(
+                "Configuration validation errors in {}:\n  - {}",
+                path.display(),
+                errors.join("\n  - ")
+            ))
+        })?;
+        Ok(config)
     }
 
     /// Parse config from a TOML string, tracking the path to any deserialization error.
@@ -248,6 +298,108 @@ impl ServerConfig {
                 inner
             ))
         })
+    }
+
+    /// Post-deserialization validation with human-friendly messages.
+    /// Returns Ok(()) if valid, Err with list of issues otherwise.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors = Vec::new();
+        let mut warnings = Vec::new();
+
+        // [server] section
+        if self.server.bind.is_empty() {
+            errors.push(
+                "missing required field 'bind' in [server] — add something like bind = \"0.0.0.0:3128\"".to_string()
+            );
+        } else if !self.server.bind.contains(':') {
+            errors.push(format!(
+                "[server].bind \"{}\" doesn't look like host:port — expected something like \"0.0.0.0:3128\"",
+                self.server.bind
+            ));
+        }
+
+        // [grpc] section
+        if self.grpc.bind.is_empty() {
+            errors.push(
+                "missing required field 'bind' in [grpc] — add something like bind = \"0.0.0.0:50051\"".to_string()
+            );
+        }
+
+        // [database] section
+        if self.database.url.is_empty() {
+            errors.push(
+                "missing [database].url — add something like url = \"postgres://monopsony:password@localhost/monopsony\"".to_string()
+            );
+        } else if !self.database.url.starts_with("postgres://") && !self.database.url.starts_with("postgresql://") {
+            errors.push(format!(
+                "[database].url should start with postgres:// — got \"{}\"",
+                &self.database.url[..self.database.url.len().min(40)]
+            ));
+        }
+
+        if self.database.max_connections == 0 {
+            errors.push("[database].max_connections must be at least 1".to_string());
+        }
+
+        // [cache] section
+        if self.cache.path.as_os_str().is_empty() {
+            errors.push(
+                "missing [cache].path — add something like path = \"/var/cache/monopsony\"".to_string()
+            );
+        }
+
+        if self.cache.max_size_gb == 0 {
+            warnings.push(
+                "[cache].max_size_gb is 0 — cache will have no size limit".to_string()
+            );
+        }
+
+        // [tls] section — warn if paths don't exist (installer creates them)
+        for (name, p) in [
+            ("ca_path", &self.tls.ca_path),
+            ("ca_key_path", &self.tls.ca_key_path),
+            ("server_cert_path", &self.tls.server_cert_path),
+            ("server_key_path", &self.tls.server_key_path),
+        ] {
+            if !p.exists() {
+                warnings.push(format!(
+                    "[tls].{} \"{}\" does not exist — run the installer to generate certificates",
+                    name,
+                    p.display()
+                ));
+            }
+        }
+
+        // Auth mode validation
+        if self.server.auth_mode == AuthMode::Mtls {
+            errors.push(
+                "auth_mode = \"mtls\" is not yet implemented — use \"open\" or \"token\" for now".to_string()
+            );
+        }
+
+        if self.server.auth_mode == AuthMode::Token {
+            warnings.push(
+                "auth_mode = \"token\" requires API keys — run 'monopsony-server api-key create' to generate one".to_string()
+            );
+        }
+
+        // Cross-field validation
+        if self.discovery.mdns_enabled && self.server.hostname.is_none() {
+            warnings.push(
+                "mDNS discovery is enabled but [server].hostname is not set — auto-detected hostname will be used".to_string()
+            );
+        }
+
+        // Log warnings
+        for w in &warnings {
+            tracing::warn!("Config warning: {}", w);
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
     }
 
     pub fn to_toml(&self) -> crate::Result<String> {
@@ -368,5 +520,108 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Helper to build a valid ServerConfig for validation tests
+    fn valid_server_config() -> ServerConfig {
+        ServerConfig {
+            server: HttpServerConfig {
+                bind: "0.0.0.0:3128".to_string(),
+                hostname: Some("test-host".to_string()),
+                auth_mode: AuthMode::Open,
+            },
+            grpc: GrpcServerConfig {
+                bind: "0.0.0.0:50051".to_string(),
+            },
+            database: DatabaseConfig {
+                url: "postgres://monopsony:pass@localhost/monopsony".to_string(),
+                max_connections: 10,
+            },
+            cache: CacheConfig {
+                path: PathBuf::from("/tmp/cache"),
+                max_size_gb: 50,
+                purge_after_days: 30,
+            },
+            tls: TlsServerConfig {
+                ca_path: PathBuf::from("/tmp/ca.pem"),
+                ca_key_path: PathBuf::from("/tmp/ca.key"),
+                server_cert_path: PathBuf::from("/tmp/server.pem"),
+                server_key_path: PathBuf::from("/tmp/server.key"),
+            },
+            discovery: DiscoveryConfig {
+                mdns_enabled: true,
+                mdns_service_name: "monopsony-server".to_string(),
+            },
+            metrics: MetricsConfig {
+                enabled: true,
+                bind: "0.0.0.0:9090".to_string(),
+                path: "/metrics".to_string(),
+            },
+            logging: LoggingConfig {
+                level: "info".to_string(),
+                format: "json".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_validate_valid_config() {
+        let config = valid_server_config();
+        assert!(config.validate().is_ok(), "Valid config should pass validation");
+    }
+
+    #[test]
+    fn test_validate_empty_bind() {
+        let mut config = valid_server_config();
+        config.server.bind = String::new();
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("[server]") && e.contains("bind")),
+            "Should flag empty bind: got {:?}", errors
+        );
+    }
+
+    #[test]
+    fn test_validate_bad_bind_format() {
+        let mut config = valid_server_config();
+        config.server.bind = "no-port-here".to_string();
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("host:port")),
+            "Should flag bad bind format: got {:?}", errors
+        );
+    }
+
+    #[test]
+    fn test_validate_bad_database_url() {
+        let mut config = valid_server_config();
+        config.database.url = "mysql://wrong".to_string();
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("postgres://")),
+            "Should flag bad database URL: got {:?}", errors
+        );
+    }
+
+    #[test]
+    fn test_validate_mtls_not_implemented() {
+        let mut config = valid_server_config();
+        config.server.auth_mode = AuthMode::Mtls;
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("mtls") && e.contains("not yet implemented")),
+            "Should flag mtls as unimplemented: got {:?}", errors
+        );
+    }
+
+    #[test]
+    fn test_validate_zero_max_connections() {
+        let mut config = valid_server_config();
+        config.database.max_connections = 0;
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("max_connections")),
+            "Should flag zero max_connections: got {:?}", errors
+        );
     }
 }
