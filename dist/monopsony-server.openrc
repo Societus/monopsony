@@ -1,0 +1,26 @@
+#!/sbin/openrc-run
+# Monopsony Caching Proxy Server — OpenRC init script
+# For Artix/Alpine systems without systemd
+
+description="Monopsony caching proxy server"
+command="/usr/bin/monopsony-server"
+command_args="--config /etc/monopsony/server.toml"
+command_user="monopsony:monopsony"
+
+pidfile="/run/${RC_SVCNAME}.pid"
+command_background=true
+start_stop_daemon_args="--make-pidfile"
+
+output_log="/var/log/monopsony/server.log"
+error_log="/var/log/monopsony/server-error.log"
+
+depend() {
+    need net
+    after postgresql
+    use dns
+}
+
+start_pre() {
+    checkpath --directory --owner monopsony:monopsony --mode 0755 \
+        /var/cache/monopsony /var/lib/monopsony /var/log/monopsony
+}

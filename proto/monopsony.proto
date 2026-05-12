@@ -1,0 +1,190 @@
+syntax = "proto3";
+
+package monopsony;
+
+// Main control plane service with bidirectional streaming
+service MonopsonyControl {
+    // Bidirectional stream for control plane communication
+    rpc ControlStream(stream ClientMessage) returns (stream ServerMessage);
+    
+    // Unary RPCs for specific operations
+    rpc Register(RegisterRequest) returns (RegisterResponse);
+    rpc ReportInventory(InventoryReport) returns (InventoryResponse);
+    rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// Client -> Server messages (for streaming)
+message ClientMessage {
+    oneof msg {
+        RegisterRequest register = 1;
+        HeartbeatRequest heartbeat = 2;
+        InventoryReport inventory = 3;
+        InventoryDelta delta = 4;
+    }
+}
+
+// Server -> Client messages (for streaming)
+message ServerMessage {
+    oneof msg {
+        RegisterResponse register = 1;
+        Command command = 2;
+        SyncRequest sync_request = 3;
+    }
+}
+
+message RegisterRequest {
+    string hostname = 1;
+    string os = 2;
+    string os_version = 3;
+    repeated string package_managers = 4;
+}
+
+message RegisterResponse {
+    string client_id = 1;
+    repeated string enabled_managers = 2;
+    bytes client_cert_pem = 3;  // Issued client certificate
+    bytes client_key_pem = 4;   // Issued client private key
+    string ca_cert_pem = 5;     // CA certificate for verification
+}
+
+message HeartbeatRequest {
+    string client_id = 1;
+    int64 timestamp = 2;
+}
+
+message HeartbeatResponse {
+    int64 server_time = 1;
+}
+
+message InventoryReport {
+    string client_id = 1;
+    repeated PackageEntry packages = 2;
+    bool full_sync = 3;  // true = complete inventory, false = partial
+}
+
+message InventoryResponse {
+    bool accepted = 1;
+    string message = 2;
+}
+
+message InventoryDelta {
+    string client_id = 1;
+    repeated PackageEntry added = 2;
+    repeated string removed = 3;  // package IDs
+}
+
+message PackageEntry {
+    string manager = 1;
+    string name = 2;
+    string version = 3;
+    string arch = 4;
+}
+
+message Command {
+    enum CommandType {
+        RESYNC = 0;
+        UPDATE_CONFIG = 1;
+        RESTART = 2;
+    }
+    CommandType type = 1;
+    map<string, string> params = 2;
+}
+
+message SyncRequest {
+    // Server requests full inventory resync
+}
+
+// Pairing messages (exchanged over plaintext pairing port 50052)
+message PairRequest {
+    string code = 1;                    // 6-char alphanumeric pairing code
+    string hostname = 2;
+    string os = 3;
+    string os_version = 4;
+    repeated string package_managers = 5;
+}
+
+message PairResponse {
+    string client_id = 1;
+    bytes client_cert_pem = 2;
+    bytes client_key_pem = 3;
+    bytes ca_cert_pem = 4;
+    string grpc_addr = 5;               // Server gRPC address for future mTLS connections
+}
+
+// Mirror management RPCs
+service MirrorControl {
+    // List all configured mirrors and their status
+    rpc ListMirrors(ListMirrorsRequest) returns (ListMirrorsResponse);
+    // Trigger immediate sync for a specific distro mirror
+    rpc TriggerMirrorSync(TriggerMirrorSyncRequest) returns (TriggerMirrorSyncResponse);
+    // Get detailed status for a single mirror
+    rpc GetMirrorStatus(GetMirrorStatusRequest) returns (GetMirrorStatusResponse);
+    // Add or update a mirror configuration
+    rpc UpsertMirrorConfig(UpsertMirrorConfigRequest) returns (UpsertMirrorConfigResponse);
+    // Remove a mirror configuration
+    rpc DeleteMirrorConfig(DeleteMirrorConfigRequest) returns (DeleteMirrorConfigResponse);
+}
+
+message MirrorInfo {
+    string distro = 1;
+    string upstream_url = 2;
+    string local_path = 3;
+    bool sync_enabled = 4;
+    int64 sync_interval_secs = 5;
+    int64 bandwidth_limit_bps = 6;
+    repeated string include_patterns = 7;
+    repeated string exclude_patterns = 8;
+    bool public = 9;
+    int64 last_sync = 10;           // epoch seconds, 0 = never
+    string sync_status = 11;        // "idle", "syncing", "error: ..."
+    int64 total_bytes = 12;
+}
+
+message ListMirrorsRequest {}
+
+message ListMirrorsResponse {
+    repeated MirrorInfo mirrors = 1;
+}
+
+message TriggerMirrorSyncRequest {
+    string distro = 1;
+}
+
+message TriggerMirrorSyncResponse {
+    bool triggered = 1;
+    string message = 2;
+}
+
+message GetMirrorStatusRequest {
+    string distro = 1;
+}
+
+message GetMirrorStatusResponse {
+    MirrorInfo mirror = 1;
+}
+
+message UpsertMirrorConfigRequest {
+    string distro = 1;
+    string upstream_url = 2;
+    string local_path = 3;
+    bool sync_enabled = 4;
+    int64 sync_interval_secs = 5;
+    int64 bandwidth_limit_bps = 6;
+    repeated string include_patterns = 7;
+    repeated string exclude_patterns = 8;
+    bool public = 9;
+}
+
+message UpsertMirrorConfigResponse {
+    bool created = 1;
+    string message = 2;
+}
+
+message DeleteMirrorConfigRequest {
+    string distro = 1;
+}
+
+message DeleteMirrorConfigResponse {
+    bool deleted = 1;
+    string message = 2;
+}

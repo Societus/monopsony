@@ -1,0 +1,30 @@
+[Unit]
+Description=Monopsony Client Daemon
+Documentation=https://github.com/Societus/monopsony
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/monopsony-client daemon --config /etc/monopsony/client.toml
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Security hardening
+LimitNOFILE=8192
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+# User — must have read access to cert dir (~/.config/monopsony)
+User=root
+Group=root
+
+# Environment
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,144 @@
+//! Metrics definitions for Monopsony
+
+use metrics::{counter, gauge, histogram};
+
+/// Metric names for server
+pub mod server {
+    pub const CACHE_REQUESTS_TOTAL: &str = "monopsony_cache_requests_total";
+    pub const CACHE_BYTES_SERVED: &str = "monopsony_cache_bytes_served_total";
+    pub const CACHE_BYTES_CACHED: &str = "monopsony_cache_bytes_cached_total";
+    pub const CACHE_ENTRIES: &str = "monopsony_cache_entries_current";
+    pub const CLIENTS_CONNECTED: &str = "monopsony_clients_connected_current";
+    pub const CLIENTS_REGISTERED: &str = "monopsony_clients_registered_total";
+    pub const PACKAGES_CACHED: &str = "monopsony_packages_cached_current";
+    pub const PACKAGES_PREFETCHED: &str = "monopsony_packages_prefetched_total";
+    pub const PACKAGES_PURGED: &str = "monopsony_packages_purged_total";
+    pub const GRPC_REQUESTS_TOTAL: &str = "monopsony_grpc_requests_total";
+    pub const GRPC_REQUEST_DURATION: &str = "monopsony_grpc_request_duration_seconds";
+}
+
+/// Metric names for mirror subsystem
+pub mod mirror {
+    pub const SYNC_TOTAL: &str = "monopsony_mirror_sync_total";
+    pub const SYNC_DURATION: &str = "monopsony_mirror_sync_duration_seconds";
+    pub const SYNC_BYTES: &str = "monopsony_mirror_sync_bytes_total";
+    pub const SYNC_FILES: &str = "monopsony_mirror_sync_files_total";
+    pub const SERVED_TOTAL: &str = "monopsony_mirror_served_total";
+    pub const SERVED_BYTES: &str = "monopsony_mirror_served_bytes_total";
+}
+
+/// Metric names for client
+pub mod client {
+    pub const PROXY_REQUESTS_TOTAL: &str = "monopsony_client_proxy_requests_total";
+    pub const BYTES_SAVED: &str = "monopsony_client_bytes_saved_total";
+    pub const GRPC_CONNECTIONS: &str = "monopsony_client_grpc_connections_total";
+}
+
+/// Increment cache request counter
+pub fn cache_request_hit() {
+    counter!(server::CACHE_REQUESTS_TOTAL, "result" => "hit").increment(1);
+}
+
+pub fn cache_request_miss() {
+    counter!(server::CACHE_REQUESTS_TOTAL, "result" => "miss").increment(1);
+}
+
+/// Record bytes served from cache
+pub fn cache_bytes_served(bytes: u64) {
+    counter!(server::CACHE_BYTES_SERVED).increment(bytes);
+}
+
+/// Record bytes cached
+pub fn cache_bytes_cached(bytes: u64) {
+    counter!(server::CACHE_BYTES_CACHED).increment(bytes);
+}
+
+/// Set current cache entry count
+pub fn set_cache_entries(count: u64) {
+    gauge!(server::CACHE_ENTRIES).set(count as f64);
+}
+
+/// Set connected clients count
+pub fn set_clients_connected(count: u64) {
+    gauge!(server::CLIENTS_CONNECTED).set(count as f64);
+}
+
+/// Increment registered clients
+pub fn client_registered() {
+    counter!(server::CLIENTS_REGISTERED).increment(1);
+}
+
+/// Set cached packages count
+pub fn set_packages_cached(manager: &'static str, count: u64) {
+    gauge!(server::PACKAGES_CACHED, "manager" => manager).set(count as f64);
+}
+
+/// Increment prefetched packages
+pub fn package_prefetched(manager: &'static str) {
+    counter!(server::PACKAGES_PREFETCHED, "manager" => manager).increment(1);
+}
+
+/// Increment purged packages
+pub fn package_purged(manager: &'static str) {
+    counter!(server::PACKAGES_PURGED, "manager" => manager).increment(1);
+}
+
+/// Record gRPC request
+pub fn grpc_request(method: &'static str) {
+    counter!(server::GRPC_REQUESTS_TOTAL, "method" => method).increment(1);
+}
+
+/// Record gRPC request duration
+pub fn grpc_request_duration(method: &'static str, duration_secs: f64) {
+    histogram!(server::GRPC_REQUEST_DURATION, "method" => method).record(duration_secs);
+}
+
+// Client metrics
+
+/// Record client proxy request
+pub fn client_proxy_request(result: &'static str) {
+    counter!(client::PROXY_REQUESTS_TOTAL, "result" => result).increment(1);
+}
+
+/// Record bytes saved by using cache
+pub fn client_bytes_saved(bytes: u64) {
+    counter!(client::BYTES_SAVED).increment(bytes);
+}
+
+/// Record gRPC connection attempt
+pub fn client_grpc_connection(success: bool) {
+    let result = if success { "success" } else { "failure" };
+    counter!(client::GRPC_CONNECTIONS, "result" => result).increment(1);
+}
+
+// Mirror metrics
+
+/// Record mirror sync completion
+pub fn mirror_sync(distro: &str, result: &'static str) {
+    counter!(mirror::SYNC_TOTAL, "distro" => distro.to_string(), "result" => result).increment(1);
+}
+
+/// Record mirror sync duration
+pub fn mirror_sync_duration(distro: &str, duration_secs: f64) {
+    histogram!(mirror::SYNC_DURATION, "distro" => distro.to_string()).record(duration_secs);
+}
+
+/// Record mirror sync bytes transferred
+pub fn mirror_sync_bytes(distro: &str, bytes: u64) {
+    counter!(mirror::SYNC_BYTES, "distro" => distro.to_string()).increment(bytes);
+}
+
+/// Record mirror sync files transferred
+pub fn mirror_sync_files(distro: &str, count: u64) {
+    counter!(mirror::SYNC_FILES, "distro" => distro.to_string()).increment(count);
+}
+
+/// Record mirror file served
+pub fn mirror_served(distro: &str) {
+    counter!(mirror::SERVED_TOTAL, "distro" => distro.to_string()).increment(1);
+}
+
+/// Record mirror bytes served
+pub fn mirror_served_bytes(distro: &str, bytes: u64) {
+    counter!(mirror::SERVED_BYTES, "distro" => distro.to_string()).increment(bytes);
+}

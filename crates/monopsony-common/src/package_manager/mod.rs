@@ -1,0 +1,269 @@
+//! Package manager abstraction for Monopsony
+//!
+//! This module provides a trait-based abstraction for different package managers,
+//! allowing uniform handling of package installation, inventory, and proxy configuration.
+
+mod apt;
+mod dnf;
+mod pacman;
+mod winget;
+mod choco;
+mod scoop;
+
+pub use apt::AptBackend;
+pub use dnf::DnfBackend;
+pub use pacman::PacmanBackend;
+pub use winget::WingetBackend;
+pub use choco::ChocoBackend;
+pub use scoop::ScoopBackend;
+
+use async_trait::async_trait;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Supported package manager kinds
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PackageManagerKind {
+    Apt,
+    Dnf,
+    Pacman,
+    Winget,
+    Choco,
+    Scoop,
+}
+
+impl PackageManagerKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PackageManagerKind::Apt => "apt",
+            PackageManagerKind::Dnf => "dnf",
+            PackageManagerKind::Pacman => "pacman",
+            PackageManagerKind::Winget => "winget",
+            PackageManagerKind::Choco => "choco",
+            PackageManagerKind::Scoop => "scoop",
+        }
+    }
+
+    /// Parse a package manager kind from its string name.
+    /// Not named `from_str` to avoid confusion with `std::str::FromStr`.
+    pub fn parse_kind(s: &str) -> Option<Self> {
+        match s {
+            "apt" => Some(PackageManagerKind::Apt),
+            "dnf" => Some(PackageManagerKind::Dnf),
+            "pacman" => Some(PackageManagerKind::Pacman),
+            "winget" => Some(PackageManagerKind::Winget),
+            "choco" => Some(PackageManagerKind::Choco),
+            "scoop" => Some(PackageManagerKind::Scoop),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for PackageManagerKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Reference to an installed package
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageRef {
+    pub name: String,
+    pub version: Option<String>,
+    pub architecture: Option<String>,
+    pub manager: PackageManagerKind,
+}
+
+/// URL pattern for matching upstream package URLs
+#[derive(Debug, Clone)]
+pub struct UrlPattern {
+    /// Regex pattern for matching URLs
+    pub pattern: Regex,
+    /// Priority for pattern matching (higher = checked first)
+    pub priority: u32,
+    /// Description of what this pattern matches
+    pub description: String,
+}
+
+impl UrlPattern {
+    pub fn new(pattern: &str, priority: u32, description: &str) -> crate::Result<Self> {
+        let regex = Regex::new(pattern)
+            .map_err(|e| crate::Error::Parse(format!("Invalid URL pattern: {}", e)))?;
+        Ok(Self {
+            pattern: regex,
+            priority,
+            description: description.to_string(),
+        })
+    }
+
+    pub fn matches(&self, url: &str) -> bool {
+        self.pattern.is_match(url)
+    }
+}
+
+/// Action to configure proxy for a package manager
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ProxyConfigAction {
+    /// Write a configuration file
+    WriteFile {
+        path: PathBuf,
+        content: String,
+    },
+    /// Remove a configuration file
+    RemoveFile {
+        path: PathBuf,
+    },
+    /// Set an environment variable
+    SetEnv {
+        key: String,
+        value: String,
+    },
+    /// Unset an environment variable
+    UnsetEnv {
+        key: String,
+    },
+    /// Run a command
+    RunCommand {
+        program: String,
+        args: Vec<String>,
+    },
+    /// Multiple actions needed
+    Multiple(Vec<ProxyConfigAction>),
+    /// No configuration needed (package manager uses system proxy)
+    None,
+}
+
+impl ProxyConfigAction {
+    /// Execute this proxy config action. Returns a human-readable description of what was done.
+    /// For `Multiple`, all inner actions are executed in order.
+    /// Errors are logged but do not stop execution of subsequent actions in `Multiple`.
+    pub fn execute(&self) -> Vec<anyhow::Result<String>> {
+        match self {
+            ProxyConfigAction::WriteFile { path, content } => {
+                let result = (|| -> anyhow::Result<String> {
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(path, content)?;
+                    Ok(format!("wrote {}", path.display()))
+                })();
+                vec![result]
+            }
+            ProxyConfigAction::RemoveFile { path } => {
+                let result = (|| -> anyhow::Result<String> {
+                    if path.exists() {
+                        std::fs::remove_file(path)?;
+                        Ok(format!("removed {}", path.display()))
+                    } else {
+                        Ok(format!("skipped {} (not found)", path.display()))
+                    }
+                })();
+                vec![result]
+            }
+            ProxyConfigAction::SetEnv { key, value } => {
+                std::env::set_var(key, value);
+                vec![Ok(format!("set env {}", key))]
+            }
+            ProxyConfigAction::UnsetEnv { key } => {
+                std::env::remove_var(key);
+                vec![Ok(format!("unset env {}", key))]
+            }
+            ProxyConfigAction::RunCommand { program, args } => {
+                let result = (|| -> anyhow::Result<String> {
+                    let output = std::process::Command::new(program)
+                        .args(args)
+                        .output()?;
+                    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if output.status.success() {
+                        Ok(format!("ran {} -> {}", program, stdout))
+                    } else {
+                        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                        anyhow::bail!("{} failed (exit {:?}): {}", program, output.status.code(), stderr)
+                    }
+                })();
+                vec![result]
+            }
+            ProxyConfigAction::Multiple(actions) => {
+                actions.iter().flat_map(|a| a.execute()).collect()
+            }
+            ProxyConfigAction::None => vec![Ok("no action needed".to_string())],
+        }
+    }
+
+    /// Dry-run: describe what would be done without executing.
+    pub fn describe(&self) -> Vec<String> {
+        match self {
+            ProxyConfigAction::WriteFile { path, .. } => vec![format!("write {}", path.display())],
+            ProxyConfigAction::RemoveFile { path } => vec![format!("remove {}", path.display())],
+            ProxyConfigAction::SetEnv { key, value } => vec![format!("set {}={}", key, value)],
+            ProxyConfigAction::UnsetEnv { key } => vec![format!("unset {}", key)],
+            ProxyConfigAction::RunCommand { program, args } => {
+                vec![format!("run {} {}", program, args.join(" "))]
+            }
+            ProxyConfigAction::Multiple(actions) => {
+                actions.iter().flat_map(|a| a.describe()).collect()
+            }
+            ProxyConfigAction::None => vec!["no action needed".to_string()],
+        }
+    }
+}
+
+/// Backend trait for package manager implementations
+#[async_trait]
+pub trait PackageManagerBackend: Send + Sync {
+    /// Returns the kind of this package manager
+    fn kind(&self) -> PackageManagerKind;
+
+    /// Check if this package manager is available on the current system
+    fn is_available(&self) -> bool;
+
+    /// List all installed packages
+    async fn list_installed(&self) -> crate::Result<Vec<PackageRef>>;
+
+    /// Get URL patterns for matching upstream package URLs
+    fn upstream_url_patterns(&self) -> Vec<UrlPattern>;
+
+    /// Convert an upstream URL to a cache path
+    fn url_to_cache_path(&self, url: &str) -> Option<String>;
+
+    /// Get the action needed to configure this package manager to use a proxy
+    fn proxy_config(&self, proxy_addr: &str) -> ProxyConfigAction;
+
+    /// Get the action needed to remove proxy configuration
+    fn remove_proxy_config(&self) -> ProxyConfigAction;
+}
+
+/// Get all available package manager backends for the current platform
+pub fn get_available_backends() -> Vec<Box<dyn PackageManagerBackend>> {
+    let backends: Vec<Box<dyn PackageManagerBackend>> = vec![
+        Box::new(AptBackend::new()),
+        Box::new(DnfBackend::new()),
+        Box::new(PacmanBackend::new()),
+        Box::new(WingetBackend::new()),
+        Box::new(ChocoBackend::new()),
+        Box::new(ScoopBackend::new()),
+    ];
+
+    backends.into_iter().filter(|b| b.is_available()).collect()
+}
+
+/// Get a specific package manager backend by kind
+pub fn get_backend(kind: PackageManagerKind) -> Option<Box<dyn PackageManagerBackend>> {
+    match kind {
+        PackageManagerKind::Apt => Some(Box::new(AptBackend::new())),
+        PackageManagerKind::Dnf => Some(Box::new(DnfBackend::new())),
+        PackageManagerKind::Pacman => Some(Box::new(PacmanBackend::new())),
+        PackageManagerKind::Winget => Some(Box::new(WingetBackend::new())),
+        PackageManagerKind::Choco => Some(Box::new(ChocoBackend::new())),
+        PackageManagerKind::Scoop => Some(Box::new(ScoopBackend::new())),
+    }
+}
+
+/// Check if a URL matches any available package manager's upstream patterns.
+/// Returns true if the URL should be proxied through the cache server.
+pub fn matches_package_url(url: &str) -> bool {
+    get_available_backends()
+        .iter()
+        .any(|backend| backend.upstream_url_patterns().iter().any(|p| p.matches(url)))
+}

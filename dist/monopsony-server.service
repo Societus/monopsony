@@ -1,0 +1,31 @@
+[Unit]
+Description=Monopsony Caching Proxy Server
+Documentation=https://github.com/Societus/monopsony
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/monopsony-server --config /etc/monopsony/server.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+# Security hardening
+LimitNOFILE=65536
+ReadWritePaths=/var/cache/monopsony /var/lib/monopsony
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+# User/group
+User=monopsony
+Group=monopsony
+
+# Environment
+Environment=RUST_LOG=info
+Environment=RUST_BACKTRACE=1
+
+[Install]
+WantedBy=multi-user.target

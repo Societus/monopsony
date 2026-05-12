@@ -1,0 +1,93 @@
+# Monopsony Mirror Configuration
+#
+# Define distribution mirrors for local caching.
+# Each [[mirror]] entry creates a local mirror that syncs from an upstream
+# repository and serves packages to clients on your LAN.
+#
+# Place at /etc/monopsony/mirrors.toml or alongside server.toml
+
+# ============================================================================
+# Arch Linux Mirror
+# ============================================================================
+[[mirror]]
+# Distribution identifier. Used by clients to select the right config.
+distro = "archlinux"
+
+# Upstream mirror URL to sync from.
+# Use a geographically close mirror from https://archlinux.org/mirrors/
+upstream_url = "https://geo.mirror.pkgbuild.com/"
+
+# Local directory for mirrored files (relative to mirror_dir or absolute).
+local_path = "/var/cache/monopsony/mirrors/archlinux"
+
+# Enable periodic sync. Default: true.
+sync_enabled = true
+
+# How often to sync (in seconds). Default: 21600 (6 hours).
+sync_interval_secs = 21600
+
+# Bandwidth limit in bytes/sec. nil/omitted = unlimited.
+# Example: 10 MB/s = 10485760
+# bandwidth_limit_bps = 10485760
+
+# Glob patterns to include. Empty array = include everything.
+# include_patterns = ["*.pkg.tar.zst", "*.pkg.tar.xz"]
+
+# Glob patterns to exclude. Useful for skipping debug packages or sources.
+exclude_patterns = [
+    "*.pkg.tar.zst.sig",    # Skip PGP signatures (re-verified on client)
+    "*/debug/*",             # Skip debug packages
+    "*/testing/*",           # Skip testing repos
+    "*/staging/*",           # Skip staging repos
+    "*/iso/*",               # Skip ISO images (large, rarely needed)
+]
+
+# Whether this mirror is accessible without authentication.
+# For LAN-only use, set to false (requires mTLS or API key).
+# For public mirrors, set to true.
+public = true
+
+# Per-IP rate limit (requests per second). 0 = unlimited.
+per_ip_rps = 50
+
+# Max concurrent connections per IP. 0 = unlimited.
+max_concurrent_per_ip = 20
+
+
+# ============================================================================
+# Debian Mirror
+# ============================================================================
+# [[mirror]]
+# distro = "debian"
+# upstream_url = "https://deb.debian.org/debian/"
+# local_path = "/var/cache/monopsony/mirrors/debian"
+# sync_enabled = true
+# sync_interval_secs = 43200   # 12 hours
+#
+# exclude_patterns = [
+#     "*/installer-amd64/*/iso-*",  # Skip ISOs
+#     "*/dists/*/proposed-updates/*",
+#     "*/dists/*/backports/*",
+# ]
+#
+# public = true
+# per_ip_rps = 50
+
+
+# ============================================================================
+# Alpine Linux Mirror
+# ============================================================================
+# [[mirror]]
+# distro = "alpine"
+# upstream_url = "https://dl-cdn.alpinelinux.org/alpine/"
+# local_path = "/var/cache/monopsony/mirrors/alpine"
+# sync_enabled = true
+# sync_interval_secs = 21600   # 6 hours
+#
+# exclude_patterns = [
+#     "*/releases/*",   # Skip release ISOs
+#     "*/edge/*",       # Skip edge (rolling) if not needed
+# ]
+#
+# public = true
+# per_ip_rps = 50

@@ -1,0 +1,865 @@
+use anyhow::Result;
+use chrono::Utc;
+use monopsony_common::{
+    ApiKey, ApiKeyId, Client, ClientId, ClientPackage, Package, PackageId, PackageRef,
+};
+use monopsony_common::package_manager::PackageManagerKind;
+use tracing::{debug, info, warn};
+
+use sqlx::{PgPool, Row};
+use uuid::Uuid;
+
+pub struct Database {
+    pool: PgPool,
+}
+
+
+/// Cache entry metadata for recording cache misses
+#[derive(Debug, Clone)]
+pub struct CacheMissConfig {
+    pub url: String,
+    pub cache_path: String,
+    pub content_type: Option<String>,
+    pub content_length: i64,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub cached_at: i64,
+}
+
+
+/// Mirror configuration for upsert operations
+#[derive(Debug, Clone)]
+pub struct MirrorUpsertConfig {
+    pub distro: String,
+    pub upstream_url: String,
+    pub local_path: String,
+    pub sync_enabled: bool,
+    pub sync_interval_secs: i64,
+    pub bandwidth_limit_bps: Option<i64>,
+    pub include_patterns: serde_json::Value,
+    pub exclude_patterns: serde_json::Value,
+    pub public: bool,
+}
+
+impl Database {
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+}
+
+impl Database {
+    pub async fn connect(database_url: &str) -> Result<Self> {
+        info!("Connecting to PostgreSQL");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(10)
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .connect(database_url)
+            .await?;
+        info!("Connected to PostgreSQL");
+        Ok(Self { pool })
+    }
+
+    pub async fn run_migrations(&self) -> Result<()> {
+        info!("Running database migrations");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS clients (
+                id UUID PRIMARY KEY,
+                hostname TEXT NOT NULL UNIQUE,
+                os TEXT NOT NULL,
+                os_version TEXT NOT NULL,
+                package_managers JSONB NOT NULL,
+                last_seen TIMESTAMPTZ NOT NULL,
+                registered_at TIMESTAMPTZ NOT NULL,
+                cert_serial TEXT NULL,
+                paired_at TIMESTAMPTZ NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("Created clients table");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS packages (
+                id UUID PRIMARY KEY,
+                manager TEXT NOT NULL,
+                name TEXT NOT NULL,
+                version TEXT NOT NULL,
+                arch TEXT NULL,
+                file_path TEXT NOT NULL,
+                hash TEXT NULL,
+                upstream_url TEXT NOT NULL,
+                size_bytes BIGINT NOT NULL,
+                cached_at TIMESTAMPTZ NOT NULL,
+                last_accessed TIMESTAMPTZ NOT NULL,
+                UNIQUE (manager, name, version, arch)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("Created packages table");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS client_packages (
+                client_id UUID NOT NULL REFERENCES clients(id),
+                package_id UUID NOT NULL REFERENCES packages(id),
+                installed_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(client_id, package_id)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("Created client_packages table");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS cache_entries (
+                url TEXT PRIMARY KEY,
+                cache_path TEXT NOT NULL,
+                content_type TEXT NULL,
+                content_length BIGINT NOT NULL,
+                etag TEXT NULL,
+                last_modified TEXT NULL,
+                cached_at BIGINT NOT NULL,
+                last_accessed BIGINT NOT NULL,
+                hit_count BIGINT NOT NULL DEFAULT 0
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("Created cache_entries table");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS api_keys (
+                id UUID PRIMARY KEY,
+                label TEXT NOT NULL,
+                key_hash TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMPTZ NOT NULL,
+                last_used TIMESTAMPTZ NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("Created api_keys table");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS mirror_configs (
+                distro TEXT PRIMARY KEY,
+                upstream_url TEXT NOT NULL,
+                local_path TEXT NOT NULL,
+                sync_enabled BOOLEAN NOT NULL DEFAULT true,
+                sync_interval_secs BIGINT NOT NULL DEFAULT 86400,
+                bandwidth_limit_bps BIGINT NULL,
+                include_patterns JSONB NOT NULL DEFAULT '[]',
+                exclude_patterns JSONB NOT NULL DEFAULT '[]',
+                public BOOLEAN NOT NULL DEFAULT false,
+                last_sync TIMESTAMPTZ NULL,
+                sync_status TEXT NOT NULL DEFAULT 'idle',
+                total_bytes BIGINT NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("Created mirror_configs table");
+
+        info!("Database migrations complete");
+        Ok(())
+    }
+
+    pub async fn register_client(
+        &self,
+        hostname: &str,
+        os: &str,
+        os_version: &str,
+        package_managers: &[String],
+    ) -> Result<ClientId> {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        let pm_json = serde_json::to_value(package_managers)?;
+
+        let row = sqlx::query(
+            "INSERT INTO clients (id, hostname, os, os_version, package_managers, last_seen, registered_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (hostname) DO UPDATE SET
+                 os = EXCLUDED.os,
+                 os_version = EXCLUDED.os_version,
+                 package_managers = EXCLUDED.package_managers,
+                 last_seen = EXCLUDED.last_seen
+             RETURNING id",
+        )
+        .bind(id)
+        .bind(hostname)
+        .bind(os)
+        .bind(os_version)
+        .bind(pm_json)
+        .bind(now)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await?;
+
+        let returned_id: Uuid = row.get("id");
+        info!("Registered client {} (hostname={})", returned_id, hostname);
+        Ok(ClientId(returned_id))
+    }
+
+    pub async fn heartbeat(&self, client_id: &ClientId) -> Result<()> {
+        let now = Utc::now();
+        let result = sqlx::query("UPDATE clients SET last_seen = $1 WHERE id = $2")
+            .bind(now)
+            .bind(client_id.0)
+            .execute(&self.pool)
+            .await?;
+
+        if result.rows_affected() == 0 {
+            warn!("Heartbeat for unknown client {}", client_id);
+        } else {
+            debug!("Heartbeat from client {}", client_id);
+        }
+        Ok(())
+    }
+
+    pub async fn record_inventory(
+        &self,
+        client_id: &ClientId,
+        packages: &[PackageRef],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now();
+
+        // Get current package IDs for this client
+        let existing: Vec<Uuid> = sqlx::query(
+            "SELECT package_id FROM client_packages WHERE client_id = $1",
+        )
+        .bind(client_id.0)
+        .fetch_all(&mut *tx)
+        .await?
+        .iter()
+        .map(|r| r.get::<Uuid, _>("package_id"))
+        .collect();
+
+        let mut current_ids = std::collections::HashSet::new();
+
+        for pkg in packages {
+            // Find existing package by unique key, or insert new
+            let row = sqlx::query(
+                "SELECT id FROM packages WHERE manager = $1 AND name = $2 AND version = $3 AND arch IS NOT DISTINCT FROM $4",
+            )
+            .bind(pkg.manager.as_str())
+            .bind(&pkg.name)
+            .bind(pkg.version.as_deref().unwrap_or(""))
+            .bind(&pkg.architecture)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            let package_id = if let Some(r) = row {
+                r.get::<Uuid, _>("id")
+            } else {
+                let id = Uuid::new_v4();
+                sqlx::query(
+                    "INSERT INTO packages (id, manager, name, version, arch, file_path, upstream_url, size_bytes, cached_at, last_accessed)
+                     VALUES ($1, $2, $3, $4, $5, '', '', 0, $6, $6)",
+                )
+                .bind(id)
+                .bind(pkg.manager.as_str())
+                .bind(&pkg.name)
+                .bind(pkg.version.as_deref().unwrap_or(""))
+                .bind(&pkg.architecture)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+                id
+            };
+
+            current_ids.insert(package_id);
+
+            sqlx::query(
+                "INSERT INTO client_packages (client_id, package_id, installed_at) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            )
+            .bind(client_id.0)
+            .bind(package_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Remove packages no longer installed
+        for old_id in &existing {
+            if !current_ids.contains(old_id) {
+                sqlx::query("DELETE FROM client_packages WHERE client_id = $1 AND package_id = $2")
+                    .bind(client_id.0)
+                    .bind(old_id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        tx.commit().await?;
+        debug!(
+            "Recorded inventory for client {}: {} packages",
+            client_id,
+            packages.len()
+        );
+        Ok(())
+    }
+
+    /// Apply an incremental inventory delta (added/removed packages)
+    pub async fn apply_inventory_delta(
+        &self,
+        client_id: &ClientId,
+        added: &[PackageRef],
+        removed: &[(PackageManagerKind, String)],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        let now = Utc::now();
+
+        // Add new packages
+        for pkg in added {
+            let package_id = Uuid::new_v4();
+
+            sqlx::query(
+                "INSERT INTO packages (id, manager, name, version, arch, file_path, upstream_url, size_bytes, cached_at, last_accessed)
+                 VALUES ($1, $2, $3, $4, $5, '', '', 0, $6, $6)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(package_id)
+            .bind(pkg.manager.as_str())
+            .bind(&pkg.name)
+            .bind(pkg.version.as_deref().unwrap_or(""))
+            .bind(&pkg.architecture)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO client_packages (client_id, package_id, installed_at)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(client_id.0)
+            .bind(package_id)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Remove packages
+        for (manager, package_id_str) in removed {
+            // Parse the package ID string to extract components
+            // Format: "manager:name:version:arch" or "manager:name"
+            let parts: Vec<&str> = package_id_str.split(':').collect();
+            if parts.len() >= 2 {
+                let name = parts[1];
+
+                // Delete from client_packages by matching the package
+                sqlx::query(
+                    "DELETE FROM client_packages
+                     WHERE client_id = $1
+                     AND package_id IN (
+                         SELECT id FROM packages
+                         WHERE manager = $2 AND name = $3
+                     )",
+                )
+                .bind(client_id.0)
+                .bind(manager.as_str())
+                .bind(name)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+        debug!(
+            "Applied inventory delta for client {}: +{} -{}",
+            client_id,
+            added.len(),
+            removed.len()
+        );
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Admin API query method
+    pub async fn get_client(&self, client_id: &ClientId) -> Result<Option<Client>> {
+        let row = sqlx::query(
+            "SELECT id, hostname, os, os_version, package_managers, last_seen, registered_at, cert_serial
+             FROM clients WHERE id = $1",
+        )
+        .bind(client_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => {
+                let pm_value: serde_json::Value = row.get("package_managers");
+                let package_managers: Vec<String> = serde_json::from_value(pm_value)?;
+                Ok(Some(Client {
+                    id: ClientId(row.get("id")),
+                    hostname: row.get("hostname"),
+                    os: row.get("os"),
+                    os_version: row.get("os_version"),
+                    package_managers,
+                    last_seen: row.get("last_seen"),
+                    registered_at: row.get("registered_at"),
+                    cert_serial: row.get("cert_serial"),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    #[allow(dead_code)] // Admin API query method
+    pub async fn list_clients(&self) -> Result<Vec<Client>> {
+        let rows = sqlx::query(
+            "SELECT id, hostname, os, os_version, package_managers, last_seen, registered_at, cert_serial
+             FROM clients ORDER BY registered_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut clients = Vec::with_capacity(rows.len());
+        for row in rows {
+            let pm_value: serde_json::Value = row.get("package_managers");
+            let package_managers: Vec<String> = serde_json::from_value(pm_value)?;
+            clients.push(Client {
+                id: ClientId(row.get("id")),
+                hostname: row.get("hostname"),
+                os: row.get("os"),
+                os_version: row.get("os_version"),
+                package_managers,
+                last_seen: row.get("last_seen"),
+                registered_at: row.get("registered_at"),
+                cert_serial: row.get("cert_serial"),
+            });
+        }
+
+        debug!("Listed {} clients", clients.len());
+        Ok(clients)
+    }
+
+    pub async fn count_clients(&self) -> Result<i64> {
+        let row = sqlx::query("SELECT COUNT(*) as count FROM clients")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.get("count"))
+    }
+
+    pub async fn ping(&self) -> Result<bool> {
+        match sqlx::query("SELECT 1").fetch_one(&self.pool).await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                warn!("Database ping failed: {}", e);
+                Ok(false)
+            }
+        }
+    }
+
+    // --- Cache entry methods ---
+
+    pub async fn record_cache_miss(&self, config: &CacheMissConfig) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO cache_entries (url, cache_path, content_type, content_length, etag, last_modified, cached_at, last_accessed, hit_count)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0)
+             ON CONFLICT (url) DO UPDATE SET
+                 cache_path = EXCLUDED.cache_path,
+                 content_type = EXCLUDED.content_type,
+                 content_length = EXCLUDED.content_length,
+                 etag = EXCLUDED.etag,
+                 last_modified = EXCLUDED.last_modified,
+                 cached_at = EXCLUDED.cached_at,
+                 last_accessed = EXCLUDED.last_accessed,
+                 hit_count = 0",
+        )
+        .bind(&config.url)
+        .bind(&config.cache_path)
+        .bind(&config.content_type)
+        .bind(config.content_length)
+        .bind(&config.etag)
+        .bind(&config.last_modified)
+        .bind(config.cached_at)
+        .bind(config.cached_at)
+        .execute(&self.pool)
+        .await?;
+
+        debug!("Recorded cache miss for: {}", config.url);
+        Ok(())
+    }
+
+    pub async fn record_cache_hit(&self, url: &str, last_accessed: i64) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE cache_entries SET last_accessed = $1, hit_count = hit_count + 1 WHERE url = $2",
+        )
+        .bind(last_accessed)
+        .bind(url)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            debug!("Cache hit recorded for unknown URL: {}", url);
+        }
+        Ok(())
+    }
+
+    pub async fn get_cache_entry(&self, url: &str) -> Result<Option<CacheEntryRow>> {
+        let row = sqlx::query(
+            "SELECT url, cache_path, content_type, content_length, etag, last_modified, cached_at, last_accessed, hit_count
+             FROM cache_entries WHERE url = $1",
+        )
+        .bind(url)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| CacheEntryRow {
+            url: r.get("url"),
+            cache_path: r.get("cache_path"),
+            content_type: r.get("content_type"),
+            content_length: r.get("content_length"),
+            etag: r.get("etag"),
+            last_modified: r.get("last_modified"),
+            cached_at: r.get("cached_at"),
+            last_accessed: r.get("last_accessed"),
+            hit_count: r.get("hit_count"),
+        }))
+    }
+
+    #[allow(dead_code)] // Admin API cache listing
+    pub async fn list_cache_entries(&self) -> Result<Vec<CacheEntryRow>> {
+        let rows = sqlx::query(
+            "SELECT url, cache_path, content_type, content_length, etag, last_modified, cached_at, last_accessed, hit_count
+             FROM cache_entries ORDER BY cached_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let entries: Vec<CacheEntryRow> = rows
+            .iter()
+            .map(|r| CacheEntryRow {
+                url: r.get("url"),
+                cache_path: r.get("cache_path"),
+                content_type: r.get("content_type"),
+                content_length: r.get("content_length"),
+                etag: r.get("etag"),
+                last_modified: r.get("last_modified"),
+                cached_at: r.get("cached_at"),
+                last_accessed: r.get("last_accessed"),
+                hit_count: r.get("hit_count"),
+            })
+            .collect();
+
+        debug!("Listed {} cache entries", entries.len());
+        Ok(entries)
+    }
+
+    #[allow(dead_code)] // Admin API cache management
+    pub async fn delete_cache_entry(&self, url: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM cache_entries WHERE url = $1")
+            .bind(url)
+            .execute(&self.pool)
+            .await?;
+        let deleted = result.rows_affected() > 0;
+        if deleted {
+            debug!("Deleted cache entry for: {}", url);
+        }
+        Ok(deleted)
+    }
+
+    // --- API key methods ---
+
+    pub async fn create_api_key(&self, label: &str, key_hash: &str) -> Result<ApiKeyId> {
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+
+        sqlx::query(
+            "INSERT INTO api_keys (id, label, key_hash, created_at) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id)
+        .bind(label)
+        .bind(key_hash)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        info!("Created API key {} (label={})", id, label);
+        Ok(ApiKeyId(id))
+    }
+
+    #[allow(dead_code)] // Will be used when API key auth is wired to mirror middleware
+    pub async fn validate_api_key(&self, key_hash: &str) -> Result<Option<ApiKeyId>> {
+        let row = sqlx::query("UPDATE api_keys SET last_used = $1 WHERE key_hash = $2 RETURNING id")
+            .bind(Utc::now())
+            .bind(key_hash)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        match row {
+            Some(r) => {
+                let id: Uuid = r.get("id");
+                debug!("Validated API key {}", id);
+                Ok(Some(ApiKeyId(id)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_api_keys(&self) -> Result<Vec<ApiKey>> {
+        let rows = sqlx::query(
+            "SELECT id, label, key_hash, created_at, last_used FROM api_keys ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let keys: Vec<ApiKey> = rows
+            .iter()
+            .map(|r| ApiKey {
+                id: ApiKeyId(r.get("id")),
+                label: r.get("label"),
+                key_hash: r.get("key_hash"),
+                created_at: r.get("created_at"),
+                last_used: r.get("last_used"),
+            })
+            .collect();
+
+        debug!("Listed {} API keys", keys.len());
+        Ok(keys)
+    }
+
+    pub async fn revoke_api_key(&self, key_id: &ApiKeyId) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM api_keys WHERE id = $1")
+            .bind(key_id.0)
+            .execute(&self.pool)
+            .await?;
+        let deleted = result.rows_affected() > 0;
+        if deleted {
+            info!("Revoked API key {}", key_id);
+        }
+        Ok(deleted)
+    }
+
+    pub async fn record_pairing(
+        &self,
+        client_id: &ClientId,
+        paired_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE clients SET paired_at = $1, last_seen = $1 WHERE id = $2",
+        )
+        .bind(paired_at)
+        .bind(client_id.0)
+        .execute(&self.pool)
+        .await?;
+
+        info!("Recorded pairing for client {}", client_id);
+        Ok(())
+    }
+
+    // --- Package query methods ---
+
+    #[allow(dead_code)] // Admin API query method
+    pub async fn get_package(&self, package_id: &PackageId) -> Result<Option<Package>> {
+        let row = sqlx::query(
+            "SELECT id, manager, name, version, arch, file_path, hash, upstream_url, size_bytes, cached_at, last_accessed
+             FROM packages WHERE id = $1",
+        )
+        .bind(package_id.0)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| row_to_package(&r)))
+    }
+
+    #[allow(dead_code)] // Admin API query method
+    pub async fn list_packages(&self) -> Result<Vec<Package>> {
+        let rows = sqlx::query(
+            "SELECT id, manager, name, version, arch, file_path, hash, upstream_url, size_bytes, cached_at, last_accessed
+             FROM packages ORDER BY cached_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let packages: Vec<Package> = rows.iter().map(row_to_package).collect();
+        debug!("Listed {} packages", packages.len());
+        Ok(packages)
+    }
+
+    #[allow(dead_code)] // Admin API query method
+    pub async fn get_packages_for_client(&self, client_id: &ClientId) -> Result<Vec<Package>> {
+        let rows = sqlx::query(
+            "SELECT p.id, p.manager, p.name, p.version, p.arch, p.file_path, p.hash, p.upstream_url, p.size_bytes, p.cached_at, p.last_accessed
+             FROM packages p
+             INNER JOIN client_packages cp ON p.id = cp.package_id
+             WHERE cp.client_id = $1
+             ORDER BY cp.installed_at DESC",
+        )
+        .bind(client_id.0)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let packages: Vec<Package> = rows.iter().map(row_to_package).collect();
+        debug!(
+            "Listed {} packages for client {}",
+            packages.len(),
+            client_id
+        );
+        Ok(packages)
+    }
+
+    #[allow(dead_code)] // Admin API query method
+    pub async fn get_client_packages(&self, client_id: &ClientId) -> Result<Vec<ClientPackage>> {
+        let rows = sqlx::query(
+            "SELECT client_id, package_id, installed_at
+             FROM client_packages WHERE client_id = $1
+             ORDER BY installed_at DESC",
+        )
+        .bind(client_id.0)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let associations: Vec<ClientPackage> = rows
+            .iter()
+            .map(|r| ClientPackage {
+                client_id: ClientId(r.get("client_id")),
+                package_id: PackageId(r.get("package_id")),
+                installed_at: r.get("installed_at"),
+            })
+            .collect();
+
+        debug!(
+            "Listed {} client-package associations for client {}",
+            associations.len(),
+            client_id
+        );
+        Ok(associations)
+    }
+}
+
+/// Convert DB row to Package
+    #[allow(dead_code)] // Helper for DB query methods above
+fn row_to_package(row: &sqlx::postgres::PgRow) -> Package {
+    Package {
+        id: PackageId(row.get("id")),
+        manager: row.get("manager"),
+        name: row.get("name"),
+        version: row.get("version"),
+        arch: row.get("arch"),
+        file_path: row.get("file_path"),
+        hash: row.get("hash"),
+        upstream_url: row.get("upstream_url"),
+        size_bytes: row.get("size_bytes"),
+        cached_at: row.get("cached_at"),
+        last_accessed: row.get("last_accessed"),
+    }
+}
+
+#[allow(dead_code)] // DB row type for admin API cache listing
+pub struct CacheEntryRow {
+    pub url: String,
+    pub cache_path: String,
+    pub content_type: Option<String>,
+    pub content_length: i64,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub cached_at: i64,
+    pub last_accessed: i64,
+    pub hit_count: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+/// Mirror configuration stored in DB
+#[allow(dead_code)] // DB row type for mirror gRPC handlers
+pub struct MirrorConfigRow {
+    pub distro: String,
+    pub upstream_url: String,
+    pub local_path: String,
+    pub sync_enabled: bool,
+    pub sync_interval_secs: i64,
+    pub bandwidth_limit_bps: Option<i64>,
+    pub include_patterns: serde_json::Value,
+    pub exclude_patterns: serde_json::Value,
+    pub public: bool,
+    pub last_sync: Option<chrono::DateTime<chrono::Utc>>,
+    pub sync_status: String,
+    pub total_bytes: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Database {
+    pub async fn upsert_mirror_config(&self, config: &MirrorUpsertConfig) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO mirror_configs (distro, upstream_url, local_path, sync_enabled, sync_interval_secs, bandwidth_limit_bps, include_patterns, exclude_patterns, public)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             ON CONFLICT (distro) DO UPDATE SET
+                 upstream_url = EXCLUDED.upstream_url,
+                 local_path = EXCLUDED.local_path,
+                 sync_enabled = EXCLUDED.sync_enabled,
+                 sync_interval_secs = EXCLUDED.sync_interval_secs,
+                 bandwidth_limit_bps = EXCLUDED.bandwidth_limit_bps,
+                 include_patterns = EXCLUDED.include_patterns,
+                 exclude_patterns = EXCLUDED.exclude_patterns,
+                 public = EXCLUDED.public",
+        )
+        .bind(&config.distro)
+        .bind(&config.upstream_url)
+        .bind(&config.local_path)
+        .bind(config.sync_enabled)
+        .bind(config.sync_interval_secs)
+        .bind(config.bandwidth_limit_bps)
+        .bind(&config.include_patterns)
+        .bind(&config.exclude_patterns)
+        .bind(config.public)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Will be used by mirror gRPC handlers
+    pub async fn get_mirror_config(&self, distro: &str) -> Result<Option<MirrorConfigRow>> {
+        let row = sqlx::query_as::<_, MirrorConfigRow>(
+            "SELECT * FROM mirror_configs WHERE distro = $1",
+        )
+        .bind(distro)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    #[allow(dead_code)] // Will be used by mirror gRPC handlers
+    pub async fn list_mirror_configs(&self) -> Result<Vec<MirrorConfigRow>> {
+        let rows = sqlx::query_as::<_, MirrorConfigRow>(
+            "SELECT * FROM mirror_configs ORDER BY distro",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    #[allow(dead_code)] // Will be used by mirror gRPC handlers
+    pub async fn update_mirror_sync_status(&self, distro: &str, status: &str) -> Result<()> {
+        sqlx::query("UPDATE mirror_configs SET sync_status = $1 WHERE distro = $2")
+            .bind(status)
+            .bind(distro)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // Will be used by mirror gRPC handlers
+    pub async fn update_mirror_last_sync(&self, distro: &str, total_bytes: i64) -> Result<()> {
+        let now = Utc::now();
+        sqlx::query(
+            "UPDATE mirror_configs SET last_sync = $1, total_bytes = $2, sync_status = 'idle' WHERE distro = $3",
+        )
+        .bind(now)
+        .bind(total_bytes)
+        .bind(distro)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_mirror_config(&self, distro: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM mirror_configs WHERE distro = $1")
+            .bind(distro)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+

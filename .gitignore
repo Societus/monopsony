@@ -1,0 +1,48 @@
+# Build artifacts
+/target/
+
+# IDE and editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# AI assistant context files
+.claude/
+.aider/
+.cursor/
+.hermes/
+*.jsonl
+
+# Internal development docs (not for public repo)
+PLAN*.md
+ROADMAP.md
+TLS_WIRING_PLAN.md
+docs/handoff-*
+docs/sprint-*
+docs/sprint-roadmap.md
+docs/sprint-rollback-log.md
+docs/research/
+
+# Python cache (for any scripts)
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.mypy_cache/
+
+# Environment files
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+/coverage/
+*.profraw
+
+# Patch artifacts from local testing
+*.patched
+patch_install.py
