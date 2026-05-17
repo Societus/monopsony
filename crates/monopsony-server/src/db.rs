@@ -162,6 +162,72 @@ impl Database {
         .await?;
         info!("Created mirror_configs table");
 
+        // Shadow package tables
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS shadow_packages (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                client_id       UUID REFERENCES clients(id) ON DELETE CASCADE,
+                name            TEXT NOT NULL,
+                version         TEXT NOT NULL,
+                architecture    TEXT NOT NULL,
+                os_family       TEXT NOT NULL,
+                libc            TEXT,
+                source_type     TEXT NOT NULL,
+                source_url      TEXT NOT NULL,
+                recipe_path     TEXT NOT NULL,
+                install_paths   JSONB NOT NULL,
+                config_paths    JSONB,
+                service_name    TEXT,
+                masked_from_pm  TEXT,
+                registered_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                last_updated_at TIMESTAMPTZ,
+                last_checked_at TIMESTAMPTZ
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_shadow_packages_client ON shadow_packages(client_id)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_shadow_packages_name ON shadow_packages(name)")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS shadow_package_versions (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                package_id      UUID REFERENCES shadow_packages(id) ON DELETE CASCADE,
+                version         TEXT NOT NULL,
+                tag             TEXT,
+                release_notes_url TEXT,
+                assets          JSONB,
+                cached          BOOLEAN DEFAULT FALSE,
+                discovered_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE(package_id, version)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS shadow_update_history (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                package_id      UUID REFERENCES shadow_packages(id) ON DELETE CASCADE,
+                from_version    TEXT NOT NULL,
+                to_version      TEXT NOT NULL,
+                status          TEXT NOT NULL,
+                backup_path     TEXT,
+                error_message   TEXT,
+                applied_at      TIMESTAMPTZ,
+                rolled_back_at  TIMESTAMPTZ
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_shadow_update_history_package ON shadow_update_history(package_id)")
+            .execute(&self.pool)
+            .await?;
+
         info!("Database migrations complete");
         Ok(())
     }
@@ -860,6 +926,165 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    // ── Shadow package CRUD ──
+
+    pub async fn create_shadow_package(
+        &self,
+        client_id: &uuid::Uuid,
+        name: &str,
+        version: &str,
+        architecture: &str,
+        os_family: &str,
+        libc: Option<&str>,
+        source_type: &str,
+        source_url: &str,
+        recipe_path: &str,
+        install_paths: &serde_json::Value,
+        config_paths: Option<&serde_json::Value>,
+        service_name: Option<&str>,
+        masked_from_pm: Option<&str>,
+    ) -> Result<uuid::Uuid> {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO shadow_packages (id, client_id, name, version, architecture, os_family, libc, source_type, source_url, recipe_path, install_paths, config_paths, service_name, masked_from_pm)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"
+        )
+        .bind(&id)
+        .bind(client_id)
+        .bind(name)
+        .bind(version)
+        .bind(architecture)
+        .bind(os_family)
+        .bind(libc)
+        .bind(source_type)
+        .bind(source_url)
+        .bind(recipe_path)
+        .bind(install_paths)
+        .bind(config_paths)
+        .bind(service_name)
+        .bind(masked_from_pm)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn get_shadow_package(&self, id: &uuid::Uuid) -> Result<Option<sqlx::types::Json<serde_json::Value>>> {
+        let row = sqlx::query_as::<_, (sqlx::types::Json<serde_json::Value>,)>(
+            "SELECT row_to_json(shadow_packages.*) FROM shadow_packages WHERE id = $1"
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.0))
+    }
+
+    pub async fn list_shadow_packages_for_client(
+        &self,
+        client_id: &uuid::Uuid,
+    ) -> Result<Vec<sqlx::types::Json<serde_json::Value>>> {
+        let rows = sqlx::query_as::<_, (sqlx::types::Json<serde_json::Value>,)>(
+            "SELECT row_to_json(shadow_packages.*) FROM shadow_packages WHERE client_id = $1 ORDER BY name"
+        )
+        .bind(client_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
+    pub async fn update_shadow_package_version(&self, id: &uuid::Uuid, version: &str) -> Result<()> {
+        sqlx::query(
+            "UPDATE shadow_packages SET version = $1, last_updated_at = now() WHERE id = $2"
+        )
+        .bind(version)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn update_shadow_package_checked(&self, id: &uuid::Uuid) -> Result<()> {
+        sqlx::query("UPDATE shadow_packages SET last_checked_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_shadow_package(&self, id: &uuid::Uuid) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM shadow_packages WHERE id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn record_shadow_package_version(
+        &self,
+        package_id: &uuid::Uuid,
+        version: &str,
+        tag: Option<&str>,
+        release_notes_url: Option<&str>,
+        assets: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO shadow_package_versions (package_id, version, tag, release_notes_url, assets)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT (package_id, version) DO UPDATE SET assets = COALESCE(EXCLUDED.assets, shadow_package_versions.assets)"
+        )
+        .bind(package_id)
+        .bind(version)
+        .bind(tag)
+        .bind(release_notes_url)
+        .bind(assets)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn record_shadow_update(
+        &self,
+        package_id: &uuid::Uuid,
+        from_version: &str,
+        to_version: &str,
+        status: &str,
+        backup_path: Option<&str>,
+    ) -> Result<uuid::Uuid> {
+        let id = uuid::Uuid::new_v4();
+        let applied_at = if status == "applied" { "now()" } else { "NULL" };
+        sqlx::query(&format!(
+            "INSERT INTO shadow_update_history (id, package_id, from_version, to_version, status, backup_path, applied_at)
+             VALUES ($1, $2, $3, $4, $5, $6, {applied_at})"
+        ))
+        .bind(&id)
+        .bind(package_id)
+        .bind(from_version)
+        .bind(to_version)
+        .bind(status)
+        .bind(backup_path)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn update_shadow_update_status(
+        &self,
+        id: &uuid::Uuid,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let applied = if status == "applied" { ", applied_at = now()" } else { "" };
+        let rolled = if status == "rolled_back" { ", rolled_back_at = now()" } else { "" };
+        sqlx::query(&format!(
+            "UPDATE shadow_update_history SET status = $1, error_message = $2{applied}{rolled} WHERE id = $3"
+        ))
+        .bind(status)
+        .bind(error)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 

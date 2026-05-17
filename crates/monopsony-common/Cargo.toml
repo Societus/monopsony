@@ -25,6 +25,8 @@ hex = { workspace = true }
 serde_path_to_error = { workspace = true }
 url = "2"
 which = "6"
+ed25519-dalek = { version = "2", features = ["serde"] }
+base64 = "0.22"
 
 [build-dependencies]
 tonic-build = "0.12"

@@ -19,6 +19,8 @@ uuid = { workspace = true }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+ed25519-dalek = { workspace = true }
+jsonwebtoken = { workspace = true }
 monopsony-common = { workspace = true }
 
 [dev-dependencies]

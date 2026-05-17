@@ -21,6 +21,13 @@ mod mirror;
 mod announce;
 mod nat;
 mod auth;
+mod shadow_signing;
+mod shadow_recipe;
+mod shadow_conflict;
+mod shadow_cache;
+mod shadow_source;
+mod shadow_git_mirror;
+mod shadow;
 
 #[derive(Parser, Debug)]
 #[command(name = "monopsony-server", version)]

@@ -11,6 +11,16 @@ service MonopsonyControl {
     rpc Register(RegisterRequest) returns (RegisterResponse);
     rpc ReportInventory(InventoryReport) returns (InventoryResponse);
     rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+    // Shadow package management
+    rpc ListShadowPackages(ListShadowPackagesRequest) returns (ShadowPackageList);
+    rpc RegisterShadowPackage(RegisterShadowPackageRequest) returns (ShadowPackageInfo);
+    rpc UnregisterShadowPackage(UnregisterShadowPackageRequest) returns (UnregisterShadowPackageResponse);
+    rpc CheckShadowUpdates(CheckShadowUpdatesRequest) returns (ShadowUpdateList);
+    rpc ApplyShadowUpdate(ApplyShadowUpdateRequest) returns (ShadowUpdateResult);
+    rpc RollbackShadowUpdate(RollbackShadowUpdateRequest) returns (ShadowUpdateResult);
+    rpc GetShadowRecipe(GetShadowRecipeRequest) returns (SignedShadowRecipe);
+    rpc DownloadShadowAsset(DownloadShadowAssetRequest) returns (stream ShadowAssetChunk);
 }
 
 // Client -> Server messages (for streaming)
@@ -187,4 +197,125 @@ message DeleteMirrorConfigRequest {
 message DeleteMirrorConfigResponse {
     bool deleted = 1;
     string message = 2;
+}
+
+// ── Shadow Package Messages ──
+
+message ListShadowPackagesRequest {
+    string client_id = 1;
+}
+
+message ShadowPackageInfo {
+    string id = 1;
+    string name = 2;
+    string version = 3;
+    string architecture = 4;
+    string os_family = 5;
+    string libc = 6;
+    string source_type = 7;
+    string source_url = 8;
+    string recipe_path = 9;
+    repeated string install_paths = 10;
+    repeated string config_paths = 11;
+    string service_name = 12;
+    string masked_from_pm = 13;
+    int64 registered_at = 14;
+    int64 last_updated_at = 15;
+    int64 last_checked_at = 16;
+}
+
+message ShadowPackageList {
+    repeated ShadowPackageInfo packages = 1;
+}
+
+message RegisterShadowPackageRequest {
+    string client_id = 1;
+    string name = 2;
+    string version = 3;
+    string architecture = 4;
+    string os_family = 5;
+    string libc = 6;
+    string source_type = 7;
+    string source_url = 8;
+    string recipe_toml = 9;
+    repeated string install_paths = 10;
+    repeated string config_paths = 11;
+    string service_name = 12;
+    bool mask_from_pm = 13;
+}
+
+message UnregisterShadowPackageRequest {
+    string client_id = 1;
+    string package_id = 2;
+    bool unmask_from_pm = 3;
+}
+
+message UnregisterShadowPackageResponse {
+    bool deleted = 1;
+    string message = 2;
+}
+
+message CheckShadowUpdatesRequest {
+    string client_id = 1;
+    repeated string package_ids = 2; // empty = check all
+}
+
+message ShadowUpdateInfo {
+    string package_id = 1;
+    string package_name = 2;
+    string current_version = 3;
+    string latest_version = 4;
+    string asset_url = 5;
+    string asset_name = 6;
+    int64 asset_size = 7;
+    string release_notes_url = 8;
+}
+
+message ShadowUpdateList {
+    repeated ShadowUpdateInfo updates = 1;
+}
+
+message ApplyShadowUpdateRequest {
+    string client_id = 1;
+    string package_id = 2;
+    string target_version = 3;
+    string asset_url = 4;
+    bool create_backup = 5;
+}
+
+message RollbackShadowUpdateRequest {
+    string client_id = 1;
+    string package_id = 2;
+}
+
+message ShadowUpdateResult {
+    bool success = 1;
+    string message = 2;
+    string new_version = 3;
+    string backup_path = 4;
+}
+
+message GetShadowRecipeRequest {
+    string client_id = 1;
+    string package_name = 2;
+}
+
+message SignedShadowRecipe {
+    string recipe_toml = 1;
+    string key_id = 2;
+    string signature = 3;
+    int64 signed_at = 4;
+}
+
+message DownloadShadowAssetRequest {
+    string client_id = 1;
+    string package_id = 2;
+    string target_version = 3;
+}
+
+message ShadowAssetChunk {
+    bytes data = 1;
+    int64 offset = 2;
+    int64 total_size = 3;
+    string blob_hash = 4;
 }

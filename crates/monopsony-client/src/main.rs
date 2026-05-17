@@ -1,5 +1,8 @@
 //! Monopsony Client - Local proxy and package manager integration
 
+mod shadow;
+mod shadow_cli;
+
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

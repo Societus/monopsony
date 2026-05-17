@@ -15,6 +15,10 @@ use monopsony_common::proto::monopsony::{
     client_message, server_message, ClientMessage, HeartbeatRequest, HeartbeatResponse,
     InventoryDelta, InventoryReport, InventoryResponse, RegisterRequest, RegisterResponse,
     ServerMessage, SyncRequest,
+    ListShadowPackagesRequest, ShadowPackageList, RegisterShadowPackageRequest, ShadowPackageInfo,
+    UnregisterShadowPackageRequest, UnregisterShadowPackageResponse, CheckShadowUpdatesRequest,
+    ShadowUpdateList, ApplyShadowUpdateRequest, RollbackShadowUpdateRequest, ShadowUpdateResult,
+    GetShadowRecipeRequest, SignedShadowRecipe, DownloadShadowAssetRequest, ShadowAssetChunk,
 };
 use monopsony_common::proto::monopsony::monopsony_control_server::{
     MonopsonyControl, MonopsonyControlServer,
@@ -341,6 +345,66 @@ impl MonopsonyControl for MonopsonyGrpc {
         };
 
         Ok(Response::new(Box::pin(output)))
+    }
+
+    // ── Shadow package RPC stubs (Batch C) ──
+
+    async fn list_shadow_packages(
+        &self,
+        _request: Request<ListShadowPackagesRequest>,
+    ) -> Result<Response<ShadowPackageList>, Status> {
+        Err(Status::unimplemented("list_shadow_packages not yet implemented"))
+    }
+
+    async fn register_shadow_package(
+        &self,
+        _request: Request<RegisterShadowPackageRequest>,
+    ) -> Result<Response<ShadowPackageInfo>, Status> {
+        Err(Status::unimplemented("register_shadow_package not yet implemented"))
+    }
+
+    async fn unregister_shadow_package(
+        &self,
+        _request: Request<UnregisterShadowPackageRequest>,
+    ) -> Result<Response<UnregisterShadowPackageResponse>, Status> {
+        Err(Status::unimplemented("unregister_shadow_package not yet implemented"))
+    }
+
+    async fn check_shadow_updates(
+        &self,
+        _request: Request<CheckShadowUpdatesRequest>,
+    ) -> Result<Response<ShadowUpdateList>, Status> {
+        Err(Status::unimplemented("check_shadow_updates not yet implemented"))
+    }
+
+    async fn apply_shadow_update(
+        &self,
+        _request: Request<ApplyShadowUpdateRequest>,
+    ) -> Result<Response<ShadowUpdateResult>, Status> {
+        Err(Status::unimplemented("apply_shadow_update not yet implemented"))
+    }
+
+    async fn rollback_shadow_update(
+        &self,
+        _request: Request<RollbackShadowUpdateRequest>,
+    ) -> Result<Response<ShadowUpdateResult>, Status> {
+        Err(Status::unimplemented("rollback_shadow_update not yet implemented"))
+    }
+
+    async fn get_shadow_recipe(
+        &self,
+        _request: Request<GetShadowRecipeRequest>,
+    ) -> Result<Response<SignedShadowRecipe>, Status> {
+        Err(Status::unimplemented("get_shadow_recipe not yet implemented"))
+    }
+
+    type DownloadShadowAssetStream = Pin<Box<dyn Stream<Item = Result<ShadowAssetChunk, Status>> + Send>>;
+
+    async fn download_shadow_asset(
+        &self,
+        _request: Request<DownloadShadowAssetRequest>,
+    ) -> Result<Response<Self::DownloadShadowAssetStream>, Status> {
+        Err(Status::unimplemented("download_shadow_asset not yet implemented"))
     }
 }
 

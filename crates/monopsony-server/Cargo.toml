@@ -46,3 +46,10 @@ getrandom = "0.2"
 mime_guess = "2"
 toml = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
+ed25519-dalek = { version = "2", features = ["serde"] }
+base64 = "0.22"
+regex = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
