@@ -28,6 +28,8 @@ pub enum ShadowClientError {
     RollbackFailed(String),
     #[error("verification failed: {0}")]
     VerificationFailed(String),
+    #[error("trust verification failed: {0}")]
+    TrustVerificationFailed(String),
     #[error("IO: {0}")]
     Io(#[from] std::io::Error),
 }

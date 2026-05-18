@@ -5,6 +5,7 @@
 //! SQLite-backed, ~600 lines.
 
 mod auth;
+mod recipes;
 mod report;
 mod reputation;
 mod stun;
@@ -718,6 +719,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     reputation::init_reputation_tables(&conn);
+    recipes::init_recipe_tables(&conn);
 
     let state = Arc::new(TrackerState {
         db: Arc::new(tokio::sync::Mutex::new(conn)),
@@ -762,7 +764,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/reputation/attest", post(reputation::handle_attest))
         .route("/blacklist", post(handle_blacklist_add))
         .route("/blacklist", get(handle_blacklist_list))
-        .route("/blacklist/{id}", axum::routing::delete(handle_blacklist_remove));
+        .route("/blacklist/{id}", axum::routing::delete(handle_blacklist_remove))
+        .merge(recipes::recipe_router());
 
     let app = protected
         .merge(open)
@@ -802,6 +805,7 @@ mod tests {
         report::init_reports_table(&conn);
         reputation::init_reputation_tables(&conn);
         stun::migrate_nat_columns(&conn);
+        recipes::init_recipe_tables(&conn);
 
         let jwt_config = if auth_mode == TrackerAuthMode::Jwt {
             Some(JwtConfig {
@@ -841,7 +845,8 @@ mod tests {
             .route("/reputation/attest", post(reputation::handle_attest))
             .route("/blacklist", post(handle_blacklist_add))
             .route("/blacklist", get(handle_blacklist_list))
-            .route("/blacklist/{id}", axum::routing::delete(handle_blacklist_remove));
+            .route("/blacklist/{id}", axum::routing::delete(handle_blacklist_remove))
+            .merge(recipes::recipe_router());
 
         protected.merge(open).with_state(state)
     }

@@ -13,6 +13,7 @@ use tracing_subscriber::FmtSubscriber;
 mod proxy;
 mod grpc_client;
 mod discovery;
+mod trust;
 
 #[derive(Parser, Debug)]
 #[command(name = "monopsony-client", version)]
@@ -103,6 +104,11 @@ enum Commands {
         #[arg(long)]
         server: String,
     },
+    /// Shadow package management (register, add, update, rollback, etc.)
+    Package {
+        #[command(subcommand)]
+        cmd: shadow_cli::PackageCommand,
+    },
 }
 
 #[tokio::main]
@@ -139,6 +145,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::CacheStats { server }) => {
             run_cache_stats(&server).await?;
+        }
+        Some(Commands::Package { cmd }) => {
+            run_shadow_package(cmd)?;
         }
         None => {
             info!("No command specified. Use --help for usage.");
@@ -615,5 +624,133 @@ async fn run_cache_stats(server: &str) -> anyhow::Result<()> {
     println!("Or connect to the server at {} and query the metrics endpoint:", server);
     println!("  curl http://{}/metrics | grep monopsony_cache", server);
     
+    Ok(())
+}
+
+fn run_shadow_package(cmd: shadow_cli::PackageCommand) -> anyhow::Result<()> {
+    use shadow_cli::PackageCommand::*;
+
+    match cmd {
+        Register { path, source, name, recipe, method, branch, requires } => {
+            let pkg_name = name.unwrap_or_else(|| {
+                std::path::Path::new(&path)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+            let source_type = shadow_cli::detect_source_type(&source);
+            println!("Registering shadow package: {}", pkg_name);
+            println!("  Source: {} ({:?})", source, source_type);
+            println!("  Install: {}", method);
+            println!("  Branch: {}", branch);
+            if let Some(deps) = &requires {
+                println!("  Build deps: {}", deps);
+            }
+            if let Some(recipe_path) = &recipe {
+                println!("  Recipe file: {}", recipe_path);
+            }
+            println!();
+            println!("Note: Full registration requires a running server connection.");
+            println!("Use 'monopsony-client daemon' to connect, then register via gRPC.");
+        }
+        Add { name, tracker, non_interactive } => {
+            let tracker_url = tracker.unwrap_or_else(|| "http://localhost:8080".to_string());
+            println!("Searching tracker at {} for '{}'...", tracker_url, name);
+            if non_interactive {
+                println!("  Mode: non-interactive (auto-select highest-scored)");
+            } else {
+                println!("  Mode: interactive (prompt for variant selection)");
+            }
+            println!();
+            println!("Note: Full add requires a running tracker. Start one with:");
+            println!("  monopsony-tracker");
+        }
+        Unregister { name } => {
+            println!("Unregistering shadow package: {}", name);
+            println!("Note: Requires server connection.");
+        }
+        List => {
+            println!("Listing registered shadow packages...");
+            println!("Note: Requires server connection.");
+        }
+        Inspect { name } => {
+            println!("Inspecting shadow package: {}", name);
+            println!("Note: Requires server connection.");
+        }
+        Check { name } => {
+            if let Some(pkg) = name {
+                println!("Checking updates for: {}", pkg);
+            } else {
+                println!("Checking updates for all shadow packages...");
+            }
+            println!("Note: Requires server connection.");
+        }
+        Update { name, dry_run, no_restart: _ } => {
+            if dry_run {
+                println!("Dry-run: checking updates for '{}'...", name);
+            } else {
+                println!("Updating shadow package: {}", name);
+            }
+
+            // Load trust configuration from client config
+            let config_path = std::env::var("MONOPSONY_CLIENT_CONFIG")
+                .unwrap_or_else(|_| "/etc/monopsony/client.toml".to_string());
+            match std::fs::read_to_string(&config_path) {
+                Ok(content) => {
+                    match toml::from_str::<monopsony_common::config::ClientConfig>(&content) {
+                        Ok(config) => {
+                            let trust_config = &config.shadow_trust;
+                            println!("Trust policy: {}", trust_config.policy);
+                            if !trust_config.trusted_author_keys.is_empty() {
+                                println!(
+                                    "Trusted author keys: {}",
+                                    trust_config.trusted_author_keys.join(", ")
+                                );
+                            }
+                            if !trust_config.trusted_operator_keys.is_empty() {
+                                println!(
+                                    "Trusted operator keys: {}",
+                                    trust_config.trusted_operator_keys.join(", ")
+                                );
+                            }
+                            // When a signed recipe arrives from the server, trust
+                            // verification happens before execute_build/execute_script.
+                            // See: trust::verify_recipe_trust()
+                            println!("Trust enforcement: enabled (policy: {})", trust_config.policy);
+                        }
+                        Err(e) => eprintln!("Warning: could not parse client config: {}", e),
+                    }
+                }
+                Err(_) => {
+                    println!("Trust enforcement: default (no client config found)");
+                }
+            }
+
+            println!("Note: Requires server connection for full update.");
+        }
+        Rollback { name } => {
+            println!("Rolling back shadow package: {}", name);
+            println!("Note: Requires server connection.");
+        }
+        Recipe { command: sub } => {
+            match sub {
+                shadow_cli::RecipeCommand::Edit { name } => {
+                    println!("Edit recipe for: {}", name);
+                    println!("Recipe files are stored in /etc/monopsony/recipes/<name>.toml");
+                }
+                shadow_cli::RecipeCommand::Validate { path } => {
+                    match std::fs::read_to_string(&path) {
+                        Ok(content) => {
+                            match toml::from_str::<monopsony_common::shadow_types::ShadowRecipe>(&content) {
+                                Ok(recipe) => println!("Recipe {} is valid (package: {}).", path, recipe.package.name),
+                                Err(e) => eprintln!("Recipe validation failed: {}", e),
+                            }
+                        }
+                        Err(e) => eprintln!("Cannot read {}: {}", path, e),
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }

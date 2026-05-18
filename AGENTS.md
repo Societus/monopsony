@@ -7,7 +7,7 @@
 ```
 Monopsony is a centralized package caching proxy system - like Windows Update's LAN sharing but for all package managers across all OSes. A central server pre-fetches and caches packages from upstream repositories, and clients redirect their package managers through it via a local HTTP proxy.
 **Target scale:** SMB/office (20-200 clients, single server)
-**Git state:** Forgejo: base.societus.club/societus/monopsony.git. Local: ~/projects/monopsony. **Sprint 8 in progress. 124 tests passing.**
+**Git state:** Forgejo: base.societus.club/societus/monopsony.git. Local: ~/projects/monopsony. **Sprint 9 complete. 203 tests passing.**
 ## Build & Run
 ```
 bash
@@ -26,12 +26,12 @@ cargo test                     # Run tests
 | Crate | Status | Notes |
 |-------|--------|-------|
 | `monopsony-common` | Compiles clean | shadow_types (shared), AuthMode enum, config validation |
-| `monopsony-client` | Compiles clean | shadow.rs (verify_version, backup, extract, health check, atomic swap), shadow_cli.rs (clap subcommands) |
+| `monopsony-client` | Compiles clean | shadow.rs (verify_version, backup, extract, health check, atomic swap), shadow_cli.rs (clap subcommands), trust.rs (client trust enforcement) |
 | `monopsony-server` | Compiles clean | 8 shadow modules: types, signing, recipe, conflict, cache, source, git_mirror, manager. GitBuildSource, DirectUrlSource. Mirror SSRF validation, body size limits |
-| `monopsony-tracker` | Compiles clean | HTTP API, graceful shutdown |
+| `monopsony-tracker` | Compiles clean | HTTP API, recipe admin routes (quarantine reinstate/remove), graceful shutdown |
 
 Full workspace: `cargo check` passes, 0 errors, warnings only (dead_code in server shadow modules -- not yet wired to gRPC handlers).
-Tests: 124 passed, 0 failed. Clippy: 0 warnings on non-shadow code; shadow code passes clippy.
+Tests: 203 passed, 0 failed. Clippy: 0 warnings on non-shadow code; shadow code passes clippy.
 ## Critical Issues
 
 None currently. All modules compile.
@@ -102,7 +102,8 @@ monopsony/
             ├── grpc_client.rs    # Real tonic gRPC client with register/heartbeat/inventory RPCs + pair() static method. is_connected() checks client_id.
             ├── discovery.rs      # mDNS browsing with spawn_blocking, discover/discover_one
 |           ├── shadow.rs         # Client-side shadow package ops: verify_version, backup, extract, health check, atomic swap, check_build_deps, execute_build, execute_script, run_hook
-|           └── shadow_cli.rs     # Clap subcommands: Register/Unregister/List/Inspect/Check/Update/Rollback/Recipe + detect_source_type()
+|           ├── shadow_cli.rs     # Clap subcommands: Register/Unregister/List/Inspect/Check/Update/Rollback/Recipe + detect_source_type()
+|           └── trust.rs          # Client trust enforcement: verify_recipe_trust (trusted_server_only, trusted_authors, paranoid policies)
 ```
 
 ## Key Types & Interfaces

@@ -185,6 +185,33 @@ pub struct RecipeSignature {
     pub signed_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Severity of an update annotation
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnotationSeverity {
+    Info,
+    Warning,
+    Breaking,
+}
+
+/// An update annotation published by an operator to warn about package transitions.
+///
+/// Operators sign annotations with their Ed25519 operator key so consumers
+/// can verify provenance before acting on the information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateAnnotation {
+    pub package: String,
+    pub from_version: String,
+    pub to_version: String,
+    pub severity: AnnotationSeverity,
+    pub message: String,
+    #[serde(default)]
+    pub url: Option<String>,
+    pub author: String,
+    pub timestamp: i64,
+    pub signature: String,
+}
+
 /// A recipe with its signature(s)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignedRecipe {
@@ -384,5 +411,56 @@ mod tests {
             let back: UpdateStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(status, back);
         }
+    }
+
+    #[test]
+    fn annotation_severity_round_trip() {
+        for sev in [
+            AnnotationSeverity::Info,
+            AnnotationSeverity::Warning,
+            AnnotationSeverity::Breaking,
+        ] {
+            let json = serde_json::to_string(&sev).unwrap();
+            let back: AnnotationSeverity = serde_json::from_str(&json).unwrap();
+            assert_eq!(sev, back);
+        }
+    }
+
+    #[test]
+    fn update_annotation_serialize_round_trip() {
+        let ann = UpdateAnnotation {
+            package: "sonarr".to_string(),
+            from_version: "4.0.6".to_string(),
+            to_version: "4.0.7".to_string(),
+            severity: AnnotationSeverity::Warning,
+            message: "Database migration required".to_string(),
+            url: Some("https://example.com/changelog".to_string()),
+            author: "op123".to_string(),
+            timestamp: 1700000000,
+            signature: "base64sig".to_string(),
+        };
+        let json = serde_json::to_string(&ann).unwrap();
+        let back: UpdateAnnotation = serde_json::from_str(&json).unwrap();
+        assert_eq!(ann.package, back.package);
+        assert_eq!(ann.severity, back.severity);
+        assert_eq!(ann.url, back.url);
+    }
+
+    #[test]
+    fn update_annotation_minimal() {
+        let ann = UpdateAnnotation {
+            package: "mytool".to_string(),
+            from_version: "1.0".to_string(),
+            to_version: "2.0".to_string(),
+            severity: AnnotationSeverity::Info,
+            message: "Minor update".to_string(),
+            url: None,
+            author: "op456".to_string(),
+            timestamp: 1700000000,
+            signature: "sig".to_string(),
+        };
+        let json = serde_json::to_string(&ann).unwrap();
+        let back: UpdateAnnotation = serde_json::from_str(&json).unwrap();
+        assert!(back.url.is_none());
     }
 }

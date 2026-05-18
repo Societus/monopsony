@@ -135,3 +135,47 @@ server_key_path = "/var/lib/monopsony/server.key"
 # Default: "json"
 # Type: string
 # format = "json"
+
+# ============================================================================
+# Shadow Package Trust
+# ============================================================================
+# Controls how the server and clients verify recipe signatures before
+# applying shadow package updates. Recipes are signed with Ed25519 keys;
+# this section configures which signatures are required.
+[shadow_trust]
+
+# Trust policy — determines which signatures are checked before a recipe
+# is accepted for execution.
+#
+# Options:
+#   "trusted_server_only" (default)
+#     Only the server operator's countersignature is required.
+#     Use when you control the server and all recipes yourself.
+#
+#   "trusted_authors"
+#     Recipes must be signed by a trusted author key. The operator
+#     signature is not checked. Use when federating recipes from
+#     external authors you trust.
+#
+#   "paranoid"
+#     Both the operator countersignature AND a trusted author signature
+#     are required. Use for maximum security in federated deployments.
+#
+# Default: "trusted_server_only"
+# Type: string
+# policy = "trusted_server_only"
+
+# List of trusted author key IDs (hex, first 8 bytes of the Ed25519 public key).
+# Only used with "trusted_authors" or "paranoid" policies.
+# Generate keys with: monopsony-server shadow keygen
+#
+# Default: [] (empty — no trusted authors)
+# Type: array of strings
+# trusted_author_keys = []
+
+# List of trusted operator key IDs. Used to verify the server operator's
+# countersignature on federated recipes received from other servers.
+#
+# Default: [] (empty — operator key is loaded from server state)
+# Type: array of strings
+# trusted_operator_keys = []

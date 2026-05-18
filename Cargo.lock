@@ -1611,6 +1611,7 @@ version = "0.1.0-rc1"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "ed25519-dalek",
@@ -1621,6 +1622,7 @@ dependencies = [
  "mdns-sd",
  "monopsony-common",
  "prost",
+ "rand 0.8.5",
  "regex",
  "reqwest",
  "rustls 0.23.37",
@@ -1631,6 +1633,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tonic",
  "tracing",
  "tracing-subscriber",

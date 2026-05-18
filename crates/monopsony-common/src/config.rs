@@ -53,6 +53,8 @@ pub struct ServerConfig {
     pub discovery: DiscoveryConfig,
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub shadow_trust: ShadowPackageTrustConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +172,44 @@ fn default_log_format() -> String {
 }
 
 // ============================================================================
+// Shadow Package Trust Configuration
+// ============================================================================
+
+fn default_trust_policy() -> String {
+    "trusted_server_only".to_string()
+}
+
+/// Trust policy for verifying federated shadow package recipes.
+///
+/// - `trusted_server_only` (default): only accept recipes countersigned by this operator
+/// - `trusted_authors`: accept recipes signed by trusted author keys
+/// - `paranoid`: require both author and operator signatures
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowPackageTrustConfig {
+    /// Trust policy: "trusted_server_only", "trusted_authors", or "paranoid"
+    #[serde(default = "default_trust_policy")]
+    pub policy: String,
+
+    /// Author key IDs to trust (for trusted_authors policy)
+    #[serde(default)]
+    pub trusted_author_keys: Vec<String>,
+
+    /// Operator key IDs to trust (for verifying countersignatures)
+    #[serde(default)]
+    pub trusted_operator_keys: Vec<String>,
+}
+
+impl Default for ShadowPackageTrustConfig {
+    fn default() -> Self {
+        Self {
+            policy: default_trust_policy(),
+            trusted_author_keys: Vec::new(),
+            trusted_operator_keys: Vec::new(),
+        }
+    }
+}
+
+// ============================================================================
 // Client Configuration
 // ============================================================================
 
@@ -182,6 +222,8 @@ pub struct ClientConfig {
     pub proxy: ProxyConfig,
     pub metrics: ClientMetricsConfig,
     pub logging: LoggingConfig,
+    #[serde(default)]
+    pub shadow_trust: ShadowPackageTrustConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,6 +603,7 @@ mod tests {
                 level: "info".to_string(),
                 format: "json".to_string(),
             },
+            shadow_trust: ShadowPackageTrustConfig::default(),
         }
     }
 
@@ -623,5 +666,32 @@ mod tests {
             errors.iter().any(|e| e.contains("max_connections")),
             "Should flag zero max_connections: got {:?}", errors
         );
+    }
+
+    #[test]
+    fn test_shadow_trust_config_defaults() {
+        let trust = ShadowPackageTrustConfig::default();
+        assert_eq!(trust.policy, "trusted_server_only");
+        assert!(trust.trusted_author_keys.is_empty());
+        assert!(trust.trusted_operator_keys.is_empty());
+    }
+
+    #[test]
+    fn test_shadow_trust_config_in_server_config() {
+        let config = valid_server_config();
+        assert_eq!(config.shadow_trust.policy, "trusted_server_only");
+    }
+
+    #[test]
+    fn test_shadow_trust_config_deserialize() {
+        let toml = r#"
+policy = "paranoid"
+trusted_author_keys = ["key1", "key2"]
+trusted_operator_keys = ["op1"]
+"#;
+        let trust: ShadowPackageTrustConfig = toml::from_str(toml).unwrap();
+        assert_eq!(trust.policy, "paranoid");
+        assert_eq!(trust.trusted_author_keys, vec!["key1", "key2"]);
+        assert_eq!(trust.trusted_operator_keys, vec!["op1"]);
     }
 }

@@ -30,6 +30,7 @@ mod shadow_cache;
 mod shadow_source;
 mod shadow_git_mirror;
 mod shadow;
+mod tracker;
 
 #[derive(Parser, Debug)]
 #[command(name = "monopsony-server", version)]
