@@ -21,6 +21,8 @@ mod mirror;
 mod announce;
 mod nat;
 mod auth;
+mod manifest;
+mod public_rate_limit;
 mod shadow_signing;
 mod shadow_recipe;
 mod shadow_conflict;
