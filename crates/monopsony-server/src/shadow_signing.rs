@@ -228,6 +228,8 @@ mod tests {
                 pre_update: None,
                 post_update: None,
                 on_failure: None,
+                max_backups: 3,
+                binaries: vec![],
             },
             asset_selector: None,
             build: None,

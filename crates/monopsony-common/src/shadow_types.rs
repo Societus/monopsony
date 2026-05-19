@@ -19,7 +19,37 @@ pub enum InstallMethod {
     Script,
 }
 
-/// Health check type
+/// Method used to detect the currently installed version of a shadow package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VersionDetectMethod {
+    /// Run a shell command and regex-match stdout (default, existing behavior)
+    Command,
+    /// Read a file and regex-match its contents
+    File,
+    /// HTTP GET/HEAD to a URL, regex-match a response header
+    Header,
+}
+
+/// Version detection configuration. Extends the existing `detect_command` +
+/// `detect_pattern` pair with alternative detection methods.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VersionDetect {
+    /// Detection method (default: "command")
+    #[serde(default = "default_version_detect_method")]
+    pub method: VersionDetectMethod,
+    /// Source: command string (method=command), file path (method=file), or URL (method=header)
+    pub source: String,
+    /// Regex pattern with one capture group for the version
+    pub pattern: String,
+    /// Header name to inspect (only used with method=header)
+    #[serde(default)]
+    pub header_name: Option<String>,
+}
+
+fn default_version_detect_method() -> VersionDetectMethod {
+    VersionDetectMethod::Command
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthCheckType {
@@ -76,6 +106,30 @@ pub struct RecipeInstall {
     /// Command to run if update fails (before rollback)
     #[serde(default)]
     pub on_failure: Option<String>,
+    /// Maximum number of backup versions to keep (default: 3, min: 1)
+    #[serde(default = "default_max_backups")]
+    pub max_backups: usize,
+    /// Multi-binary install map. When set, individual binaries are extracted
+    /// from the archive and installed to their own target paths instead of
+    /// extracting the whole archive to `target_dir`.
+    #[serde(default)]
+    pub binaries: Vec<BinaryEntry>,
+}
+
+fn default_max_backups() -> usize { 3 }
+
+/// Describes a single binary to extract from a release archive.
+/// When `binaries` is set on `RecipeInstall`, each binary is installed
+/// to its own target path instead of extracting the whole archive to `target_dir`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BinaryEntry {
+    /// Filename within the archive (e.g., "bin/myapp" or "myapp")
+    pub source: String,
+    /// Absolute install path on the target system (e.g., "/usr/local/bin/myapp")
+    pub target: String,
+    /// Optional chmod string (e.g., "0755"). Defaults to "0755" if not set.
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// Direct URL source configuration
@@ -462,5 +516,82 @@ mod tests {
         let json = serde_json::to_string(&ann).unwrap();
         let back: UpdateAnnotation = serde_json::from_str(&json).unwrap();
         assert!(back.url.is_none());
+    }
+
+    #[test]
+    fn binary_entry_deserialize() {
+        let toml = r#"
+            source = "bin/myapp"
+            target = "/usr/local/bin/myapp"
+            mode = "0755"
+        "#;
+        let entry: BinaryEntry = toml::from_str(toml).unwrap();
+        assert_eq!(entry.source, "bin/myapp");
+        assert_eq!(entry.target, "/usr/local/bin/myapp");
+        assert_eq!(entry.mode.as_deref(), Some("0755"));
+    }
+
+    #[test]
+    fn binary_entry_minimal() {
+        let toml = r#"
+            source = "myapp"
+            target = "/usr/local/bin/myapp"
+        "#;
+        let entry: BinaryEntry = toml::from_str(toml).unwrap();
+        assert_eq!(entry.source, "myapp");
+        assert!(entry.mode.is_none());
+    }
+
+    #[test]
+    fn recipe_with_binaries() {
+        let toml = [
+            "[package]",
+            "name = \"mytool\"",
+            "source_type = \"github_release\"",
+            "source_url = \"https://github.com/example/tool\"",
+            "",
+            "[install]",
+            "method = \"extract\"",
+            "target_dir = \"/opt/mytool\"",
+            "",
+            "[[install.binaries]]",
+            "source = \"myapp\"",
+            "target = \"/usr/local/bin/myapp\"",
+            "",
+            "[[install.binaries]]",
+            "source = \"myapp-helper\"",
+            "target = \"/usr/local/bin/myapp-helper\"",
+            "mode = \"0700\"",
+            "",
+            "[version]",
+            "detect_command = \"myapp --version\"",
+            r#"detect_pattern = "([0-9]+\\.[0-9]+\\.[0-9]+)""#,
+        ].join("\n");
+        let recipe: ShadowRecipe = toml::from_str(&toml).unwrap();
+        assert_eq!(recipe.install.binaries.len(), 2);
+        assert_eq!(recipe.install.binaries[0].source, "myapp");
+        assert_eq!(recipe.install.binaries[0].target, "/usr/local/bin/myapp");
+        assert!(recipe.install.binaries[0].mode.is_none());
+        assert_eq!(recipe.install.binaries[1].mode.as_deref(), Some("0700"));
+    }
+
+    #[test]
+    fn recipe_without_binaries_is_empty() {
+        let toml = [
+            "[package]",
+            "name = \"simple\"",
+            "source_type = \"direct_url\"",
+            "source_url = \"https://example.com/simple.tar.gz\"",
+            "",
+            "[install]",
+            "method = \"extract\"",
+            "target_dir = \"/opt/simple\"",
+            "",
+            "[version]",
+            "detect_command = \"simple --version\"",
+            "detect_pattern = \"([0-9]+)\"",
+        ].join("\n");
+        let recipe: ShadowRecipe = toml::from_str(&toml).unwrap();
+        assert!(recipe.install.binaries.is_empty());
     }
 }

@@ -7,7 +7,7 @@
 ```
 Monopsony is a centralized package caching proxy system - like Windows Update's LAN sharing but for all package managers across all OSes. A central server pre-fetches and caches packages from upstream repositories, and clients redirect their package managers through it via a local HTTP proxy.
 **Target scale:** SMB/office (20-200 clients, single server)
-**Git state:** Forgejo: base.societus.club/societus/monopsony.git. Local: ~/projects/monopsony. **Sprint 9 complete. 203 tests passing.**
+**Git state:** Forgejo: base.societus.club/societus/monopsony.git. Local: ~/projects/monopsony. **Sprint 10 complete. 238 tests passing.**
 ## Build & Run
 ```
 bash
@@ -31,7 +31,7 @@ cargo test                     # Run tests
 | `monopsony-tracker` | Compiles clean | HTTP API, recipe admin routes (quarantine reinstate/remove), graceful shutdown |
 
 Full workspace: `cargo check` passes, 0 errors, warnings only (dead_code in server shadow modules -- not yet wired to gRPC handlers).
-Tests: 203 passed, 0 failed. Clippy: 0 warnings on non-shadow code; shadow code passes clippy.
+Tests: 238 passed, 0 failed. Clippy: 0 warnings on non-shadow code; shadow code passes clippy.
 ## Critical Issues
 
 None currently. All modules compile.

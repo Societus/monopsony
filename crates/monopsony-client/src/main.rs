@@ -9,11 +9,13 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
+use anyhow::Context;
 
 mod proxy;
 mod grpc_client;
 mod discovery;
 mod trust;
+mod auto_update;
 
 #[derive(Parser, Debug)]
 #[command(name = "monopsony-client", version)]
@@ -126,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
 
     match args.command {
         Some(Commands::Daemon { proxy_addr, server, timeout_ms }) => {
-            run_daemon(proxy_addr, server, timeout_ms, cert_dir).await?;
+            run_daemon(proxy_addr, server, timeout_ms, cert_dir, &args.config).await?;
         }
         Some(Commands::Discover { timeout_secs, tracker_url, peer_url, distro }) => {
             run_discover(timeout_secs, tracker_url, peer_url, &distro).await?;
@@ -162,8 +164,44 @@ async fn run_daemon(
     server: Option<String>,
     timeout_ms: u64,
     cert_dir: PathBuf,
+    config_path: &str,
 ) -> anyhow::Result<()> {
     info!("Starting Monopsony Client v{}", env!("CARGO_PKG_VERSION"));
+
+    // Load client config (optional — daemon works without one using CLI args)
+    let client_config = match std::fs::read_to_string(config_path) {
+        Ok(toml_str) => {
+            match toml::from_str::<monopsony_common::config::ClientConfig>(&toml_str) {
+                Ok(cfg) => {
+                    info!("Loaded config from {}", config_path);
+                    Some(cfg)
+                }
+                Err(e) => {
+                    warn!("Failed to parse config at {}: {}", config_path, e);
+                    None
+                }
+            }
+        }
+        Err(_) => {
+            info!("No config file at {} (using CLI args)", config_path);
+            None
+        }
+    };
+
+    // Validate auto-update config if present and enabled
+    let auto_update_config = client_config.as_ref().map(|c| c.auto_update.clone());
+    if let Some(ref au_cfg) = auto_update_config {
+        if au_cfg.enabled {
+            auto_update::validate_schedule(&au_cfg.schedule)
+                .context("auto-update schedule is invalid")?;
+            auto_update::validate_timezone(&au_cfg.timezone)
+                .context("auto-update timezone is invalid")?;
+            info!(
+                "Auto-update enabled: schedule='{}' tz='{}' max_severity='{}'",
+                au_cfg.schedule, au_cfg.timezone, au_cfg.max_severity
+            );
+        }
+    }
 
     // Require paired certificates
     let certs = grpc_client::ClientCerts::load(&cert_dir).ok_or_else(|| {
@@ -321,6 +359,35 @@ async fn run_daemon(
         }
     });
 
+    // Spawn auto-update scheduler if configured and enabled
+    let auto_update_handle = if let Some(ref au_cfg) = auto_update_config {
+        if au_cfg.enabled {
+            let au_cfg = au_cfg.clone();
+            info!("Spawning auto-update scheduler");
+            Some(tokio::spawn(async move {
+                loop {
+                    match auto_update::next_delay(&au_cfg) {
+                        Some(delay) => {
+                            info!("Next auto-update check in {:?}", delay);
+                            tokio::time::sleep(delay).await;
+                            info!("Auto-update window reached — checking for updates");
+                            // TODO: integrate with shadow package check/apply cycle
+                            // (will be wired when shadow daemon loop is implemented)
+                        }
+                        None => {
+                            warn!("Auto-update schedule produced no future times — disabling scheduler");
+                            break;
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let proxy_config = proxy::ProxyConfig {
         server_addr: server_addr.clone(),
         fallback_timeout_ms: timeout_ms,
@@ -331,6 +398,9 @@ async fn run_daemon(
     proxy::run_proxy(listen_addr, proxy_config).await?;
 
     heartbeat_handle.abort();
+    if let Some(h) = auto_update_handle {
+        h.abort();
+    }
     Ok(())
 }
 
@@ -730,7 +800,8 @@ fn run_shadow_package(cmd: shadow_cli::PackageCommand) -> anyhow::Result<()> {
         }
         Rollback { name } => {
             println!("Rolling back shadow package: {}", name);
-            println!("Note: Requires server connection.");
+            println!("Note: Requires server connection for full rollback.");
+            println!("Available rollback versions can be listed once connected.");
         }
         Recipe { command: sub } => {
             match sub {

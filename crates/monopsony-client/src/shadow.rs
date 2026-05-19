@@ -30,6 +30,8 @@ pub enum ShadowClientError {
     VerificationFailed(String),
     #[error("trust verification failed: {0}")]
     TrustVerificationFailed(String),
+    #[error("install failed: {0}")]
+    InstallFailed(String),
     #[error("IO: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -60,21 +62,65 @@ pub async fn verify_version(detect_command: &str, detect_pattern: &str) -> Resul
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let pat = Regex::new(detect_pattern)
+    extract_version(&stdout, detect_pattern)
+}
+
+/// Detect installed version using an alternative detection method.
+pub async fn detect_version(
+    config: &monopsony_common::shadow_types::VersionDetect,
+) -> Result<String, ShadowClientError> {
+    use monopsony_common::shadow_types::VersionDetectMethod;
+
+    match config.method {
+        VersionDetectMethod::Command => {
+            verify_version(&config.source, &config.pattern).await
+        }
+        VersionDetectMethod::File => {
+            let content = tokio::fs::read_to_string(&config.source)
+                .await
+                .map_err(|e| ShadowClientError::VerificationFailed(
+                    format!("failed to read file '{}': {}", config.source, e)
+                ))?;
+            extract_version(&content, &config.pattern)
+        }
+        VersionDetectMethod::Header => {
+            let header_name = config.header_name.as_deref().unwrap_or("etag");
+            let client = reqwest::Client::new();
+            let resp = client.head(&config.source)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+                .map_err(|e| ShadowClientError::VerificationFailed(
+                    format!("HTTP HEAD to '{}' failed: {}", config.source, e)
+                ))?;
+            let value = resp.headers()
+                .get(header_name)
+                .ok_or_else(|| ShadowClientError::VerificationFailed(
+                    format!("header '{}' not found in response", header_name)
+                ))?
+                .to_str()
+                .map_err(|e| ShadowClientError::VerificationFailed(
+                    format!("header value not valid UTF-8: {}", e)
+                ))?;
+            extract_version(value, &config.pattern)
+        }
+    }
+}
+
+/// Extract a version string from text using a regex with one capture group.
+fn extract_version(text: &str, pattern: &str) -> Result<String, ShadowClientError> {
+    let pat = Regex::new(pattern)
         .map_err(|e| ShadowClientError::VerificationFailed(e.to_string()))?;
-
     let caps = pat
-        .captures(&stdout)
+        .captures(text)
         .ok_or_else(|| ShadowClientError::VersionMismatch {
-            expected: detect_pattern.to_string(),
-            got: stdout.trim().to_string(),
+            expected: pattern.to_string(),
+            got: text.trim().to_string(),
         })?;
-
     let version = caps
         .get(1)
         .map(|m| m.as_str().to_string())
-        .unwrap_or_else(|| stdout.trim().to_string());
-
+        .unwrap_or_else(|| text.trim().to_string());
     Ok(version)
 }
 
@@ -109,6 +155,111 @@ pub async fn restore_backup(target_dir: &str, backup_path: &Path) -> Result<(), 
     Ok(())
 }
 
+/// A single rollback entry (versioned backup).
+#[derive(Debug, Clone)]
+pub struct RollbackEntry {
+    pub version: String,
+    pub backup_path: PathBuf,
+    /// Modification time of the backup directory.
+    pub modified: std::time::SystemTime,
+}
+
+/// List available rollback versions for a package.
+///
+/// Scans for directories matching `{target_dir}.bak.*` and returns them
+/// sorted newest-first.
+pub async fn list_rollback_versions(target_dir: &str) -> Result<Vec<RollbackEntry>, ShadowClientError> {
+    let parent = Path::new(target_dir)
+        .parent()
+        .unwrap_or(Path::new("."));
+    let dir_name = Path::new(target_dir)
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let prefix = format!("{dir_name}.bak.");
+
+    let mut entries = Vec::new();
+    let mut read_dir = fs::read_dir(parent).await?;
+    while let Some(entry) = read_dir.next_entry().await? {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(version) = name.strip_prefix(&prefix) {
+            let meta = entry.metadata().await?;
+            entries.push(RollbackEntry {
+                version: version.to_string(),
+                backup_path: entry.path(),
+                modified: meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+            });
+        }
+    }
+
+    // Sort newest first
+    entries.sort_by(|a, b| b.modified.cmp(&a.modified));
+    Ok(entries)
+}
+
+/// Rollback to a specific version by restoring its backup.
+///
+/// Creates a backup of the current version first, then restores the target.
+pub async fn rollback_to_version(
+    target_dir: &str,
+    target_version: &str,
+) -> Result<(), ShadowClientError> {
+    let versions = list_rollback_versions(target_dir).await?;
+    let entry = versions
+        .iter()
+        .find(|v| v.version == target_version)
+        .ok_or_else(|| ShadowClientError::RollbackFailed(format!(
+            "version '{}' not found in rollback history (available: {})",
+            target_version,
+            versions.iter().map(|v| v.version.as_str()).collect::<Vec<_>>().join(", ")
+        )))?;
+
+    // Detect current version from the live directory name for logging
+    info!("Rolling back {} to version {}", target_dir, target_version);
+
+    // Backup current state before rollback
+    let current = Path::new(target_dir);
+    if current.exists() {
+        let current_backup = PathBuf::from(format!(
+            "{target_dir}.bak.prerollback.{target_version}"
+        ));
+        copy_dir_recursive(current, &current_backup).await?;
+    }
+
+    // Restore the target backup
+    restore_backup(target_dir, &entry.backup_path).await?;
+
+    info!("Successfully rolled back {} to {}", target_dir, target_version);
+    Ok(())
+}
+
+/// Prune old backups exceeding max_backups.
+///
+/// Keeps the `max_backups` most recent backups, deletes the rest.
+pub async fn prune_backups(target_dir: &str, max_backups: usize) -> Result<usize, ShadowClientError> {
+    let max = max_backups.max(1);
+    let versions = list_rollback_versions(target_dir).await?;
+
+    if versions.len() <= max {
+        return Ok(0);
+    }
+
+    let to_remove = &versions[max..];
+    let mut removed = 0;
+    for entry in to_remove {
+        debug!("Pruning old backup: {}", entry.backup_path.display());
+        if entry.backup_path.is_dir() {
+            fs::remove_dir_all(&entry.backup_path).await?;
+        } else {
+            fs::remove_file(&entry.backup_path).await?;
+        }
+        removed += 1;
+    }
+
+    info!("Pruned {} old backups for {}", removed, target_dir);
+    Ok(removed)
+}
+
 /// Extract a tar.gz archive to a temp directory
 pub async fn extract_to_temp(archive_path: &Path) -> Result<PathBuf, ShadowClientError> {
     let temp_dir = archive_path.parent().unwrap_or(Path::new("/tmp")).join("extracted");
@@ -136,6 +287,119 @@ pub async fn extract_to_temp(archive_path: &Path) -> Result<PathBuf, ShadowClien
 
     debug!("Extracted to {}", temp_dir.display());
     Ok(temp_dir)
+}
+
+/// Install individual binaries from an extracted archive to their target paths.
+/// Used when `RecipeInstall.binaries` is populated (multi-binary packages).
+///
+/// For each `BinaryEntry`:
+/// 1. Locate the source file in the extracted temp dir
+/// 2. Back up the existing target file (if present)
+/// 3. Copy source -> target
+/// 4. Apply chmod (default 0755)
+pub async fn install_binaries(
+    temp_dir: &Path,
+    entries: &[monopsony_common::shadow_types::BinaryEntry],
+    backup_dir: &Path,
+) -> Result<Vec<PathBuf>, ShadowClientError> {
+    let mut installed = Vec::new();
+
+    // Ensure backup dir exists
+    if !backup_dir.exists() {
+        fs::create_dir_all(backup_dir).await?;
+    }
+
+    for entry in entries {
+        // Find the source file in extracted dir (may be at root or under subdirs)
+        let source = find_in_extracted(temp_dir, &entry.source)?;
+
+        let target = PathBuf::from(&entry.target);
+
+        // Ensure parent directory exists
+        if let Some(parent) = target.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent).await
+                    .map_err(|e| ShadowClientError::InstallFailed(
+                        format!("failed to create parent dir {}: {}", parent.display(), e)
+                    ))?;
+            }
+        }
+
+        // Back up existing target if present
+        if target.exists() {
+            let backup_name = format!("{}.bak.{}", 
+                target.file_name().unwrap_or_default().to_string_lossy(),
+                chrono::Utc::now().timestamp()
+            );
+            let backup_path = backup_dir.join(&backup_name);
+            fs::copy(&target, &backup_path).await
+                .map_err(|e| ShadowClientError::InstallFailed(
+                    format!("failed to back up {}: {}", target.display(), e)
+                ))?;
+            debug!("Backed up {} -> {}", target.display(), backup_path.display());
+        }
+
+        // Copy source to target
+        fs::copy(&source, &target).await
+            .map_err(|e| ShadowClientError::InstallFailed(
+                format!("failed to copy {} -> {}: {}", source.display(), target.display(), e)
+            ))?;
+
+        // Apply chmod (default 0755)
+        let mode_str = entry.mode.as_deref().unwrap_or("0755");
+        let mode = u32::from_str_radix(mode_str, 8)
+            .map_err(|e| ShadowClientError::InstallFailed(
+                format!("invalid chmod mode '{}': {}", mode_str, e)
+            ))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).await
+                .map_err(|e| ShadowClientError::InstallFailed(
+                    format!("failed to chmod {}: {}", target.display(), e)
+                ))?;
+        }
+
+        info!("Installed {} -> {} ({:o})", source.display(), target.display(), mode);
+        installed.push(target);
+    }
+
+    Ok(installed)
+}
+
+/// Find a file within the extracted directory. Searches at root level first,
+/// then recursively through subdirectories (to handle --strip-components).
+fn find_in_extracted(temp_dir: &Path, filename: &str) -> Result<PathBuf, ShadowClientError> {
+    // Try direct path first
+    let direct = temp_dir.join(filename);
+    if direct.exists() {
+        return Ok(direct);
+    }
+
+    // Try just the filename component (strip any prefix dirs)
+    let basename = Path::new(filename).file_name()
+        .unwrap_or_default().to_string_lossy();
+    
+    // Walk temp_dir looking for the file
+    for entry in std::fs::read_dir(temp_dir)
+        .map_err(|e| ShadowClientError::InstallFailed(
+            format!("failed to read temp dir {}: {}", temp_dir.display(), e)
+        ))?
+    {
+        let entry = entry.map_err(|e| ShadowClientError::InstallFailed(
+            format!("failed to read dir entry: {}", e)
+        ))?;
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            let candidate = entry.path().join(basename.as_ref());
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(ShadowClientError::InstallFailed(
+        format!("binary '{}' not found in extracted archive at {}", filename, temp_dir.display())
+    ))
 }
 
 /// Run a health check after update
@@ -508,6 +772,8 @@ mod tests {
                 pre_update: None,
                 post_update: None,
                 on_failure: None,
+                max_backups: 3,
+                binaries: vec![],
             },
             asset_selector: None,
             build: None,
@@ -620,5 +886,343 @@ mod tests {
         let result = run_hook(Some("exit 1"), "pre_update").await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("pre_update"));
+    }
+
+    // --- Rollback chain tests ---
+
+    #[tokio::test]
+    async fn list_rollback_versions_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("mypkg");
+        fs::create_dir_all(&target).await.unwrap();
+
+        let versions = list_rollback_versions(&target.to_string_lossy()).await.unwrap();
+        assert!(versions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_rollback_versions_finds_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("mypkg");
+        fs::create_dir_all(&target).await.unwrap();
+
+        // Create backup dirs
+        fs::create_dir_all(dir.path().join("mypkg.bak.1.0.0")).await.unwrap();
+        fs::create_dir_all(dir.path().join("mypkg.bak.1.1.0")).await.unwrap();
+        fs::create_dir_all(dir.path().join("mypkg.bak.2.0.0")).await.unwrap();
+        // Non-matching dir
+        fs::create_dir_all(dir.path().join("other.bak.1.0")).await.unwrap();
+
+        let versions = list_rollback_versions(&target.to_string_lossy()).await.unwrap();
+        assert_eq!(versions.len(), 3);
+        // Should be sorted newest-first (all created in same second, so order
+        // may vary — just check all versions are present)
+        let v: Vec<&str> = versions.iter().map(|e| e.version.as_str()).collect();
+        assert!(v.contains(&"1.0.0"));
+        assert!(v.contains(&"1.1.0"));
+        assert!(v.contains(&"2.0.0"));
+    }
+
+    #[tokio::test]
+    async fn prune_backups_keeps_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("mypkg");
+        fs::create_dir_all(&target).await.unwrap();
+
+        // Create 5 backup dirs
+        for v in ["1.0.0", "1.1.0", "1.2.0", "2.0.0", "2.1.0"] {
+            let p = dir.path().join(format!("mypkg.bak.{v}"));
+            fs::create_dir_all(&p).await.unwrap();
+            // Add a small file to each so they have different mtime
+            fs::write(p.join("marker"), v).await.unwrap();
+        }
+
+        let removed = prune_backups(&target.to_string_lossy(), 3).await.unwrap();
+        assert_eq!(removed, 2);
+
+        let remaining = list_rollback_versions(&target.to_string_lossy()).await.unwrap();
+        assert_eq!(remaining.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn prune_backups_max_1() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("mypkg");
+        fs::create_dir_all(&target).await.unwrap();
+
+        for v in ["1.0.0", "2.0.0"] {
+            fs::create_dir_all(dir.path().join(format!("mypkg.bak.{v}"))).await.unwrap();
+        }
+
+        let removed = prune_backups(&target.to_string_lossy(), 1).await.unwrap();
+        assert_eq!(removed, 1);
+
+        let remaining = list_rollback_versions(&target.to_string_lossy()).await.unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn rollback_to_version_restores_correct_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("mypkg");
+        fs::create_dir_all(&target).await.unwrap();
+        fs::write(target.join("current.txt"), "latest").await.unwrap();
+
+        // Create backup of version 1.0.0
+        let bak1 = dir.path().join("mypkg.bak.1.0.0");
+        fs::create_dir_all(&bak1).await.unwrap();
+        fs::write(bak1.join("data.txt"), "version-1.0.0").await.unwrap();
+
+        // Create backup of version 2.0.0
+        let bak2 = dir.path().join("mypkg.bak.2.0.0");
+        fs::create_dir_all(&bak2).await.unwrap();
+        fs::write(bak2.join("data.txt"), "version-2.0.0").await.unwrap();
+
+        // Rollback to 1.0.0
+        rollback_to_version(&target.to_string_lossy(), "1.0.0").await.unwrap();
+
+        // Current directory should now have version-1.0.0 content
+        let content = fs::read_to_string(target.join("data.txt")).await.unwrap();
+        assert_eq!(content, "version-1.0.0");
+    }
+
+    #[tokio::test]
+    async fn rollback_to_nonexistent_version_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("mypkg");
+        fs::create_dir_all(&target).await.unwrap();
+
+        let result = rollback_to_version(&target.to_string_lossy(), "99.0.0").await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn install_binaries_copies_and_chmods() {
+        use monopsony_common::shadow_types::BinaryEntry;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let extracted = tmp.path().join("extracted");
+        fs::create_dir_all(&extracted).await.unwrap();
+
+        // Create fake binaries in extracted dir
+        fs::write(extracted.join("myapp"), "#!/bin/sh\necho myapp").await.unwrap();
+        fs::write(extracted.join("helper"), "#!/bin/sh\necho helper").await.unwrap();
+
+        let install_dir = tmp.path().join("install");
+        fs::create_dir_all(&install_dir).await.unwrap();
+        let backup_dir = tmp.path().join("backups");
+
+        let entries = vec![
+            BinaryEntry {
+                source: "myapp".to_string(),
+                target: install_dir.join("bin/myapp").to_string_lossy().to_string(),
+                mode: Some("0755".to_string()),
+            },
+            BinaryEntry {
+                source: "helper".to_string(),
+                target: install_dir.join("bin/helper").to_string_lossy().to_string(),
+                mode: None, // defaults to 0755
+            },
+        ];
+
+        let installed = install_binaries(&extracted, &entries, &backup_dir).await.unwrap();
+        assert_eq!(installed.len(), 2);
+
+        // Verify files exist
+        assert!(install_dir.join("bin/myapp").exists());
+        assert!(install_dir.join("bin/helper").exists());
+
+        // Verify content
+        let content = fs::read_to_string(install_dir.join("bin/myapp")).await.unwrap();
+        assert!(content.contains("myapp"));
+    }
+
+    #[tokio::test]
+    async fn install_binaries_backs_up_existing() {
+        use monopsony_common::shadow_types::BinaryEntry;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let extracted = tmp.path().join("extracted");
+        fs::create_dir_all(&extracted).await.unwrap();
+        fs::write(extracted.join("app"), "new-binary").await.unwrap();
+
+        let install_dir = tmp.path().join("install/bin");
+        fs::create_dir_all(&install_dir).await.unwrap();
+        fs::write(install_dir.join("app"), "old-binary").await.unwrap();
+
+        let backup_dir = tmp.path().join("backups");
+
+        let entries = vec![
+            BinaryEntry {
+                source: "app".to_string(),
+                target: install_dir.join("app").to_string_lossy().to_string(),
+                mode: None,
+            },
+        ];
+
+        let installed = install_binaries(&extracted, &entries, &backup_dir).await.unwrap();
+        assert_eq!(installed.len(), 1);
+
+        // New binary should be in place
+        let content = fs::read_to_string(install_dir.join("app")).await.unwrap();
+        assert_eq!(content, "new-binary");
+
+        // Old binary should be backed up
+        let backup_files: Vec<_> = std::fs::read_dir(&backup_dir).unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(backup_files.len(), 1);
+        let backup_content = fs::read_to_string(backup_files[0].path()).await.unwrap();
+        assert_eq!(backup_content, "old-binary");
+    }
+
+    #[tokio::test]
+    async fn install_binaries_missing_source_fails() {
+        use monopsony_common::shadow_types::BinaryEntry;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let extracted = tmp.path().join("extracted");
+        fs::create_dir_all(&extracted).await.unwrap();
+        // No files created — source won't be found
+
+        let backup_dir = tmp.path().join("backups");
+
+        let entries = vec![
+            BinaryEntry {
+                source: "nonexistent".to_string(),
+                target: "/tmp/should-not-exist".to_string(),
+                mode: None,
+            },
+        ];
+
+        let result = install_binaries(&extracted, &entries, &backup_dir).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("not found"));
+    }
+
+    #[test]
+    fn find_in_extracted_direct_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("myapp"), "binary").unwrap();
+        let result = find_in_extracted(tmp.path(), "myapp");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().file_name().unwrap(), "myapp");
+    }
+
+    #[test]
+    fn find_in_extracted_subdirectory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let subdir = tmp.path().join("bin");
+        std::fs::create_dir_all(&subdir).unwrap();
+        std::fs::write(subdir.join("myapp"), "binary").unwrap();
+        // "bin/myapp" as source should find it directly
+        let result = find_in_extracted(tmp.path(), "bin/myapp");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn find_in_extracted_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = find_in_extracted(tmp.path(), "missing");
+        assert!(result.is_err());
+    }
+
+    // --- Version detection tests ---
+
+    #[test]
+    fn extract_version_captures_group() {
+        let ver = extract_version("v2.3.1", r"v?(\d+\.\d+\.\d+)").unwrap();
+        assert_eq!(ver, "2.3.1");
+    }
+
+    #[test]
+    fn extract_version_no_match() {
+        let result = extract_version("no version here", r"(\d+\.\d+)");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn extract_version_falls_back_to_trimmed() {
+        // If pattern has no capture group, returns trimmed text
+        let ver = extract_version("  1.0.0  ", r"\d+\.\d+\.\d+").unwrap();
+        assert_eq!(ver, "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn detect_version_command_method() {
+        let config = monopsony_common::shadow_types::VersionDetect {
+            method: monopsony_common::shadow_types::VersionDetectMethod::Command,
+            source: "echo 'v1.2.3'".into(),
+            pattern: r"v?(\d+\.\d+\.\d+)".into(),
+            header_name: None,
+        };
+        let ver = detect_version(&config).await.unwrap();
+        assert_eq!(ver, "1.2.3");
+    }
+
+    #[tokio::test]
+    async fn detect_version_file_method() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_path = tmp.path().join("version.txt");
+        std::fs::write(&file_path, "version=4.5.6\n").unwrap();
+
+        let config = monopsony_common::shadow_types::VersionDetect {
+            method: monopsony_common::shadow_types::VersionDetectMethod::File,
+            source: file_path.to_str().unwrap().into(),
+            pattern: r"(\d+\.\d+\.\d+)".into(),
+            header_name: None,
+        };
+        let ver = detect_version(&config).await.unwrap();
+        assert_eq!(ver, "4.5.6");
+    }
+
+    #[tokio::test]
+    async fn detect_version_file_missing() {
+        let config = monopsony_common::shadow_types::VersionDetect {
+            method: monopsony_common::shadow_types::VersionDetectMethod::File,
+            source: "/nonexistent/path/version.txt".into(),
+            pattern: r"(\d+)".into(),
+            header_name: None,
+        };
+        let result = detect_version(&config).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn version_detect_method_serde_default() {
+        let toml = r#"
+            method = "command"
+            source = "myapp --version"
+            pattern = "([0-9]+)"
+        "#;
+        let vd: monopsony_common::shadow_types::VersionDetect = toml::from_str(toml).unwrap();
+        assert_eq!(vd.method, monopsony_common::shadow_types::VersionDetectMethod::Command);
+    }
+
+    #[test]
+    fn version_detect_method_file_serde() {
+        let toml = r#"
+            method = "file"
+            source = "/etc/myapp/version"
+            pattern = "([0-9]+\\.[0-9]+)"
+        "#;
+        let vd: monopsony_common::shadow_types::VersionDetect = toml::from_str(toml).unwrap();
+        assert_eq!(vd.method, monopsony_common::shadow_types::VersionDetectMethod::File);
+        assert_eq!(vd.source, "/etc/myapp/version");
+        assert!(vd.header_name.is_none());
+    }
+
+    #[test]
+    fn version_detect_method_header_serde() {
+        let toml = r#"
+            method = "header"
+            source = "https://example.com/release"
+            pattern = "v([0-9]+)"
+            header_name = "X-Version"
+        "#;
+        let vd: monopsony_common::shadow_types::VersionDetect = toml::from_str(toml).unwrap();
+        assert_eq!(vd.method, monopsony_common::shadow_types::VersionDetectMethod::Header);
+        assert_eq!(vd.header_name.as_deref(), Some("X-Version"));
     }
 }

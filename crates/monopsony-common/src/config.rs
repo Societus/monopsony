@@ -224,6 +224,8 @@ pub struct ClientConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub shadow_trust: ShadowPackageTrustConfig,
+    #[serde(default)]
+    pub auto_update: AutoUpdateConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,6 +305,55 @@ pub struct ClientMetricsConfig {
 
 fn default_client_metrics_bind() -> String {
     "127.0.0.1:9091".to_string()
+}
+
+fn default_auto_update_schedule() -> String {
+    "0 0 3 * * * *".to_string() // sec min hour dom month dow year — daily at 3 AM
+}
+
+fn default_timezone() -> String {
+    "UTC".to_string()
+}
+
+fn default_auto_update_severity() -> String {
+    "all".to_string()
+}
+
+/// Auto-update configuration for shadow packages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoUpdateConfig {
+    /// Enable automatic updates
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Cron expression for update window (e.g., "0 3 * * *" = daily at 3 AM)
+    #[serde(default = "default_auto_update_schedule")]
+    pub schedule: String,
+
+    /// Timezone for schedule (e.g., "America/New_York")
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+
+    /// Only auto-update packages with this severity or lower.
+    /// "all" (default) | "warning" | "breaking" (never auto-update breaking)
+    #[serde(default = "default_auto_update_severity")]
+    pub max_severity: String,
+
+    /// Send notification before auto-update (seconds before)
+    #[serde(default)]
+    pub notify_before_secs: Option<u64>,
+}
+
+impl Default for AutoUpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            schedule: default_auto_update_schedule(),
+            timezone: default_timezone(),
+            max_severity: default_auto_update_severity(),
+            notify_before_secs: None,
+        }
+    }
 }
 
 // ============================================================================
