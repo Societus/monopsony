@@ -1640,7 +1640,7 @@ dependencies = [
 
 [[package]]
 name = "monopsony-client"
-version = "0.1.0-rc1"
+version = "1.0.0-rc1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1677,7 +1677,7 @@ dependencies = [
 
 [[package]]
 name = "monopsony-common"
-version = "0.1.0-rc1"
+version = "1.0.0-rc1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1706,7 +1706,7 @@ dependencies = [
 
 [[package]]
 name = "monopsony-server"
-version = "0.1.0-rc1"
+version = "1.0.0-rc1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "monopsony-tracker"
-version = "0.1.0-rc1"
+version = "1.0.0-rc1"
 dependencies = [
  "anyhow",
  "axum",

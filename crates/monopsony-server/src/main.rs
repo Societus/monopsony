@@ -8,6 +8,7 @@ use std::time::Duration;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
+mod cache_storage;
 mod proxy;
 mod grpc;
 mod db;
@@ -210,7 +211,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let cache_dir_for_proxy = cache_dir.clone();
+    let storage = Arc::new(cache_storage::FilesystemStorage::new(cache_dir.clone()));
     let db_clone = db.clone();
     let auth_mode: monopsony_common::config::AuthMode = args.auth_mode.parse()
         .unwrap_or_else(|_| {
@@ -219,7 +220,7 @@ async fn main() -> anyhow::Result<()> {
         });
     info!("Auth mode: {}", auth_mode);
     let proxy_handle = tokio::spawn(async move {
-        if let Err(e) = proxy::run_proxy(http_addr, cache_dir_for_proxy, db_clone, auth_mode).await {
+        if let Err(e) = proxy::run_proxy(http_addr, storage, db_clone, auth_mode).await {
             error!("HTTP proxy error: {}", e);
         }
     });
@@ -257,7 +258,7 @@ async fn main() -> anyhow::Result<()> {
     // Start cache purge task if database is available
     let purge_handle = if let Some(db) = db.clone() {
         let purge_config = purge::PurgeConfig {
-            cache_dir: cache_dir.clone(),
+            storage: Arc::new(cache_storage::FilesystemStorage::new(cache_dir.clone())),
             purge_after_days: 30,
             max_size_gb: 0,
         };
@@ -274,7 +275,7 @@ async fn main() -> anyhow::Result<()> {
     // Start pre-fetch scheduler if database is available
     let prefetch_handle = if let Some(db) = db.clone() {
         let prefetch_config = prefetch::PrefetchConfig {
-            cache_dir: cache_dir.clone(),
+            storage: Arc::new(cache_storage::FilesystemStorage::new(cache_dir.clone())),
             interval_secs: 3600,
             max_concurrent: 10,
             request_timeout_secs: 300,

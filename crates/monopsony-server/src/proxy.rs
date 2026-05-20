@@ -24,6 +24,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use monopsony_common::{PackageManagerBackend, PackageManagerKind};
 
+use crate::cache_storage::{CacheStorage, FilesystemStorage};
 use crate::db::Database;
 use crate::security::RateLimiter;
 
@@ -45,22 +46,21 @@ pub struct CacheEntry {
 pub struct ProxyState {
     pub client: Client<HttpConnector, Body>,
     pub cache_dir: PathBuf,
-    pub meta_dir: PathBuf,
+    pub storage: Arc<FilesystemStorage>,
     pub backends: Vec<Box<dyn PackageManagerBackend>>,
     pub db: Option<Arc<Database>>,
 }
 
 impl ProxyState {
-    pub fn new(cache_dir: PathBuf, db: Option<Arc<Database>>) -> Self {
+    pub fn new(storage: Arc<FilesystemStorage>, db: Option<Arc<Database>>) -> Self {
         let client = Client::builder(TokioExecutor::new()).build_http();
-
-        let meta_dir = cache_dir.join("meta");
+        let cache_dir = storage.base_dir().to_path_buf();
         let backends = monopsony_common::package_manager::get_available_backends();
 
         Self {
             client,
             cache_dir,
-            meta_dir,
+            storage,
             backends,
             db,
         }
@@ -78,56 +78,48 @@ impl ProxyState {
         None
     }
 
-    /// Convert a URL to a cache file path
-    pub fn url_to_cache_path(&self, url: &str) -> Option<PathBuf> {
+    /// Convert a URL to a storage key (relative path within the cache).
+    /// This key is used with the CacheStorage trait.
+    pub fn url_to_cache_key(&self, url: &str) -> Option<String> {
         if let Some((_, backend)) = self.find_backend_for_url(url) {
             let relative = backend.url_to_cache_path(url)?;
-            Some(self.cache_dir.join(relative))
+            Some(relative)
         } else {
             // Generic cache path for unmatched URLs
             let parsed = url::Url::parse(url).ok()?;
             let host = parsed.host_str()?;
             let path = parsed.path().trim_start_matches('/');
-            Some(self.cache_dir.join("other").join(host).join(path))
+            Some(format!("other/{}/{}", host, path))
         }
     }
 
-    /// Get the metadata path for a cache entry
-    pub fn meta_path_for_cache(&self, cache_path: &Path) -> PathBuf {
-        let relative = cache_path.strip_prefix(&self.cache_dir).unwrap_or(cache_path);
-        let mut meta_path = self.meta_dir.join(relative);
-        meta_path.set_extension("json");
-        meta_path
+    /// Convert a URL to a cache file path (kept for path traversal validation).
+    pub fn url_to_cache_path(&self, url: &str) -> Option<PathBuf> {
+        self.url_to_cache_key(url).map(|key| self.storage.key_to_path(&key))
     }
 
-    /// Load cache metadata
-    pub async fn load_meta(&self, cache_path: &Path) -> Option<CacheEntry> {
-        let meta_path = self.meta_path_for_cache(cache_path);
-        let content = tokio::fs::read(&meta_path).await.ok()?;
+    /// Load cache metadata via storage backend
+    pub async fn load_meta(&self, cache_key: &str) -> Option<CacheEntry> {
+        let content = self.storage.load_meta_json(cache_key).await?;
         serde_json::from_slice(&content).ok()
     }
 
-    /// Save cache metadata
-    pub async fn save_meta(&self, cache_path: &Path, entry: &CacheEntry) -> anyhow::Result<()> {
-        let meta_path = self.meta_path_for_cache(cache_path);
-        if let Some(parent) = meta_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
+    /// Save cache metadata via storage backend
+    pub async fn save_meta(&self, cache_key: &str, entry: &CacheEntry) -> anyhow::Result<()> {
         let content = serde_json::to_vec_pretty(entry)?;
-        tokio::fs::write(&meta_path, content).await?;
-        Ok(())
+        self.storage.save_meta_json(cache_key, &content).await
     }
 
     /// Update last accessed time and hit count
-    pub async fn update_access(&self, cache_path: &Path, url: &str) {
-        if let Some(mut meta) = self.load_meta(cache_path).await {
+    pub async fn update_access(&self, cache_key: &str, url: &str) {
+        if let Some(mut meta) = self.load_meta(cache_key).await {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
             meta.last_accessed = now;
             meta.hit_count += 1;
-            let _ = self.save_meta(cache_path, &meta).await;
+            let _ = self.save_meta(cache_key, &meta).await;
 
             if let Some(db) = &self.db {
                 if let Err(e) = db.record_cache_hit(url, now as i64).await {
@@ -234,13 +226,15 @@ async fn handle_cached_request(
     request: Request<Body>,
     url: &str,
 ) -> Response<Body> {
-    let cache_path = match state.url_to_cache_path(url) {
-        Some(path) => path,
+    let cache_key = match state.url_to_cache_key(url) {
+        Some(key) => key,
         None => {
-            warn!("Could not determine cache path for URL: {}", url);
+            warn!("Could not determine cache key for URL: {}", url);
             return proxy_passthrough(state, request).await;
         }
     };
+
+    let cache_path = state.storage.key_to_path(&cache_key);
 
     // Check DB first for authoritative cache state
     let db_cached = if let Some(db) = &state.db {
@@ -255,34 +249,33 @@ async fn handle_cached_request(
             }
             Err(e) => {
                 trace!("DB lookup failed for {}: {}", url, e);
-                // Fall through to filesystem check
                 false
             }
         }
     } else {
-        // No DB — always check filesystem
         true
     };
 
     // Validate cache path doesn't escape cache directory (path traversal prevention)
-    let path_valid = db_cached && cache_path.exists() && crate::security::validate_cache_path(&cache_path.to_string_lossy(), &state.cache_dir);
+    let exists = state.storage.exists(&cache_key).await.unwrap_or(false);
+    let path_valid = db_cached && exists && crate::security::validate_cache_path(&cache_path.to_string_lossy(), &state.cache_dir);
     
-    // Serve from filesystem if cached (either DB confirms or no DB available)
+    // Serve from storage if cached
     if path_valid {
         debug!("Cache hit for: {}", url);
         monopsony_common::metrics::cache_request_hit();
         
-        state.update_access(&cache_path, url).await;
+        state.update_access(&cache_key, url).await;
 
         // Load metadata for content type
-        let meta = state.load_meta(&cache_path).await;
+        let meta = state.load_meta(&cache_key).await;
         let content_type = meta
             .as_ref()
             .and_then(|m| m.content_type.clone())
             .unwrap_or_else(|| "application/octet-stream".to_string());
 
-        // Read cached file
-        match tokio::fs::read(&cache_path).await {
+        // Read cached file via storage backend
+        match state.storage.read(&cache_key).await {
             Ok(data) => {
                 let mut builder = Response::builder()
                     .status(StatusCode::OK)
@@ -297,7 +290,6 @@ async fn handle_cached_request(
                     if let Some(lm) = &m.last_modified {
                         builder = builder.header(header::LAST_MODIFIED, lm);
                     }
-                    // Add X-Cache header to indicate cache hit
                     builder = builder.header("X-Cache", "HIT");
                 }
 
@@ -307,8 +299,7 @@ async fn handle_cached_request(
                 });
             }
             Err(e) => {
-                warn!("Failed to read cached file {:?}: {}", cache_path, e);
-                // Fall through to fetch from upstream
+                warn!("Failed to read cached file {}: {}", cache_key, e);
             }
         }
     }
@@ -366,56 +357,53 @@ async fn handle_cached_request(
         }
     };
 
-    // Save to cache
-    if let Some(parent) = cache_path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            warn!("Failed to create cache directory {:?}: {}", parent, e);
-        }
-    }
+    // Save to cache via storage backend
+    match state.storage.write(&cache_key, &bytes).await {
+        Ok(_meta) => {
+            info!("Cached: {} -> {}", url, cache_key);
+            monopsony_common::metrics::cache_bytes_cached(bytes.len() as u64);
 
-    if let Err(e) = tokio::fs::write(&cache_path, &bytes).await {
-        warn!("Failed to write cache file {:?}: {}", cache_path, e);
-    } else {
-        info!("Cached: {} -> {:?}", url, cache_path);
-        monopsony_common::metrics::cache_bytes_cached(bytes.len() as u64);
+            // Save metadata
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
 
-        // Save metadata
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
+            let entry = CacheEntry {
+                url: url.to_string(),
+                cache_path: cache_path.to_string_lossy().to_string(),
+                content_type,
+                content_length,
+                etag,
+                last_modified,
+                cached_at: now,
+                last_accessed: now,
+                hit_count: 1,
+            };
 
-        let entry = CacheEntry {
-            url: url.to_string(),
-            cache_path: cache_path.to_string_lossy().to_string(),
-            content_type,
-            content_length,
-            etag,
-            last_modified,
-            cached_at: now,
-            last_accessed: now,
-            hit_count: 1,
-        };
-
-        if let Err(e) = state.save_meta(&cache_path, &entry).await {
-            warn!("Failed to save cache metadata: {}", e);
-        }
-
-        if let Some(db) = &state.db {
-            if let Err(e) = db
-                .record_cache_miss(&crate::db::CacheMissConfig {
-                    url: url.to_string(),
-                    cache_path: entry.cache_path.clone(),
-                    content_type: entry.content_type.clone(),
-                    content_length: entry.content_length as i64,
-                    etag: entry.etag.clone(),
-                    last_modified: entry.last_modified.clone(),
-                    cached_at: entry.cached_at as i64,
-                })
-                .await
-            {
-                trace!("Failed to record cache miss in DB for {}: {}", url, e);
+            if let Err(e) = state.save_meta(&cache_key, &entry).await {
+                warn!("Failed to save cache metadata: {}", e);
             }
+
+            if let Some(db) = &state.db {
+                if let Err(e) = db
+                    .record_cache_miss(&crate::db::CacheMissConfig {
+                        url: url.to_string(),
+                        cache_path: entry.cache_path.clone(),
+                        content_type: entry.content_type.clone(),
+                        content_length: entry.content_length as i64,
+                        etag: entry.etag.clone(),
+                        last_modified: entry.last_modified.clone(),
+                        cached_at: entry.cached_at as i64,
+                    })
+                    .await
+                {
+                    trace!("Failed to record cache miss in DB for {}: {}", url, e);
+                }
+            }
+        }
+        Err(e) => {
+            warn!("Failed to write cache file {}: {}", cache_key, e);
         }
     }
 
@@ -499,15 +487,13 @@ async fn fetch_upstream(
 /// Start the HTTP proxy server
 pub async fn run_proxy(
     addr: SocketAddr,
-    cache_dir: PathBuf,
+    storage: Arc<FilesystemStorage>,
     db: Option<Arc<Database>>,
     auth_mode: monopsony_common::config::AuthMode,
 ) -> anyhow::Result<()> {
-    tokio::fs::create_dir_all(&cache_dir).await?;
-    tokio::fs::create_dir_all(cache_dir.join("meta")).await?;
-    tokio::fs::create_dir_all(cache_dir.join("other")).await?;
+    storage.init_dirs().await?;
 
-    let state = Arc::new(ProxyState::new(cache_dir, db.clone()));
+    let state = Arc::new(ProxyState::new(storage, db.clone()));
     
     // Create rate limiter and spawn cleanup task
     let limiter = crate::security::create_default_rate_limiter();
@@ -541,7 +527,8 @@ mod tests {
     #[test]
     fn test_url_to_cache_path() {
         let temp_dir = std::env::temp_dir().join("monopsony-test-cache");
-        let state = ProxyState::new(temp_dir, None);
+        let storage = Arc::new(FilesystemStorage::new(temp_dir));
+        let state = ProxyState::new(storage, None);
 
         // Test with a known apt URL pattern
         let url = "http://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-image_5.15.0-1_amd64.deb";

@@ -4,7 +4,7 @@
 //! Uses the package manager URL patterns to identify which upstream URLs need caching,
 //! prioritized by how many clients need each package.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,6 +18,7 @@ use hyper_util::{
 use sqlx::Row;
 use tracing::{debug, error, info, warn, trace};
 
+use crate::cache_storage::{CacheStorage, FilesystemStorage};
 use crate::db::Database;
 
 /// Boxed body type for hyper client requests
@@ -32,8 +33,8 @@ fn empty_body() -> BoxBody {
 /// Configuration for the pre-fetch scheduler
 #[derive(Debug, Clone)]
 pub struct PrefetchConfig {
-    /// Path to cache directory
-    pub cache_dir: PathBuf,
+    /// Cache storage backend
+    pub storage: Arc<FilesystemStorage>,
     /// How often to run pre-fetch cycles (seconds)
     pub interval_secs: u64,
     /// Maximum concurrent fetches
@@ -47,8 +48,8 @@ pub struct PrefetchConfig {
 impl Default for PrefetchConfig {
     fn default() -> Self {
         Self {
-            cache_dir: PathBuf::from("/var/cache/monopsony"),
-            interval_secs: 3600, // 1 hour
+            storage: Arc::new(FilesystemStorage::new(std::path::PathBuf::from("/var/cache/monopsony"))),
+            interval_secs: 3600,
             max_concurrent: 10,
             request_timeout_secs: 300,
             bandwidth_limit_bps: 0,
@@ -131,7 +132,7 @@ async fn run_prefetch_cycle(db: &Database, config: &PrefetchConfig) -> anyhow::R
     let results: Vec<PrefetchResult> = stream::iter(candidates)
         .map(|candidate| {
             let client = client.clone();
-            let cache_dir = config.cache_dir.clone();
+            let storage = config.storage.clone();
             let timeout_secs = config.request_timeout_secs;
             let bw_limit = config.bandwidth_limit_bps;
 
@@ -149,7 +150,7 @@ async fn run_prefetch_cycle(db: &Database, config: &PrefetchConfig) -> anyhow::R
                 // Bandwidth throttle: acquire permit, fetch, then pace release
                 let _permit = bw_sem.acquire().await.ok()?;
 
-                match prefetch_url(&client, &candidate.url, &cache_dir, timeout_secs).await {
+                match prefetch_url(&client, &candidate.url, &storage, timeout_secs).await {
                     Ok(size) => {
                         debug!(
                             "Pre-fetched: {} ({} bytes, {} clients)",
@@ -158,7 +159,8 @@ async fn run_prefetch_cycle(db: &Database, config: &PrefetchConfig) -> anyhow::R
 
                         // Record in DB
                         let now = chrono::Utc::now().timestamp();
-                        let cache_path = url_to_cache_path(&candidate.url, &cache_dir);
+                        let cache_key = url_to_cache_key(&candidate.url);
+                        let cache_path = storage.key_to_path(&cache_key).to_string_lossy().to_string();
                         if let Err(e) = db.record_cache_miss(&crate::db::CacheMissConfig {
                             url: candidate.url.clone(),
                             cache_path,
@@ -245,13 +247,13 @@ async fn find_uncached_packages(db: &Database) -> anyhow::Result<Vec<PrefetchCan
 async fn prefetch_url(
     client: &Client<HttpConnector, BoxBody>,
     url: &str,
-    cache_dir: &Path,
+    storage: &FilesystemStorage,
     timeout_secs: u64,
 ) -> Result<u64, String> {
-    let cache_path = url_to_cache_path(url, cache_dir);
+    let cache_key = url_to_cache_key(url);
 
-    // Skip if already cached on disk
-    if Path::new(&cache_path).exists() {
+    // Skip if already cached
+    if storage.exists(&cache_key).await.unwrap_or(false) {
         return Ok(0);
     }
 
@@ -308,59 +310,35 @@ async fn prefetch_url(
         ));
     }
 
-    // Write to cache atomically
-    if let Some(parent) = Path::new(&cache_path).parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| format!("Failed to create dir: {}", e))?;
-    }
-
-    let tmp_path = {
-        let mut p = cache_path.clone();
-        let stem = Path::new(&p)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file")
-            .to_string();
-        p = format!("{}/{}.tmp", Path::new(&p).parent().unwrap_or(Path::new(".")).display(), stem);
-        p
-    };
-
-    tokio::fs::write(&tmp_path, &bytes)
+    // Write to cache via storage backend
+    storage.write(&cache_key, &bytes)
         .await
         .map_err(|e| format!("Failed to write cache: {}", e))?;
 
-    tokio::fs::rename(&tmp_path, &cache_path)
-        .await
-        .map_err(|e| format!("Failed to rename tmp file: {}", e))?;
-
     // Write metadata sidecar
+    let cache_path = storage.key_to_path(&cache_key);
     let meta = serde_json::json!({
         "url": url,
-        "cache_path": cache_path,
+        "cache_path": cache_path.to_string_lossy().to_string(),
         "content_type": parts.headers.get("content-type").and_then(|v| v.to_str().ok()),
         "content_length": bytes.len(),
         "cached_at": chrono::Utc::now().timestamp(),
         "prefetched": true,
     });
 
-    let meta_path = format!("{}.json", cache_path);
-    if let Some(parent) = Path::new(&meta_path).parent() {
-        tokio::fs::create_dir_all(parent).await.ok();
-    }
-    tokio::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).map_err(|e| format!("Failed to serialize metadata: {}", e))?)
-        .await
-        .ok();
+    let meta_bytes = serde_json::to_vec_pretty(&meta)
+        .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
+    storage.save_meta_json(&cache_key, &meta_bytes).await.ok();
 
     Ok(bytes.len() as u64)
 }
 
-/// Convert a URL to a filesystem cache path
-fn url_to_cache_path(url: &str, cache_dir: &Path) -> String {
+/// Convert a URL to a storage key for the prefetch namespace
+fn url_to_cache_key(url: &str) -> String {
     let parsed = url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://invalid").unwrap());
     let host = parsed.host_str().unwrap_or("unknown");
     let path = parsed.path().trim_start_matches('/');
-    cache_dir.join("prefetch").join(host).join(path).to_string_lossy().to_string()
+    format!("prefetch/{}/{}", host, path)
 }
 
 #[cfg(test)]
@@ -377,25 +355,21 @@ mod tests {
     }
 
     #[test]
-    fn test_url_to_cache_path() {
-        let cache_dir = PathBuf::from("/var/cache/monopsony");
-        let path = url_to_cache_path(
+    fn test_url_to_cache_key() {
+        let key = url_to_cache_key(
             "https://repo.archlinux.org/os/x86_64/linux-6.1.pkg.tar.zst",
-            &cache_dir,
         );
-        assert!(path.contains("prefetch"));
-        assert!(path.contains("repo.archlinux.org"));
-        assert!(path.contains("linux-6.1.pkg.tar.zst"));
+        assert!(key.contains("prefetch"));
+        assert!(key.contains("repo.archlinux.org"));
+        assert!(key.contains("linux-6.1.pkg.tar.zst"));
     }
 
     #[test]
-    fn test_url_to_cache_path_complex() {
-        let cache_dir = PathBuf::from("/tmp/cache");
-        let path = url_to_cache_path(
+    fn test_url_to_cache_key_complex() {
+        let key = url_to_cache_key(
             "http://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-image_5.15.0-1_amd64.deb",
-            &cache_dir,
         );
-        assert!(path.starts_with("/tmp/cache/prefetch/archive.ubuntu.com/"));
-        assert!(path.contains("linux-image_5.15.0-1_amd64.deb"));
+        assert!(key.starts_with("prefetch/archive.ubuntu.com/"));
+        assert!(key.contains("linux-image_5.15.0-1_amd64.deb"));
     }
 }

@@ -11,13 +11,14 @@ use std::time::Duration;
 use sqlx::Row;
 use tracing::{debug, error, info, warn};
 
+use crate::cache_storage::{CacheStorage, FilesystemStorage};
 use crate::db::Database;
 
 /// Configuration for cache purging
 #[derive(Debug, Clone)]
 pub struct PurgeConfig {
-    /// Path to cache directory
-    pub cache_dir: PathBuf,
+    /// Cache storage backend
+    pub storage: Arc<FilesystemStorage>,
     /// Days before purging unreferenced packages
     pub purge_after_days: u32,
     /// Maximum cache size in GB (0 = unlimited)
@@ -27,7 +28,7 @@ pub struct PurgeConfig {
 impl Default for PurgeConfig {
     fn default() -> Self {
         Self {
-            cache_dir: PathBuf::from("/var/cache/monopsony"),
+            storage: Arc::new(FilesystemStorage::new(PathBuf::from("/var/cache/monopsony"))),
             purge_after_days: 30,
             max_size_gb: 0,
         }
@@ -74,22 +75,22 @@ async fn run_purge(db: &Database, config: &PurgeConfig) -> anyhow::Result<()> {
         let url: String = row.get("url");
         let cache_path: String = row.get("cache_path");
 
-        // Delete the file
-        let path = PathBuf::from(&cache_path);
-        if path.exists() {
-            let metadata = tokio::fs::metadata(&path).await.ok();
-            if let Err(e) = tokio::fs::remove_file(&path).await {
-                warn!("Failed to delete cache file {}: {}", path.display(), e);
-                continue;
-            }
-            if let Some(meta) = metadata {
-                purged_bytes += meta.len();
-            }
-        }
+        // Derive the storage key from the cache path
+        let cache_key = if let Some(key) = config.storage.path_to_key(&PathBuf::from(&cache_path)) {
+            key
+        } else {
+            // Fall back to using the path as-is
+            cache_path.clone()
+        };
 
-        // Delete the meta file
-        let meta_path = PathBuf::from(format!("{}.json", cache_path));
-        let _ = tokio::fs::remove_file(&meta_path).await;
+        // Get file size before deleting
+        let file_size = tokio::fs::metadata(&cache_path).await.map(|m| m.len()).unwrap_or(0);
+
+        // Delete via storage backend
+        if let Err(e) = config.storage.delete(&cache_key).await {
+            warn!("Failed to delete cache entry {}: {}", cache_key, e);
+            continue;
+        }
 
         // Delete from database
         if let Err(e) = sqlx::query("DELETE FROM cache_entries WHERE url = $1")
@@ -101,13 +102,14 @@ async fn run_purge(db: &Database, config: &PurgeConfig) -> anyhow::Result<()> {
         }
 
         purged_count += 1;
+        purged_bytes += file_size;
         debug!("Purged cache entry: {}", url);
     }
 
     // Check cache size limit
     if config.max_size_gb > 0 {
         let max_bytes = config.max_size_gb * 1024 * 1024 * 1024;
-        let current_size = get_cache_size(&config.cache_dir).await;
+        let current_size = config.storage.total_size().await;
 
         if current_size > max_bytes {
             info!(
@@ -118,7 +120,7 @@ async fn run_purge(db: &Database, config: &PurgeConfig) -> anyhow::Result<()> {
 
             // Evict oldest entries until under limit
             let bytes_to_free = current_size - max_bytes;
-            let evicted = evict_oldest_entries(db, bytes_to_free, &config.cache_dir).await?;
+            let evicted = evict_oldest_entries(db, bytes_to_free, &config.storage).await?;
             purged_count += evicted.0;
             purged_bytes += evicted.1;
         }
@@ -132,27 +134,11 @@ async fn run_purge(db: &Database, config: &PurgeConfig) -> anyhow::Result<()> {
 
     Ok(())
 }
-/// Get total cache directory size
-async fn get_cache_size(cache_dir: &PathBuf) -> u64 {
-    let mut total_size = 0u64;
-
-    if let Ok(mut entries) = tokio::fs::read_dir(cache_dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            if entry.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
-                if let Ok(metadata) = entry.metadata().await {
-                    total_size += metadata.len();
-                }
-            }
-        }
-    }
-
-    total_size
-}
 /// Evict oldest cache entries to free up space
 async fn evict_oldest_entries(
     db: &Database,
     bytes_to_free: u64,
-    _cache_dir: &PathBuf,
+    storage: &FilesystemStorage,
 ) -> anyhow::Result<(usize, u64)> {
     let old_entries = sqlx::query(
         "SELECT url, cache_path, content_length FROM cache_entries ORDER BY last_accessed ASC",
@@ -172,18 +158,15 @@ async fn evict_oldest_entries(
         let cache_path: String = row.get("cache_path");
         let content_length: i64 = row.get("content_length");
 
-        // Delete the file
-        let path = PathBuf::from(&cache_path);
-        if path.exists() {
-            if let Err(e) = tokio::fs::remove_file(&path).await {
-                warn!("Failed to delete cache file {}: {}", path.display(), e);
-                continue;
-            }
-        }
+        // Derive storage key from path
+        let cache_key = storage.path_to_key(&PathBuf::from(&cache_path))
+            .unwrap_or_else(|| cache_path.clone());
 
-        // Delete the meta file
-        let meta_path = PathBuf::from(format!("{}.json", cache_path));
-        let _ = tokio::fs::remove_file(&meta_path).await;
+        // Delete via storage backend
+        if let Err(e) = storage.delete(&cache_key).await {
+            warn!("Failed to delete cache file {}: {}", cache_key, e);
+            continue;
+        }
 
         // Delete from database
         if let Err(e) = sqlx::query("DELETE FROM cache_entries WHERE url = $1")

@@ -4,6 +4,16 @@ Centralized package caching proxy for LAN environments. One server pulls package
 
 **Scale:** offices, labs, homelabs (20-200 machines, single server).
 
+## Features
+
+- **HTTP caching proxy**: transparent cache for apt, dnf, pacman, and 7 other package managers
+- **mTLS security**: built-in private CA, automatic client certificate generation
+- **Distribution mirrors**: sync and serve Arch, Debian, Alpine, Fedora repos locally
+- **Tracker service**: discover mirrors by geo-proximity with operator reputation and blacklisting
+- **Shadow packages**: install third-party software via signed TOML recipes with rollback chains
+- **Scheduled auto-updates**: cron-based update windows with severity filtering
+- **Federated recipes**: share recipes via tracker with dual-signature verification and voting
+
 ## Install
 
 ### Client (default)
@@ -60,6 +70,7 @@ Arches: x86_64, aarch64 (musl-static binary).
                     |
          monopsony-server
          :3128 (HTTP proxy)
+         :3129 (Mirror HTTP)
          :50051 (gRPC mTLS)
          :9090 (Prometheus)
                 |
@@ -67,10 +78,53 @@ Arches: x86_64, aarch64 (musl-static binary).
                 |
          Clients (pacman,
           apt, dnf, nix, ...)
+
+       monopsony-tracker
+       :3130 (HTTP tracker)
+       SQLite
 ```
 
 First client request: cache miss, proxy fetches from upstream, caches, serves.
 Second request for same package: instant cache hit from local storage.
+
+### Shadow Packages
+
+Shadow packages install third-party software outside the system package manager:
+
+```toml
+# recipe.toml — signed with Ed25519
+[package]
+name = "tailscale"
+version = "1.72.0"
+
+[source]
+type = "github_release"
+repo = "tailscale/tailscale"
+asset = "tailscale_{{version}}_{{arch}}.tar.gz"
+
+[install]
+method = "extract"
+binaries = [
+  { source = "tailscale", target = "/usr/local/bin/tailscale" },
+  { source = "tailscaled", target = "/usr/local/bin/tailscaled" },
+]
+
+[health_check]
+type = "command"
+command = "tailscale version"
+```
+
+Features: rollback chains (last N backups), cron-based auto-updates, version detection via command/file/HTTP header, pre/post hooks.
+
+### Tracker
+
+The tracker enables multi-site mirror discovery:
+
+- Operators register mirrors with Nostr-style Ed25519 identity
+- Clients discover nearest mirrors by geo-proximity scoring
+- Reputation system with anti-malice dispute mechanism
+- Client reports (hash mismatch, stale mirror) trigger auto-blacklisting
+- Server metrics aggregation (installs, OS/arch distribution)
 
 ## Other Flags
 
@@ -98,7 +152,7 @@ cargo test
 cargo clippy
 ```
 
-1258 tests, 0 clippy warnings.
+238 tests, 0 failures, 4 crates.
 
 ## License
 
