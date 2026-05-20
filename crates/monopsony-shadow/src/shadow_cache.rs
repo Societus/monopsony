@@ -203,7 +203,7 @@ impl ShadowCache {
         let mut entries = fs::read_dir(dir).await.map_err(CacheError::Io)?;
         while let Some(entry) = entries.next_entry().await.map_err(CacheError::Io)? {
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "json") {
+            if path.extension().is_some_and(|e| e == "json") {
                 if let Ok(data) = fs::read_to_string(&path).await {
                     if let Ok(idx) = serde_json::from_str::<AssetIndexEntry>(&data) {
                         hashes.insert(idx.blob_hash);

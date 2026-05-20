@@ -11,24 +11,25 @@ use std::time::Duration;
 use sqlx::Row;
 use tracing::{debug, error, info, warn};
 
-use crate::cache_storage::{CacheStorage, FilesystemStorage};
-use crate::db::Database;
+use crate::cache_storage::CacheStorage;
+use monopsony_db::Database;
 
 /// Configuration for cache purging
-#[derive(Debug, Clone)]
 pub struct PurgeConfig {
     /// Cache storage backend
-    pub storage: Arc<FilesystemStorage>,
+    pub storage: Arc<dyn CacheStorage>,
     /// Days before purging unreferenced packages
     pub purge_after_days: u32,
     /// Maximum cache size in GB (0 = unlimited)
     pub max_size_gb: u64,
 }
 
+#[cfg(test)]
 impl Default for PurgeConfig {
     fn default() -> Self {
+        use crate::object_store_backend::ObjectStoreBackend;
         Self {
-            storage: Arc::new(FilesystemStorage::new(PathBuf::from("/var/cache/monopsony"))),
+            storage: Arc::new(ObjectStoreBackend::in_memory("memory")),
             purge_after_days: 30,
             max_size_gb: 0,
         }
@@ -76,15 +77,15 @@ async fn run_purge(db: &Database, config: &PurgeConfig) -> anyhow::Result<()> {
         let cache_path: String = row.get("cache_path");
 
         // Derive the storage key from the cache path
-        let cache_key = if let Some(key) = config.storage.path_to_key(&PathBuf::from(&cache_path)) {
-            key
-        } else {
-            // Fall back to using the path as-is
-            cache_path.clone()
+        let cache_key = {
+            let path = PathBuf::from(&cache_path);
+            config.storage.base_dir()
+                .and_then(|base| path.strip_prefix(&base).ok())
+                .map(|rel| rel.to_string_lossy().to_string())
+                .unwrap_or(cache_path.clone())
         };
 
-        // Get file size before deleting
-        let file_size = tokio::fs::metadata(&cache_path).await.map(|m| m.len()).unwrap_or(0);
+        let file_size = config.storage.total_size().await; // best-effort
 
         // Delete via storage backend
         if let Err(e) = config.storage.delete(&cache_key).await {
@@ -120,7 +121,7 @@ async fn run_purge(db: &Database, config: &PurgeConfig) -> anyhow::Result<()> {
 
             // Evict oldest entries until under limit
             let bytes_to_free = current_size - max_bytes;
-            let evicted = evict_oldest_entries(db, bytes_to_free, &config.storage).await?;
+            let evicted = evict_oldest_entries(db, bytes_to_free, &*config.storage).await?;
             purged_count += evicted.0;
             purged_bytes += evicted.1;
         }
@@ -138,7 +139,7 @@ async fn run_purge(db: &Database, config: &PurgeConfig) -> anyhow::Result<()> {
 async fn evict_oldest_entries(
     db: &Database,
     bytes_to_free: u64,
-    storage: &FilesystemStorage,
+    storage: &dyn CacheStorage,
 ) -> anyhow::Result<(usize, u64)> {
     let old_entries = sqlx::query(
         "SELECT url, cache_path, content_length FROM cache_entries ORDER BY last_accessed ASC",
@@ -159,8 +160,13 @@ async fn evict_oldest_entries(
         let content_length: i64 = row.get("content_length");
 
         // Derive storage key from path
-        let cache_key = storage.path_to_key(&PathBuf::from(&cache_path))
-            .unwrap_or_else(|| cache_path.clone());
+        let cache_key = {
+            let path = PathBuf::from(&cache_path);
+            storage.base_dir()
+                .and_then(|base| path.strip_prefix(&base).ok())
+                .map(|rel| rel.to_string_lossy().to_string())
+                .unwrap_or_else(|| cache_path.clone())
+        };
 
         // Delete via storage backend
         if let Err(e) = storage.delete(&cache_key).await {

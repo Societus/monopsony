@@ -3,7 +3,7 @@
 use monopsony_common::shadow_types::ReleaseAsset;
 use regex::Regex;
 use std::path::PathBuf;
-use tracing::{debug, warn};
+use tracing::debug;
 
 #[derive(Debug)]
 pub enum SourceError {
@@ -404,7 +404,7 @@ impl UpdateSource for DirectUrlSource {
                     .replace("{arch}", "amd64")
                     .replace("{os}", "linux");
                 Ok(vec![ReleaseAsset {
-                    name: url.split('/').last().unwrap_or("asset").to_string(),
+                    name: url.split('/').next_back().unwrap_or("asset").to_string(),
                     url: url.clone(),
                     size: 0, // unknown until download
                     sha256: None,

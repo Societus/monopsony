@@ -1,0 +1,35 @@
+[package]
+name = "monopsony-mirror"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+monopsony-common = { path = "../monopsony-common" }
+monopsony-db = { path = "../monopsony-db" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = "0.1"
+sha2 = { workspace = true }
+hex = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+url = "2"
+chrono = { workspace = true }
+bytes = "1"
+parking_lot = "0.12"
+mime_guess = "2"
+toml = { workspace = true }
+ed25519-dalek = { version = "2", features = ["serde"] }
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

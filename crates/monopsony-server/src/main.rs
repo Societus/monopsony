@@ -8,30 +8,12 @@ use std::time::Duration;
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
-mod cache_storage;
-mod proxy;
-mod grpc;
-mod db;
-mod discovery;
-mod tls;
-mod metrics;
-mod purge;
-mod prefetch;
-mod security;
-mod mirror;
-mod announce;
-mod nat;
-mod auth;
-mod manifest;
-mod public_rate_limit;
-mod shadow_signing;
-mod shadow_recipe;
-mod shadow_conflict;
-mod shadow_cache;
-mod shadow_source;
-mod shadow_git_mirror;
-mod shadow;
-mod tracker;
+// Crate imports
+use monopsony_db::Database;
+use monopsony_proxy::{cache_storage, object_store_backend, proxy, prefetch, purge};
+use monopsony_control::{announce, discovery, grpc, metrics, tls};
+use monopsony_mirror::mirror;
+
 
 #[derive(Parser, Debug)]
 #[command(name = "monopsony-server", version)]
@@ -93,6 +75,42 @@ struct Args {
     /// Authentication mode for HTTP proxy: open (default), token, mtls
     #[arg(long, default_value = "open")]
     auth_mode: String,
+
+    /// Cache backend: filesystem (default) or s3
+    #[arg(long, default_value = "filesystem")]
+    cache_backend: String,
+
+    /// S3 endpoint URL (e.g. http://127.0.0.1:8333)
+    #[arg(long)]
+    s3_endpoint: Option<String>,
+
+    /// S3 region
+    #[arg(long)]
+    s3_region: Option<String>,
+
+    /// S3 bucket name
+    #[arg(long)]
+    s3_bucket: Option<String>,
+
+    /// S3 access key (or set MONOPSONY_S3_ACCESS_KEY)
+    #[arg(long)]
+    s3_access_key: Option<String>,
+
+    /// S3 secret key (or set MONOPSONY_S3_SECRET_KEY)
+    #[arg(long)]
+    s3_secret_key: Option<String>,
+
+    /// S3 SSE-C encryption key file path (32 bytes)
+    #[arg(long)]
+    s3_encryption_key_path: Option<PathBuf>,
+
+    /// S3 Object Lock retention days (default: 7)
+    #[arg(long)]
+    s3_retention_days: Option<u32>,
+
+    /// S3 path-style access (true for SeaweedFS/Garage)
+    #[arg(long)]
+    s3_force_path_style: Option<bool>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -198,7 +216,7 @@ async fn main() -> anyhow::Result<()> {
         info!("Database disabled, using file-only caching");
         None
     } else {
-        match db::Database::connect(&args.database_url).await {
+        match Database::connect(&args.database_url).await {
             Ok(database) => {
                 database.run_migrations().await?;
                 info!("Database connected and migrations applied");
@@ -211,7 +229,31 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let storage = Arc::new(cache_storage::FilesystemStorage::new(cache_dir.clone()));
+    let storage: Arc<dyn cache_storage::CacheStorage> = match args.cache_backend.as_str() {
+        "s3" => {
+            let s3_config = monopsony_common::config::S3Config {
+                endpoint: args.s3_endpoint.clone().unwrap_or_default(),
+                region: args.s3_region.clone().unwrap_or_else(|| "us-east-1".to_string()),
+                bucket: args.s3_bucket.clone().unwrap_or_default(),
+                access_key: args.s3_access_key.clone().unwrap_or_default(),
+                secret_key: args.s3_secret_key.clone().unwrap_or_default(),
+                encryption_key_path: args.s3_encryption_key_path.clone(),
+                retention_days: args.s3_retention_days.unwrap_or(7),
+                force_path_style: args.s3_force_path_style.unwrap_or(true),
+            };
+            info!("Cache backend: S3 (bucket: {})", s3_config.bucket);
+            let backend = object_store_backend::ObjectStoreBackend::s3(&s3_config)?;
+            Arc::new(backend)
+        }
+        _ => {
+            info!("Cache backend: local ({})", cache_dir.display());
+            let backend = object_store_backend::ObjectStoreBackend::local(
+                cache_dir.clone(),
+                0, // retention_days — no retention for local
+            )?;
+            Arc::new(backend)
+        }
+    };
     let db_clone = db.clone();
     let auth_mode: monopsony_common::config::AuthMode = args.auth_mode.parse()
         .unwrap_or_else(|_| {
@@ -219,8 +261,9 @@ async fn main() -> anyhow::Result<()> {
             monopsony_common::config::AuthMode::Open
         });
     info!("Auth mode: {}", auth_mode);
+    let storage_for_proxy = storage.clone();
     let proxy_handle = tokio::spawn(async move {
-        if let Err(e) = proxy::run_proxy(http_addr, storage, db_clone, auth_mode).await {
+        if let Err(e) = proxy::run_proxy(http_addr, storage_for_proxy, db_clone, auth_mode).await {
             error!("HTTP proxy error: {}", e);
         }
     });
@@ -258,7 +301,7 @@ async fn main() -> anyhow::Result<()> {
     // Start cache purge task if database is available
     let purge_handle = if let Some(db) = db.clone() {
         let purge_config = purge::PurgeConfig {
-            storage: Arc::new(cache_storage::FilesystemStorage::new(cache_dir.clone())),
+            storage: storage.clone(),
             purge_after_days: 30,
             max_size_gb: 0,
         };
@@ -275,7 +318,7 @@ async fn main() -> anyhow::Result<()> {
     // Start pre-fetch scheduler if database is available
     let prefetch_handle = if let Some(db) = db.clone() {
         let prefetch_config = prefetch::PrefetchConfig {
-            storage: Arc::new(cache_storage::FilesystemStorage::new(cache_dir.clone())),
+            storage: storage.clone(),
             interval_secs: 3600,
             max_concurrent: 10,
             request_timeout_secs: 300,
@@ -472,7 +515,7 @@ async fn handle_pair_command(
     let db = {
         let database_url = std::env::var("MONOPSONY_DATABASE_URL")
             .unwrap_or_else(|_| "postgres://monopsony:monopsony@localhost/monopsony".to_string());
-        match db::Database::connect(&database_url).await {
+        match Database::connect(&database_url).await {
             Ok(d) => { d.run_migrations().await?; Some(d) }
             Err(_) => { warn!("No database available, pairing will not be recorded"); None }
         }
@@ -571,7 +614,7 @@ async fn handle_pair_command(
 }
 
 async fn handle_api_key_command(action: &ApiKeyCommands, database_url: &str) -> anyhow::Result<()> {
-    let db = db::Database::connect(database_url).await?;
+    let db = Database::connect(database_url).await?;
     db.run_migrations().await?;
 
     match action {

@@ -2,6 +2,11 @@
 resolver = "2"
 members = [
     "crates/monopsony-common",
+    "crates/monopsony-db",
+    "crates/monopsony-proxy",
+    "crates/monopsony-control",
+    "crates/monopsony-mirror",
+    "crates/monopsony-shadow",
     "crates/monopsony-server",
     "crates/monopsony-client",
     "crates/monopsony-tracker",

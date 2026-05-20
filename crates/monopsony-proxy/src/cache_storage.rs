@@ -51,6 +51,28 @@ pub trait CacheStorage: Send + Sync {
 
     /// List all keys in storage (for stats/purge).
     async fn list_keys(&self) -> anyhow::Result<Vec<String>>;
+
+    /// Load JSON metadata sidecar for a key (backend-specific, may be no-op).
+    async fn load_meta_json(&self, key: &str) -> Option<Vec<u8>> {
+        let _ = key;
+        None
+    }
+
+    /// Save JSON metadata sidecar for a key (backend-specific, may be no-op).
+    async fn save_meta_json(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+        let _ = (key, data);
+        Ok(())
+    }
+
+    /// Initialize storage directories (filesystem only).
+    async fn init_dirs(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Get filesystem base dir if applicable (owned copy).
+    fn base_dir(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -75,12 +97,7 @@ impl FilesystemStorage {
     }
 
     /// The base cache directory (for consumers that need the raw path,
-    /// e.g. path traversal validation).
-    pub fn base_dir(&self) -> &Path {
-        &self.base_dir
-    }
-
-    /// Convert a storage key to a filesystem path.
+    /// e.g. path traversal validation). Available via trait's base_dir().
     pub fn key_to_path(&self, key: &str) -> PathBuf {
         self.base_dir.join(key)
     }
@@ -196,33 +213,30 @@ impl CacheStorage for FilesystemStorage {
         }
         Ok(keys)
     }
-}
 
-// ---------------------------------------------------------------------------
-// Metadata helpers (used by proxy.rs for CacheEntry JSON)
-// ---------------------------------------------------------------------------
+    // -- Override default trait methods for filesystem-specific behavior --
 
-impl FilesystemStorage {
-    /// Load a JSON metadata file for a cache key.
-    pub async fn load_meta_json(&self, key: &str) -> Option<Vec<u8>> {
+    async fn load_meta_json(&self, key: &str) -> Option<Vec<u8>> {
         let meta_path = self.meta_path(key);
         tokio::fs::read(&meta_path).await.ok()
     }
 
-    /// Save a JSON metadata file for a cache key.
-    pub async fn save_meta_json(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
+    async fn save_meta_json(&self, key: &str, data: &[u8]) -> anyhow::Result<()> {
         let meta_path = self.meta_path(key);
         Self::ensure_parent(&meta_path).await;
         tokio::fs::write(&meta_path, data).await?;
         Ok(())
     }
 
-    /// Initialize directory structure.
-    pub async fn init_dirs(&self) -> anyhow::Result<()> {
+    async fn init_dirs(&self) -> anyhow::Result<()> {
         tokio::fs::create_dir_all(&self.base_dir).await?;
         tokio::fs::create_dir_all(&self.meta_dir).await?;
         tokio::fs::create_dir_all(self.base_dir.join("other")).await?;
         Ok(())
+    }
+
+    fn base_dir(&self) -> Option<PathBuf> {
+        Some(self.base_dir.clone())
     }
 }
 

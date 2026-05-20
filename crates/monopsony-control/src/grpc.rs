@@ -24,8 +24,8 @@ use monopsony_common::proto::monopsony::monopsony_control_server::{
     MonopsonyControl, MonopsonyControlServer,
 };
 
-use crate::db::Database;
-use crate::mirror::MirrorManager;
+use monopsony_db::Database;
+use monopsony_mirror::MirrorManager;
 use crate::tls::TlsManager;
 
 pub struct MonopsonyGrpc {
@@ -463,7 +463,7 @@ use monopsony_common::proto::monopsony::{
     DeleteMirrorConfigRequest, DeleteMirrorConfigResponse,
 };
 
-fn config_to_mirror_info(c: &crate::mirror::MirrorConfig) -> MirrorInfo {
+fn config_to_mirror_info(c: &monopsony_mirror::mirror::MirrorConfig) -> MirrorInfo {
     MirrorInfo {
         distro: c.distro.clone(),
         upstream_url: c.upstream_url.clone(),
@@ -547,7 +547,7 @@ impl monopsony_common::proto::monopsony::mirror_control_server::MirrorControl fo
         if let Some(db) = self.mirror_manager.db() {
             let includes = serde_json::to_value(&req.include_patterns).unwrap_or_default();
             let excludes = serde_json::to_value(&req.exclude_patterns).unwrap_or_default();
-            let config = crate::db::MirrorUpsertConfig {
+            let config = monopsony_db::db::MirrorUpsertConfig {
                 distro: req.distro.clone(),
                 upstream_url: req.upstream_url.clone(),
                 local_path: req.local_path.clone(),
@@ -562,7 +562,7 @@ impl monopsony_common::proto::monopsony::mirror_control_server::MirrorControl fo
         }
 
         // Update in-memory config
-        let mut new_config = crate::mirror::MirrorConfig {
+        let mut new_config = monopsony_mirror::mirror::MirrorConfig {
             distro: req.distro.clone(),
             upstream_url: req.upstream_url.clone(),
             local_path: std::path::PathBuf::from(&req.local_path),

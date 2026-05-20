@@ -1,0 +1,31 @@
+[package]
+name = "monopsony-shadow"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+monopsony-common = { path = "../monopsony-common" }
+monopsony-db = { path = "../monopsony-db" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+ed25519-dalek = { version = "2", features = ["serde", "rand_core"] }
+getrandom = "0.2"
+base64 = "0.22"
+rand = "0.8"
+regex = { workspace = true }
+toml = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"

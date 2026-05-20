@@ -4,7 +4,6 @@
 //! Uses the package manager URL patterns to identify which upstream URLs need caching,
 //! prioritized by how many clients need each package.
 
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,8 +17,8 @@ use hyper_util::{
 use sqlx::Row;
 use tracing::{debug, error, info, warn, trace};
 
-use crate::cache_storage::{CacheStorage, FilesystemStorage};
-use crate::db::Database;
+use crate::cache_storage::CacheStorage;
+use monopsony_db::Database;
 
 /// Boxed body type for hyper client requests
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
@@ -31,10 +30,9 @@ fn empty_body() -> BoxBody {
 }
 
 /// Configuration for the pre-fetch scheduler
-#[derive(Debug, Clone)]
 pub struct PrefetchConfig {
     /// Cache storage backend
-    pub storage: Arc<FilesystemStorage>,
+    pub storage: Arc<dyn CacheStorage>,
     /// How often to run pre-fetch cycles (seconds)
     pub interval_secs: u64,
     /// Maximum concurrent fetches
@@ -45,10 +43,12 @@ pub struct PrefetchConfig {
     pub bandwidth_limit_bps: u64,
 }
 
+#[cfg(test)]
 impl Default for PrefetchConfig {
     fn default() -> Self {
+        use crate::object_store_backend::ObjectStoreBackend;
         Self {
-            storage: Arc::new(FilesystemStorage::new(std::path::PathBuf::from("/var/cache/monopsony"))),
+            storage: Arc::new(ObjectStoreBackend::in_memory("memory")),
             interval_secs: 3600,
             max_concurrent: 10,
             request_timeout_secs: 300,
@@ -150,7 +150,7 @@ async fn run_prefetch_cycle(db: &Database, config: &PrefetchConfig) -> anyhow::R
                 // Bandwidth throttle: acquire permit, fetch, then pace release
                 let _permit = bw_sem.acquire().await.ok()?;
 
-                match prefetch_url(&client, &candidate.url, &storage, timeout_secs).await {
+                match prefetch_url(&client, &candidate.url, &*storage, timeout_secs).await {
                     Ok(size) => {
                         debug!(
                             "Pre-fetched: {} ({} bytes, {} clients)",
@@ -160,8 +160,10 @@ async fn run_prefetch_cycle(db: &Database, config: &PrefetchConfig) -> anyhow::R
                         // Record in DB
                         let now = chrono::Utc::now().timestamp();
                         let cache_key = url_to_cache_key(&candidate.url);
-                        let cache_path = storage.key_to_path(&cache_key).to_string_lossy().to_string();
-                        if let Err(e) = db.record_cache_miss(&crate::db::CacheMissConfig {
+                        let cache_path = storage.base_dir()
+                            .map(|base| base.join(&cache_key).to_string_lossy().to_string())
+                            .unwrap_or_else(|| cache_key.clone());
+                        if let Err(e) = db.record_cache_miss(&monopsony_db::db::CacheMissConfig {
                             url: candidate.url.clone(),
                             cache_path,
                             content_type: None,
@@ -247,7 +249,7 @@ async fn find_uncached_packages(db: &Database) -> anyhow::Result<Vec<PrefetchCan
 async fn prefetch_url(
     client: &Client<HttpConnector, BoxBody>,
     url: &str,
-    storage: &FilesystemStorage,
+    storage: &dyn CacheStorage,
     timeout_secs: u64,
 ) -> Result<u64, String> {
     let cache_key = url_to_cache_key(url);
@@ -316,10 +318,12 @@ async fn prefetch_url(
         .map_err(|e| format!("Failed to write cache: {}", e))?;
 
     // Write metadata sidecar
-    let cache_path = storage.key_to_path(&cache_key);
+    let cache_path = storage.base_dir()
+        .map(|base| base.join(&cache_key).to_string_lossy().to_string())
+        .unwrap_or_else(|| cache_key.clone());
     let meta = serde_json::json!({
         "url": url,
-        "cache_path": cache_path.to_string_lossy().to_string(),
+        "cache_path": cache_path,
         "content_type": parts.headers.get("content-type").and_then(|v| v.to_str().ok()),
         "content_length": bytes.len(),
         "cached_at": chrono::Utc::now().timestamp(),

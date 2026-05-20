@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use tokio::process::Command;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 #[derive(Debug)]
 pub enum MirrorError {

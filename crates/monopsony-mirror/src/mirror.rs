@@ -26,7 +26,7 @@ use sha2::{Sha256, Digest};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, trace, warn};
 
-use crate::db::Database;
+use monopsony_db::Database;
 
 /// Boxed body type for hyper client requests
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
@@ -600,7 +600,7 @@ async fn proxy_to_upstream(upstream_url: &str, file_path: &str) -> Response {
         Ok(u) => u,
         Err(_) => return (StatusCode::BAD_REQUEST, "Invalid URL").into_response(),
     };
-    if crate::security::validate_url_host(&parsed_url).is_err() {
+    if crate::url_validation::validate_url_host(&parsed_url).is_err() {
         warn!("Mirror proxy blocked SSRF attempt: {}", url);
         return (StatusCode::BAD_REQUEST, "Blocked URL").into_response();
     }
@@ -672,7 +672,7 @@ async fn sync_mirror(
     // SSRF validation on upstream URL
     let parsed_upstream = url::Url::parse(upstream_url)
         .map_err(|e| format!("Invalid upstream URL: {}", e))?;
-    if let Err(e) = crate::security::validate_url_host(&parsed_upstream) {
+    if let Err(e) = crate::url_validation::validate_url_host(&parsed_upstream) {
         return Err(format!("SSRF blocked: upstream URL {} — {}", upstream_url, e));
     }
 

@@ -951,7 +951,7 @@ impl Database {
             "INSERT INTO shadow_packages (id, client_id, name, version, architecture, os_family, libc, source_type, source_url, recipe_path, install_paths, config_paths, service_name, masked_from_pm)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"
         )
-        .bind(&id)
+        .bind(id)
         .bind(client_id)
         .bind(name)
         .bind(version)
@@ -1057,7 +1057,7 @@ impl Database {
             "INSERT INTO shadow_update_history (id, package_id, from_version, to_version, status, backup_path, applied_at)
              VALUES ($1, $2, $3, $4, $5, $6, {applied_at})"
         ))
-        .bind(&id)
+        .bind(id)
         .bind(package_id)
         .bind(from_version)
         .bind(to_version)

@@ -7,7 +7,7 @@
 ```
 Monopsony is a centralized package caching proxy system - like Windows Update's LAN sharing but for all package managers across all OSes. A central server pre-fetches and caches packages from upstream repositories, and clients redirect their package managers through it via a local HTTP proxy.
 **Target scale:** SMB/office (20-200 clients, single server)
-**Git state:** Forgejo: base.societus.club/societus/monopsony.git. Local: ~/projects/monopsony. **v1.0.0-rc1. 238 tests passing. All sprints complete.**
+**Git state:** Forgejo: base.societus.club/societus/monopsony.git. Local: ~/projects/monopsony. **v1.0.0-rc1. 266 tests passing. Crate split complete.**
 ## Build & Run
 ```
 bash
@@ -26,12 +26,17 @@ cargo test                     # Run tests
 | Crate | Status | Notes |
 |-------|--------|-------|
 | `monopsony-common` | Compiles clean | shadow_types (shared), AuthMode enum, config validation |
-| `monopsony-client` | Compiles clean | shadow.rs (verify_version, backup, extract, health check, atomic swap), shadow_cli.rs (clap subcommands), trust.rs (client trust enforcement) |
-| `monopsony-server` | Compiles clean | 8 shadow modules: types, signing, recipe, conflict, cache, source, git_mirror, manager. GitBuildSource, DirectUrlSource. Mirror SSRF validation, body size limits |
+| `monopsony-db` | Compiles clean | PostgreSQL Database struct, migrations, CRUD for clients/packages/cache_entries/api_keys |
+| `monopsony-proxy` | Compiles clean | HTTP caching proxy, cache_storage, object_store_backend, prefetch, purge, security |
+| `monopsony-control` | Compiles clean | gRPC server, auth, discovery (mDNS), TLS, metrics, NAT, announce, tracker |
+| `monopsony-mirror` | Compiles clean | MirrorManager, manifest signing, public_rate_limit |
+| `monopsony-shadow` | Compiles clean | ShadowPackageManager, signing, recipe, conflict, cache, source, git_mirror |
+| `monopsony-server` | Compiles clean | Thin orchestrator -- wires the 5 crates above into a single binary |
+| `monopsony-client` | Compiles clean | Local proxy, gRPC client, shadow CLI, trust enforcement |
 | `monopsony-tracker` | Compiles clean | HTTP API, recipe admin routes (quarantine reinstate/remove), graceful shutdown |
 
-Full workspace: `cargo check` passes, 0 errors, warnings only (dead_code in server shadow modules -- not yet wired to gRPC handlers).
-Tests: 238 passed, 0 failed. Clippy: 0 warnings on non-shadow code; shadow code passes clippy.
+Full workspace: `cargo check` passes, 0 errors, warnings only (dead_code in shadow modules -- not yet wired to gRPC handlers).
+Tests: 266 passed, 0 failed. Clippy: clean on new crates (3 pre-existing dead_code warnings in shadow/db).
 
 ## Release Status
 
@@ -82,32 +87,70 @@ monopsony/
     │           ├── winget.rs     # Full implementation (winget list, GitHub CDN URL patterns)
     │           ├── choco.rs      # Full implementation (choco list --local-only, chocolatey.org patterns)
     │           └── scoop.rs      # Full implementation (scoop list, GitHub raw URL patterns)
-    ├── monopsony-server/
+    ├── monopsony-db/             # Database layer (extracted from monopsony-server)
     │   ├── Cargo.toml
     │   └── src/
-    │       ├── main.rs           # CLI (clap) with args: --config, --http-addr, --grpc-addr, --metrics-addr, --cache-dir, --discovery, --tls-cert-dir. Subcommands: pair, api-key. Starts HTTP proxy, gRPC server, mDNS discovery, TLS CA. Waits for ctrl-c.
-    │       ├── proxy.rs          # Full HTTP caching proxy with CacheEntry metadata, ProxyState, URL matching, file-based cache with JSON metadata. DB read-through: checks DB before filesystem for cache lookups.
-    │       ├── grpc.rs           # MonopsonyControl tonic trait impl, register/heartbeat/inventory/streaming handlers. start() uses mTLS (always requires client certs).
-    │       ├── db.rs             # PostgreSQL Database struct with PgPool, migrations, CRUD for clients/packages/cache_entries/api_keys. UPSERT inventory. record_pairing.
+    │       ├── lib.rs
+    │       └── db.rs             # PostgreSQL Database struct with PgPool, migrations, CRUD
+    ├── monopsony-proxy/          # HTTP caching proxy (extracted from monopsony-server)
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── lib.rs
+    │       ├── proxy.rs          # Full HTTP caching proxy with CacheEntry metadata, ProxyState
+    │       ├── cache_storage.rs  # File-based cache with JSON metadata
+    │       ├── object_store_backend.rs  # Object store backend abstraction
+    │       ├── prefetch.rs       # Prefetch task for warming cache
+    │       ├── purge.rs          # Cache purge task
+    │       └── security.rs       # URL validation, private IP checks, body size limits
+    ├── monopsony-control/        # gRPC + coordination (extracted from monopsony-server)
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── lib.rs
+    │       ├── grpc.rs           # MonopsonyControl tonic trait impl
+    │       ├── auth.rs           # AuthMode: open, token, mTLS
     │       ├── discovery.rs      # DiscoveryService with mDNS broadcast via mdns-sd
-    │       ├── tls.rs            # TlsManager with CA load/create, server/client TLS config, client cert generation, SHA-256 fingerprint, ca_cert_pem_bytes(), cert_and_key_to_pem(). mTLS wired into gRPC.
-|       ├── shadow.rs          # ShadowPackageManager: server-side orchestration (register, check sources, cache, polling loop, git mirror integration)
-|       ├── shadow_signing.rs  # Ed25519 recipe signing: keygen, sign, verify (ed25519-dalek 2.2, getrandom)
-|       ├── shadow_recipe.rs   # TOML recipe parsing + validation + template generation
-|       ├── shadow_conflict.rs # PM conflict detection (apt/dnf/pacman/apk) + masking
-|       ├── shadow_cache.rs    # Content-addressed blob store with platform index + disk-budget GC
-|       ├── shadow_source.rs   # UpdateSource trait + GithubReleaseSource + GitBuildSource + DirectUrlSource
-|       ├── shadow_git_mirror.rs # Git mirror maintenance: bare clone, fetch, tags, worktree, GC
-    └── monopsony-client/
+    │       ├── tls.rs            # TlsManager with CA load/create, mTLS config
+    │       ├── metrics.rs        # Metrics HTTP server (/health, /metrics)
+    │       ├── nat.rs            # NAT type detection
+    │       ├── announce.rs       # Tracker announcement
+    │       └── tracker.rs        # Tracker client
+    ├── monopsony-mirror/         # Mirror subsystem (extracted from monopsony-server)
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── lib.rs
+    │       ├── mirror.rs         # MirrorManager, MirrorState, Axum router
+    │       ├── manifest.rs       # Mirror manifest with Ed25519 signing
+    │       ├── public_rate_limit.rs  # Rate limiting for public mirrors
+    │       └── url_validation.rs # Duplicated from security.rs (is_private_ip, validate_url_host)
+    ├── monopsony-shadow/         # Shadow packages (extracted from monopsony-server)
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── lib.rs
+    │       ├── shadow.rs         # ShadowPackageManager: orchestration
+    │       ├── shadow_signing.rs # Ed25519 recipe signing: keygen, sign, verify
+    │       ├── shadow_recipe.rs  # TOML recipe parsing + validation
+    │       ├── shadow_conflict.rs # PM conflict detection + masking
+    │       ├── shadow_cache.rs   # Content-addressed blob store + disk-budget GC
+    │       ├── shadow_source.rs  # UpdateSource trait + GithubReleaseSource + GitBuildSource + DirectUrlSource
+    │       └── shadow_git_mirror.rs # Git mirror maintenance
+    ├── monopsony-server/         # Thin orchestrator binary
+    │   ├── Cargo.toml
+    │   └── src/
+    │       └── main.rs           # CLI (clap), wires db+proxy+control+mirror crates into single binary
+    ├── monopsony-client/
+    │   ├── Cargo.toml
+    │   └── src/
+    │       ├── main.rs           # CLI (clap) with subcommands: Daemon, Discover, Status, Configure, Pair
+    │       ├── proxy.rs          # Local HTTP proxy with timeout + upstream fallback
+    │       ├── grpc_client.rs    # Real tonic gRPC client with register/heartbeat/inventory RPCs
+    │       ├── discovery.rs      # mDNS browsing with spawn_blocking
+    │       ├── shadow.rs         # Client-side shadow package ops
+    │       ├── shadow_cli.rs     # Clap subcommands for shadow ops
+    │       └── trust.rs          # Client trust enforcement
+    └── monopsony-tracker/
         ├── Cargo.toml
         └── src/
-            ├── main.rs           # CLI (clap) with subcommands: Daemon, Discover, Status, Configure, Pair. Daemon requires paired certs for mTLS. Pair does protobuf exchange on port 50052. Configure executes ProxyConfigActions. Heartbeat loop with exponential backoff reconnect.
-            ├── proxy.rs          # Local HTTP proxy with timeout + upstream fallback, X-Monopsony headers
-            ├── grpc_client.rs    # Real tonic gRPC client with register/heartbeat/inventory RPCs + pair() static method. is_connected() checks client_id.
-            ├── discovery.rs      # mDNS browsing with spawn_blocking, discover/discover_one
-|           ├── shadow.rs         # Client-side shadow package ops: verify_version, backup, extract, health check, atomic swap, check_build_deps, execute_build, execute_script, run_hook
-|           ├── shadow_cli.rs     # Clap subcommands: Register/Unregister/List/Inspect/Check/Update/Rollback/Recipe + detect_source_type()
-|           └── trust.rs          # Client trust enforcement: verify_recipe_trust (trusted_server_only, trusted_authors, paranoid policies)
+            └── main.rs           # HTTP API, recipe admin routes, graceful shutdown
 ```
 
 ## Key Types & Interfaces
@@ -139,7 +182,7 @@ pub enum ProxyConfigAction {
 }
 ```
 
-### Server HTTP Proxy (monopsony-server/src/proxy.rs)
+### Server HTTP Proxy (monopsony-proxy/src/proxy.rs)
 The server's HTTP proxy is the most complete module. It:
 - Uses `axum` with `ConnectInfo<SocketAddr>` for the router
 - `ProxyState` holds a `hyper` client, cache_dir, meta_dir, and package manager backends

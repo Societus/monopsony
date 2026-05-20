@@ -126,7 +126,7 @@ pub fn verify_trust(
 
 /// Verify the author signature on a signed recipe.
 fn verify_author_signature(signed: &SignedRecipe) -> Result<(), TrustError> {
-    use ed25519_dalek::{Signature, Verifier};
+    use ed25519_dalek::Signature;
 
     let author_sig = signed
         .author_signature
@@ -140,7 +140,7 @@ fn verify_author_signature(signed: &SignedRecipe) -> Result<(), TrustError> {
         .try_into()
         .map_err(|_| TrustError::AuthorSignatureInvalid("signature wrong length".into()))?;
 
-    let signature = Signature::from_bytes(&sig_bytes);
+    let _signature = Signature::from_bytes(&sig_bytes);
 
     // We need the author's verifying key. The key_id is a hash of the public key,
     // but we don't store the raw key in the signature. For federated recipes,

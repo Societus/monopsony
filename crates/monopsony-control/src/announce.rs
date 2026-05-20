@@ -7,7 +7,7 @@ use std::sync::Arc;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
 
-use crate::mirror::MirrorManager;
+use monopsony_mirror::MirrorManager;
 
 /// Tracker announcer — periodically POSTs mirror configs to tracker(s)
 pub struct TrackerAnnouncer {

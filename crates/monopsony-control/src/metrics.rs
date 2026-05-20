@@ -9,7 +9,7 @@ use std::sync::Arc;
 use axum::{extract::State, Json};
 use tracing::info;
 
-use crate::db::Database;
+use monopsony_db::Database;
 
 /// Metrics state shared across the server
 #[derive(Clone)]

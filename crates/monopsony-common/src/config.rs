@@ -87,15 +87,70 @@ fn default_max_connections() -> u32 {
     10
 }
 
+/// Cache backend type.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheBackend {
+    #[default]
+    Filesystem,
+    S3,
+}
+
+impl std::fmt::Display for CacheBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CacheBackend::Filesystem => write!(f, "filesystem"),
+            CacheBackend::S3 => write!(f, "s3"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheConfig {
-    /// Path to cache directory
+    /// Storage backend: "filesystem" (default) or "s3"
+    #[serde(default)]
+    pub backend: CacheBackend,
+    /// Path to cache directory (filesystem backend)
     pub path: PathBuf,
     /// Maximum cache size in GB
     pub max_size_gb: u64,
     /// Days before purging unreferenced packages
     #[serde(default = "default_purge_days")]
     pub purge_after_days: u32,
+    /// S3 backend configuration
+    #[serde(default)]
+    pub s3: Option<S3Config>,
+}
+
+/// S3-compatible storage backend configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3Config {
+    /// S3 endpoint URL (e.g., "http://127.0.0.1:8333" for SeaweedFS)
+    pub endpoint: String,
+    /// Region name
+    #[serde(default = "default_s3_region")]
+    pub region: String,
+    /// Bucket name
+    pub bucket: String,
+    /// Access key ID (or set MONOPSONY_S3_ACCESS_KEY env var)
+    #[serde(default)]
+    pub access_key: String,
+    /// Secret access key (or set MONOPSONY_S3_SECRET_KEY env var)
+    #[serde(default)]
+    pub secret_key: String,
+    /// Path to SSE-C encryption key file (256-bit / 32 bytes)
+    #[serde(default)]
+    pub encryption_key_path: Option<PathBuf>,
+    /// Object Lock retention period in days (0 = no retention)
+    #[serde(default)]
+    pub retention_days: u32,
+    /// Use path-style access (true for SeaweedFS/Garage, false for AWS)
+    #[serde(default = "default_true")]
+    pub force_path_style: bool,
+}
+
+fn default_s3_region() -> String {
+    "us-east-1".to_string()
 }
 
 fn default_purge_days() -> u32 {
@@ -631,9 +686,11 @@ mod tests {
                 max_connections: 10,
             },
             cache: CacheConfig {
+                backend: CacheBackend::Filesystem,
                 path: PathBuf::from("/tmp/cache"),
                 max_size_gb: 50,
                 purge_after_days: 30,
+                s3: None,
             },
             tls: TlsServerConfig {
                 ca_path: PathBuf::from("/tmp/ca.pem"),

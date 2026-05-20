@@ -16,7 +16,7 @@ use hyper_util::{
 };
 use std::{
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -24,8 +24,8 @@ use tracing::{debug, error, info, trace, warn};
 
 use monopsony_common::{PackageManagerBackend, PackageManagerKind};
 
-use crate::cache_storage::{CacheStorage, FilesystemStorage};
-use crate::db::Database;
+use crate::cache_storage::CacheStorage;
+use monopsony_db::Database;
 use crate::security::RateLimiter;
 
 /// Cache metadata for a cached package
@@ -46,15 +46,15 @@ pub struct CacheEntry {
 pub struct ProxyState {
     pub client: Client<HttpConnector, Body>,
     pub cache_dir: PathBuf,
-    pub storage: Arc<FilesystemStorage>,
+    pub storage: Arc<dyn CacheStorage>,
     pub backends: Vec<Box<dyn PackageManagerBackend>>,
     pub db: Option<Arc<Database>>,
 }
 
 impl ProxyState {
-    pub fn new(storage: Arc<FilesystemStorage>, db: Option<Arc<Database>>) -> Self {
+    pub fn new(storage: Arc<dyn CacheStorage>, db: Option<Arc<Database>>) -> Self {
         let client = Client::builder(TokioExecutor::new()).build_http();
-        let cache_dir = storage.base_dir().to_path_buf();
+        let cache_dir = storage.base_dir().unwrap_or_default();
         let backends = monopsony_common::package_manager::get_available_backends();
 
         Self {
@@ -93,9 +93,11 @@ impl ProxyState {
         }
     }
 
-    /// Convert a URL to a cache file path (kept for path traversal validation).
+    /// Convert a URL to a cache file path (filesystem only, for path traversal validation).
     pub fn url_to_cache_path(&self, url: &str) -> Option<PathBuf> {
-        self.url_to_cache_key(url).map(|key| self.storage.key_to_path(&key))
+        self.url_to_cache_key(url).and_then(|key| {
+            self.storage.base_dir().map(|base| base.join(&key))
+        })
     }
 
     /// Load cache metadata via storage backend
@@ -134,7 +136,7 @@ impl ProxyState {
 pub fn create_proxy_router(
     state: Arc<ProxyState>,
     rate_limiter: Option<Arc<RateLimiter>>,
-    auth_state: Arc<crate::auth::AuthState>,
+    auth_state: Arc<monopsony_control::auth::AuthState>,
 ) -> axum::Router {
     axum::Router::new()
         .route("/health", axum::routing::get(health_check))
@@ -142,7 +144,7 @@ pub fn create_proxy_router(
         .route("/", axum::routing::any(handle_proxy_request))
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
-            crate::auth::auth_middleware,
+            monopsony_control::auth::auth_middleware,
         ))
         .with_state((state, rate_limiter))
 }
@@ -234,7 +236,8 @@ async fn handle_cached_request(
         }
     };
 
-    let cache_path = state.storage.key_to_path(&cache_key);
+    let cache_path = state.storage.base_dir()
+        .map(|base| base.join(&cache_key));
 
     // Check DB first for authoritative cache state
     let db_cached = if let Some(db) = &state.db {
@@ -256,9 +259,14 @@ async fn handle_cached_request(
         true
     };
 
-    // Validate cache path doesn't escape cache directory (path traversal prevention)
+    // Validate cache path doesn't escape cache directory (path traversal prevention, filesystem only)
     let exists = state.storage.exists(&cache_key).await.unwrap_or(false);
-    let path_valid = db_cached && exists && crate::security::validate_cache_path(&cache_path.to_string_lossy(), &state.cache_dir);
+    let path_valid = if let Some(ref path) = cache_path {
+        db_cached && exists && crate::security::validate_cache_path(&path.to_string_lossy(), &state.cache_dir)
+    } else {
+        // S3 backend: no path traversal concern
+        db_cached && exists
+    };
     
     // Serve from storage if cached
     if path_valid {
@@ -371,7 +379,10 @@ async fn handle_cached_request(
 
             let entry = CacheEntry {
                 url: url.to_string(),
-                cache_path: cache_path.to_string_lossy().to_string(),
+                cache_path: cache_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| cache_key.clone()),
                 content_type,
                 content_length,
                 etag,
@@ -387,7 +398,7 @@ async fn handle_cached_request(
 
             if let Some(db) = &state.db {
                 if let Err(e) = db
-                    .record_cache_miss(&crate::db::CacheMissConfig {
+                    .record_cache_miss(&monopsony_db::db::CacheMissConfig {
                         url: url.to_string(),
                         cache_path: entry.cache_path.clone(),
                         content_type: entry.content_type.clone(),
@@ -487,7 +498,7 @@ async fn fetch_upstream(
 /// Start the HTTP proxy server
 pub async fn run_proxy(
     addr: SocketAddr,
-    storage: Arc<FilesystemStorage>,
+    storage: Arc<dyn CacheStorage>,
     db: Option<Arc<Database>>,
     auth_mode: monopsony_common::config::AuthMode,
 ) -> anyhow::Result<()> {
@@ -501,7 +512,7 @@ pub async fn run_proxy(
     tokio::spawn(crate::security::run_rate_limiter_cleanup(limiter_clone, 120));
 
     // Create auth middleware state
-    let auth_state = Arc::new(crate::auth::AuthState {
+    let auth_state = Arc::new(monopsony_control::auth::AuthState {
         auth_mode,
         db,
     });
@@ -523,6 +534,7 @@ pub async fn run_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_storage::FilesystemStorage;
 
     #[test]
     fn test_url_to_cache_path() {

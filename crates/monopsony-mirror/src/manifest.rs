@@ -48,7 +48,7 @@ impl MirrorManifest {
 
     /// Sign the manifest with an Ed25519 signing key.
     pub fn sign(&mut self, signing_key: &ed25519_dalek::SigningKey) {
-        use ed25519_dalek::{Signer, Verifier};
+        use ed25519_dalek::Signer;
         let canonical = self.canonical_json();
         let signature = signing_key.sign(canonical.as_bytes());
         self.signature = Some(signature.to_bytes().iter().map(|b| format!("{:02x}", b)).collect());
@@ -119,7 +119,7 @@ fn sort_json_object(value: &mut serde_json::Value) {
 }
 
 fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return None;
     }
     (0..hex.len())

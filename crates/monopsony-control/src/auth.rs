@@ -15,7 +15,7 @@ use monopsony_common::config::AuthMode;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-use crate::db::Database;
+use monopsony_db::Database;
 
 /// Shared state for auth middleware
 pub struct AuthState {
