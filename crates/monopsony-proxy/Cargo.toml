@@ -31,6 +31,8 @@ url = "2"
 mime_guess = "2"
 chrono = { workspace = true }
 bytes = "1"
+tar = "0.4"
+clamav-client = { version = "2.2", features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"

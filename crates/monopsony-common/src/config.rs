@@ -55,6 +55,8 @@ pub struct ServerConfig {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub shadow_trust: ShadowPackageTrustConfig,
+    #[serde(default)]
+    pub scan: ScanConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +262,63 @@ impl Default for ShadowPackageTrustConfig {
             policy: default_trust_policy(),
             trusted_author_keys: Vec::new(),
             trusted_operator_keys: Vec::new(),
+        }
+    }
+}
+
+// ============================================================================
+// Scan Configuration
+// ============================================================================
+
+fn default_clamd_socket() -> String {
+    "tcp://127.0.0.1:3310".to_string()
+}
+
+fn default_entropy_threshold() -> f64 {
+    7.5
+}
+
+/// Malware and vulnerability scanning configuration.
+///
+/// When enabled, cached packages are scanned asynchronously after write
+/// using ClamAV (signature-based), YARA (supply-chain rules), and
+/// Shannon entropy heuristics. Results are stored in `cache_scan_results`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanConfig {
+    /// Enable malware scanning (requires clamd for ClamAV)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// ClamAV daemon address (e.g., "tcp://127.0.0.1:3310")
+    #[serde(default = "default_clamd_socket")]
+    pub clamd_socket: String,
+
+    /// Directory containing YARA rule files (*.yar)
+    #[serde(default)]
+    pub yara_rules_dir: Option<PathBuf>,
+
+    /// Entropy threshold for flagging (0.0-8.0, default 7.5)
+    #[serde(default = "default_entropy_threshold")]
+    pub entropy_threshold: f64,
+
+    /// Block updates with detected malware unless client forces
+    #[serde(default = "default_true")]
+    pub block_on_malware: bool,
+
+    /// Warn (but allow) on CVEs found in requested version
+    #[serde(default = "default_true")]
+    pub warn_on_cve: bool,
+}
+
+impl Default for ScanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            clamd_socket: default_clamd_socket(),
+            yara_rules_dir: None,
+            entropy_threshold: default_entropy_threshold(),
+            block_on_malware: true,
+            warn_on_cve: true,
         }
     }
 }
@@ -712,6 +771,7 @@ mod tests {
                 format: "json".to_string(),
             },
             shadow_trust: ShadowPackageTrustConfig::default(),
+            scan: ScanConfig::default(),
         }
     }
 

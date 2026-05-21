@@ -262,8 +262,10 @@ async fn main() -> anyhow::Result<()> {
         });
     info!("Auth mode: {}", auth_mode);
     let storage_for_proxy = storage.clone();
+    // Scan config will be loaded from TOML config file in future sprint
+    let scan_config_for_proxy = None;
     let proxy_handle = tokio::spawn(async move {
-        if let Err(e) = proxy::run_proxy(http_addr, storage_for_proxy, db_clone, auth_mode).await {
+        if let Err(e) = proxy::run_proxy(http_addr, storage_for_proxy, db_clone, auth_mode, scan_config_for_proxy).await {
             error!("HTTP proxy error: {}", e);
         }
     });

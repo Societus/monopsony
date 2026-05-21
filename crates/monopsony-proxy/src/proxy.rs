@@ -49,6 +49,7 @@ pub struct ProxyState {
     pub storage: Arc<dyn CacheStorage>,
     pub backends: Vec<Box<dyn PackageManagerBackend>>,
     pub db: Option<Arc<Database>>,
+    pub scan_config: Option<monopsony_common::config::ScanConfig>,
 }
 
 impl ProxyState {
@@ -63,6 +64,7 @@ impl ProxyState {
             storage,
             backends,
             db,
+            scan_config: None,
         }
     }
 
@@ -412,6 +414,36 @@ async fn handle_cached_request(
                     trace!("Failed to record cache miss in DB for {}: {}", url, e);
                 }
             }
+
+            // Fire-and-forget malware scan dispatch
+            if let Some(ref scan_cfg) = state.scan_config {
+                if scan_cfg.enabled {
+                    let scan_bytes = bytes.clone();
+                    let scan_path = cache_path
+                        .as_ref()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| state.cache_dir.join(&cache_key));
+                    let scan_config = scan_cfg.clone();
+                    let scan_db = state.db.clone();
+
+                    tokio::spawn(async move {
+                        let (_result, record) = crate::scan::run_scan(
+                            &scan_bytes,
+                            &scan_path,
+                            None, // package_name extracted from URL in future sprint
+                            None, // package_version
+                            &scan_config,
+                        )
+                        .await;
+
+                        if let Some(db) = &scan_db {
+                            if let Err(e) = db.record_scan_result(&record).await {
+                                tracing::warn!("Failed to record scan result: {}", e);
+                            }
+                        }
+                    });
+                }
+            }
         }
         Err(e) => {
             warn!("Failed to write cache file {}: {}", cache_key, e);
@@ -501,10 +533,17 @@ pub async fn run_proxy(
     storage: Arc<dyn CacheStorage>,
     db: Option<Arc<Database>>,
     auth_mode: monopsony_common::config::AuthMode,
+    scan_config: Option<monopsony_common::config::ScanConfig>,
 ) -> anyhow::Result<()> {
     storage.init_dirs().await?;
 
-    let state = Arc::new(ProxyState::new(storage, db.clone()));
+    let mut state = Arc::new(ProxyState::new(storage, db.clone()));
+    // Wire scan config into proxy state
+    if let Some(ref cfg) = scan_config {
+        Arc::get_mut(&mut state)
+            .expect("state should be uniquely owned at this point")
+            .scan_config = Some(cfg.clone());
+    }
     
     // Create rate limiter and spawn cleanup task
     let limiter = crate::security::create_default_rate_limiter();

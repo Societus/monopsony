@@ -41,6 +41,38 @@ pub struct MirrorUpsertConfig {
     pub public: bool,
 }
 
+/// Scan result record for writing to cache_scan_results.
+#[derive(Debug, Clone)]
+pub struct ScanResultRecord {
+    pub cache_path: String,
+    pub package_name: Option<String>,
+    pub package_version: Option<String>,
+    pub scan_version: i64,
+    pub clamav_result: Option<String>,
+    pub yara_matches: Option<serde_json::Value>,
+    pub max_entropy: Option<f64>,
+    pub cve_matches: Option<serde_json::Value>,
+    pub scan_status: String,
+    pub blocked_reason: Option<String>,
+    pub scanned_at: chrono::DateTime<Utc>,
+}
+
+/// Row from cache_scan_results.
+#[derive(Debug, Clone)]
+pub struct ScanResultRow {
+    pub cache_path: String,
+    pub package_name: Option<String>,
+    pub package_version: Option<String>,
+    pub scan_version: i64,
+    pub clamav_result: Option<String>,
+    pub yara_matches: Option<serde_json::Value>,
+    pub max_entropy: Option<f64>,
+    pub cve_matches: Option<serde_json::Value>,
+    pub scan_status: String,
+    pub blocked_reason: Option<String>,
+    pub scanned_at: chrono::DateTime<Utc>,
+}
+
 impl Database {
     pub fn pool(&self) -> &PgPool {
         &self.pool
@@ -225,6 +257,33 @@ impl Database {
         .execute(&self.pool)
         .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_shadow_update_history_package ON shadow_update_history(package_id)")
+            .execute(&self.pool)
+            .await?;
+
+        // Scan results for malware/vulnerability detection
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS cache_scan_results (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                cache_path      TEXT NOT NULL,
+                package_name    TEXT,
+                package_version TEXT,
+                scan_version    BIGINT NOT NULL DEFAULT 1,
+                clamav_result   TEXT,
+                yara_matches    JSONB,
+                max_entropy     FLOAT,
+                cve_matches     JSONB,
+                scan_status     TEXT NOT NULL DEFAULT 'pending',
+                blocked_reason  TEXT,
+                scanned_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(cache_path, scan_version)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_cache_scan_results_path ON cache_scan_results(cache_path)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_cache_scan_results_status ON cache_scan_results(scan_status)")
             .execute(&self.pool)
             .await?;
 
@@ -1085,6 +1144,76 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // ========================================================================
+    // Scan Results
+    // ========================================================================
+
+    /// Record a scan result for a cached package.
+    pub async fn record_scan_result(&self, record: &ScanResultRecord) -> Result<()> {
+        let yara_json = record.yara_matches.as_ref().map(|v| v.to_string());
+        let cve_json = record.cve_matches.as_ref().map(|v| v.to_string());
+
+        sqlx::query(
+            "INSERT INTO cache_scan_results
+                (cache_path, package_name, package_version, scan_version,
+                 clamav_result, yara_matches, max_entropy, cve_matches,
+                 scan_status, blocked_reason, scanned_at)
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb, $9, $10, $11)"
+        )
+        .bind(&record.cache_path)
+        .bind(&record.package_name)
+        .bind(&record.package_version)
+        .bind(record.scan_version)
+        .bind(&record.clamav_result)
+        .bind(&yara_json)
+        .bind(record.max_entropy)
+        .bind(&cve_json)
+        .bind(&record.scan_status)
+        .bind(&record.blocked_reason)
+        .bind(record.scanned_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Get the latest scan result for a cache path.
+    pub async fn get_latest_scan_result(&self, cache_path: &str) -> Result<Option<ScanResultRow>> {
+        let row = sqlx::query(
+            "SELECT cache_path, package_name, package_version, scan_version,
+                    clamav_result, yara_matches, max_entropy, cve_matches,
+                    scan_status, blocked_reason, scanned_at
+             FROM cache_scan_results
+             WHERE cache_path = $1
+             ORDER BY scan_version DESC LIMIT 1"
+        )
+        .bind(cache_path)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(r) => {
+                let yara: Option<serde_json::Value> = r.try_get("yara_matches")
+                    .unwrap_or(None);
+                let cve: Option<serde_json::Value> = r.try_get("cve_matches")
+                    .unwrap_or(None);
+                Ok(Some(ScanResultRow {
+                    cache_path: r.get("cache_path"),
+                    package_name: r.try_get("package_name").unwrap_or(None),
+                    package_version: r.try_get("package_version").unwrap_or(None),
+                    scan_version: r.get("scan_version"),
+                    clamav_result: r.try_get("clamav_result").unwrap_or(None),
+                    yara_matches: yara,
+                    max_entropy: r.try_get("max_entropy").unwrap_or(None),
+                    cve_matches: cve,
+                    scan_status: r.get("scan_status"),
+                    blocked_reason: r.try_get("blocked_reason").unwrap_or(None),
+                    scanned_at: r.get("scanned_at"),
+                }))
+            }
+            None => Ok(None),
+        }
     }
 }
 
