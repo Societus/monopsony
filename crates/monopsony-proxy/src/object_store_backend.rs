@@ -506,4 +506,51 @@ mod tests {
         assert!(debug_str.contains("memory"));
         assert!(debug_str.contains("ObjectStoreBackend"));
     }
+
+    #[tokio::test]
+    async fn test_local_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = ObjectStoreBackend::local(tmp.path().to_path_buf(), 0).unwrap();
+
+        // base_dir should point to the temp dir
+        assert_eq!(storage.base_dir().unwrap(), tmp.path());
+
+        // Write
+        let meta = storage.write("test/local-key.deb", b"local data").await.unwrap();
+        assert_eq!(meta.size_bytes, 10);
+
+        // Read back
+        let buf = storage.read("test/local-key.deb").await.unwrap();
+        assert_eq!(buf.as_slice(), b"local data");
+
+        // Exists
+        assert!(storage.exists("test/local-key.deb").await.unwrap());
+        assert!(!storage.exists("test/nonexistent.deb").await.unwrap());
+
+        // Checksum
+        let cs = storage.get_checksum("test/local-key.deb").await.unwrap().unwrap();
+        assert_eq!(cs.len(), 64);
+
+        // Delete
+        storage.delete("test/local-key.deb").await.unwrap();
+        assert!(!storage.exists("test/local-key.deb").await.unwrap());
+    }
+
+    #[test]
+    fn test_s3_constructor_compiles() {
+        // Verifies the s3() constructor compiles. No live S3 connection.
+        let config = monopsony_common::config::S3Config {
+            endpoint: "http://localhost:9000".to_string(),
+            region: "us-east-1".to_string(),
+            bucket: "test-bucket".to_string(),
+            access_key: "minioadmin".to_string(),
+            secret_key: "minioadmin".to_string(),
+            encryption_key_path: None,
+            retention_days: 7,
+            force_path_style: true,
+        };
+        // Constructor should succeed (only builds the client, doesn't connect)
+        let result = ObjectStoreBackend::s3(&config);
+        assert!(result.is_ok(), "s3() constructor failed: {:?}", result.err());
+    }
 }
