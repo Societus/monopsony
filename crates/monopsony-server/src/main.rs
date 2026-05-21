@@ -265,7 +265,7 @@ async fn main() -> anyhow::Result<()> {
     // Scan config will be loaded from TOML config file in future sprint
     let scan_config_for_proxy = None;
     let proxy_handle = tokio::spawn(async move {
-        if let Err(e) = proxy::run_proxy(http_addr, storage_for_proxy, db_clone, auth_mode, scan_config_for_proxy).await {
+        if let Err(e) = proxy::run_proxy(http_addr, storage_for_proxy, db_clone, auth_mode, scan_config_for_proxy, None).await {
             error!("HTTP proxy error: {}", e);
         }
     });

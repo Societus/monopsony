@@ -57,6 +57,8 @@ pub struct ServerConfig {
     pub shadow_trust: ShadowPackageTrustConfig,
     #[serde(default)]
     pub scan: ScanConfig,
+    #[serde(default)]
+    pub node: NodeConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +89,49 @@ pub struct DatabaseConfig {
 
 fn default_max_connections() -> u32 {
     10
+}
+
+/// Node deployment tier — controls storage and scanning requirements.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeTier {
+    /// Homelab, air-gap, testing. No restrictions.
+    #[default]
+    Private,
+    /// Internet-facing, serves other clients. Requires S3 + scan.
+    Public,
+    /// Public + bidirectional federation. Requires S3 + scan + peer verification.
+    Federated,
+}
+
+impl std::fmt::Display for NodeTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NodeTier::Private => write!(f, "private"),
+            NodeTier::Public => write!(f, "public"),
+            NodeTier::Federated => write!(f, "federated"),
+        }
+    }
+}
+
+/// Node identity and tier configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConfig {
+    /// Deployment tier: "private" (default), "public", or "federated"
+    #[serde(default)]
+    pub tier: NodeTier,
+    /// Unique node name (for federation identification)
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            tier: NodeTier::Private,
+            name: None,
+        }
+    }
 }
 
 /// Cache backend type.
@@ -606,6 +651,32 @@ impl ServerConfig {
             );
         }
 
+        // Node tier validation
+        match self.node.tier {
+            NodeTier::Public | NodeTier::Federated => {
+                if self.cache.backend != CacheBackend::S3 {
+                    errors.push(format!(
+                        "[node] tier = \"{}\" requires S3 storage backend, but [cache] backend = \"{}\"",
+                        self.node.tier, self.cache.backend
+                    ));
+                }
+                if !self.scan.enabled {
+                    errors.push(format!(
+                        "[node] tier = \"{}\" requires scanning enabled — set [scan] enabled = true",
+                        self.node.tier
+                    ));
+                }
+                if let NodeTier::Federated = self.node.tier {
+                    if self.node.name.is_none() {
+                        warnings.push(
+                            "[node] tier = \"federated\" but name is not set — set [node] name for federation identity".to_string()
+                        );
+                    }
+                }
+            }
+            NodeTier::Private => {}
+        }
+
         // Log warnings
         for w in &warnings {
             tracing::warn!("Config warning: {}", w);
@@ -781,6 +852,7 @@ mod tests {
             },
             shadow_trust: ShadowPackageTrustConfig::default(),
             scan: ScanConfig::default(),
+            node: NodeConfig::default(),
         }
     }
 
@@ -870,5 +942,193 @@ trusted_operator_keys = ["op1"]
         assert_eq!(trust.policy, "paranoid");
         assert_eq!(trust.trusted_author_keys, vec!["key1", "key2"]);
         assert_eq!(trust.trusted_operator_keys, vec!["op1"]);
+    }
+
+    // Node tier tests
+
+    #[test]
+    fn test_node_tier_default_is_private() {
+        let config = NodeConfig::default();
+        assert_eq!(config.tier, NodeTier::Private);
+        assert!(config.name.is_none());
+    }
+
+    #[test]
+    fn test_node_tier_display() {
+        assert_eq!(format!("{}", NodeTier::Private), "private");
+        assert_eq!(format!("{}", NodeTier::Public), "public");
+        assert_eq!(format!("{}", NodeTier::Federated), "federated");
+    }
+
+    #[test]
+    fn test_node_tier_deserialize() {
+        let tier: NodeTier = toml::from_str("tier = \"public\"\n")
+            .map(|v: NodeConfig| v.tier)
+            .unwrap();
+        assert_eq!(tier, NodeTier::Public);
+    }
+
+    #[test]
+    fn test_node_tier_private_validates_clean() {
+        let mut config = valid_server_config();
+        config.node.tier = NodeTier::Private;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_node_tier_public_requires_s3() {
+        let mut config = valid_server_config();
+        config.node.tier = NodeTier::Public;
+        // Default backend is filesystem
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("S3 storage backend")),
+            "Should flag missing S3: got {:?}", errors
+        );
+    }
+
+    #[test]
+    fn test_node_tier_public_requires_scan_enabled() {
+        let mut config = valid_server_config();
+        config.node.tier = NodeTier::Public;
+        config.cache.backend = CacheBackend::S3;
+        config.cache.s3 = Some(S3Config {
+            endpoint: "http://localhost:8333".into(),
+            region: "us-east-1".into(),
+            bucket: "test".into(),
+            access_key: "key".into(),
+            secret_key: "secret".into(),
+            encryption_key_path: None,
+            retention_days: 7,
+            force_path_style: true,
+        });
+        config.scan.enabled = false;
+        let errors = config.validate().unwrap_err();
+        assert!(
+            errors.iter().any(|e| e.contains("scanning enabled")),
+            "Should flag scan disabled: got {:?}", errors
+        );
+    }
+
+    #[test]
+    fn test_node_tier_public_with_s3_and_scan_passes() {
+        let mut config = valid_server_config();
+        config.node.tier = NodeTier::Public;
+        config.cache.backend = CacheBackend::S3;
+        config.cache.s3 = Some(S3Config {
+            endpoint: "http://localhost:8333".into(),
+            region: "us-east-1".into(),
+            bucket: "test".into(),
+            access_key: "key".into(),
+            secret_key: "secret".into(),
+            encryption_key_path: None,
+            retention_days: 7,
+            force_path_style: true,
+        });
+        config.scan.enabled = true;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_node_tier_federated_warns_without_name() {
+        let mut config = valid_server_config();
+        config.node.tier = NodeTier::Federated;
+        config.cache.backend = CacheBackend::S3;
+        config.cache.s3 = Some(S3Config {
+            endpoint: "http://localhost:8333".into(),
+            region: "us-east-1".into(),
+            bucket: "test".into(),
+            access_key: "key".into(),
+            secret_key: "secret".into(),
+            encryption_key_path: None,
+            retention_days: 7,
+            force_path_style: true,
+        });
+        config.scan.enabled = true;
+        // Should pass validation (warnings only, not errors)
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_node_config_default_values() {
+        let cfg = NodeConfig::default();
+        assert_eq!(cfg.tier, NodeTier::Private);
+        assert!(cfg.name.is_none());
+    }
+
+    #[test]
+    fn test_node_tier_serde_roundtrip() {
+        let tiers = vec![NodeTier::Private, NodeTier::Public, NodeTier::Federated];
+        for tier in tiers {
+            let json = serde_json::to_string(&tier).unwrap();
+            let parsed: NodeTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(tier, parsed);
+        }
+    }
+
+    #[test]
+    fn test_node_tier_json_roundtrip() {
+        let tiers = vec![NodeTier::Private, NodeTier::Public, NodeTier::Federated];
+        for tier in tiers {
+            let json = serde_json::to_string(&tier).unwrap();
+            let parsed: NodeTier = serde_json::from_str(&json).unwrap();
+            assert_eq!(tier, parsed);
+        }
+        // Verify lowercase serialization
+        assert_eq!(serde_json::to_string(&NodeTier::Public).unwrap(), "\"public\"");
+        assert_eq!(serde_json::to_string(&NodeTier::Federated).unwrap(), "\"federated\"");
+        // Unknown tier should fail
+        assert!(serde_json::from_str::<NodeTier>("\"unknown\"").is_err());
+    }
+
+    #[test]
+    fn test_node_config_toml_roundtrip() {
+        let cfg = NodeConfig {
+            tier: NodeTier::Public,
+            name: Some("node-1".to_string()),
+        };
+        let toml_str = toml::to_string(&cfg).unwrap();
+        let parsed: NodeConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg.tier, parsed.tier);
+        assert_eq!(cfg.name, parsed.name);
+    }
+
+    #[test]
+    fn test_sha256_hash_consistency() {
+        use sha2::{Sha256, Digest};
+        let data = b"hello monopsony";
+        let mut hasher = Sha256::new();
+        hasher.update(data);
+        let hash1 = format!("{:x}", hasher.finalize());
+
+        let mut hasher2 = Sha256::new();
+        hasher2.update(data);
+        let hash2 = format!("{:x}", hasher2.finalize());
+        assert_eq!(hash1, hash2);
+        assert_eq!(hash1.len(), 64); // SHA256 hex is 64 chars
+    }
+
+    #[test]
+    fn test_sha256_tamper_detection() {
+        use sha2::{Sha256, Digest};
+        let data1 = b"original content";
+        let data2 = b"tampered content";
+        let mut h1 = Sha256::new();
+        h1.update(data1);
+        let hash1 = format!("{:x}", h1.finalize());
+        let mut h2 = Sha256::new();
+        h2.update(data2);
+        let hash2 = format!("{:x}", h2.finalize());
+        assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_sha256_empty_data() {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(b"");
+        let hash = format!("{:x}", hasher.finalize());
+        // Known SHA256 of empty string
+        assert_eq!(hash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
     }
 }

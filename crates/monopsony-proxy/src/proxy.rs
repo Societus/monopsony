@@ -50,6 +50,7 @@ pub struct ProxyState {
     pub backends: Vec<Box<dyn PackageManagerBackend>>,
     pub db: Option<Arc<Database>>,
     pub scan_config: Option<monopsony_common::config::ScanConfig>,
+    pub node_config: Option<monopsony_common::config::ServerConfig>,
 }
 
 impl ProxyState {
@@ -65,6 +66,7 @@ impl ProxyState {
             backends,
             db,
             scan_config: None,
+            node_config: None,
         }
     }
 
@@ -186,6 +188,20 @@ pub async fn handle_proxy_request(
         }
     }
 
+    // Federation gate: reject peer requests on private-tier nodes
+    if request.headers().contains_key("x-federated-peer") {
+        if let Some(ref node_cfg) = state.node_config {
+            if node_cfg.node.tier == monopsony_common::config::NodeTier::Private {
+                warn!("Rejecting federated peer request on private-tier node");
+                return Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("X-Federation-Rejected", "private-tier")
+                    .body(Body::from("This node does not accept federated data"))
+                    .unwrap_or_else(|_| Response::new(Body::from("Federation rejected")));
+            }
+        }
+    }
+
     // Only handle GET and HEAD for caching
     if method != Method::GET && method != Method::HEAD {
         return proxy_passthrough(&state, request).await;
@@ -242,24 +258,25 @@ async fn handle_cached_request(
         .map(|base| base.join(&cache_key));
 
     // Check DB first for authoritative cache state
-    let db_cached = if let Some(db) = &state.db {
+    let db_entry = if let Some(db) = &state.db {
         match db.get_cache_entry(url).await {
-            Ok(Some(_entry)) => {
+            Ok(entry) => {
                 debug!("DB cache entry found for: {}", url);
-                true
+                entry
             }
             Ok(None) => {
                 debug!("DB: no entry for: {}", url);
-                false
+                None
             }
             Err(e) => {
                 trace!("DB lookup failed for {}: {}", url, e);
-                false
+                None
             }
         }
     } else {
-        true
+        None
     };
+    let db_cached = db_entry.is_some();
 
     // Validate cache path doesn't escape cache directory (path traversal prevention, filesystem only)
     let exists = state.storage.exists(&cache_key).await.unwrap_or(false);
@@ -287,6 +304,30 @@ async fn handle_cached_request(
         // Read cached file via storage backend
         match state.storage.read(&cache_key).await {
             Ok(data) => {
+                // Tamper detection: verify SHA256 if we have a stored hash
+                if let Some(ref entry) = db_entry {
+                    if let Some(ref stored_hash) = entry.sha256 {
+                        use sha2::{Sha256, Digest};
+                        let mut hasher = Sha256::new();
+                        hasher.update(&data);
+                        let actual_hash = format!("{:x}", hasher.finalize());
+                        if actual_hash != *stored_hash {
+                            warn!(
+                                "Tamper detected for {}: stored hash {} != actual {}",
+                                url, stored_hash, actual_hash
+                            );
+                            monopsony_common::metrics::cache_request_miss();
+                            return Response::builder()
+                                .status(StatusCode::SERVICE_UNAVAILABLE)
+                                .header("X-Tamper-Detected", "true")
+                                .body(Body::from("Cached content integrity check failed"))
+                                .unwrap_or_else(|_| {
+                                    Response::new(Body::from("Integrity check failed"))
+                                });
+                        }
+                    }
+                }
+
                 let mut builder = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, &content_type)
@@ -508,9 +549,16 @@ async fn handle_cached_request(
                         .unwrap_or_else(|| state.cache_dir.join(&cache_key));
                     let scan_config = scan_cfg.clone();
                     let scan_db = state.db.clone();
+                    let scan_storage = state.storage.clone();
+                    let scan_cache_key = cache_key.clone();
+                    let scan_url = url.to_owned();
+                    let retention_days = state.node_config.as_ref()
+                        .and_then(|n| n.cache.s3.as_ref())
+                        .map(|s3| s3.retention_days)
+                        .unwrap_or(0);
 
                     tokio::spawn(async move {
-                        let (_result, record) = crate::scan::run_scan(
+                        let (result, record) = crate::scan::run_scan(
                             &scan_bytes,
                             &scan_path,
                             None, // package_name extracted from URL in future sprint
@@ -522,6 +570,37 @@ async fn handle_cached_request(
                         if let Some(db) = &scan_db {
                             if let Err(e) = db.record_scan_result(&record).await {
                                 tracing::warn!("Failed to record scan result: {}", e);
+                            }
+                            // Compute and store SHA256 for tamper detection
+                            use sha2::{Sha256, Digest};
+                            let mut hasher = Sha256::new();
+                            hasher.update(&scan_bytes);
+                            let hash = format!("{:x}", hasher.finalize());
+                            if let Err(e) = db.update_cache_sha256(&scan_url, &hash).await {
+                                tracing::warn!("Failed to store SHA256 for {}: {}", scan_url, e);
+                            }
+                        }
+
+                        // Object Lock: set retention on clean/flagged scans
+                        if retention_days > 0 {
+                            let should_lock = matches!(
+                                result.status,
+                                crate::scan::ScanStatus::Clean | crate::scan::ScanStatus::Flagged
+                            );
+                            if should_lock {
+                                let until = std::time::SystemTime::now()
+                                    + std::time::Duration::from_secs(retention_days as u64 * 86400);
+                                if let Err(e) = scan_storage.set_retention(&scan_cache_key, until).await {
+                                    tracing::warn!(
+                                        "Failed to set Object Lock retention on {}: {}",
+                                        scan_cache_key, e
+                                    );
+                                } else {
+                                    tracing::debug!(
+                                        "Object Lock set for {} days on {}",
+                                        retention_days, scan_cache_key
+                                    );
+                                }
                             }
                         }
                     });
@@ -625,6 +704,7 @@ pub async fn run_proxy(
     db: Option<Arc<Database>>,
     auth_mode: monopsony_common::config::AuthMode,
     scan_config: Option<monopsony_common::config::ScanConfig>,
+    node_config: Option<monopsony_common::config::ServerConfig>,
 ) -> anyhow::Result<()> {
     storage.init_dirs().await?;
 
@@ -634,6 +714,12 @@ pub async fn run_proxy(
         Arc::get_mut(&mut state)
             .expect("state should be uniquely owned at this point")
             .scan_config = Some(cfg.clone());
+    }
+    // Wire node config (for Object Lock retention)
+    if let Some(ref cfg) = node_config {
+        Arc::get_mut(&mut state)
+            .expect("state should be uniquely owned at this point")
+            .node_config = Some(cfg.clone());
     }
     
     // Create rate limiter and spawn cleanup task

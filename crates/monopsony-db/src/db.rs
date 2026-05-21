@@ -153,7 +153,8 @@ impl Database {
                 last_modified TEXT NULL,
                 cached_at BIGINT NOT NULL,
                 last_accessed BIGINT NOT NULL,
-                hit_count BIGINT NOT NULL DEFAULT 0
+                hit_count BIGINT NOT NULL DEFAULT 0,
+                sha256 TEXT NULL
             )",
         )
         .execute(&self.pool)
@@ -623,9 +624,19 @@ impl Database {
         Ok(())
     }
 
+    /// Update the SHA256 checksum for a cached URL (tamper detection).
+    pub async fn update_cache_sha256(&self, url: &str, sha256: &str) -> Result<()> {
+        sqlx::query("UPDATE cache_entries SET sha256 = $1 WHERE url = $2")
+            .bind(sha256)
+            .bind(url)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_cache_entry(&self, url: &str) -> Result<Option<CacheEntryRow>> {
         let row = sqlx::query(
-            "SELECT url, cache_path, content_type, content_length, etag, last_modified, cached_at, last_accessed, hit_count
+            "SELECT url, cache_path, content_type, content_length, etag, last_modified, cached_at, last_accessed, hit_count, sha256
              FROM cache_entries WHERE url = $1",
         )
         .bind(url)
@@ -642,13 +653,14 @@ impl Database {
             cached_at: r.get("cached_at"),
             last_accessed: r.get("last_accessed"),
             hit_count: r.get("hit_count"),
+            sha256: r.get("sha256"),
         }))
     }
 
     #[allow(dead_code)] // Admin API cache listing
     pub async fn list_cache_entries(&self) -> Result<Vec<CacheEntryRow>> {
         let rows = sqlx::query(
-            "SELECT url, cache_path, content_type, content_length, etag, last_modified, cached_at, last_accessed, hit_count
+            "SELECT url, cache_path, content_type, content_length, etag, last_modified, cached_at, last_accessed, hit_count, sha256
              FROM cache_entries ORDER BY cached_at DESC",
         )
         .fetch_all(&self.pool)
@@ -666,6 +678,7 @@ impl Database {
                 cached_at: r.get("cached_at"),
                 last_accessed: r.get("last_accessed"),
                 hit_count: r.get("hit_count"),
+                sha256: r.get("sha256"),
             })
             .collect();
 
@@ -884,6 +897,7 @@ pub struct CacheEntryRow {
     pub cached_at: i64,
     pub last_accessed: i64,
     pub hit_count: i64,
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
