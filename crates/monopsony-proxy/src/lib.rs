@@ -5,7 +5,9 @@ pub mod prefetch;
 pub mod purge;
 pub mod scan;
 pub mod scan_clamav;
+pub mod scan_cve;
 pub mod scan_entropy;
+pub mod scan_policy;
 pub mod scan_yara;
 pub mod security;
 

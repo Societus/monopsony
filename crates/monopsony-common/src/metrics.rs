@@ -34,6 +34,13 @@ pub mod client {
     pub const GRPC_CONNECTIONS: &str = "monopsony_client_grpc_connections_total";
 }
 
+/// Metric names for scan subsystem
+pub mod scan {
+    pub const SCAN_TOTAL: &str = "monopsony_scan_total";
+    pub const CVE_LOOKUPS_TOTAL: &str = "monopsony_scan_cve_lookup_total";
+    pub const POLICY_DECISIONS_TOTAL: &str = "monopsony_scan_policy_decision_total";
+}
+
 /// Increment cache request counter
 pub fn cache_request_hit() {
     counter!(server::CACHE_REQUESTS_TOTAL, "result" => "hit").increment(1);
@@ -141,4 +148,24 @@ pub fn mirror_served(distro: &str) {
 /// Record mirror bytes served
 pub fn mirror_served_bytes(distro: &str, bytes: u64) {
     counter!(mirror::SERVED_BYTES, "distro" => distro.to_string()).increment(bytes);
+}
+
+// Scan metrics
+
+/// Record scan outcome
+pub fn scan_outcome(status: &str) {
+    counter!(scan::SCAN_TOTAL, "status" => status.to_string()).increment(1);
+}
+
+/// Record CVE lookup
+pub fn scan_cve_lookup(cve_count: usize) {
+    counter!(scan::CVE_LOOKUPS_TOTAL).increment(1);
+    if cve_count > 0 {
+        counter!(scan::CVE_LOOKUPS_TOTAL, "result" => "found").increment(1);
+    }
+}
+
+/// Record policy decision
+pub fn scan_policy_decision(decision: &str) {
+    counter!(scan::POLICY_DECISIONS_TOTAL, "decision" => decision.to_string()).increment(1);
 }

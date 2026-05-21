@@ -303,6 +303,89 @@ async fn handle_cached_request(
                     builder = builder.header("X-Cache", "HIT");
                 }
 
+                // Scan policy enforcement: query DB for scan status on HIT
+                if let Some(db) = &state.db {
+                    if let Ok(Some(scan_row)) =
+                        db.get_latest_scan_result(&cache_key).await
+                    {
+                        builder =
+                            builder.header("X-Scan-Status", &scan_row.scan_status);
+
+                        if let Some(ref scan_cfg) = state.scan_config {
+                            let yara_rules: Vec<String> = scan_row
+                                .yara_matches
+                                .as_ref()
+                                .and_then(|v| {
+                                    v.as_array().map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|v| {
+                                                v.get("rule")
+                                                    .and_then(|r| r.as_str())
+                                                    .map(String::from)
+                                            })
+                                            .collect()
+                                    })
+                                })
+                                .unwrap_or_default();
+
+                            let scan_info =
+                                crate::scan_policy::ScanInfo {
+                                    status: scan_row.scan_status.clone(),
+                                    clamav_result: scan_row.clamav_result,
+                                    yara_rules,
+                                    max_entropy: scan_row.max_entropy,
+                                    cves: vec![],
+                                    cves_in_installed: vec![],
+                                };
+
+                            let client_ctx =
+                                crate::scan_policy::ClientContext {
+                                    installed_version: None,
+                                    force: false,
+                                };
+
+                            let decision = crate::scan_policy::evaluate_policy(
+                                &scan_info,
+                                &client_ctx,
+                                scan_cfg,
+                            );
+
+                            match &decision {
+                                crate::scan_policy::PolicyDecision::Block(
+                                    reason,
+                                ) => {
+                                    monopsony_common::metrics::scan_policy_decision("block");
+                                    return builder
+                                        .status(StatusCode::FORBIDDEN)
+                                        .header(
+                                            "X-Scan-Block-Reason",
+                                            format!("{:?}", reason),
+                                        )
+                                        .body(Body::from(format!(
+                                            "Package blocked by scan policy: {:?}",
+                                            reason
+                                        )))
+                                        .unwrap_or_else(|_| {
+                                            Response::new(Body::from(
+                                                "Package blocked by scan policy",
+                                            ))
+                                        });
+                                }
+                                crate::scan_policy::PolicyDecision::Warn(
+                                    warning,
+                                ) => {
+                                    monopsony_common::metrics::scan_policy_decision("warn");
+                                    builder = builder.header(
+                                        "X-Scan-Warning",
+                                        format!("{:?}", warning),
+                                    );
+                                }
+                                crate::scan_policy::PolicyDecision::Allow => {}
+                            }
+                        }
+                    }
+                }
+
                 monopsony_common::metrics::cache_bytes_served(data.len() as u64);
                 return builder.body(Body::from(data)).unwrap_or_else(|_| {
                     Response::new(Body::from("Failed to build response"))
@@ -453,6 +536,14 @@ async fn handle_cached_request(
     // Build response with cache header
     let mut response = Response::from_parts(parts, Body::from(bytes));
     response.headers_mut().insert("X-Cache", "MISS".parse().unwrap());
+    if let Some(ref scan_cfg) = state.scan_config {
+        if scan_cfg.enabled {
+            response.headers_mut().insert(
+                "X-Scan-Status",
+                "pending".parse().unwrap(),
+            );
+        }
+    }
     response
 }
 

@@ -101,6 +101,31 @@ pub async fn run_scan(
         }
     };
 
+    // 4. CVE lookup (OSV.dev)
+    let cve_result = if config.enabled && config.warn_on_cve {
+        if let (Some(name), Some(version)) = (package_name, package_version) {
+            let ecosystem = crate::scan_cve::infer_ecosystem(file_path);
+            crate::scan_cve::lookup_cve(
+                &config.osv_endpoint,
+                name,
+                version,
+                ecosystem,
+                Duration::from_secs(10),
+            )
+            .await
+        } else {
+            crate::scan_cve::OsvResult {
+                matches: vec![],
+                error: None,
+            }
+        }
+    } else {
+        crate::scan_cve::OsvResult {
+            matches: vec![],
+            error: None,
+        }
+    };
+
     // Determine overall status
     let status = derive_status(&clamav, &entropy, &yara);
 
@@ -165,7 +190,22 @@ pub async fn run_scan(
         } else {
             None
         },
-        cve_matches: None, // CVE lookup deferred to Sprint 16
+        cve_matches: if cve_result.matches.is_empty() {
+            None
+        } else {
+            let cves: Vec<serde_json::Value> = cve_result
+                .matches
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "id": m.id,
+                        "severity": m.severity,
+                        "summary": m.summary,
+                    })
+                })
+                .collect();
+            Some(serde_json::Value::Array(cves))
+        },
         scan_status: status.as_str().to_string(),
         blocked_reason,
         scanned_at: now,
@@ -187,19 +227,27 @@ pub async fn run_scan(
                 full_result.yara.matches.len(),
                 full_result.entropy.max_entropy,
             );
+            monopsony_common::metrics::scan_outcome("infected");
         }
         ScanStatus::Flagged => {
             info!(
                 "Scan flagged: path={:?}, entropy_max={:.2}",
                 file_path, full_result.entropy.max_entropy,
             );
+            monopsony_common::metrics::scan_outcome("flagged");
         }
         ScanStatus::Error => {
             warn!("Scan error for {:?}", file_path);
+            monopsony_common::metrics::scan_outcome("error");
         }
         ScanStatus::Clean => {
             debug!("Scan clean: {:?}", file_path);
+            monopsony_common::metrics::scan_outcome("clean");
         }
+    }
+
+    if !cve_result.matches.is_empty() {
+        monopsony_common::metrics::scan_cve_lookup(cve_result.matches.len());
     }
 
     (full_result, record)

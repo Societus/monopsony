@@ -308,6 +308,14 @@ pub struct ScanConfig {
     /// Warn (but allow) on CVEs found in requested version
     #[serde(default = "default_true")]
     pub warn_on_cve: bool,
+
+    /// OSV API endpoint for CVE lookups (or local mirror).
+    #[serde(default = "default_osv_endpoint")]
+    pub osv_endpoint: String,
+}
+
+fn default_osv_endpoint() -> String {
+    "https://api.osv.dev".to_string()
 }
 
 impl Default for ScanConfig {
@@ -319,6 +327,7 @@ impl Default for ScanConfig {
             entropy_threshold: default_entropy_threshold(),
             block_on_malware: true,
             warn_on_cve: true,
+            osv_endpoint: default_osv_endpoint(),
         }
     }
 }
