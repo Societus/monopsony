@@ -14,6 +14,8 @@ use monopsony_proxy::{cache_storage, object_store_backend, proxy, prefetch, purg
 use monopsony_control::{announce, discovery, grpc, metrics, tls};
 use monopsony_mirror::mirror;
 
+mod setup;
+
 
 #[derive(Parser, Debug)]
 #[command(name = "monopsony-server", version)]
@@ -143,6 +145,12 @@ enum Commands {
         #[arg(long, default_value = "/var/cache/monopsony")]
         cache_dir: String,
     },
+    /// Interactive setup wizard for storage, scanning, and node tier
+    Setup {
+        /// Validate existing config instead of running wizard
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -180,6 +188,23 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(Commands::CacheStats { cache_dir }) = &args.command {
         return handle_cache_stats_command(cache_dir).await;
+    }
+    if let Some(Commands::Setup { check }) = &args.command {
+        if *check {
+            let issues = setup::run_check(&args.config)?;
+            if issues.is_empty() {
+                println!("Config OK: {}", args.config);
+            } else {
+                println!("Issues found in {}:", args.config);
+                for issue in &issues {
+                    println!("  - {}", issue);
+                }
+                std::process::exit(1);
+            }
+        } else {
+            setup::run_setup(&args.config)?;
+        }
+        return Ok(());
     }
 
     info!("Starting Monopsony Server v{}", env!("CARGO_PKG_VERSION"));
