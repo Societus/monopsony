@@ -1,4 +1,5 @@
 //! CLI subcommands for shadow package management.
+#![allow(dead_code)]
 
 use clap::Subcommand;
 use monopsony_common::shadow_types::ShadowSource;

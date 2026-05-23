@@ -83,6 +83,7 @@ pub struct JwtClaims {
 
 /// Extension carrying the authenticated operator npub (set by JWT/token middleware)
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct OperatorNpub(pub String);
 
 // ---------------------------------------------------------------------------

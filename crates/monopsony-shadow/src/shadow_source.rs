@@ -326,8 +326,10 @@ pub enum VersionDiscovery {
 }
 
 /// Source for direct_url packages (e.g., Tailscale pkgs.tailscale.com)
+#[allow(dead_code)]
 pub struct DirectUrlSource {
     /// Base URL for version scraping / asset download
+    #[allow(dead_code)]
     source_url: String,
     /// How to discover the latest version
     version_discovery: VersionDiscovery,

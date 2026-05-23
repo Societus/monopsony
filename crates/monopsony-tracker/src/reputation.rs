@@ -24,6 +24,7 @@ use crate::TrackerState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum ReputationEventType {
     Report,
     Attestation,
@@ -129,7 +130,8 @@ pub fn get_reputation(
 }
 
 /// Record a reputation event.
-pub fn record_event(
+#[allow(clippy::too_many_arguments, dead_code)]
+pub async fn record_event(
     db: &rusqlite::Connection,
     operator_npub: &str,
     event_type: ReputationEventType,

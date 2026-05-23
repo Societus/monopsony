@@ -16,6 +16,7 @@ use std::path::Path;
 
 /// Result of the setup wizard.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct SetupResult {
     pub config_path: String,
     pub sections_written: Vec<String>,

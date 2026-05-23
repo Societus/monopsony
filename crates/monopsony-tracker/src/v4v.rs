@@ -56,6 +56,7 @@ pub fn init_v4v_schema(conn: &Connection) {
 }
 
 /// Check if V4V tables exist (i.e., were created at startup).
+#[allow(dead_code)]
 pub fn v4v_tables_exist(conn: &Connection) -> bool {
     conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='bounty_pool'",

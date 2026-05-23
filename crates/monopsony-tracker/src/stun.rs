@@ -10,7 +10,6 @@
 //! - PortRestrictedCone: like RestrictedCone but port-specific
 //! - Symmetric: different mapping per destination, hardest to traverse
 
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -68,6 +67,7 @@ impl NatType {
     }
 
     /// Whether this NAT type allows direct peer connectivity.
+    #[allow(dead_code)]
     pub fn is_directly_reachable(&self) -> bool {
         matches!(self, Self::Public | Self::FullCone)
     }
@@ -75,6 +75,7 @@ impl NatType {
 
 /// STUN binding response (simplified for self-report).
 #[derive(Debug, Serialize, Deserialize)]
+#[allow(dead_code)]
 pub struct StunReport {
     pub mirror_id: String,
     pub nat_type: NatType,

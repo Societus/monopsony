@@ -12,6 +12,7 @@ use crate::shadow_cache::ShadowCache;
 use crate::shadow_git_mirror::GitMirrorManager;
 use crate::shadow_source::{GithubReleaseSource, UpdateSource};
 
+#[allow(dead_code)]
 pub struct ShadowPackageManager {
     db: Arc<Database>,
     cache: ShadowCache,

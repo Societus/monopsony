@@ -81,6 +81,7 @@ pub struct ReportEntry {
 // ---------------------------------------------------------------------------
 
 /// Create the reports table if it doesn't exist.
+#[allow(dead_code)]
 pub fn init_reports_table(conn: &rusqlite::Connection) {
     let _ = conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS reports (
@@ -221,6 +222,7 @@ pub async fn handle_list_reports(
 }
 
 /// Count reports for a mirror in the last N hours. Used by blacklisting logic.
+#[allow(dead_code)]
 pub async fn count_recent_reports(
     db: &tokio::sync::MutexGuard<'_, rusqlite::Connection>,
     mirror_id: &str,

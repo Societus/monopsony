@@ -1003,6 +1003,7 @@ impl Database {
 
     // ── Shadow package CRUD ──
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_shadow_package(
         &self,
         client_id: &uuid::Uuid,

@@ -1,4 +1,5 @@
 //! Client-side trust enforcement for federated recipes.
+#![allow(dead_code)]
 //!
 //! Before executing any recipe (local or federated), the client verifies
 //! the recipe's signature against its configured trust policy.
@@ -7,7 +8,9 @@ use anyhow::{bail, Context, Result};
 use tracing::{debug, warn};
 
 use monopsony_common::config::ShadowPackageTrustConfig;
-use monopsony_common::shadow_types::{RecipeSignature, SignedRecipe};
+use monopsony_common::shadow_types::SignedRecipe;
+#[cfg(test)]
+use monopsony_common::shadow_types::RecipeSignature;
 
 /// Verify a signed recipe against the client's trust policy.
 ///
@@ -61,7 +64,7 @@ fn verify_operator_signature(
     signed: &SignedRecipe,
     verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<()> {
-    use ed25519_dalek::{Signature, Signer, Verifier};
+    use ed25519_dalek::{Signature, Verifier};
     use base64::Engine;
 
     let sig_bytes: Vec<u8> = base64::engine::general_purpose::STANDARD
@@ -104,6 +107,7 @@ fn verify_author_signature_present(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn base64_engine() -> base64::engine::GeneralPurpose {
     base64::engine::GeneralPurpose::new(
         &base64::alphabet::STANDARD,

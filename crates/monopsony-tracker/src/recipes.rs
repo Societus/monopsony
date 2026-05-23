@@ -705,9 +705,12 @@ pub struct PublishAnnotationRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct AnnotationQuery {
     pub package: String,
+    #[allow(dead_code)]
     pub from: Option<String>,
+    #[allow(dead_code)]
     pub to: Option<String>,
 }
 

@@ -1,14 +1,15 @@
 //! Client-side shadow package operations: download, extract, health check, rollback.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use regex::Regex;
 use tokio::fs;
 use tokio::process::Command;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use monopsony_common::shadow_types::{HealthCheck, HealthCheckType, ShadowRecipe};
 

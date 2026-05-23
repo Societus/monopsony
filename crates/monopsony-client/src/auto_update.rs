@@ -1,4 +1,5 @@
 //! Scheduled auto-update system for shadow packages.
+#![allow(dead_code)]
 //!
 //! Uses cron expressions to schedule automatic package updates during
 //! maintenance windows, with severity-based filtering.
@@ -8,7 +9,6 @@ use std::str::FromStr;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use cron::Schedule;
-use tracing::{error, info, warn};
 
 use monopsony_common::config::AutoUpdateConfig;
 

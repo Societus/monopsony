@@ -280,6 +280,7 @@ fn migrate_schema(conn: &rusqlite::Connection) {
 }
 
 /// Ensure the operators table exists (idempotent).
+#[allow(dead_code)]
 fn ensure_operators_table(conn: &rusqlite::Connection) {
     let _ = conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS operators (

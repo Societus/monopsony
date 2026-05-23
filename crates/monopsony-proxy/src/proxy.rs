@@ -260,9 +260,9 @@ async fn handle_cached_request(
     // Check DB first for authoritative cache state
     let db_entry = if let Some(db) = &state.db {
         match db.get_cache_entry(url).await {
-            Ok(entry) => {
+            Ok(Some(entry)) => {
                 debug!("DB cache entry found for: {}", url);
-                entry
+                Some(entry)
             }
             Ok(None) => {
                 debug!("DB: no entry for: {}", url);
