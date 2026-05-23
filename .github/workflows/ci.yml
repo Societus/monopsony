@@ -8,16 +8,15 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # protoc needed for tonic-build
   PROTOC: /usr/local/bin/protoc
 
 jobs:
   check:
     name: Check
-    runs-on: ubuntu-latest
+    runs-on: docker://node:22-bookworm
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable  # overridden by rust-toolchain.toml
+      - uses: dtolnay/rust-toolchain@stable
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
@@ -25,7 +24,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: docker://node:22-bookworm
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -36,7 +35,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: docker://node:22-bookworm
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -47,7 +46,7 @@ jobs:
 
   build-x86_64:
     name: Build (x86_64 musl)
-    runs-on: ubuntu-latest
+    runs-on: docker://node:22-bookworm
     needs: [check, test, clippy]
     steps:
       - uses: actions/checkout@v4
@@ -70,14 +69,14 @@ jobs:
           cp dist/server.toml.example dist-out/
           cp dist/mirrors.toml.example dist-out/
           cd dist-out && sha256sum * > SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v3
         with:
           name: monopsony-x86_64-musl
           path: dist-out/
 
   build-aarch64:
     name: Build (aarch64 musl)
-    runs-on: ubuntu-latest
+    runs-on: docker://node:22-bookworm
     needs: [check, test, clippy]
     steps:
       - uses: actions/checkout@v4
@@ -85,7 +84,6 @@ jobs:
       - name: Install cross-compilation tools and protoc
         run: |
           sudo apt-get update && sudo apt-get install -y protobuf-compiler
-          # Install aarch64 cross-linker
           sudo apt-get install -y gcc-aarch64-linux-gnu
       - name: Configure cargo for aarch64 cross-compilation
         run: |
@@ -110,14 +108,14 @@ jobs:
           cp dist/server.toml.example dist-out/
           cp dist/mirrors.toml.example dist-out/
           cd dist-out && sha256sum * > SHA256SUMS
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v3
         with:
           name: monopsony-aarch64-musl
           path: dist-out/
 
   sbom:
     name: Generate SBOM
-    runs-on: ubuntu-latest
+    runs-on: docker://node:22-bookworm
     needs: [check]
     steps:
       - uses: actions/checkout@v4
@@ -125,64 +123,56 @@ jobs:
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx
       - run: cargo cyclonedx --all --format json --describe binaries
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v3
         with:
           name: sbom
           path: "**/*.cdx.json"
 
   release:
     name: Create Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(forge.ref, 'refs/tags/v')
+    runs-on: docker://node:22-bookworm
     needs: [build-x86_64, build-aarch64, sbom]
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v3
         with:
           path: artifacts/
       - name: Prepare release assets
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME}"
+          # Tag name — works on both GitHub and Forgejo
+          VERSION="${GITHUB_REF_NAME:-${forge_ref_name:-}}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
-          # Package x86_64
           mkdir -p release
           tar czf "release/monopsony-${VERSION}-linux-x86_64.tar.gz" -C artifacts/monopsony-x86_64-musl .
           tar czf "release/monopsony-${VERSION}-linux-aarch64.tar.gz" -C artifacts/monopsony-aarch64-musl .
 
-          # Merge SHA256SUMS from both arches
-          cat artifacts/monopsony-x86_64-musl/SHA256SUMS > /tmp/sums-x86.txt
-          cat artifacts/monopsony-aarch64-musl/SHA256SUMS > /tmp/sums-arm.txt
-
           # Copy SBOM
           find artifacts/sbom -name '*.cdx.json' -exec cp {} release/ \;
 
-          # Generate combined SHA256SUMS for tarballs
+          # Generate combined SHA256SUMS
           cd release
-          sha256sum "monopsony-${VERSION}-linux-x86_64.tar.gz" "monopsony-${VERSION}-linux-aarch64.tar.gz" > SHA256SUMS
-          # Append SBOM checksums if present
+          sha256sum \
+            "monopsony-${VERSION}-linux-x86_64.tar.gz" \
+            "monopsony-${VERSION}-linux-aarch64.tar.gz" > SHA256SUMS
           for f in *.json; do
             [ -f "$f" ] && sha256sum "$f" >> SHA256SUMS
           done
 
-      - name: Sign SHA256SUMS with GPG
-        run: |
-          set -euo pipefail
-          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --import --batch --passphrase "${{ secrets.GPG_PASSPHRASE }}"
-          gpg --batch --yes --passphrase "${{ secrets.GPG_PASSPHRASE }}" \
-              --pinentry-mode loopback \
-              --local-user "${{ secrets.GPG_KEY_ID }}" \
-              --detach-sign release/SHA256SUMS
-          # Also sign the git tag (already signed if done locally, but verify)
-          git tag -v "${GITHUB_REF_NAME}" 2>/dev/null || echo "Tag not GPG-signed (sign locally with: git tag -s)"
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Create Release
+        uses: actions/forgejo-release@v2.12.0
         with:
-          generate_release_notes: true
-          files: |
-            release/*
-          fail_on_unmatched_files: true
+          direction: upload
+          tag: ${{ env.VERSION }}
+          release-dir: release/
+          gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
+          gpg-passphrase: ${{ secrets.GPG_PASSPHRASE }}
+          token: ${{ secrets.RELEASE_TOKEN }}
+          # Generate release notes from commit history
+          release-notes: |
+            See [CHANGELOG.md](CHANGELOG.md) for details.
+            Built with pinned rustc 1.94.1, --locked, musl static.
+            SHA256SUMS signed with GPG. Verify: `gpg --verify SHA256SUMS.sig SHA256SUMS`
