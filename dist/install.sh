@@ -257,6 +257,29 @@ download_binary() {
         else
             warn "SHA256SUMS file found but no entry for ${asset_name}. Skipping verification."
         fi
+
+        # Verify GPG signature on SHA256SUMS if available
+        local sig_url="${DOWNLOAD_BASE}/v${VERSION}/SHA256SUMS.sig"
+        if curl -fsSL --retry 3 -o "${tmpdir}/SHA256SUMS.sig" "${sig_url}"; then
+            if command -v gpg >/dev/null 2>&1; then
+                # Import Monopsony release signing key
+                local gpg_key_url="https://monopsony.dev/gpg/monopsony-release.asc"
+                if curl -fsSL --retry 3 -o "${tmpdir}/release.asc" "${gpg_key_url}"; then
+                    gpg --batch --no-autostart --import "${tmpdir}/release.asc" 2>/dev/null || true
+                    if gpg --batch --no-autostart --verify "${tmpdir}/SHA256SUMS.sig" "${tmpdir}/SHA256SUMS" 2>/dev/null; then
+                        ok "SHA256SUMS GPG signature verified."
+                    else
+                        warn "SHA256SUMS GPG signature verification failed. Proceeding with checksum-only verification."
+                    fi
+                else
+                    warn "Could not download release signing key. Skipping GPG verification."
+                fi
+            else
+                warn "gpg not found. Skipping SHA256SUMS signature verification."
+            fi
+        else
+            warn "SHA256SUMS.sig not available. Skipping GPG verification."
+        fi
     else
         warn "SHA256SUMS not available. Skipping checksum verification."
     fi

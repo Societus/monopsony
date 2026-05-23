@@ -17,11 +17,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable  # overridden by rust-toolchain.toml
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace
+      - run: cargo check --workspace --locked
 
   test:
     name: Test
@@ -32,7 +32,7 @@ jobs:
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace -- --test-threads=1
+      - run: cargo test --workspace --locked -- --test-threads=1
 
   clippy:
     name: Clippy
@@ -40,26 +40,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy --workspace --locked -- -D warnings
 
-  build-linux:
+  build-x86_64:
     name: Build (x86_64 musl)
     runs-on: ubuntu-latest
     needs: [check, test, clippy]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
       - name: Install musl tools and protoc
         run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --target x86_64-unknown-linux-musl
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
       - name: Package release artifacts
         run: |
           mkdir -p dist-out
@@ -78,3 +74,115 @@ jobs:
         with:
           name: monopsony-x86_64-musl
           path: dist-out/
+
+  build-aarch64:
+    name: Build (aarch64 musl)
+    runs-on: ubuntu-latest
+    needs: [check, test, clippy]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cross-compilation tools and protoc
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          # Install aarch64 cross-linker
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Configure cargo for aarch64 cross-compilation
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml <<'EOF'
+          [target.aarch64-unknown-linux-musl]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked --target aarch64-unknown-linux-musl
+      - name: Package release artifacts
+        run: |
+          mkdir -p dist-out
+          cp target/aarch64-unknown-linux-musl/release/monopsony-server dist-out/
+          cp target/aarch64-unknown-linux-musl/release/monopsony-client dist-out/
+          cp target/aarch64-unknown-linux-musl/release/monopsony-tracker dist-out/
+          cp dist/monopsony-server.service dist-out/
+          cp dist/monopsony-client.service dist-out/
+          cp dist/monopsony-server.openrc dist-out/
+          cp dist/monopsony-tmpfiles.conf dist-out/
+          cp dist/monopsony-sysusers.conf dist-out/
+          cp dist/server.toml.example dist-out/
+          cp dist/mirrors.toml.example dist-out/
+          cd dist-out && sha256sum * > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: monopsony-aarch64-musl
+          path: dist-out/
+
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    needs: [check]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx
+      - run: cargo cyclonedx --all --format json --describe binaries
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: "**/*.cdx.json"
+
+  release:
+    name: Create Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: [build-x86_64, build-aarch64, sbom]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+      - name: Prepare release assets
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+
+          # Package x86_64
+          mkdir -p release
+          tar czf "release/monopsony-${VERSION}-linux-x86_64.tar.gz" -C artifacts/monopsony-x86_64-musl .
+          tar czf "release/monopsony-${VERSION}-linux-aarch64.tar.gz" -C artifacts/monopsony-aarch64-musl .
+
+          # Merge SHA256SUMS from both arches
+          cat artifacts/monopsony-x86_64-musl/SHA256SUMS > /tmp/sums-x86.txt
+          cat artifacts/monopsony-aarch64-musl/SHA256SUMS > /tmp/sums-arm.txt
+
+          # Copy SBOM
+          find artifacts/sbom -name '*.cdx.json' -exec cp {} release/ \;
+
+          # Generate combined SHA256SUMS for tarballs
+          cd release
+          sha256sum "monopsony-${VERSION}-linux-x86_64.tar.gz" "monopsony-${VERSION}-linux-aarch64.tar.gz" > SHA256SUMS
+          # Append SBOM checksums if present
+          for f in *.json; do
+            [ -f "$f" ] && sha256sum "$f" >> SHA256SUMS
+          done
+
+      - name: Sign SHA256SUMS with GPG
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | gpg --import --batch --passphrase "${{ secrets.GPG_PASSPHRASE }}"
+          gpg --batch --yes --passphrase "${{ secrets.GPG_PASSPHRASE }}" \
+              --pinentry-mode loopback \
+              --local-user "${{ secrets.GPG_KEY_ID }}" \
+              --detach-sign release/SHA256SUMS
+          # Also sign the git tag (already signed if done locally, but verify)
+          git tag -v "${GITHUB_REF_NAME}" 2>/dev/null || echo "Tag not GPG-signed (sign locally with: git tag -s)"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release/*
+          fail_on_unmatched_files: true
