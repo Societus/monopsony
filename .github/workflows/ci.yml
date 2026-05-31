@@ -9,62 +9,56 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  PROTOC: /usr/local/bin/protoc
 
 jobs:
   check:
     name: Check
-    runs-on: debian-bookworm
+    runs-on: landhunter
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust
+      - name: Install Rust and build deps
         run: |
+          apk add --no-cache protobuf-dev protobuf curl gcc musl-dev pkgconf openssl-dev openssl-libs-static
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo check --workspace --locked
 
   test:
     name: Test
-    runs-on: debian-bookworm
+    runs-on: landhunter
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust
+      - name: Install Rust and build deps
         run: |
+          apk add --no-cache protobuf-dev protobuf curl gcc musl-dev pkgconf openssl-dev openssl-libs-static
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: cargo test --workspace --locked -- --test-threads=1
 
   clippy:
     name: Clippy
-    runs-on: debian-bookworm
+    runs-on: landhunter
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust
+      - name: Install Rust and build deps
         run: |
+          apk add --no-cache protobuf-dev protobuf curl gcc musl-dev pkgconf openssl-dev openssl-libs-static
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-      - name: Install protoc
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - run: rustup component add clippy
       - run: cargo clippy --workspace --locked -- -D warnings
 
   build-x86_64:
     name: Build (x86_64 musl)
-    runs-on: debian-bookworm
+    runs-on: landhunter
     needs: [check, test, clippy]
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust
+      - name: Install Rust and build deps
         run: |
+          apk add --no-cache protobuf-dev protobuf curl gcc musl-dev pkgconf openssl-dev openssl-libs-static
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-      - name: Install musl target and protoc
-        run: |
-          sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
           rustup target add x86_64-unknown-linux-musl
       - run: cargo build --release --locked --target x86_64-unknown-linux-musl
       - name: Package release artifacts
@@ -88,24 +82,22 @@ jobs:
 
   build-aarch64:
     name: Build (aarch64 musl)
-    runs-on: debian-bookworm
+    runs-on: landhunter
     needs: [check, test, clippy]
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust
+      - name: Install Rust and cross-compilation deps
         run: |
+          apk add --no-cache protobuf-dev protobuf curl gcc musl-dev pkgconf openssl-dev openssl-libs-static gcc-aarch64-none-elf
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-      - name: Install cross-compilation tools and protoc
-        run: |
-          sudo apt-get update && sudo apt-get install -y protobuf-compiler gcc-aarch64-linux-gnu
           rustup target add aarch64-unknown-linux-musl
       - name: Configure cargo for aarch64 cross-compilation
         run: |
           mkdir -p .cargo
           cat >> .cargo/config.toml <<'EOF'
           [target.aarch64-unknown-linux-musl]
-          linker = "aarch64-linux-gnu-gcc"
+          linker = "aarch64-none-elf-gcc"
           EOF
       - run: cargo build --release --locked --target aarch64-unknown-linux-musl
       - name: Package release artifacts
@@ -129,12 +121,13 @@ jobs:
 
   sbom:
     name: Generate SBOM
-    runs-on: debian-bookworm
+    runs-on: landhunter
     needs: [check]
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
         run: |
+          apk add --no-cache protobuf-dev protobuf curl gcc musl-dev pkgconf openssl-dev openssl-libs-static
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - name: Install cargo-cyclonedx
@@ -148,7 +141,7 @@ jobs:
   release:
     name: Create Release
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: debian-bookworm
+    runs-on: landhunter
     needs: [build-x86_64, build-aarch64, sbom]
     steps:
       - uses: actions/checkout@v4
@@ -189,5 +182,5 @@ jobs:
           token: ${{ secrets.RELEASE_TOKEN }}
           release-notes: |
             See [CHANGELOG.md](CHANGELOG.md) for details.
-            Built with pinned rustc, --locked, musl static.
+            Built with rustc stable, --locked, musl static (Alpine).
             SHA256SUMS signed with GPG. Verify: `gpg --verify SHA256SUMS.sig SHA256SUMS`
