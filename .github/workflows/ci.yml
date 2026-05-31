@@ -17,10 +17,12 @@ jobs:
     runs-on: debian-bookworm
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --locked
 
   test:
@@ -28,10 +30,12 @@ jobs:
     runs-on: debian-bookworm
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked -- --test-threads=1
 
   clippy:
@@ -39,10 +43,13 @@ jobs:
     runs-on: debian-bookworm
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - run: rustup component add clippy
       - run: cargo clippy --workspace --locked -- -D warnings
 
   build-x86_64:
@@ -51,10 +58,14 @@ jobs:
     needs: [check, test, clippy]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install musl tools and protoc
-        run: sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - name: Install musl target and protoc
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools protobuf-compiler
+          rustup target add x86_64-unknown-linux-musl
       - run: cargo build --release --locked --target x86_64-unknown-linux-musl
       - name: Package release artifacts
         run: |
@@ -81,11 +92,14 @@ jobs:
     needs: [check, test, clippy]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - name: Install cross-compilation tools and protoc
         run: |
-          sudo apt-get update && sudo apt-get install -y protobuf-compiler
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler gcc-aarch64-linux-gnu
+          rustup target add aarch64-unknown-linux-musl
       - name: Configure cargo for aarch64 cross-compilation
         run: |
           mkdir -p .cargo
@@ -93,7 +107,6 @@ jobs:
           [target.aarch64-unknown-linux-musl]
           linker = "aarch64-linux-gnu-gcc"
           EOF
-      - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked --target aarch64-unknown-linux-musl
       - name: Package release artifacts
         run: |
@@ -120,7 +133,10 @@ jobs:
     needs: [check]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx
       - run: cargo cyclonedx --all --format json --describe binaries
@@ -143,7 +159,6 @@ jobs:
       - name: Prepare release assets
         run: |
           set -euo pipefail
-          # Forgejo exposes forge.ref_name, GitHub uses GITHUB_REF_NAME
           VERSION="${FORGE_REF_NAME:-${GITHUB_REF_NAME:-}}"
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
@@ -172,8 +187,7 @@ jobs:
           gpg-private-key: ${{ secrets.GPG_PRIVATE_KEY }}
           gpg-passphrase: ${{ secrets.GPG_PASSPHRASE }}
           token: ${{ secrets.RELEASE_TOKEN }}
-          # Generate release notes from commit history
           release-notes: |
             See [CHANGELOG.md](CHANGELOG.md) for details.
-            Built with pinned rustc 1.94.1, --locked, musl static.
+            Built with pinned rustc, --locked, musl static.
             SHA256SUMS signed with GPG. Verify: `gpg --verify SHA256SUMS.sig SHA256SUMS`
