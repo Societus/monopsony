@@ -1,0 +1,58 @@
+name: 'Setup Rust (Alpine musl)'
+description: 'Install Rust toolchain with minimal profile + Alpine build deps. Creates 1G swapfile if no swap exists.'
+
+inputs:
+  components:
+    description: 'Additional rustup components (space-separated)'
+    required: false
+    default: ''
+  target:
+    description: 'Additional rustup target triple'
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Add swapfile (guard against OOM)
+      shell: sh
+      run: |
+        if [ "$(swapon --show | wc -l)" -le 1 ]; then
+          echo "No swap detected, creating 1G swapfile..."
+          dd if=/dev/zero of=/tmp/swapfile bs=1M count=1024 2>/dev/null
+          chmod 600 /tmp/swapfile
+          mkswap /tmp/swapfile >/dev/null
+          swapon /tmp/swapfile
+          echo "Swap added."
+        else
+          echo "Swap already present, skipping."
+        fi
+
+    - name: Install Alpine build dependencies
+      shell: sh
+      run: |
+        apk add --no-cache protobuf-dev protobuf curl gcc musl-dev pkgconf openssl-dev openssl-libs-static
+
+    - name: Install Rust (minimal profile)
+      shell: sh
+      run: |
+        if command -v rustup >/dev/null 2>&1; then
+          echo "rustup already installed, skipping."
+        else
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+        fi
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+    - name: Add components
+      shell: sh
+      if: ${{ inputs.components != '' }}
+      run: |
+        for comp in ${{ inputs.components }}; do
+          rustup component add "$comp"
+        done
+
+    - name: Add target
+      shell: sh
+      if: ${{ inputs.target != '' }}
+      run: |
+        rustup target add ${{ inputs.target }}

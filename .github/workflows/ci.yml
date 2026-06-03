@@ -16,11 +16,7 @@ jobs:
     runs-on: landhunter
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust and build deps
-        run: |
-          apk add --no-cache protobuf-dev protobuf curl gcc musl-dev pkgconf openssl-dev openssl-libs-static
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - uses: ./.forgejo/actions/setup-rust
       - run: cargo check --workspace --locked
 
   test:
@@ -28,11 +24,7 @@ jobs:
     runs-on: landhunter
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust and build deps
-        run: |
-          apk add --no-cache protobuf-dev protobuf curl gcc musl-dev pkgconf openssl-dev openssl-libs-static
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - uses: ./.forgejo/actions/setup-rust
       - run: cargo test --workspace --locked -- --test-threads=1
 
   clippy:
@@ -40,12 +32,9 @@ jobs:
     runs-on: landhunter
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust and build deps
-        run: |
-          apk add --no-cache protobuf-dev protobuf curl gcc musl-dev pkgconf openssl-dev openssl-libs-static
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-      - run: rustup component add clippy
+      - uses: ./.forgejo/actions/setup-rust
+        with:
+          components: clippy
       - run: cargo clippy --workspace --locked -- -D warnings
 
   build-x86_64:
@@ -54,12 +43,9 @@ jobs:
     needs: [check, test, clippy]
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust and build deps
-        run: |
-          apk add --no-cache protobuf-dev protobuf curl gcc musl-dev pkgconf openssl-dev openssl-libs-static
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          rustup target add x86_64-unknown-linux-musl
+      - uses: ./.forgejo/actions/setup-rust
+        with:
+          target: x86_64-unknown-linux-musl
       - run: cargo build --release --locked --target x86_64-unknown-linux-musl
       - name: Package release artifacts
         run: |
@@ -86,12 +72,11 @@ jobs:
     needs: [check, test, clippy]
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust and cross-compilation deps
-        run: |
-          apk add --no-cache protobuf-dev protobuf curl gcc musl-dev pkgconf openssl-dev openssl-libs-static gcc-aarch64-none-elf
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          rustup target add aarch64-unknown-linux-musl
+      - uses: ./.forgejo/actions/setup-rust
+        with:
+          target: aarch64-unknown-linux-musl
+      - name: Install cross-compilation toolchain
+        run: apk add --no-cache gcc-aarch64-none-elf
       - name: Configure cargo for aarch64 cross-compilation
         run: |
           mkdir -p .cargo
@@ -125,11 +110,7 @@ jobs:
     needs: [check]
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust
-        run: |
-          apk add --no-cache protobuf-dev protobuf curl gcc musl-dev pkgconf openssl-dev openssl-libs-static
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+      - uses: ./.forgejo/actions/setup-rust
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx
       - run: cargo cyclonedx --all --format json --describe binaries
