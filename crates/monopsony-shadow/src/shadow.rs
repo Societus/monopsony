@@ -186,6 +186,16 @@ impl ShadowPackageManager {
             }
         });
     }
+
+    /// Accessor for the signing key (needed by gRPC layer for recipe signing)
+    pub fn signing_key_ref(&self) -> &ed25519_dalek::SigningKey {
+        &self.signing_key
+    }
+
+    /// Accessor for the cache (needed by gRPC layer for asset streaming)
+    pub fn cache_ref(&self) -> &ShadowCache {
+        &self.cache
+    }
 }
 
 #[cfg(test)]

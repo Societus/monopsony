@@ -8,6 +8,7 @@ license.workspace = true
 monopsony-common = { path = "../monopsony-common" }
 monopsony-db = { path = "../monopsony-db" }
 monopsony-mirror = { path = "../monopsony-mirror" }
+monopsony-shadow = { path = "../monopsony-shadow" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -32,7 +33,7 @@ parking_lot = "0.12"
 async-stream = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+pnet = "0.35"
 
 [dev-dependencies]
-tempfile = "3"
 toml = { workspace = true }

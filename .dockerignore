@@ -1,0 +1,13 @@
+# Monopsony Server
+*.md
+.git
+.gitignore
+.github
+.forgejo
+target
+dist-out
+docs
+*.patch
+*.bak
+.venv
+__pycache__

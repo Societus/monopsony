@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use pnet::datalink;
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
 };
@@ -56,17 +57,49 @@ impl TlsManager {
     }
 
     /// Deserialize a previously persisted CA from PEM files on disk.
+    ///
+    /// **Implementation note:** We parse the original DER directly from the PEM
+    /// and use *those* bytes as the trust anchor (`ca_cert_der`), rather than
+    /// re-deriving them from a reconstructed rcgen `Certificate`. The rcgen
+    /// round-trip (`from_ca_cert_pem` → `self_signed`) generates a new serial
+    /// and may encode the subject DN differently, causing leaf certs to carry
+    /// an issuer DN that doesn't byte-match the original CA's subject DN —
+    /// which webpki rejects as `UnknownIssuer`.
+    ///
+    /// We reconstruct the rcgen `Certificate` only for signing operations, and
+    /// explicitly restore the CA attributes (`is_ca`, `key_usages`, DN) to
+    /// match [`generate_ca`](Self::generate_ca) exactly.
     fn load_ca(ca_cert_path: &Path, ca_key_path: &Path) -> anyhow::Result<Self> {
         let ca_cert_pem = std::fs::read_to_string(ca_cert_path)?;
         let ca_key_pem = std::fs::read_to_string(ca_key_path)?;
 
         let ca_key = KeyPair::from_pem(&ca_key_pem)?;
-        let params = CertificateParams::from_ca_cert_pem(&ca_cert_pem)?;
-        let ca_cert = params.self_signed(&ca_key)?;
-        let ca_cert_der = CertificateDer::from(ca_cert.der().as_ref().to_vec());
 
+        // Parse the original DER directly from the PEM to preserve exact bytes.
+        let mut pem_reader = ca_cert_pem.as_bytes();
+        let original_der: CertificateDer<'static> = rustls_pemfile::certs(&mut pem_reader)
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("No certificate found in CA PEM file"))??
+            .into_owned();
+
+        // Reconstruct rcgen params from the original DER so we can sign leaf
+        // certs. Explicitly restore CA attributes that may be lost in round-trip.
+        let mut params = CertificateParams::from_ca_cert_der(&original_der)?;
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        // Restore the exact DN used by generate_ca to guarantee issuer DN match.
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Monopsony CA");
+        params
+            .distinguished_name
+            .push(rcgen::DnType::OrganizationName, "Monopsony");
+        let ca_cert = params.self_signed(&ca_key)?;
+
+        // Use the ORIGINAL DER as the trust anchor — not the reconstructed cert.
         Ok(Self {
-            ca_cert_der,
+            ca_cert_der: original_der,
             ca_cert,
             ca_key,
             ca_cert_pem,
@@ -131,11 +164,19 @@ impl TlsManager {
     ///
     /// **Note:** This returns a tonic-level config. For a raw `rustls::ServerConfig`
     /// (e.g. when using axum/hyper directly), use [`server_tls_config`](Self::server_tls_config).
-    pub fn tonic_server_tls_config(&self) -> anyhow::Result<tonic::transport::ServerTlsConfig> {
-        let (cert_pem, key_pem) = self.generate_server_cert()?;
+    pub fn tonic_server_tls_config(
+        &self,
+        bind_addr: Option<std::net::IpAddr>,
+    ) -> anyhow::Result<tonic::transport::ServerTlsConfig> {
+        let (cert_pem, key_pem) = self.generate_server_cert(bind_addr)?;
         let cert_str = String::from_utf8(cert_pem)?;
         let key_str = String::from_utf8(key_pem)?;
-        let identity = tonic::transport::Identity::from_pem(&cert_str, &key_str);
+        // Include the CA cert in the identity so the server presents the full
+        // chain (leaf + CA) during the TLS handshake. Without this, clients
+        // that only have the CA as a trusted root see "UnknownIssuer" because
+        // the leaf's issuer (CA) is not sent alongside it.
+        let chain = format!("{}\n{}", cert_str, self.ca_cert_pem);
+        let identity = tonic::transport::Identity::from_pem(&chain, &key_str);
         let ca_cert = tonic::transport::Certificate::from_pem(&self.ca_cert_pem);
         Ok(tonic::transport::ServerTlsConfig::new()
             .identity(identity)
@@ -145,15 +186,41 @@ impl TlsManager {
     /// Generate an in-memory server leaf certificate signed by the CA.
     ///
     /// Returns `(cert_pem, key_pem)` as byte vectors. The certificate has
-    /// SAN `monopsony-server` and EKU `serverAuth`, valid until 2036-01-01.
-    pub fn generate_server_cert(&self) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-        let mut params = CertificateParams::new(vec!["monopsony-server".to_string()])?;
+    /// SAN `monopsony-server` plus the bind IP address (if provided) and
+    /// EKU `serverAuth`, valid until 2036-01-01.
+    ///
+    /// Includes SubjectKeyIdentifier and AuthorityKeyIdentifier extensions
+    /// required for proper chain validation by webpki/rustls.
+    pub fn generate_server_cert(
+        &self,
+        bind_addr: Option<std::net::IpAddr>,
+    ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        let mut san_types: Vec<rcgen::SanType> =
+            vec![rcgen::SanType::DnsName("monopsony-server".try_into()?)];
+        
+        // If bind_addr is 0.0.0.0 or ::, try to detect the actual LAN IP to include in SAN
+        if let Some(ip) = bind_addr {
+            if ip.is_unspecified() {
+                // Try to find a non-loopback, non-link-local IP
+                if let Ok(lan_ip) = Self::detect_lan_ip() {
+                    san_types.push(rcgen::SanType::IpAddress(lan_ip));
+                }
+            } else {
+                san_types.push(rcgen::SanType::IpAddress(ip));
+            }
+        }
+        let mut params = CertificateParams::new(Vec::<String>::new())?;
+        params.subject_alt_names = san_types;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, "Monopsony Server");
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         params.not_after = rcgen::date_time_ymd(2036, 1, 1);
+        // Use ExplicitNoCa to ensure SubjectKeyIdentifier extension is included
+        params.is_ca = IsCa::ExplicitNoCa;
+        // Enable AuthorityKeyIdentifier extension for proper chain building
+        params.use_authority_key_identifier_extension = true;
 
         let key = KeyPair::generate()?;
         let cert = params.signed_by(&key, &self.ca_cert, &self.ca_key)?;
@@ -232,13 +299,32 @@ impl TlsManager {
             .join(":")
     }
 
+    /// Detect the LAN IP address for certificate SAN inclusion.
+    /// Returns the first non-loopback, non-link-local IPv4 address.
+    fn detect_lan_ip() -> anyhow::Result<std::net::IpAddr> {
+        for iface in pnet::datalink::interfaces() {
+            for ip in iface.ips {
+                let addr = ip.ip();
+                if let std::net::IpAddr::V4(ipv4) = addr {
+                    if !ipv4.is_loopback() && !ipv4.is_link_local() {
+                        return Ok(std::net::IpAddr::V4(ipv4));
+                    }
+                }
+            }
+        }
+        Err(anyhow::anyhow!("No suitable LAN IP found"))
+    }
+
     /// Generate a client leaf certificate signed by the CA.
     ///
     /// - `client_id` — Used as both the SAN and the Common Name in the
     ///   certificate subject, typically a unique identifier for the client
     ///   machine (hostname or UUID).
     ///
-    /// EKU is set to `clientAuth`. Valid until 2027-01-01.
+    /// EKU is set to `clientAuth`. Valid until 2036-01-01.
+    ///
+    /// Includes SubjectKeyIdentifier and AuthorityKeyIdentifier extensions
+    /// required for proper chain validation by webpki/rustls.
     ///
     /// Returns the signed [`rcgen::Certificate`] and its [`KeyPair`]; use
     /// [`cert_and_key_to_pem`](Self::cert_and_key_to_pem) to serialize them
@@ -253,6 +339,10 @@ impl TlsManager {
             .push(rcgen::DnType::CommonName, client_id);
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         params.not_after = rcgen::date_time_ymd(2036, 1, 1);
+        // Use ExplicitNoCa to ensure SubjectKeyIdentifier extension is included
+        params.is_ca = IsCa::ExplicitNoCa;
+        // Enable AuthorityKeyIdentifier extension for proper chain building
+        params.use_authority_key_identifier_extension = true;
 
         let key = KeyPair::generate()?;
         let cert = params.signed_by(&key, &self.ca_cert, &self.ca_key)?;

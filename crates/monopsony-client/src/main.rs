@@ -115,6 +115,11 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Install the default crypto provider for rustls (required by rustls 0.23)
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     let args = Args::parse();
 
     let subscriber = FmtSubscriber::builder()
@@ -233,15 +238,18 @@ async fn run_daemon(
     let listen_addr: SocketAddr = proxy_addr.parse()
         .expect("invalid proxy listen address");
 
+    // Build TLS config for the initial connection
     let tls = tonic::transport::ClientTlsConfig::new()
         .ca_certificate(tonic::transport::Certificate::from_pem(&certs.ca_cert_pem))
         .identity(tonic::transport::Identity::from_pem(
             &certs.client_cert_pem,
             &certs.client_key_pem,
-        ));
+        ))
+        .domain_name("monopsony-server")
+        .assume_http2(true);
 
-    let mut grpc_client = grpc_client::MonopsonyGrpcClient::connect(&server_addr, Some(tls)).await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to server at {}: {}. Is the server running?", server_addr, e))?;
+    // Connect using standard connect() with TLS
+    let mut grpc_client = grpc_client::MonopsonyGrpcClient::connect(&server_addr, Some(tls)).await?;
 
     // Get client ID from stored file or register
     let client_id = {
@@ -297,7 +305,8 @@ async fn run_daemon(
                 .identity(tonic::transport::Identity::from_pem(
                     &certs.client_cert_pem,
                     &certs.client_key_pem,
-                ));
+                ))
+                .domain_name("monopsony-server");
 
             let mut client = match grpc_client::MonopsonyGrpcClient::connect(&server_addr_for_task, Some(tls)).await {
                 Ok(c) => {

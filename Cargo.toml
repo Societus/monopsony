@@ -10,6 +10,7 @@ members = [
     "crates/monopsony-server",
     "crates/monopsony-client",
     "crates/monopsony-tracker",
+    "crates/monopsony-admin",
 ]
 
 [workspace.package]
@@ -54,7 +55,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # TLS
-rustls = "0.23"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2"
 rcgen = { version = "0.13", features = ["x509-parser"] }
 
@@ -63,7 +64,7 @@ mdns-sd = "0.11"
 
 # Metrics
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 
 # Utilities
 thiserror = "2"
@@ -89,3 +90,9 @@ tonic-build = "0.12"
 
 # Internal crates
 monopsony-common = { path = "crates/monopsony-common" }
+
+# Dashboard / Admin
+rust-embed = { version = "8", features = ["compression"] }
+mime_guess = "2"
+bcrypt = "0.16"
+tower-cookies = "0.10"

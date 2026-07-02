@@ -1,0 +1,87 @@
+# ============================================================================
+# Monopsony Server — Docker Compose / Podman Compose
+# ============================================================================
+#
+# Quick start:
+#   docker compose up -d           (Docker)
+#   podman-compose up -d           (Podman rootful)
+#   podman-compose --userns=keep-id up -d  (Podman rootless)
+#
+# With Podman rootless, uncomment the `userns` line under the server service
+# to map your host UID/GID into the container. Volume ownership is automatic.
+#
+# Environment overrides (see also docker-compose.override.yml for local dev):
+#   MONOPSONY_DB_URL      — PostgreSQL connection string
+#   MONOPSONY_HTTP_ADDR   — HTTP proxy bind address
+#   MONOPSONY_CACHE_DIR   — Cache directory path
+#   MONOPSONY_TLS_DIR     — TLS certificate directory
+#   POSTGRES_PASSWORD      — PostgreSQL password (change me)
+# ============================================================================
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: monopsony
+      POSTGRES_USER: monopsony
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-monopsony}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U monopsony"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      # HTTP caching proxy — clients point here
+      - "${MONOPSONY_PROXY_PORT:-3128}:3128"
+      # gRPC control plane (mTLS)
+      - "${MONOPSONY_GRPC_PORT:-50051}:50051"
+      # Prometheus metrics
+      - "${MONOPSONY_METRICS_PORT:-9090}:9090"
+      # Distribution mirror HTTP
+      - "${MONOPSONY_MIRROR_PORT:-3129}:3129"
+    environment:
+      MONOPSONY_DB_URL: postgres://monopsony:${POSTGRES_PASSWORD:-monopsony}@db:5432/monopsony
+      MONOPSONY_HTTP_ADDR: "0.0.0.0:3128"
+      MONOPSONY_CACHE_DIR: "/var/cache/monopsony"
+      # Uncomment for mTLS:
+      # MONOPSONY_TLS_DIR: "/var/lib/monopsony/tls"
+    volumes:
+      - cache-data:/var/cache/monopsony
+      - lib-data:/var/lib/monopsony
+      # Mount your own server.toml (optional — auto-generated if absent):
+      # - ./server.toml:/etc/monopsony/server.toml:ro
+      # Mount TLS certs (optional):
+      # - ./tls:/var/lib/monopsony/tls:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    # Podman rootless: uncomment to map host user into container
+    # userns: keep-id
+
+  # Optional: Tracker for mirror federation
+  # tracker:
+  #   build:
+  #     context: .
+  #     dockerfile: Dockerfile
+  #   entrypoint: ["monopsony-tracker"]
+  #   command: ["--database-url", "postgres://monopsony:${POSTGRES_PASSWORD:-monopsony}@db:5432/monopsony"]
+  #   ports:
+  #     - "3130:3130"
+  #   restart: unless-stopped
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+
+volumes:
+  db-data:
+  cache-data:
+  lib-data:

@@ -17,7 +17,9 @@ cargo build -p monopsony-server # Build server only
 cargo build -p monopsony-client # Build client only
 cargo test                     # Run tests
 ```
-**protoc** must be installed for gRPC codegen (`pacman -S protobuf` or `uv tool install grpcio-tools`). Common warnings: unused fields on `AptBackend.config_path`, `DnfBackend.config_path` — these are harmless.
+**Container:** `docker compose up -d` or `podman-compose up -d`. See `docs/container-deploy.md`. Multi-stage Dockerfile produces Alpine/musl image. Entrypoint auto-detects Docker/Podman and rootless mode.
+
+**protoc** must be installed for gRPC codegen (`pacman -S protobuf` or `uv tool install grpcio-tools`). Common warnings: unused fields on `AptBackend.config_path`, `DnfBackend.config_path` -- these are harmless.
 
 **PROTOC env var:** Set `PROTOC=/home/societus/.local/bin/python-grpc-tools-protoc` if using the uv-installed protoc.
 
@@ -55,7 +57,11 @@ monopsony/
 │   ├── sprint-rollback-log.md
 │   └── research/
 │       └── public-mirror-network.md  # Phase 1-3 design: public mirrors, tracker, darknet transports
-├── dist/                          # Distribution packaging
+├── Dockerfile                     # Multi-stage container build (Alpine/musl)
+├── docker-compose.yml             # Server + PostgreSQL (Docker/Podman)
+├── dist/
+│   ├── container/
+│   │   └── entrypoint.sh          # Container entrypoint (Docker/Podman/rootless detect)
 │   ├── install.sh                  # curl|bash installer (client default, --server for server)
 │   ├── monopsony-server.service    # systemd unit
 │   ├── monopsony-server.openrc     # OpenRC init script

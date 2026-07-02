@@ -4,15 +4,24 @@
 //! allowing uniform handling of package installation, inventory, and proxy configuration.
 
 mod apt;
+mod bsd_privilege;
 mod dnf;
+mod mport;
 mod pacman;
+mod pkg;
+mod pkg_add;
+mod pkgin;
 mod winget;
 mod choco;
 mod scoop;
 
 pub use apt::AptBackend;
 pub use dnf::DnfBackend;
+pub use mport::MportBackend;
 pub use pacman::PacmanBackend;
+pub use pkg::PkgBackend;
+pub use pkg_add::PkgAddBackend;
+pub use pkgin::PkginBackend;
 pub use winget::WingetBackend;
 pub use choco::ChocoBackend;
 pub use scoop::ScoopBackend;
@@ -27,7 +36,11 @@ use std::path::PathBuf;
 pub enum PackageManagerKind {
     Apt,
     Dnf,
+    Mport,
     Pacman,
+    Pkg,
+    PkgAdd,
+    Pkgin,
     Winget,
     Choco,
     Scoop,
@@ -38,7 +51,11 @@ impl PackageManagerKind {
         match self {
             PackageManagerKind::Apt => "apt",
             PackageManagerKind::Dnf => "dnf",
+            PackageManagerKind::Mport => "mport",
             PackageManagerKind::Pacman => "pacman",
+            PackageManagerKind::Pkg => "pkg",
+            PackageManagerKind::PkgAdd => "pkg_add",
+            PackageManagerKind::Pkgin => "pkgin",
             PackageManagerKind::Winget => "winget",
             PackageManagerKind::Choco => "choco",
             PackageManagerKind::Scoop => "scoop",
@@ -51,7 +68,11 @@ impl PackageManagerKind {
         match s {
             "apt" => Some(PackageManagerKind::Apt),
             "dnf" => Some(PackageManagerKind::Dnf),
+            "mport" => Some(PackageManagerKind::Mport),
             "pacman" => Some(PackageManagerKind::Pacman),
+            "pkg" => Some(PackageManagerKind::Pkg),
+            "pkg_add" => Some(PackageManagerKind::PkgAdd),
+            "pkgin" => Some(PackageManagerKind::Pkgin),
             "winget" => Some(PackageManagerKind::Winget),
             "choco" => Some(PackageManagerKind::Choco),
             "scoop" => Some(PackageManagerKind::Scoop),
@@ -239,7 +260,11 @@ pub fn get_available_backends() -> Vec<Box<dyn PackageManagerBackend>> {
     let backends: Vec<Box<dyn PackageManagerBackend>> = vec![
         Box::new(AptBackend::new()),
         Box::new(DnfBackend::new()),
+        Box::new(MportBackend::new()),
         Box::new(PacmanBackend::new()),
+        Box::new(PkgBackend::new()),
+        Box::new(PkgAddBackend::new()),
+        Box::new(PkginBackend::new()),
         Box::new(WingetBackend::new()),
         Box::new(ChocoBackend::new()),
         Box::new(ScoopBackend::new()),
@@ -253,7 +278,11 @@ pub fn get_backend(kind: PackageManagerKind) -> Option<Box<dyn PackageManagerBac
     match kind {
         PackageManagerKind::Apt => Some(Box::new(AptBackend::new())),
         PackageManagerKind::Dnf => Some(Box::new(DnfBackend::new())),
+        PackageManagerKind::Mport => Some(Box::new(MportBackend::new())),
         PackageManagerKind::Pacman => Some(Box::new(PacmanBackend::new())),
+        PackageManagerKind::Pkg => Some(Box::new(PkgBackend::new())),
+        PackageManagerKind::PkgAdd => Some(Box::new(PkgAddBackend::new())),
+        PackageManagerKind::Pkgin => Some(Box::new(PkginBackend::new())),
         PackageManagerKind::Winget => Some(Box::new(WingetBackend::new())),
         PackageManagerKind::Choco => Some(Box::new(ChocoBackend::new())),
         PackageManagerKind::Scoop => Some(Box::new(ScoopBackend::new())),

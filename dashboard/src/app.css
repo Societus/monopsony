@@ -1,0 +1,161 @@
+@import 'tailwindcss';
+
+/* ─── Monopsony Design Tokens ────────────────────────────────────── */
+/* Extracted from monopsony.clubhouse-c21.workers.dev                */
+
+@theme {
+  --color-bg-base: #031427;
+  --color-bg-surface: #0B1C30;
+  --color-bg-surface-2: #102034;
+  --color-bg-surface-3: #26364A;
+  --color-text-primary: #D3E4FE;
+  --color-text-muted: #C6C6CD;
+  --color-accent: #44E2CD;
+  --color-accent-text: #000F21;
+  --color-status-warning: #F9BD22;
+  --color-status-error: #EF4444;
+  --color-status-success: #22C55E;
+  --color-border-default: #45464D;
+
+  --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+
+  --radius-card: 6px;
+  --radius-btn: 4px;
+}
+
+/* ─── Base Styles ─────────────────────────────────────────────────── */
+
+html {
+  font-family: var(--font-sans);
+  background-color: var(--color-bg-base);
+  color: var(--color-text-primary);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-bg-surface);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-bg-surface-3);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-border-default);
+}
+
+/* ─── Component Utilities ─────────────────────────────────────────── */
+
+@layer components {
+  .card {
+    @apply rounded-lg border;
+    background-color: var(--color-bg-surface);
+    border-color: var(--color-border-default);
+  }
+
+  .card-hover {
+    @apply transition-colors duration-150;
+  }
+  .card-hover:hover {
+    background-color: var(--color-bg-surface-2);
+  }
+
+  .btn {
+    @apply inline-flex items-center gap-2 rounded px-4 py-2 text-sm font-medium transition-colors duration-150;
+    border-radius: var(--radius-btn);
+  }
+
+  .btn-primary {
+    background-color: var(--color-accent);
+    color: var(--color-accent-text);
+  }
+  .btn-primary:hover {
+    filter: brightness(1.1);
+  }
+
+  .btn-secondary {
+    background-color: var(--color-bg-surface-3);
+    color: var(--color-text-primary);
+  }
+  .btn-secondary:hover {
+    filter: brightness(1.15);
+  }
+
+  .btn-ghost {
+    color: var(--color-text-muted);
+  }
+  .btn-ghost:hover {
+    color: var(--color-text-primary);
+    background-color: var(--color-bg-surface-2);
+  }
+
+  .input {
+    @apply rounded px-3 py-2 text-sm w-full;
+    background-color: var(--color-bg-surface-2);
+    border: 1px solid var(--color-border-default);
+    color: var(--color-text-primary);
+    border-radius: var(--radius-btn);
+  }
+  .input:focus {
+    outline: none;
+    border-color: var(--color-accent);
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium;
+  }
+  .badge-success {
+    background-color: color-mix(in srgb, var(--color-status-success) 15%, transparent);
+    color: var(--color-status-success);
+  }
+  .badge-warning {
+    background-color: color-mix(in srgb, var(--color-status-warning) 15%, transparent);
+    color: var(--color-status-warning);
+  }
+  .badge-error {
+    background-color: color-mix(in srgb, var(--color-status-error) 15%, transparent);
+    color: var(--color-status-error);
+  }
+  .badge-info {
+    background-color: color-mix(in srgb, var(--color-accent) 15%, transparent);
+    color: var(--color-accent);
+  }
+  .badge-muted {
+    background-color: color-mix(in srgb, var(--color-text-muted) 15%, transparent);
+    color: var(--color-text-muted);
+  }
+
+  .table-row {
+    @apply transition-colors duration-100;
+  }
+  .table-row:hover {
+    background-color: var(--color-bg-surface-2);
+  }
+
+  .nav-link {
+    @apply flex items-center gap-3 rounded px-3 py-2 text-sm transition-colors duration-100;
+    color: var(--color-text-muted);
+  }
+  .nav-link:hover {
+    color: var(--color-text-primary);
+    background-color: var(--color-bg-surface-2);
+  }
+  .nav-link-active {
+    color: var(--color-accent);
+    background-color: color-mix(in srgb, var(--color-accent) 10%, transparent);
+  }
+}

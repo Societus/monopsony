@@ -210,4 +210,13 @@ mod tests {
         let parsed = ClientId::parse(&display).unwrap();
         assert_eq!(id.0, parsed.0);
     }
+
+    /// Regression test: ClientId::parse must reject strings with a "client-"
+    /// prefix. This was the root cause of the pairing DB update failure —
+    /// the server generated "client-{uuid}" but parse() only accepts bare UUIDs.
+    #[test]
+    fn test_client_id_parse_rejects_prefix() {
+        let prefixed = format!("client-{}", uuid::Uuid::new_v4().simple());
+        assert!(ClientId::parse(&prefixed).is_err());
+    }
 }

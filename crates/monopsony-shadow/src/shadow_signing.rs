@@ -160,6 +160,30 @@ pub fn generate_signing_key() -> SigningKey {
     SigningKey::from_bytes(&secret)
 }
 
+/// Load a signing key from 32 raw bytes, or generate a new one.
+/// If `path` is provided and the file exists, reads from it; otherwise writes a
+/// new key there. If `path` is `None`, always generates a new ephemeral key.
+pub fn load_or_generate_signing_key(path: Option<&std::path::Path>) -> SigningKey {
+    if let Some(p) = path {
+        if p.exists() {
+            let bytes = std::fs::read(p).expect("failed to read signing key file");
+            assert_eq!(bytes.len(), 32, "signing key file must be 32 bytes");
+            let mut secret = [0u8; 32];
+            secret.copy_from_slice(&bytes);
+            return SigningKey::from_bytes(&secret);
+        }
+        // Generate and persist
+        let key = generate_signing_key();
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        std::fs::write(p, key.to_bytes()).expect("failed to write signing key file");
+        key
+    } else {
+        generate_signing_key()
+    }
+}
+
 /// Key ID = first 16 hex chars of SHA-256 of the public key bytes
 pub fn key_id(verifying_key: &VerifyingKey) -> String {
     let hash = Sha256::digest(verifying_key.to_bytes());

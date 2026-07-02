@@ -13,6 +13,8 @@ use monopsony_db::Database;
 use monopsony_proxy::{cache_storage, object_store_backend, proxy, prefetch, purge};
 use monopsony_control::{announce, discovery, grpc, metrics, tls};
 use monopsony_mirror::mirror;
+use monopsony_shadow::ShadowPackageManager;
+use monopsony_admin::{AdminState, DashboardConfig};
 
 mod setup;
 
@@ -37,6 +39,10 @@ struct Args {
     /// Address for the Prometheus metrics endpoint
     #[arg(long, default_value = "0.0.0.0:9090")]
     metrics_addr: String,
+
+    /// Address for the admin dashboard API
+    #[arg(long, default_value = "0.0.0.0:3130")]
+    dashboard_addr: String,
 
     /// Directory for cached package files
     #[arg(long, default_value = "/var/cache/monopsony")]
@@ -73,6 +79,22 @@ struct Args {
     /// Tracker announce interval in seconds (default: 1800 = 30min)
     #[arg(long, default_value = "1800")]
     tracker_interval: u64,
+
+    /// Directory for shadow package cache and signing key
+    #[arg(long, default_value = "/var/lib/monopsony/shadow")]
+    shadow_dir: String,
+
+    /// Directory for shadow git mirrors
+    #[arg(long, default_value = "/var/lib/monopsony/shadow/git-mirrors")]
+    shadow_git_mirror_dir: String,
+
+    /// GitHub API token for shadow package update checking (or set MONOPSONY_GITHUB_TOKEN)
+    #[arg(long, env = "MONOPSONY_GITHUB_TOKEN")]
+    github_token: Option<String>,
+
+    /// Shadow update poll interval in seconds (default: 3600 = 1h)
+    #[arg(long, default_value = "3600")]
+    shadow_poll_interval: u64,
 
     /// Authentication mode for HTTP proxy: open (default), token, mtls
     #[arg(long, default_value = "open")]
@@ -172,6 +194,12 @@ enum ApiKeyCommands {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Install the default crypto provider for rustls (required by rustls 0.23)
+    // This prevents panics when gRPC TLS connections are established
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     let args = Args::parse();
 
     let subscriber = FmtSubscriber::builder()
@@ -211,6 +239,7 @@ async fn main() -> anyhow::Result<()> {
     info!("HTTP proxy: {}", args.http_addr);
     info!("gRPC: {}", args.grpc_addr);
     info!("Metrics: {}", args.metrics_addr);
+    info!("Dashboard: {}", args.dashboard_addr);
     info!("Cache directory: {}", args.cache_dir);
 
     let http_addr: SocketAddr = args.http_addr.parse()
@@ -236,6 +265,8 @@ async fn main() -> anyhow::Result<()> {
         &tls_dir.join("ca.key"),
     )?;
     info!("CA fingerprint: {}", tls_manager.ca_fingerprint());
+
+    let tls_manager = Arc::new(tls_manager);
 
     let db = if args.no_db {
         info!("Database disabled, using file-only caching");
@@ -309,12 +340,44 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Initialize shadow package manager
+    let shadow_dir = PathBuf::from(&args.shadow_dir);
+    let shadow_git_mirror_dir = PathBuf::from(&args.shadow_git_mirror_dir);
+    let shared_shadow_manager = if db.is_some() {
+        if let Err(e) = tokio::fs::create_dir_all(&shadow_dir).await {
+            warn!("Could not create shadow directory: {}", e);
+        }
+        let signing_key_path = shadow_dir.join("signing.key");
+        let signing_key = monopsony_shadow::shadow_signing::load_or_generate_signing_key(Some(&signing_key_path));
+        let cache_dir = shadow_dir.join("cache");
+        let poll_interval = std::time::Duration::from_secs(args.shadow_poll_interval);
+
+        let mgr = ShadowPackageManager::new(
+            db.clone().unwrap(),
+            cache_dir,
+            signing_key,
+            args.github_token.clone(),
+            poll_interval,
+            shadow_git_mirror_dir,
+        );
+        info!("Shadow package manager initialized (key: {})", shadow_dir.join("signing.key").display());
+
+        // Start background polling
+        let mgr_arc = Arc::new(mgr);
+        mgr_arc.start_polling();
+        Some(mgr_arc)
+    } else {
+        info!("Shadow package manager not started (requires database)");
+        None
+    };
+
     if let Some(db) = db.clone() {
-        let tls_manager = Arc::new(tls_manager);
         let db_for_grpc = db.clone();
         let mirror_for_grpc = shared_mirror_manager.clone();
+        let shadow_for_grpc = shared_shadow_manager.clone();
+        let tls_for_grpc = tls_manager.clone();
         let grpc_handle = tokio::spawn(async move {
-            if let Err(e) = grpc::start(grpc_addr, db_for_grpc, tls_manager, mirror_for_grpc).await {
+            if let Err(e) = grpc::start(grpc_addr, db_for_grpc, tls_for_grpc, mirror_for_grpc, shadow_for_grpc).await {
                 error!("gRPC server error: {}", e);
             }
         });
@@ -330,7 +393,7 @@ async fn main() -> anyhow::Result<()> {
         let purge_config = purge::PurgeConfig {
             storage: storage.clone(),
             purge_after_days: 30,
-            max_size_gb: 0,
+            max_size_gb: 4,
         };
         let db_for_purge = db.clone();
         Some(tokio::spawn(async move {
@@ -457,7 +520,52 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    info!("Server started - HTTP proxy, gRPC, and metrics active");
+    // Start admin dashboard API server
+    let dashboard_addr: SocketAddr = args.dashboard_addr.parse()
+        .expect("Invalid dashboard address");
+    // Parse dashboard config from the TOML config file
+    let dashboard_config = {
+        #[derive(serde::Deserialize)]
+        struct ConfigWrapper {
+            #[serde(default)]
+            dashboard: DashboardConfig,
+        }
+        match std::fs::read_to_string(&args.config) {
+            Ok(content) => {
+                match toml::from_str::<ConfigWrapper>(&content) {
+                    Ok(wrapped) => wrapped.dashboard,
+                    Err(_) => DashboardConfig::default(),
+                }
+            }
+            Err(_) => DashboardConfig::default(),
+        }
+    };
+    info!("Dashboard enabled: {}, credentials configured: {}",
+        dashboard_config.enabled,
+        dashboard_config.username.is_some() && dashboard_config.password_hash.is_some());
+
+    let admin_state = AdminState {
+        db: db.clone(),
+        cache_dir: cache_dir.clone(),
+        shadow_manager: shared_shadow_manager.clone(),
+        mirror_manager: shared_mirror_manager.clone(),
+        tls_manager: tls_manager.clone(),
+        config_path: PathBuf::from(&args.config),
+        dashboard_config: Arc::new(dashboard_config),
+        tailscale: Arc::new(monopsony_admin::auth::TailscaleDetector::new()),
+    };
+    let admin_router = monopsony_admin::admin_router(admin_state);
+    let dashboard_handle = tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::bind(dashboard_addr)
+            .await
+            .expect("Failed to bind dashboard port");
+        info!("Dashboard API listening on {}", dashboard_addr);
+        if let Err(e) = axum::serve(listener, admin_router.into_make_service()).await {
+            error!("Dashboard server error: {}", e);
+        }
+    });
+
+    info!("Server started - HTTP proxy, gRPC, metrics, and dashboard active");
 
     // Graceful shutdown: broadcast signal to all tasks
     let (shutdown_tx, _) = tokio::sync::broadcast::channel::<()>(1);
@@ -502,6 +610,7 @@ async fn main() -> anyhow::Result<()> {
     let remaining = drain_timeout.saturating_sub(drain_start.elapsed());
     let _ = tokio::time::timeout(remaining, proxy_handle).await;
     let _ = tokio::time::timeout(Duration::from_secs(5), metrics_handle).await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), dashboard_handle).await;
 
     if let Some(disc) = discovery_service {
         if let Err(e) = disc.stop() {
@@ -596,13 +705,23 @@ async fn handle_pair_command(
                     // Generate client certificate
                     let new_client_id = client_id_override
                         .map(|s| s.to_string())
-                        .unwrap_or_else(|| format!("client-{}", uuid::Uuid::new_v4().simple()));
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+
+                    // Parse as ClientId early — must be a bare UUID (no prefix)
+                    let cid = monopsony_common::ClientId::parse(&new_client_id)
+                        .map_err(|e| anyhow::anyhow!("Invalid client ID: {}", e))?;
 
                     let (client_cert, client_key) = tls_manager.generate_client_cert(&new_client_id)?;
                     let (client_cert_pem, client_key_pem) = tls::TlsManager::cert_and_key_to_pem(&client_cert, &client_key);
                     let ca_cert_pem = tls_manager.ca_cert_pem_bytes();
 
-                    // Build PairResponse
+                    // Record pairing in DB BEFORE sending response — ensures the
+                    // DB row exists before the client receives its credentials.
+                    if let Some(db) = db.as_ref() {
+                        db.record_pairing(&cid, chrono::Utc::now()).await?;
+                    }
+
+                    // Build and send PairResponse
                     let resp = monopsony_common::proto::monopsony::PairResponse {
                         client_id: new_client_id.clone(),
                         client_cert_pem,
@@ -616,14 +735,6 @@ async fn handle_pair_command(
                     socket.write_all(&resp_bytes).await?;
 
                     info!("Client certificates sent to {}", addr);
-
-                    // Record pairing in DB
-                    if let Some(db) = db.as_ref() {
-                        let cid = monopsony_common::ClientId::parse(&new_client_id)
-                            .map_err(|e| anyhow::anyhow!("Invalid client ID: {}", e))?;
-                        db.record_pairing(&cid, chrono::Utc::now()).await?;
-                    }
-
                     println!("Pairing complete with client: {}", new_client_id);
                     println!("Client can now connect over mTLS on {}", server_addr);
                 }

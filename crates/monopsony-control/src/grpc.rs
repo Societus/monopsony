@@ -26,16 +26,18 @@ use monopsony_common::proto::monopsony::monopsony_control_server::{
 
 use monopsony_db::Database;
 use monopsony_mirror::MirrorManager;
+use monopsony_shadow::ShadowPackageManager;
 use crate::tls::TlsManager;
 
 pub struct MonopsonyGrpc {
     db: Arc<Database>,
     tls_manager: Arc<TlsManager>,
+    shadow_manager: Option<Arc<ShadowPackageManager>>,
 }
 
 impl MonopsonyGrpc {
-    pub fn new(db: Arc<Database>, tls_manager: Arc<TlsManager>) -> Self {
-        Self { db, tls_manager }
+    pub fn new(db: Arc<Database>, tls_manager: Arc<TlsManager>, shadow_manager: Option<Arc<ShadowPackageManager>>) -> Self {
+        Self { db, tls_manager, shadow_manager }
     }
 
     async fn handle_register(&self, req: RegisterRequest) -> Result<RegisterResponse> {
@@ -327,13 +329,14 @@ impl MonopsonyControl for MonopsonyGrpc {
     ) -> Result<Response<Self::ControlStreamStream>, Status> {
         let db = self.db.clone();
         let tls_manager = self.tls_manager.clone();
+        let shadow_manager = self.shadow_manager.clone();
         let mut stream = request.into_inner();
 
         let output = async_stream::stream! {
             while let Some(msg) = stream.next().await {
                 match msg {
                     Ok(client_msg) => {
-                        let grpc = MonopsonyGrpc::new(db.clone(), tls_manager.clone());
+                        let grpc = MonopsonyGrpc::new(db.clone(), tls_manager.clone(), shadow_manager.clone());
                         yield grpc.dispatch_client_message(client_msg).await;
                     }
                     Err(status) => {
@@ -347,64 +350,349 @@ impl MonopsonyControl for MonopsonyGrpc {
         Ok(Response::new(Box::pin(output)))
     }
 
-    // ── Shadow package RPC stubs (Batch C) ──
+    // ── Shadow package RPCs ──
 
     async fn list_shadow_packages(
         &self,
-        _request: Request<ListShadowPackagesRequest>,
+        request: Request<ListShadowPackagesRequest>,
     ) -> Result<Response<ShadowPackageList>, Status> {
-        Err(Status::unimplemented("list_shadow_packages not yet implemented"))
+        let req = request.into_inner();
+        let client_id = ClientId::parse(&req.client_id).map_err(|e| {
+            Status::invalid_argument(format!("Invalid client ID: {e}"))
+        })?;
+
+        let rows = self.db.list_shadow_packages_for_client(&client_id.0).await
+            .map_err(|e| Status::internal(format!("DB error listing shadow packages: {e}")))?;
+
+        let packages: Vec<ShadowPackageInfo> = rows.iter().filter_map(|row| {
+            let v = row.0.as_object()?;
+            Some(ShadowPackageInfo {
+                id: v.get("id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                name: v.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                version: v.get("version").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                architecture: v.get("architecture").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                os_family: v.get("os_family").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                libc: v.get("libc").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                source_type: v.get("source_type").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                source_url: v.get("source_url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                recipe_path: v.get("recipe_path").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                install_paths: v.get("install_paths").and_then(|x| x.as_str())
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                    .unwrap_or_default(),
+                config_paths: v.get("config_paths").and_then(|x| x.as_str())
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                    .unwrap_or_default(),
+                service_name: v.get("service_name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                masked_from_pm: v.get("masked_from_pm").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                registered_at: v.get("registered_at").and_then(|x| {
+                    // Handle both numeric timestamps and ISO strings
+                    if let Some(n) = x.as_i64() { Some(n) }
+                    else if let Some(s) = x.as_str() {
+                        chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp())
+                    } else { None }
+                }).unwrap_or(0),
+                last_updated_at: v.get("last_updated_at").and_then(|x| {
+                    if let Some(n) = x.as_i64() { Some(n) }
+                    else if let Some(s) = x.as_str() {
+                        chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp())
+                    } else { None }
+                }).unwrap_or(0),
+                last_checked_at: v.get("last_checked_at").and_then(|x| {
+                    if let Some(n) = x.as_i64() { Some(n) }
+                    else if let Some(s) = x.as_str() {
+                        chrono::DateTime::parse_from_rfc3339(s).ok().map(|dt| dt.timestamp())
+                    } else { None }
+                }).unwrap_or(0),
+            })
+        }).collect();
+
+        Ok(Response::new(ShadowPackageList { packages }))
     }
 
     async fn register_shadow_package(
         &self,
-        _request: Request<RegisterShadowPackageRequest>,
+        request: Request<RegisterShadowPackageRequest>,
     ) -> Result<Response<ShadowPackageInfo>, Status> {
-        Err(Status::unimplemented("register_shadow_package not yet implemented"))
+        let req = request.into_inner();
+        let client_id = ClientId::parse(&req.client_id).map_err(|e| {
+            Status::invalid_argument(format!("Invalid client ID: {e}"))
+        })?;
+
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+
+        let install_paths = serde_json::json!(req.install_paths);
+        // TODO: serialize config_paths to JSON value when proto supports it
+        let config_paths_val: Option<&serde_json::Value> = None;
+
+        let service_name = if req.service_name.is_empty() { None } else { Some(req.service_name.as_str()) };
+        let masked_from_pm = if req.mask_from_pm {
+            Some("true")
+        } else {
+            None
+        };
+
+        let id = self.db.create_shadow_package(
+            &client_id.0,
+            &req.name,
+            &req.version,
+            &req.architecture,
+            &req.os_family,
+            if req.libc.is_empty() { None } else { Some(req.libc.as_str()) },
+            &req.source_type,
+            &req.source_url,
+            &req.recipe_toml,
+            &install_paths,
+            config_paths_val,
+            service_name,
+            masked_from_pm,
+        ).await.map_err(|e| Status::internal(format!("DB error creating shadow package: {e}")))?;
+
+        Ok(Response::new(ShadowPackageInfo {
+            id: id.to_string(),
+            name: req.name,
+            version: req.version,
+            architecture: req.architecture,
+            os_family: req.os_family,
+            libc: req.libc,
+            source_type: req.source_type,
+            source_url: req.source_url,
+            recipe_path: req.recipe_toml,
+            install_paths: req.install_paths,
+            config_paths: req.config_paths,
+            service_name: req.service_name,
+            masked_from_pm: req.mask_from_pm.to_string(),
+            registered_at: chrono::Utc::now().timestamp(),
+            last_updated_at: chrono::Utc::now().timestamp(),
+            last_checked_at: 0,
+        }))
     }
 
     async fn unregister_shadow_package(
         &self,
-        _request: Request<UnregisterShadowPackageRequest>,
+        request: Request<UnregisterShadowPackageRequest>,
     ) -> Result<Response<UnregisterShadowPackageResponse>, Status> {
-        Err(Status::unimplemented("unregister_shadow_package not yet implemented"))
+        let req = request.into_inner();
+        let _client_id = ClientId::parse(&req.client_id).map_err(|e| {
+            Status::invalid_argument(format!("Invalid client ID: {e}"))
+        })?;
+        let package_id = uuid::Uuid::parse_str(&req.package_id).map_err(|e| {
+            Status::invalid_argument(format!("Invalid package ID: {e}"))
+        })?;
+
+        let deleted = self.db.delete_shadow_package(&package_id).await
+            .map_err(|e| Status::internal(format!("DB error deleting shadow package: {e}")))?;
+
+        Ok(Response::new(UnregisterShadowPackageResponse {
+            deleted,
+            message: if deleted {
+                format!("Shadow package {} removed", req.package_id)
+            } else {
+                format!("Shadow package {} not found", req.package_id)
+            },
+        }))
     }
 
     async fn check_shadow_updates(
         &self,
-        _request: Request<CheckShadowUpdatesRequest>,
+        request: Request<CheckShadowUpdatesRequest>,
     ) -> Result<Response<ShadowUpdateList>, Status> {
-        Err(Status::unimplemented("check_shadow_updates not yet implemented"))
+        let req = request.into_inner();
+        let client_id = ClientId::parse(&req.client_id).map_err(|e| {
+            Status::invalid_argument(format!("Invalid client ID: {e}"))
+        })?;
+
+        // If shadow manager is available, use it for real update checking
+        if let Some(ref mgr) = self.shadow_manager {
+            let rows = self.db.list_shadow_packages_for_client(&client_id.0).await
+                .map_err(|e| Status::internal(format!("DB error: {e}")))?;
+
+            let mut updates = vec![];
+            for row in &rows {
+                let v = match row.0.as_object() {
+                    Some(v) => v,
+                    None => continue,
+                };
+                let pkg_id_str = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                let pkg_id = match uuid::Uuid::parse_str(pkg_id_str) {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                let source_url = v.get("source_url").and_then(|x| x.as_str()).unwrap_or("");
+                let version = v.get("version").and_then(|x| x.as_str()).unwrap_or("");
+                let tag_pattern = v.get("tag_pattern").and_then(|x| x.as_str()).unwrap_or(".*");
+
+                match mgr.check_one(&pkg_id, source_url, tag_pattern, version).await {
+                    Ok(Some(info)) => {
+                        updates.push(monopsony_common::proto::monopsony::ShadowUpdateInfo {
+                            package_id: info.package_id,
+                            package_name: info.package_name,
+                            current_version: info.current_version,
+                            latest_version: info.latest_version,
+                            asset_url: info.asset_url.unwrap_or_default(),
+                            asset_name: info.asset_name.unwrap_or_default(),
+                            asset_size: info.asset_size.unwrap_or(0) as i64,
+                            release_notes_url: info.release_notes_url.unwrap_or_default(),
+                        });
+                    }
+                    Ok(None) => { /* up to date */ }
+                    Err(e) => {
+                        warn!(package_id = %pkg_id, error = %e, "Shadow update check failed");
+                    }
+                }
+            }
+            Ok(Response::new(ShadowUpdateList { updates }))
+        } else {
+            // No shadow manager -- return empty (same as before)
+            Ok(Response::new(ShadowUpdateList { updates: vec![] }))
+        }
     }
 
     async fn apply_shadow_update(
         &self,
-        _request: Request<ApplyShadowUpdateRequest>,
+        request: Request<ApplyShadowUpdateRequest>,
     ) -> Result<Response<ShadowUpdateResult>, Status> {
-        Err(Status::unimplemented("apply_shadow_update not yet implemented"))
+        let req = request.into_inner();
+        let package_id = uuid::Uuid::parse_str(&req.package_id).map_err(|e| {
+            Status::invalid_argument(format!("Invalid package ID: {e}"))
+        })?;
+
+        // Record the update in history. The actual update is performed client-side
+        // (download, extract, apply). The server records the intent.
+        let history_id = self.db.record_shadow_update(
+            &package_id,
+            &req.target_version,
+            "", // from_version unknown to server
+            "pending",
+            if req.create_backup { Some("pending") } else { None },
+        ).await.map_err(|e| Status::internal(format!("DB error recording shadow update: {e}")))?;
+
+        Ok(Response::new(ShadowUpdateResult {
+            success: true,
+            message: format!("Update recorded as {} (history: {})", req.target_version, history_id),
+            new_version: req.target_version,
+            backup_path: String::new(),
+        }))
     }
 
     async fn rollback_shadow_update(
         &self,
-        _request: Request<RollbackShadowUpdateRequest>,
+        request: Request<RollbackShadowUpdateRequest>,
     ) -> Result<Response<ShadowUpdateResult>, Status> {
-        Err(Status::unimplemented("rollback_shadow_update not yet implemented"))
+        let req = request.into_inner();
+        let package_id = uuid::Uuid::parse_str(&req.package_id).map_err(|e| {
+            Status::invalid_argument(format!("Invalid package ID: {e}"))
+        })?;
+
+        // Record rollback intent in update history
+        let history_id = self.db.record_shadow_update(
+            &package_id,
+            "", // target version from rollback
+            "", // from_version unknown to server
+            "rollback_pending",
+            None,
+        ).await.map_err(|e| Status::internal(format!("DB error recording shadow rollback: {e}")))?;
+
+        Ok(Response::new(ShadowUpdateResult {
+            success: true,
+            message: format!("Rollback recorded (history: {})", history_id),
+            new_version: String::new(),
+            backup_path: String::new(),
+        }))
     }
 
     async fn get_shadow_recipe(
         &self,
-        _request: Request<GetShadowRecipeRequest>,
+        request: Request<GetShadowRecipeRequest>,
     ) -> Result<Response<SignedShadowRecipe>, Status> {
-        Err(Status::unimplemented("get_shadow_recipe not yet implemented"))
+        let req = request.into_inner();
+        let client_id = ClientId::parse(&req.client_id).map_err(|e| {
+            Status::invalid_argument(format!("Invalid client ID: {e}"))
+        })?;
+        let package_name = req.package_name.trim().to_string();
+
+        if package_name.is_empty() {
+            return Err(Status::invalid_argument("package_name is required"));
+        }
+
+        // Look up the shadow package by name within the client's packages
+        let rows = self.db.list_shadow_packages_for_client(&client_id.0).await
+            .map_err(|e| Status::internal(format!("DB error: {e}")))?;
+
+        let pkg = rows.iter().find_map(|row| {
+            let v = row.0.as_object()?;
+            if v.get("name").and_then(|x| x.as_str()) == Some(&package_name) {
+                Some(v.clone())
+            } else {
+                None
+            }
+        }).ok_or_else(|| Status::not_found(format!("Shadow package '{package_name}' not found")))?;
+
+        let recipe_toml = pkg.get("recipe_path").and_then(|x| x.as_str()).unwrap_or("").to_string();
+        if recipe_toml.is_empty() {
+            return Err(Status::not_found(format!("No recipe TOML stored for '{package_name}'")));
+        }
+
+        // Parse the recipe TOML to get a ShadowRecipe struct for signing
+        let recipe = monopsony_shadow::shadow_recipe::parse_recipe_str(&recipe_toml)
+            .map_err(|e| Status::internal(format!("Failed to parse recipe: {e}")))?;
+
+        // Sign the recipe using the shadow manager's signing key
+        let mgr = self.shadow_manager.as_ref()
+            .ok_or_else(|| Status::unimplemented("Shadow manager not available for recipe signing"))?;
+
+        let signed = {
+            use monopsony_shadow::shadow_signing::{sign_recipe, key_id};
+            let signed_recipe = sign_recipe(&recipe_toml, recipe, mgr.signing_key_ref());
+            SignedShadowRecipe {
+                recipe_toml: signed_recipe.recipe_toml,
+                key_id: key_id(&mgr.signing_key_ref().verifying_key()),
+                signature: signed_recipe.operator_signature.signature,
+                signed_at: signed_recipe.operator_signature.signed_at.timestamp(),
+            }
+        };
+
+        Ok(Response::new(signed))
     }
 
     type DownloadShadowAssetStream = Pin<Box<dyn Stream<Item = Result<ShadowAssetChunk, Status>> + Send>>;
 
     async fn download_shadow_asset(
         &self,
-        _request: Request<DownloadShadowAssetRequest>,
+        request: Request<DownloadShadowAssetRequest>,
     ) -> Result<Response<Self::DownloadShadowAssetStream>, Status> {
-        Err(Status::unimplemented("download_shadow_asset not yet implemented"))
+        let req = request.into_inner();
+        let _client_id = ClientId::parse(&req.client_id).map_err(|e| {
+            Status::invalid_argument(format!("Invalid client ID: {e}"))
+        })?;
+
+        let mgr = self.shadow_manager.as_ref()
+            .ok_or_else(|| Status::unimplemented("Shadow manager not available for asset download"))?;
+
+        let cache = mgr.cache_ref();
+
+        // Look up the cached asset by package_id + target_version
+        // The cache uses package name (not UUID), so we need to resolve
+        let blob_data = cache.read_blob(&req.target_version).await
+            .map_err(|e| Status::internal(format!("Cache read error: {e}")))?;
+
+        let total_size = blob_data.len() as i64;
+        let chunk_size = 64 * 1024; // 64KB chunks
+        let blob_hash = req.target_version.clone();
+
+        let output = async_stream::stream! {
+            for (offset, chunk) in blob_data.chunks(chunk_size).enumerate() {
+                yield Ok(ShadowAssetChunk {
+                    data: chunk.to_vec(),
+                    offset: (offset * chunk_size) as i64,
+                    total_size,
+                    blob_hash: blob_hash.clone(),
+                });
+            }
+        };
+
+        Ok(Response::new(Box::pin(output)))
     }
 }
 
@@ -413,12 +701,13 @@ pub async fn start(
     db: Arc<Database>,
     tls_manager: Arc<TlsManager>,
     mirror_manager: Option<Arc<MirrorManager>>,
+    shadow_manager: Option<Arc<ShadowPackageManager>>,
 ) -> Result<()> {
     info!(addr = %addr, "gRPC server starting (mTLS required)");
 
-    let grpc = MonopsonyGrpc::new(db.clone(), tls_manager.clone());
+    let grpc = MonopsonyGrpc::new(db.clone(), tls_manager.clone(), shadow_manager);
 
-    let tls_config = tls_manager.tonic_server_tls_config()?;
+    let tls_config = tls_manager.tonic_server_tls_config(Some(addr.ip()))?;
 
     let mut builder = tonic::transport::Server::builder()
         .tls_config(tls_config).context("Failed to configure TLS")?;
