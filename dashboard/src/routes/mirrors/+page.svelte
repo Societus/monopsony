@@ -91,10 +91,20 @@
   }
 
   async function triggerSync(distro: string) {
+    const mirror = mirrors.find(m => m.distro === distro);
+    if (mirror) {
+      mirror.sync_status = 'syncing';
+    }
     try {
-      await api.mirrors.sync(distro);
+      const res = await api.mirrors.sync(distro);
+      // Refresh after a short delay to show updated status
+      setTimeout(() => load(), 3000);
     } catch (e: any) {
       error = e.message;
+      // Restore status on error
+      if (mirror) {
+        mirror.sync_status = 'idle';
+      }
     }
   }
 
@@ -171,8 +181,12 @@
               <td class="px-4 py-2.5 font-medium">{m.distro}</td>
               <td class="px-4 py-2.5 max-w-xs truncate font-mono text-xs">{m.upstream_url}</td>
               <td class="px-4 py-2.5">
-                {#if m.sync_enabled}
-                  <span class="badge badge-success">{m.sync_status || 'enabled'}</span>
+                {#if m.sync_enabled || m.sync_status === 'syncing'}
+                  {#if m.sync_status === 'syncing'}
+                    <span class="badge badge-info animate-pulse">syncing…</span>
+                  {:else}
+                    <span class="badge badge-success">{m.sync_status || 'enabled'}</span>
+                  {/if}
                 {:else}
                   <span class="badge badge-muted">disabled</span>
                 {/if}
@@ -188,8 +202,12 @@
               </td>
               <td class="px-4 py-2.5">
                 <div class="flex gap-1">
-                  <button class="btn-ghost rounded p-1.5" onclick={() => triggerSync(m.distro)} title="Sync now">
-                    <Zap size={14} />
+                  <button class="btn-ghost rounded p-1.5" onclick={() => triggerSync(m.distro)} title="Sync now" disabled={m.sync_status === 'syncing'}>
+                    {#if m.sync_status === 'syncing'}
+                      <RefreshCw size={14} class="animate-spin" />
+                    {:else}
+                      <Zap size={14} />
+                    {/if}
                   </button>
                   <button class="btn-ghost rounded p-1.5" onclick={() => removeMirror(m.distro)} title="Remove">
                     <Trash2 size={14} />

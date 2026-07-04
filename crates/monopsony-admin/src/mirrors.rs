@@ -7,6 +7,7 @@ use axum::{
 };
 use serde::Deserialize;
 use sqlx::Row;
+use tracing::{info, warn};
 
 use crate::AdminState;
 
@@ -134,17 +135,49 @@ pub async fn handle_delete_mirror(
 }
 
 /// POST /api/v1/mirrors/:distro/sync — trigger immediate sync.
+///
+/// Spawns the sync as a background task so the HTTP response returns
+/// immediately. The sync status is visible via GET /mirrors/:distro/status.
 pub async fn handle_trigger_sync(
     State(state): State<AdminState>,
     Path(distro): Path<String>,
 ) -> impl IntoResponse {
-    if let Some(ref mgr) = state.mirror_manager {
-        match mgr.trigger_sync(&distro).await {
-            Ok(()) => Json(serde_json::json!({"success": true, "message": "Sync triggered"})),
-            Err(e) => Json(serde_json::json!({"success": false, "message": e})),
+    let mgr = match &state.mirror_manager {
+        Some(m) => m.clone(),
+        None => return Json(serde_json::json!({"success": false, "message": "Mirror manager not available"})),
+    };
+
+    // Verify the mirror exists before spawning
+    match mgr.get_config(&distro).await {
+        Some(config) => {
+            if config.sync_status == "syncing" {
+                return Json(serde_json::json!({"success": false, "message": "Sync already in progress"}));
+            }
+
+            // Mark as syncing immediately so the UI reflects it
+            if let Some(ref db) = state.db {
+                let _ = db.update_mirror_sync_status(&distro, "syncing").await;
+            }
+
+            // Spawn the sync as a detached background task
+            let distro_cloned = distro.clone();
+            let db = state.db.clone();
+            tokio::spawn(async move {
+                let result = mgr.trigger_sync(&distro_cloned).await;
+                match &result {
+                    Ok(()) => info!("Background sync completed for {}", distro_cloned),
+                    Err(e) => {
+                        warn!("Background sync failed for {}: {}", distro_cloned, e);
+                        if let Some(db) = db {
+                            let _ = db.update_mirror_sync_status(&distro_cloned, &format!("error: {}", e)).await;
+                        }
+                    }
+                }
+            });
+
+            Json(serde_json::json!({"success": true, "message": "Sync started in background"}))
         }
-    } else {
-        Json(serde_json::json!({"success": false, "message": "Mirror manager not available"}))
+        None => Json(serde_json::json!({"success": false, "message": format!("Mirror not found: {}", distro)})),
     }
 }
 

@@ -212,10 +212,56 @@ impl MirrorManager {
         let content = tokio::fs::read_to_string(&config_path).await?;
         let file: MirrorConfigFile = toml::from_str(&content)?;
         let configs = file.mirrors;
-        info!("Loaded {} mirror configuration(s)", configs.len());
+        info!("Loaded {} mirror configuration(s) from TOML", configs.len());
 
         let mut guard = self.configs.write().await;
         *guard = configs;
+        Ok(())
+    }
+
+    /// Load mirror configurations from the database into the in-memory list.
+    ///
+    /// Called during server startup to reconcile in-memory state with what was
+    /// previously persisted to the DB (auto-created from client pairing, or
+    /// manually added via dashboard). Does not overwrite configs already loaded
+    /// from TOML.
+    pub async fn load_from_db(&self) -> anyhow::Result<()> {
+        let Some(db) = &self.db else { return Ok(()); };
+
+        let rows = db.list_mirror_configs().await?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut guard = self.configs.write().await;
+        let mut loaded = 0;
+        for row in &rows {
+            // Don't overwrite configs already loaded from TOML
+            if guard.iter().any(|c| c.distro == row.distro) {
+                continue;
+            }
+
+            guard.push(MirrorConfig {
+                distro: row.distro.clone(),
+                upstream_url: row.upstream_url.clone(),
+                local_path: PathBuf::from(&row.local_path),
+                sync_enabled: row.sync_enabled,
+                sync_interval_secs: row.sync_interval_secs as u64,
+                bandwidth_limit_bps: row.bandwidth_limit_bps.map(|v| v as u64),
+                include_patterns: serde_json::from_value(row.include_patterns.clone()).unwrap_or_default(),
+                exclude_patterns: serde_json::from_value(row.exclude_patterns.clone()).unwrap_or_default(),
+                public: row.public,
+                sync_status: row.sync_status.clone(),
+                last_sync: row.last_sync.map(|dt| dt.timestamp()),
+                total_bytes: row.total_bytes as u64,
+                ..Default::default()
+            });
+            loaded += 1;
+        }
+
+        if loaded > 0 {
+            info!("Loaded {} mirror configuration(s) from database", loaded);
+        }
         Ok(())
     }
 

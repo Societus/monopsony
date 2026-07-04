@@ -337,6 +337,11 @@ async fn main() -> anyhow::Result<()> {
         if let Err(e) = mgr.load_config().await {
             warn!("Could not load mirror config: {}", e);
         }
+        // Also load any configs persisted in the DB (auto-created from client
+        // pairing, or manually added via dashboard on a previous run).
+        if let Err(e) = mgr.load_from_db().await {
+            warn!("Could not load mirror configs from DB: {}", e);
+        }
         info!("Mirror directory: {}", mirror_dir.display());
         Some(Arc::new(mgr))
     } else {
