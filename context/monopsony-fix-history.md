@@ -305,3 +305,49 @@ Musl binaries already built and available at `target/x86_64-unknown-linux-musl/r
 
 *Document created: 2026-07-01 | From kanban task t_b75654a5 (runs 1 & 2, timed out at 150 iterations each)*
 *Last updated: 2026-07-01 | Attempt 7 completed successfully - SKI/AKI extensions added*
+
+---
+
+## Session 2026-07-04: Cache Population Fix (5 bugs)
+
+### Commits
+- `f03ac30` — fix(proxy+prefetch): HTTPS client, correct SQL query, cache key alignment
+- `5899a15` — fix(proxy): release concurrent slots + raise rate limits for LAN
+
+### Bugs fixed
+
+1. **proxy.rs `build_http()`** — HTTP-only client, couldn't fetch HTTPS upstreams.
+   All Arch mirrors serve HTTPS. Fixed: `build_https_client()` using hyper_rustls.
+
+2. **prefetch.rs `build_http()`** — Same issue, prefetch couldn't download HTTPS.
+
+3. **prefetch.rs `find_uncached_packages()`** — Queried `packages.upstream_url` (empty
+   for all rows). Fixed: join `upstream_packages.download_url` → `packages` → `client_packages`.
+
+4. **prefetch.rs `url_to_cache_key()`** — Used `prefetch/{host}/{path}` namespace.
+   Proxy uses backend-aware keys (`pacman/core/os/...`). Fixed: same backend pattern matching.
+
+5. **proxy.rs concurrent slot leak** — `acquire_concurrent()` called but
+   `release_concurrent()` never called. After 20 requests per IP, all further
+   requests got 429. Fixed: release slot after response is built.
+
+### Additional fix
+- URL scheme normalization: forward-proxy requests arrive as `http://`, prefetch
+  stores `https://`. `normalize_url_scheme()` upgrades http→https for DB lookups.
+- Prefetch metadata format: added missing CacheEntry fields (etag, last_modified,
+  last_accessed, hit_count) so `load_meta()` can deserialize for X-Cache headers.
+- Rate limits raised for LAN: 100→1000 req/min, 20→50 concurrent per IP.
+
+### Verification (live on 10.10.20.58 + 10.10.20.20 + 10.10.20.159)
+- Prefetch: 0 → 229 packages cached (was finding nothing)
+- Arch `pacman -Syu`: 30 packages upgraded through cache, 0 rate rejections
+- Arch cache HIT verified: bash + nano reinstall incremented `hit_count` in DB
+- Alpine `apk upgrade --available`: 20 packages upgraded (3.22.0→3.22.5), but
+  packages NOT cached — no apk backend exists yet (passthrough only)
+
+### Known remaining issues
+- **No apk backend** — Alpine packages pass through uncached. See `context/2026-07-04-alpine-apk-backend.md`
+- **HTTPS CONNECT tunneling not implemented** — direct HTTPS proxy mode (`curl -x proxy https://...`)
+  returns 404. Workaround: use HTTP URLs (proxy normalizes to HTTPS upstream). Affects clients
+  configured with HTTPS-only repos unless they can be switched to HTTP.
+- **Server logging hardcoded to INFO** — `main.rs:210` uses `Level::INFO`, ignores `RUST_LOG`
