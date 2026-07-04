@@ -16,7 +16,7 @@ pub const MAX_RESPONSE_BODY_SIZE: u64 = 512 * 1024 * 1024;
 
 /// Default rate limit: 100 requests per window
 #[allow(dead_code)] // Will be used as default in rate limit config
-pub const DEFAULT_RATE_LIMIT_REQUESTS: u32 = 100;
+pub const DEFAULT_RATE_LIMIT_REQUESTS: u32 = 1000;
 
 /// Default rate limit window: 60 seconds
 #[allow(dead_code)] // Will be used as default in rate limit config
@@ -24,7 +24,7 @@ pub const DEFAULT_RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 /// Default concurrent connection limit per IP
 #[allow(dead_code)] // Will be used as default in concurrent limit config
-pub const DEFAULT_MAX_CONCURRENT_PER_IP: u32 = 20;
+pub const DEFAULT_MAX_CONCURRENT_PER_IP: u32 = 50;
 
 /// Check if an IP address is private/link-local/loopback (SSRF prevention).
 /// Returns true if the address should be blocked.

@@ -202,7 +202,8 @@ pub async fn handle_proxy_request(
     debug!("Proxy request: {} {}", method, uri);
 
     // Check rate limit if a limiter is configured
-    if let Some(limiter) = &rate_limiter {
+    let limiter_clone = rate_limiter.clone();
+    let needs_release = if let Some(limiter) = &rate_limiter {
         let ip = addr.ip();
         if !limiter.check_rate(&ip) {
             warn!("Rate limit exceeded for {}", ip);
@@ -218,7 +219,10 @@ pub async fn handle_proxy_request(
                 .body(Body::from("Too many concurrent connections"))
                 .unwrap_or_else(|_| Response::new(Body::from("Too many concurrent connections")));
         }
-    }
+        true
+    } else {
+        false
+    };
 
     // Federation gate: reject peer requests on private-tier nodes
     if request.headers().contains_key("x-federated-peer") {
@@ -273,13 +277,22 @@ pub async fn handle_proxy_request(
     // Check if this URL matches a package manager pattern
     let is_package = state.find_backend_for_url(&url).is_some();
 
-    if is_package {
+    let response = if is_package {
         debug!("Package URL detected: {}", url);
         handle_cached_request(&state, request, &url).await
     } else {
         debug!("Non-package URL, passing through: {}", url);
         proxy_passthrough(&state, request).await
+    };
+
+    // Release the concurrent connection slot
+    if needs_release {
+        if let Some(limiter) = &limiter_clone {
+            limiter.release_concurrent(&addr.ip());
+        }
     }
+
+    response
 }
 
 /// Handle a request with caching
