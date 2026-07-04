@@ -64,7 +64,13 @@ impl MonopsonyGrpcClient {
             Channel::from_shared(uri)?
         };
 
-        let client = MonopsonyControlClient::connect(endpoint).await?;
+        // Connect the channel DIRECTLY — do NOT pass the Endpoint through
+        // MonopsonyControlClient::connect(), because tonic's generated connect()
+        // calls Endpoint::new() internally, which overwrites any custom TLS config
+        // with system roots when it detects an HTTPS URI (see tonic-0.12 endpoint.rs:53).
+        let channel = endpoint.connect().await?;
+
+        let client = MonopsonyControlClient::new(channel);
         info!("gRPC connection established");
 
         Ok(Self {
@@ -190,7 +196,13 @@ impl MonopsonyGrpcClient {
         use prost::Message;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let pair_addr = format!("{}:50052", server_addr.trim_end_matches(":50051"));
+        // Derive pairing port (50052) from the server address.
+        // Handles: "host", "host:50051", "host:50052", or "host:other"
+        let pair_addr = if server_addr.ends_with(":50052") {
+            server_addr.to_string()
+        } else {
+            format!("{}:50052", server_addr.trim_end_matches(":50051"))
+        };
         let mut stream = tokio::net::TcpStream::connect(&pair_addr).await
             .map_err(|e| anyhow::anyhow!("Failed to connect to pairing port {}: {}", pair_addr, e))?;
 

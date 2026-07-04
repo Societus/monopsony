@@ -142,19 +142,23 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Pair client with server (establishes mTLS trust)
+    /// Pair client with server (starts pairing via admin API on the running daemon)
     Pair {
-        /// Server gRPC address to pair with
+        /// Dashboard/admin API address of the running server
         #[arg(short, long)]
         server: String,
         
-        /// Paired client certificate directory (optional)
-        #[arg(long)]
-        cert_dir: Option<String>,
+        /// Admin API port (default: 3130)
+        #[arg(long, default_value = "3130")]
+        admin_port: u16,
         
-        /// Override paired client ID (optional)
+        /// Optional: admin username for authenticated dashboard
         #[arg(long)]
-        client_id: Option<String>,
+        admin_user: Option<String>,
+        
+        /// Optional: admin password for authenticated dashboard
+        #[arg(long)]
+        admin_pass: Option<String>,
     },
     /// API key management
     ApiKey {
@@ -208,8 +212,8 @@ async fn main() -> anyhow::Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     // Handle CLI subcommands
-    if let Some(Commands::Pair { server, cert_dir, client_id }) = &args.command {
-        return handle_pair_command(server, cert_dir.as_deref(), client_id.as_deref(), &args.grpc_addr).await;
+    if let Some(Commands::Pair { server, admin_port, admin_user, admin_pass }) = &args.command {
+        return handle_pair_via_admin_api(server, *admin_port, admin_user.as_deref(), admin_pass.as_deref()).await;
     }
     if let Some(Commands::ApiKey { action }) = &args.command {
         return handle_api_key_command(action, &args.database_url).await;
@@ -553,6 +557,9 @@ async fn main() -> anyhow::Result<()> {
         config_path: PathBuf::from(&args.config),
         dashboard_config: Arc::new(dashboard_config),
         tailscale: Arc::new(monopsony_admin::auth::TailscaleDetector::new()),
+        grpc_addr: args.grpc_addr.clone(),
+        pairing_manager: Arc::new(tokio::sync::Mutex::new(None)),
+        pairing_task: Arc::new(tokio::sync::Mutex::new(None)),
     };
     let admin_router = monopsony_admin::admin_router(admin_state);
     let dashboard_handle = tokio::spawn(async move {
@@ -622,131 +629,72 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn handle_pair_command(
-    server_grpc_addr: &str,
-    cert_dir: Option<&str>,
-    client_id_override: Option<&str>,
-    _local_grpc_addr: &str,
+async fn handle_pair_via_admin_api(
+    server: &str,
+    admin_port: u16,
+    admin_user: Option<&str>,
+    admin_pass: Option<&str>,
 ) -> anyhow::Result<()> {
-    use prost::Message;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    info!("Initiating pairing via admin API on {}:{}", server, admin_port);
 
-    let server_addr: SocketAddr = server_grpc_addr.parse().map_err(|e| {
-        anyhow::anyhow!("Invalid server address: {}. Example: 192.168.1.100:50051", e)
-    })?;
+    let client = reqwest::Client::new();
+    let url = format!("http://{}:{}/api/v1/pair/init", server, admin_port);
 
-    info!("Pairing with server: {}", server_addr);
+    let mut req = client.post(&url)
+        .header("Content-Type", "application/json")
+        .body("{}");
 
-    // Init TLS manager for this session
-    let cache_dir = PathBuf::from("/var/cache/monopsony");
-    let tls_dir = cert_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| cache_dir.join("tls"));
-    let tls_manager = tls::TlsManager::load_or_create(
-        &tls_dir.join("ca.crt"),
-        &tls_dir.join("ca.key"),
-    )?;
-
-    // Init DB for recording pairing
-    let db = {
-        let database_url = std::env::var("MONOPSONY_DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://monopsony:monopsony@localhost/monopsony".to_string());
-        match Database::connect(&database_url).await {
-            Ok(d) => { d.run_migrations().await?; Some(d) }
-            Err(_) => { warn!("No database available, pairing will not be recorded"); None }
-        }
-    };
-
-    // Generate 6-char alphanumeric pairing code
-    let charset: Vec<u8> = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789".to_vec(); // no ambiguous chars
-    let mut random_bytes = [0u8; 6];
-    getrandom::getrandom(&mut random_bytes)?;
-    let pairing_code: String = random_bytes.iter()
-        .map(|&b| charset[b as usize % charset.len()] as char)
-        .collect();
-
-    println!("Server pairing code: {}", pairing_code);
-    println!("Share this code with the client. Valid for 5 minutes.");
-    info!("Generated pairing code: {}", pairing_code);
-
-    // Short-lived plaintext listener on port 50052
-    let pair_addr: SocketAddr = "0.0.0.0:50052".parse()?;
-    let pair_listener = tokio::net::TcpListener::bind(pair_addr).await
-        .map_err(|e| anyhow::anyhow!("Failed to bind pairing port {}: {}", pair_addr, e))?;
-
-    info!("Pairing listener on {} (5-minute timeout)", pair_addr);
-
-    let timeout = tokio::time::Instant::now() + tokio::time::Duration::from_secs(300);
-
-    tokio::select! {
-        result = pair_listener.accept() => {
-            match result {
-                Ok((mut socket, addr)) => {
-                    info!("Client connected from {}", addr);
-
-                    // Read length-prefixed PairRequest
-                    let mut len_buf = [0u8; 4];
-                    socket.read_exact(&mut len_buf).await
-                        .map_err(|e| anyhow::anyhow!("Failed to read request: {}", e))?;
-                    let req_len = u32::from_le_bytes(len_buf) as usize;
-                    let mut req_buf = vec![0u8; req_len];
-                    socket.read_exact(&mut req_buf).await
-                        .map_err(|e| anyhow::anyhow!("Failed to read request body: {}", e))?;
-
-                    let req = monopsony_common::proto::monopsony::PairRequest::decode(req_buf.as_slice())
-                        .map_err(|e| anyhow::anyhow!("Failed to decode pair request: {}", e))?;
-
-                    if req.code != pairing_code {
-                        return Err(anyhow::anyhow!("Invalid pairing code"));
-                    }
-
-                    info!("Pairing code validated from {} ({})", req.hostname, req.os);
-
-                    // Generate client certificate
-                    let new_client_id = client_id_override
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
-
-                    // Parse as ClientId early — must be a bare UUID (no prefix)
-                    let cid = monopsony_common::ClientId::parse(&new_client_id)
-                        .map_err(|e| anyhow::anyhow!("Invalid client ID: {}", e))?;
-
-                    let (client_cert, client_key) = tls_manager.generate_client_cert(&new_client_id)?;
-                    let (client_cert_pem, client_key_pem) = tls::TlsManager::cert_and_key_to_pem(&client_cert, &client_key);
-                    let ca_cert_pem = tls_manager.ca_cert_pem_bytes();
-
-                    // Record pairing in DB BEFORE sending response — ensures the
-                    // DB row exists before the client receives its credentials.
-                    if let Some(db) = db.as_ref() {
-                        db.record_pairing(&cid, chrono::Utc::now()).await?;
-                    }
-
-                    // Build and send PairResponse
-                    let resp = monopsony_common::proto::monopsony::PairResponse {
-                        client_id: new_client_id.clone(),
-                        client_cert_pem,
-                        client_key_pem,
-                        ca_cert_pem,
-                        grpc_addr: format!("{}:{}", server_addr.ip(), server_addr.port()),
-                    };
-                    let resp_bytes = resp.encode_to_vec();
-                    let resp_len = resp_bytes.len() as u32;
-                    socket.write_all(&resp_len.to_le_bytes()).await?;
-                    socket.write_all(&resp_bytes).await?;
-
-                    info!("Client certificates sent to {}", addr);
-                    println!("Pairing complete with client: {}", new_client_id);
-                    println!("Client can now connect over mTLS on {}", server_addr);
-                }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("Failed to accept pairing connection: {}", e));
-                }
-            }
-        },
-        _ = tokio::time::sleep_until(timeout) => {
-            return Err(anyhow::anyhow!("Pairing timed out (5 minutes)"));
-        }
+    if let (Some(user), Some(pass)) = (admin_user, admin_pass) {
+        req = req.basic_auth(user, Some(pass));
     }
+
+    let resp = req.send().await
+        .map_err(|e| anyhow::anyhow!("Failed to reach admin API at {}: {}", url, e))?;
+
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+
+    if status == reqwest::StatusCode::CONFLICT {
+        // A session is already active — extract the existing code
+        let parsed: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("Failed to parse conflict response: {}", e))?;
+        let code = parsed.get("code")
+            .and_then(|v| v.as_str())
+            .unwrap_or("UNKNOWN");
+        println!("A pairing session is already active!");
+        println!("Code: {}", code);
+        println!();
+        println!("Client command:");
+        println!("  monopsony-client pair --server {}:50052 --code {}", server, code);
+        return Ok(());
+    }
+
+    if !status.is_success() {
+        anyhow::bail!("Admin API returned {}: {}", status, body);
+    }
+
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("Failed to parse pairing response: {}", e))?;
+
+    let code = parsed.get("code")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow::anyhow!("Missing code in pairing response"))?;
+
+    let cli_command = parsed.get("cli_command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    println!("========================================");
+    println!("     Monopsony Pairing Active");
+    println!("========================================");
+    println!();
+    println!("Pairing code: {}", code);
+    println!("Valid for 5 minutes.");
+    println!();
+    println!("On the client machine, run:");
+    println!("  {}", cli_command.replace("<SERVER_IP>", server));
+    println!();
+    println!("Or pair from the dashboard at http://{}:{}/dashboard", server, admin_port);
 
     Ok(())
 }

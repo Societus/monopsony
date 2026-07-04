@@ -31,13 +31,33 @@ pub async fn handle_list_cache(State(state): State<AdminState>) -> impl IntoResp
 
 /// GET /api/v1/cache/stats — cache statistics.
 pub async fn handle_cache_stats(State(state): State<AdminState>) -> impl IntoResponse {
-    let stats = monopsony_proxy::proxy::scan_cache_stats(&state.cache_dir).await;
-    Json(serde_json::json!({
-        "cache_dir": stats.cache_dir,
-        "total_entries": stats.total_entries,
-        "total_size_bytes": stats.total_size_bytes,
-        "total_meta_files": stats.total_meta_files,
-    }))
+    if let Some(ref db) = state.db {
+        match db.cache_stats().await {
+            Ok((total_entries, total_size_bytes)) => {
+                Json(serde_json::json!({
+                    "cache_dir": state.cache_dir.to_string_lossy(),
+                    "total_entries": total_entries,
+                    "total_size_bytes": total_size_bytes,
+                }))
+            }
+            Err(e) => {
+                tracing::error!("Failed to query cache stats: {}", e);
+                Json(serde_json::json!({
+                    "cache_dir": state.cache_dir.to_string_lossy(),
+                    "total_entries": 0,
+                    "total_size_bytes": 0,
+                    "error": e.to_string(),
+                }))
+            }
+        }
+    } else {
+        Json(serde_json::json!({
+            "cache_dir": state.cache_dir.to_string_lossy(),
+            "total_entries": 0,
+            "total_size_bytes": 0,
+            "error": "Database not available",
+        }))
+    }
 }
 
 /// DELETE /api/v1/cache/:key — purge a specific cache entry.

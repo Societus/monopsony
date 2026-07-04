@@ -29,6 +29,8 @@ bcrypt = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
 sqlx = { workspace = true }
+prost = { workspace = true }
+getrandom = "0.2"
 urlencoding = "2"
 
 [dev-dependencies]

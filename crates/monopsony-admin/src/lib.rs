@@ -9,6 +9,7 @@ pub mod clients;
 pub mod features;
 pub mod health;
 pub mod mirrors;
+pub mod pairing;
 pub mod recipe;
 pub mod settings;
 pub mod shadow;
@@ -43,6 +44,12 @@ pub struct AdminState {
     pub config_path: PathBuf,
     pub dashboard_config: Arc<DashboardConfig>,
     pub tailscale: Arc<auth::TailscaleDetector>,
+    /// The server's gRPC listen address (e.g. "0.0.0.0:50051") used in PairResponse.
+    pub grpc_addr: String,
+    /// Active pairing session (code, status, deadline) managed by the pairing module.
+    pub pairing_manager: Arc<tokio::sync::Mutex<Option<pairing::PairingSession>>>,
+    /// Handle to the spawned pairing listener task — aborted on cancel to free port 50052.
+    pub pairing_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 /// Dashboard configuration from `[dashboard]` in server.toml.
@@ -129,6 +136,10 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/api/v1/tracker/mirrors", get(tracker::handle_tracker_mirrors))
         .route("/api/v1/tracker/reputation/:npub", get(tracker::handle_tracker_reputation))
         .route("/api/v1/tracker/reports", get(tracker::handle_tracker_reports))
+        // Pairing
+        .route("/api/v1/pair/init", post(pairing::handle_pair_init))
+        .route("/api/v1/pair/status", get(pairing::handle_pair_status))
+        .route("/api/v1/pair/cancel", post(pairing::handle_pair_cancel))
         // Features & Monetization
         .route("/api/v1/features", get(features::handle_get_features))
         .route("/api/v1/features", axum::routing::put(features::handle_update_features))

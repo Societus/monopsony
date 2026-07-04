@@ -38,6 +38,11 @@ impl TlsManager {
     pub fn ca_cert_pem_bytes(&self) -> Vec<u8> {
         self.ca_cert_pem.as_bytes().to_vec()
     }
+
+    /// Return the DER-encoded CA certificate bytes (trust anchor).
+    pub fn ca_cert_der_bytes(&self) -> CertificateDer<'static> {
+        self.ca_cert_der.clone()
+    }
     /// Load an existing CA from disk, or generate a new one if neither file exists.
     ///
     /// - `ca_cert_path` — PEM file for the CA certificate.

@@ -657,6 +657,18 @@ impl Database {
         }))
     }
 
+    /// Aggregate cache statistics from the database.
+    pub async fn cache_stats(&self) -> Result<(u64, u64)> {
+        let row = sqlx::query(
+            "SELECT COUNT(*) as count, COALESCE(SUM(content_length), 0)::bigint as total_size FROM cache_entries",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        let count: i64 = row.get("count");
+        let total_size: i64 = row.get("total_size");
+        Ok((count as u64, total_size as u64))
+    }
+
     #[allow(dead_code)] // Admin API cache listing
     pub async fn list_cache_entries(&self) -> Result<Vec<CacheEntryRow>> {
         let rows = sqlx::query(
@@ -776,7 +788,7 @@ impl Database {
         client_id: &ClientId,
         paired_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE clients SET paired_at = $1, last_seen = $1 WHERE id = $2",
         )
         .bind(paired_at)
@@ -784,7 +796,14 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        info!("Recorded pairing for client {}", client_id);
+        if result.rows_affected() == 0 {
+            warn!(
+                "record_pairing: 0 rows affected for client {} — row was not created by register_client()",
+                client_id
+            );
+        } else {
+            info!("Recorded pairing for client {}", client_id);
+        }
         Ok(())
     }
 

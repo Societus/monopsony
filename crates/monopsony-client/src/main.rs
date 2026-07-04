@@ -46,7 +46,7 @@ enum Commands {
         #[arg(long)]
         server: Option<String>,
 
-        /// Timeout in ms before falling back to direct upstream
+        /// Timeout in ms before returning 503 to package manager
         #[arg(long, default_value = "5000")]
         timeout_ms: u64,
     },
@@ -397,9 +397,19 @@ async fn run_daemon(
         None
     };
 
+    // Derive HTTP proxy address from server address.
+    // The --server flag gives us the gRPC port (50051), but the HTTP forward proxy
+    // is on port 3128. We derive the proxy address from the server host.
+    let proxy_server_addr = {
+        let server_host = server_addr.split(':')
+            .next()
+            .unwrap_or("127.0.0.1");
+        format!("{}:3128", server_host)
+    };
+
     let proxy_config = proxy::ProxyConfig {
-        server_addr: server_addr.clone(),
-        fallback_timeout_ms: timeout_ms,
+        server_addr: proxy_server_addr,
+        timeout_ms,
     };
 
     info!("Local proxy listening on {}", listen_addr);
