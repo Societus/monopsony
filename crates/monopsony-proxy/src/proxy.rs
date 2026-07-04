@@ -74,7 +74,7 @@ impl ProxyState {
     pub fn new(storage: Arc<dyn CacheStorage>, db: Option<Arc<Database>>) -> Self {
         let client = build_https_client();
         let cache_dir = storage.base_dir().unwrap_or_default();
-        let backends = monopsony_common::package_manager::get_available_backends();
+        let backends = monopsony_common::package_manager::get_all_backends();
 
         Self {
             client,

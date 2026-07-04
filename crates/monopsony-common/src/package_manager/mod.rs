@@ -260,9 +260,14 @@ pub trait PackageManagerBackend: Send + Sync {
     fn remove_proxy_config(&self) -> ProxyConfigAction;
 }
 
-/// Get all available package manager backends for the current platform
-pub fn get_available_backends() -> Vec<Box<dyn PackageManagerBackend>> {
-    let backends: Vec<Box<dyn PackageManagerBackend>> = vec![
+/// Get all package manager backends (regardless of local availability).
+///
+/// Use this on the **server** where we need to match/cache URLs for all client
+/// OSes, not just the server's own OS. `get_available_backends()` filters by
+/// `is_available()` which checks for the PM binary locally — wrong for a server
+/// caching packages for Arch, Alpine, Debian, etc. clients simultaneously.
+pub fn get_all_backends() -> Vec<Box<dyn PackageManagerBackend>> {
+    vec![
         Box::new(AptBackend::new()),
         Box::new(DnfBackend::new()),
         Box::new(MportBackend::new()),
@@ -274,9 +279,18 @@ pub fn get_available_backends() -> Vec<Box<dyn PackageManagerBackend>> {
         Box::new(WingetBackend::new()),
         Box::new(ChocoBackend::new()),
         Box::new(ScoopBackend::new()),
-    ];
+    ]
+}
 
-    backends.into_iter().filter(|b| b.is_available()).collect()
+/// Get all package manager backends available on the current platform.
+///
+/// Use this on the **client** for inventory reporting (only report packages
+/// from PMs that are actually installed locally).
+pub fn get_available_backends() -> Vec<Box<dyn PackageManagerBackend>> {
+    get_all_backends()
+        .into_iter()
+        .filter(|b| b.is_available())
+        .collect()
 }
 
 /// Get a specific package manager backend by kind
@@ -296,10 +310,12 @@ pub fn get_backend(kind: PackageManagerKind) -> Option<Box<dyn PackageManagerBac
     }
 }
 
-/// Check if a URL matches any available package manager's upstream patterns.
+/// Check if a URL matches any package manager's upstream patterns.
 /// Returns true if the URL should be proxied through the cache server.
+/// Uses `get_all_backends()` so it matches URLs for all client OSes,
+/// not just PMs installed on this machine.
 pub fn matches_package_url(url: &str) -> bool {
-    get_available_backends()
+    get_all_backends()
         .iter()
         .any(|backend| backend.upstream_url_patterns().iter().any(|p| p.matches(url)))
 }
