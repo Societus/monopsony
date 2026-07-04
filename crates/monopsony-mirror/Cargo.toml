@@ -19,6 +19,8 @@ hyper = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
 hyper-rustls = { version = "0.27", features = ["http2"] }
 http-body-util = "0.1"
+flate2 = "1"
+tar = "0.4"
 sha2 = { workspace = true }
 hex = { workspace = true }
 futures = { workspace = true }

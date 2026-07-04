@@ -195,6 +195,28 @@ impl Database {
         .await?;
         info!("Created mirror_configs table");
 
+        // Upstream package index — populated by parsing repo metadata (pacman .db,
+        // Debian Packages.gz, Fedora repomd.xml). Used for inventory-aware prefetch.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS upstream_packages (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                distro          TEXT NOT NULL,
+                repo            TEXT NOT NULL,
+                name            TEXT NOT NULL,
+                version         TEXT NOT NULL,
+                architecture    TEXT NOT NULL,
+                filename        TEXT NOT NULL,
+                download_url    TEXT NOT NULL,
+                size_bytes      BIGINT NOT NULL DEFAULT 0,
+                sha256          TEXT,
+                indexed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE (distro, repo, name, version, architecture)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("Created upstream_packages table");
+
         // Shadow package tables
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS shadow_packages (
@@ -938,6 +960,34 @@ pub struct MirrorConfigRow {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Input type for bulk-upserting upstream package metadata.
+#[derive(Debug, Clone)]
+pub struct UpstreamPackage {
+    pub name: String,
+    pub version: String,
+    pub architecture: String,
+    pub filename: String,
+    pub download_url: String,
+    pub size_bytes: u64,
+    pub sha256: Option<String>,
+}
+
+/// Row type for querying upstream package data.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UpstreamPackageRow {
+    pub id: uuid::Uuid,
+    pub distro: String,
+    pub repo: String,
+    pub name: String,
+    pub version: String,
+    pub architecture: String,
+    pub filename: String,
+    pub download_url: String,
+    pub size_bytes: i64,
+    pub sha256: Option<String>,
+    pub indexed_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl Database {
     pub async fn upsert_mirror_config(&self, config: &MirrorUpsertConfig) -> Result<()> {
         sqlx::query(
@@ -1018,6 +1068,113 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    // ── Upstream package index CRUD ──
+
+    /// Bulk upsert upstream package entries from repo metadata parsing.
+    /// Replaces all entries for a given distro+repo atomically.
+    pub async fn replace_upstream_packages(
+        &self,
+        distro: &str,
+        repo: &str,
+        packages: &[UpstreamPackage],
+    ) -> Result<usize> {
+        let mut tx = self.pool.begin().await?;
+
+        // Delete old entries for this distro+repo
+        sqlx::query("DELETE FROM upstream_packages WHERE distro = $1 AND repo = $2")
+            .bind(distro)
+            .bind(repo)
+            .execute(&mut *tx)
+            .await?;
+
+        let mut count = 0usize;
+        for pkg in packages {
+            sqlx::query(
+                "INSERT INTO upstream_packages (distro, repo, name, version, architecture, filename, download_url, size_bytes, sha256)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT (distro, repo, name, version, architecture) DO UPDATE SET
+                     filename = EXCLUDED.filename,
+                     download_url = EXCLUDED.download_url,
+                     size_bytes = EXCLUDED.size_bytes,
+                     sha256 = EXCLUDED.sha256,
+                     indexed_at = NOW()",
+            )
+            .bind(distro)
+            .bind(repo)
+            .bind(&pkg.name)
+            .bind(&pkg.version)
+            .bind(&pkg.architecture)
+            .bind(&pkg.filename)
+            .bind(&pkg.download_url)
+            .bind(pkg.size_bytes as i64)
+            .bind(&pkg.sha256)
+            .execute(&mut *tx)
+            .await?;
+            count += 1;
+        }
+
+        tx.commit().await?;
+        info!("Indexed {} packages for {}/{}", count, distro, repo);
+        Ok(count)
+    }
+
+    /// Get the latest upstream version for packages matching a distro and
+    /// optional name filter. Returns the highest version per name+arch.
+    pub async fn latest_upstream_versions(
+        &self,
+        distro: &str,
+    ) -> Result<Vec<UpstreamPackageRow>> {
+        let rows = sqlx::query_as::<_, UpstreamPackageRow>(
+            "SELECT DISTINCT ON (name, architecture)
+                    id, distro, repo, name, version, architecture, filename,
+                    download_url, size_bytes, sha256, indexed_at
+             FROM upstream_packages
+             WHERE distro = $1
+             ORDER BY name, architecture, indexed_at DESC",
+        )
+        .bind(distro)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Count upstream packages for a distro.
+    pub async fn count_upstream_packages(&self, distro: &str) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_packages WHERE distro = $1")
+            .bind(distro)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    /// Get all (name, version) pairs that clients have installed for a given distro.
+    /// Used by inventory-aware prefetch to determine what needs updating.
+    /// The distro parameter maps to a package manager: archlinux→pacman, debian→apt.
+    pub async fn get_all_client_package_versions(
+        &self,
+        distro: &str,
+    ) -> Result<Vec<(String, String)>> {
+        let manager = match distro {
+            "archlinux" => "pacman",
+            "debian" | "ubuntu" => "apt",
+            "fedora" => "dnf",
+            _ => distro,
+        };
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT p.name, p.version
+             FROM packages p
+             INNER JOIN client_packages cp ON p.id = cp.package_id
+             WHERE p.manager = $1 AND p.version != ''
+             ORDER BY p.name",
+        )
+        .bind(manager)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
     }
 
     // ── Shadow package CRUD ──

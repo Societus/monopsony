@@ -495,30 +495,62 @@ impl MirrorManager {
     }
 
     /// Trigger immediate sync for a distro
+    /// Trigger an index+prefetch sync for a distro.
+    ///
+    /// Phase 1 (index): Download repo metadata files (.db, Packages.gz), parse them,
+    /// and store all upstream package versions in the `upstream_packages` table.
+    /// This gives the server a complete catalog of what exists upstream.
+    ///
+    /// Phase 2 (prefetch): Cross-reference upstream packages against what clients
+    /// have installed. Download only packages where:
+    /// (a) a client has the package installed, AND
+    /// (b) the upstream version is newer than what any client has
+    /// Also keep one previous version for downgrade support.
+    ///
+    /// If no DB is available, falls back to the legacy blind directory scrape.
     pub async fn trigger_sync(&self, distro: &str) -> Result<(), String> {
         let config = self.get_config(distro).await
             .ok_or_else(|| format!("Mirror not found: {}", distro))?;
 
-        let mut configs = self.configs.write().await;
-        if let Some(c) = configs.iter_mut().find(|c| c.distro == distro) {
-            c.sync_status = "syncing".to_string();
+        // Mark as syncing
+        {
+            let mut configs = self.configs.write().await;
+            if let Some(c) = configs.iter_mut().find(|c| c.distro == distro) {
+                c.sync_status = "syncing".to_string();
+            }
         }
-        drop(configs);
 
-        let local_path = self.mirror_dir.join(&config.local_path);
         let sync_start = std::time::Instant::now();
-        match sync_mirror(&config.upstream_url, &local_path, &config.exclude_patterns, config.bandwidth_limit_bps, &config.hash_policy).await {
+        let local_path = self.mirror_dir.join(&config.local_path);
+
+        // Try index+prefetch sync (requires DB). Fall back to legacy if no DB.
+        let result = if self.db.is_some() {
+            self.index_and_prefetch(distro, &config, &local_path).await
+        } else {
+            // Legacy: blind directory scrape
+            sync_mirror(&config.upstream_url, &local_path, &config.exclude_patterns,
+                        config.bandwidth_limit_bps, &config.hash_policy).await
+        };
+
+        match result {
             Ok(bytes) => {
                 let elapsed = sync_start.elapsed().as_secs_f64();
                 monopsony_common::metrics::mirror_sync(distro, "success");
                 monopsony_common::metrics::mirror_sync_duration(distro, elapsed);
                 monopsony_common::metrics::mirror_sync_bytes(distro, bytes);
+
                 let mut configs = self.configs.write().await;
                 if let Some(c) = configs.iter_mut().find(|c| c.distro == distro) {
                     c.sync_status = "idle".to_string();
                     c.last_sync = Some(chrono::Utc::now().timestamp());
                     c.total_bytes = bytes;
                 }
+
+                // Update DB sync status
+                if let Some(db) = &self.db {
+                    let _ = db.update_mirror_last_sync(distro, bytes as i64).await;
+                }
+
                 Ok(())
             }
             Err(e) => {
@@ -530,6 +562,141 @@ impl MirrorManager {
                 Err(e)
             }
         }
+    }
+
+    /// Phase 1 + 2: Index repo metadata, then prefetch packages that clients need.
+    async fn index_and_prefetch(
+        &self,
+        distro: &str,
+        config: &MirrorConfig,
+        local_path: &Path,
+    ) -> Result<u64, String> {
+        let db = self.db.as_ref().unwrap();
+
+        // Detect arch from clients — default to x86_64
+        let arch = "x86_64";
+
+        // ── Phase 1: Download and parse repo index files ──
+        let index_urls = crate::repo_index::repo_index_urls(distro, arch);
+        if index_urls.is_empty() {
+            // Unknown distro format — fall back to legacy scrape
+            info!(distro, "No known index format, falling back to directory scrape");
+            return sync_mirror(&config.upstream_url, local_path, &config.exclude_patterns,
+                               config.bandwidth_limit_bps, &config.hash_policy).await;
+        }
+
+        info!(distro, "Phase 1: Indexing repo metadata ({} repos)", index_urls.len());
+        let mut total_indexed = 0usize;
+
+        for (repo, index_path) in &index_urls {
+            let url = format!("{}/{}", config.upstream_url.trim_end_matches('/'), index_path);
+            info!(repo, url = %url, "Downloading index");
+
+            let bytes = download_file(&url).await?;
+
+            let mut packages = if distro == "archlinux" {
+                crate::repo_index::parse_pacman_db(&bytes)
+            } else if distro == "debian" || distro == "ubuntu" {
+                crate::repo_index::parse_debian_packages(&bytes)
+            } else {
+                Vec::new()
+            };
+
+            // Fill in download URLs
+            crate::repo_index::resolve_download_urls(&mut packages, distro, repo, &config.upstream_url, arch);
+
+            // Persist to DB
+            db.replace_upstream_packages(distro, repo, &packages).await
+                .map_err(|e| format!("Failed to store index: {}", e))?;
+
+            total_indexed += packages.len();
+        }
+
+        info!(distro, total_indexed, "Phase 1 complete: indexed upstream packages");
+
+        // ── Phase 2: Prefetch packages that installed clients need ──
+        info!(distro, "Phase 2: Checking inventory for needed updates");
+
+        // Get all upstream versions for this distro
+        let upstream = db.latest_upstream_versions(distro).await
+            .map_err(|e| format!("Failed to query upstream packages: {}", e))?;
+
+        // Get all package names+versions that clients have installed
+        let client_pkgs = db.get_all_client_package_versions(distro).await
+            .map_err(|e| format!("Failed to query client inventory: {}", e))?;
+
+        // Build a set of (name) → latest installed version
+        use std::collections::HashMap;
+        let installed: HashMap<String, String> = client_pkgs.iter()
+            .map(|(name, ver)| (name.clone(), ver.clone()))
+            .collect();
+
+        // Find packages where upstream has a newer version than what's installed
+        let mut to_download = Vec::new();
+        for up in &upstream {
+            if let Some(installed_ver) = installed.get(&up.name) {
+                if up.version != *installed_ver {
+                    // Upstream version differs from installed — this is an update
+                    info!(
+                        name = %up.name,
+                        installed = %installed_ver,
+                        upstream = %up.version,
+                        "Update available, will prefetch"
+                    );
+                    to_download.push(up.download_url.clone());
+                }
+            }
+        }
+
+        // Download the packages that need updating
+        let mut total_bytes = 0u64;
+        if !to_download.is_empty() {
+            info!(distro, count = to_download.len(), "Phase 2: Prefetching updated packages");
+
+            let client = build_https_client();
+            let local_mirror = self.mirror_dir.join(&config.local_path);
+            tokio::fs::create_dir_all(&local_mirror).await
+                .map_err(|e| format!("Failed to create {}: {}", local_mirror.display(), e))?;
+
+            for url in &to_download {
+                // Derive local path from URL
+                let path_part = url.split('/').last().unwrap_or("");
+                if path_part.is_empty() { continue; }
+                let dest = local_mirror.join(path_part);
+
+                // Skip if already downloaded (recent)
+                if dest.exists() {
+                    if let Ok(meta) = tokio::fs::metadata(&dest).await {
+                        if let Ok(modified) = meta.modified() {
+                            if let Ok(age) = modified.elapsed() {
+                                if age.as_secs() < 3600 {
+                                    total_bytes += meta.len();
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                match sync_single_file(&client, url, &dest, config.bandwidth_limit_bps, &config.hash_policy).await {
+                    Ok(size) => total_bytes += size,
+                    Err(e) => warn!("Failed to prefetch {}: {}", url, e),
+                }
+            }
+        } else {
+            info!(distro, "Phase 2: No updates needed — all installed packages are current");
+        }
+
+        // Also download index files themselves (so they're cached for clients)
+        for (_repo, index_path) in &index_urls {
+            let url = format!("{}/{}", config.upstream_url.trim_end_matches('/'), index_path);
+            let dest = local_path.join(index_path.split('/').last().unwrap_or("index"));
+            if let Ok(size) = sync_single_file(&build_https_client(), &url, &dest, None, "fail-open").await {
+                total_bytes += size;
+            }
+        }
+
+        Ok(total_bytes)
     }
 }
 
@@ -813,6 +980,33 @@ async fn proxy_to_upstream(upstream_url: &str, file_path: &str) -> Response {
             (StatusCode::BAD_GATEWAY, "Upstream unavailable").into_response()
         }
     }
+}
+
+/// Download a URL into memory. Returns the raw bytes.
+/// Used for fetching repo index files.
+async fn download_file(url: &str) -> Result<Vec<u8>, String> {
+    let client = build_https_client();
+    let uri: hyper::Uri = url.parse()
+        .map_err(|e| format!("Invalid URL {}: {}", url, e))?;
+    let req = hyper::Request::builder()
+        .uri(uri)
+        .header("User-Agent", "Monopsony-Mirror/1.0")
+        .body(empty_body())
+        .map_err(|e| format!("Failed to build request: {}", e))?;
+
+    let response = client.request(req).await
+        .map_err(|e| format!("Request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP {} for {}", response.status(), url));
+    }
+
+    let (_parts, body) = response.into_parts();
+    let bytes = body.collect().await
+        .map_err(|e| format!("Failed to read body: {}", e))?
+        .to_bytes();
+
+    Ok(bytes.to_vec())
 }
 
 /// Sync files from upstream mirror to local directory

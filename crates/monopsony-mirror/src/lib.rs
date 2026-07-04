@@ -1,4 +1,5 @@
 pub mod manifest;
+pub mod repo_index;
 pub mod url_validation;
 pub mod mirror;
 pub mod public_rate_limit;
