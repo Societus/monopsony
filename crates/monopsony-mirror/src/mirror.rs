@@ -37,6 +37,23 @@ fn empty_body() -> BoxBody {
     )
 }
 
+/// HTTPS-capable hyper client type (rustls + ring).
+type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody>;
+
+/// Build an HTTPS-capable hyper client connector (rustls + ring).
+///
+/// `Client::builder().build_http()` only does plaintext HTTP. This wrapper
+/// upgrades the connector to support TLS so we can reach HTTPS upstreams.
+fn build_https_client() -> HttpClient {
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .expect("Failed to load native root certs")
+        .https_or_http()
+        .enable_http2()
+        .build();
+    Client::builder(TokioExecutor::new()).build(connector)
+}
+
 /// Per-mirror configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MirrorConfig {
@@ -745,8 +762,7 @@ async fn proxy_to_upstream(upstream_url: &str, file_path: &str) -> Response {
         return (StatusCode::BAD_REQUEST, "Blocked URL").into_response();
     }
 
-    let client: Client<HttpConnector, BoxBody> =
-        Client::builder(TokioExecutor::new()).build_http();
+    let client = build_https_client();
 
     let uri: hyper::Uri = match url.parse() {
         Ok(u) => u,
@@ -820,8 +836,7 @@ async fn sync_mirror(
     tokio::fs::create_dir_all(local_path).await
         .map_err(|e| format!("Failed to create {}: {}", local_path.display(), e))?;
 
-    let client: Client<HttpConnector, BoxBody> =
-        Client::builder(TokioExecutor::new()).build_http();
+    let client = build_https_client();
 
     let uri: hyper::Uri = upstream_url
         .parse()
@@ -889,7 +904,7 @@ async fn sync_mirror(
 /// If neither exists, returns Ok(()) (no checksum available = pass).
 /// If a checksum is found and doesn't match, returns Err.
 async fn verify_file_hash(
-    client: &Client<HttpConnector, BoxBody>,
+    client: &HttpClient,
     original_url: &str,
     data: &[u8],
     hash_policy: &str,
@@ -966,7 +981,7 @@ async fn verify_file_hash(
 
 /// Download and save a single file
 async fn sync_single_file(
-    client: &Client<HttpConnector, BoxBody>,
+    client: &HttpClient,
     url: &str,
     local_path: &Path,
     bandwidth_limit_bps: Option<u64>,
