@@ -27,6 +27,7 @@ use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, trace, warn};
 
 use monopsony_db::Database;
+use monopsony_db::db::UpstreamPackageRow;
 
 /// Boxed body type for hyper client requests
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
@@ -632,7 +633,7 @@ impl MirrorManager {
             .collect();
 
         // Find packages where upstream has a newer version than what's installed
-        let mut to_download = Vec::new();
+        let mut to_download: Vec<UpstreamPackageRow> = Vec::new();
         for up in &upstream {
             if let Some(installed_ver) = installed.get(&up.name) {
                 if up.version != *installed_ver {
@@ -643,7 +644,7 @@ impl MirrorManager {
                         upstream = %up.version,
                         "Update available, will prefetch"
                     );
-                    to_download.push(up.download_url.clone());
+                    to_download.push(up.clone());
                 }
             }
         }
@@ -658,11 +659,11 @@ impl MirrorManager {
             tokio::fs::create_dir_all(&local_mirror).await
                 .map_err(|e| format!("Failed to create {}: {}", local_mirror.display(), e))?;
 
-            for url in &to_download {
-                // Derive local path from URL
-                let path_part = url.split('/').last().unwrap_or("");
-                if path_part.is_empty() { continue; }
-                let dest = local_mirror.join(path_part);
+            for pkg in &to_download {
+                // Use the filename field which contains the full repo-relative path
+                // e.g., "core/os/x86_64/bash-5.3.15-1-x86_64.pkg.tar.zst"
+                let dest = local_mirror.join(&pkg.filename);
+                let url = &pkg.download_url;
 
                 // Skip if already downloaded (recent)
                 if dest.exists() {

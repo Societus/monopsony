@@ -19,6 +19,7 @@ tower = { workspace = true }
 tower-http = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
+hyper-rustls = { version = "0.27", features = ["http2"] }
 http-body-util = "0.1"
 reqwest = { workspace = true, features = ["json"] }
 futures = { workspace = true }
@@ -36,3 +37,4 @@ clamav-client = { version = "2.2", features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"
+rustls = { version = "0.23", features = ["ring"] }

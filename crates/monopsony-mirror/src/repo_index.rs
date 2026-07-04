@@ -175,7 +175,6 @@ pub fn repo_index_urls(distro: &str, arch: &str) -> Vec<(&'static str, String)> 
         "archlinux" => vec![
             ("core", format!("core/os/{}/core.db", arch)),
             ("extra", format!("extra/os/{}/extra.db", arch)),
-            ("community", format!("community/os/{}/community.db", arch)),
         ],
         "debian" => vec![
             ("main", format!("dists/stable/main/binary-{}/Packages.gz", arch)),
@@ -187,7 +186,11 @@ pub fn repo_index_urls(distro: &str, arch: &str) -> Vec<(&'static str, String)> 
     }
 }
 
-/// Fill in the download_url field for each package based on upstream base URL.
+/// Fill in the download_url and filename fields for each package based on upstream base URL.
+/// 
+/// For pacman:
+/// - `download_url` uses the original filename (e.g., https://mirror/core/os/x86_64/bash-5.3.15-1-x86_64.pkg.tar.zst)
+/// - `filename` is set to the repo-relative path for local storage (e.g., core/os/x86_64/bash-5.3.15-1-x86_64.pkg.tar.zst)
 pub fn resolve_download_urls(
     packages: &mut [UpstreamPackage],
     distro: &str,
@@ -198,7 +201,12 @@ pub fn resolve_download_urls(
     let base = upstream_base.trim_end_matches('/');
     for pkg in packages.iter_mut() {
         if distro == "archlinux" {
-            pkg.download_url = format!("{}/{}/os/{}/{}", base, repo, arch, pkg.filename);
+            // Save the original filename for URL construction
+            let original_filename = pkg.filename.clone();
+            // Construct the repo-relative path for local storage
+            pkg.filename = format!("{}/os/{}/{}", repo, arch, original_filename);
+            // Construct download URL using original filename
+            pkg.download_url = format!("{}/{}/os/{}/{}", base, repo, arch, original_filename);
         } else {
             // Debian: filename already contains pool/main/... path
             pkg.download_url = format!("{}/{}", base, pkg.filename);

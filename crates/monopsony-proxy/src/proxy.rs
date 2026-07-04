@@ -14,6 +14,23 @@ use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
 };
+
+/// HTTPS-capable hyper client type (rustls + ring).
+type HttpClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Body>;
+
+/// Build an HTTPS-capable hyper client connector (rustls + native roots).
+///
+/// `Client::builder().build_http()` only does plaintext HTTP. This wrapper
+/// upgrades the connector to support TLS so we can reach HTTPS upstreams.
+fn build_https_client() -> HttpClient {
+    let connector = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .expect("Failed to load native root certs")
+        .https_or_http()
+        .enable_http2()
+        .build();
+    Client::builder(TokioExecutor::new()).build(connector)
+}
 use std::{
     net::SocketAddr,
     path::PathBuf,
@@ -44,7 +61,7 @@ pub struct CacheEntry {
 
 /// Shared state for the proxy
 pub struct ProxyState {
-    pub client: Client<HttpConnector, Body>,
+    pub client: HttpClient,
     pub cache_dir: PathBuf,
     pub storage: Arc<dyn CacheStorage>,
     pub backends: Vec<Box<dyn PackageManagerBackend>>,
@@ -55,7 +72,7 @@ pub struct ProxyState {
 
 impl ProxyState {
     pub fn new(storage: Arc<dyn CacheStorage>, db: Option<Arc<Database>>) -> Self {
-        let client = Client::builder(TokioExecutor::new()).build_http();
+        let client = build_https_client();
         let cache_dir = storage.base_dir().unwrap_or_default();
         let backends = monopsony_common::package_manager::get_available_backends();
 
@@ -158,6 +175,21 @@ async fn health_check() -> &'static str {
     "ok"
 }
 
+/// Normalize a URL's scheme to HTTPS.
+///
+/// Package managers configured via forward proxy (XferCommand/proxy env) send
+/// `http://` URLs even when upstreams serve HTTPS. The prefetch module stores
+/// URLs as `https://`. Without normalization, an `http://` request never
+/// matches a prefetched `https://` entry, causing duplicate fetches and cache
+/// misses.
+fn normalize_url_scheme(url: &str) -> String {
+    if url.starts_with("http://") {
+        format!("https://{}", &url[7..])
+    } else {
+        url.to_string()
+    }
+}
+
 /// Handle HTTP proxy requests
 pub async fn handle_proxy_request(
     State((state, rate_limiter)): State<(Arc<ProxyState>, Option<Arc<crate::security::RateLimiter>>)>,
@@ -208,12 +240,22 @@ pub async fn handle_proxy_request(
     }
 
     // Get the full URL from the request
-    let url = if uri.scheme().is_some() {
+    let raw_url = if uri.scheme().is_some() {
         uri.to_string()
     } else {
         // For proxy requests, the URI should be absolute
         format!("http://{}", uri)
     };
+
+    // Normalize scheme to HTTPS for package URLs.
+    //
+    // Forward-proxy semantics deliver absolute-URI request lines, and package
+    // managers configured via XferCommand/proxy often send http:// even though
+    // upstreams serve over HTTPS. The prefetch module stores URLs as https://
+    // (from upstream_packages.download_url). Without normalization, a request
+    // for http://X never matches a prefetched https://X entry in the DB,
+    // causing duplicate fetches and cache misses.
+    let url = normalize_url_scheme(&raw_url);
 
     // SSRF prevention: validate URL host doesn't resolve to private IP
     if let Ok(parsed) = url::Url::parse(&url) {
@@ -754,6 +796,8 @@ mod tests {
 
     #[test]
     fn test_url_to_cache_path() {
+        // ProxyState::new() builds an HTTPS client which needs the ring CryptoProvider
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let temp_dir = std::env::temp_dir().join("monopsony-test-cache");
         let storage = Arc::new(FilesystemStorage::new(temp_dir));
         let state = ProxyState::new(storage, None);

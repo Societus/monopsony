@@ -119,10 +119,17 @@ async fn run_prefetch_cycle(db: &Database, config: &PrefetchConfig) -> anyhow::R
         candidates.len()
     );
 
-    let client: Client<HttpConnector, BoxBody> =
+    let client: Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody> = {
+        let connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .expect("Failed to load native root certs")
+            .https_or_http()
+            .enable_http2()
+            .build();
         Client::builder(TokioExecutor::new())
             .pool_max_idle_per_host(config.max_concurrent)
-            .build_http();
+            .build(connector)
+    };
 
     let bandwidth_remaining = Arc::new(tokio::sync::Semaphore::new(
         if config.bandwidth_limit_bps > 0 { 1 } else { config.max_concurrent }
@@ -216,17 +223,23 @@ async fn run_prefetch_cycle(db: &Database, config: &PrefetchConfig) -> anyhow::R
 }
 
 /// Find packages that clients have but aren't cached yet.
-/// Joins client_packages → packages → cache_entries, ordered by demand.
+/// Joins client_packages → packages → upstream_packages → cache_entries, ordered by demand.
+///
+/// NOTE: The `packages` table has an empty `upstream_url` column — the actual
+/// upstream download URLs live in `upstream_packages.download_url`. We join
+/// client_packages → packages (by id) → upstream_packages (by name) to find
+/// which HTTPS download URLs need pre-fetching.
 async fn find_uncached_packages(db: &Database) -> anyhow::Result<Vec<PrefetchCandidate>> {
     let rows = sqlx::query(
-        "SELECT p.upstream_url, p.manager, COUNT(DISTINCT cp.client_id) AS client_count
-         FROM packages p
-         INNER JOIN client_packages cp ON p.id = cp.package_id
-         LEFT JOIN cache_entries ce ON p.upstream_url = ce.url
+        "SELECT up.download_url AS upstream_url, up.distro AS manager, COUNT(DISTINCT cp.client_id) AS client_count
+         FROM upstream_packages up
+         INNER JOIN packages p ON p.name = up.name
+         INNER JOIN client_packages cp ON cp.package_id = p.id
+         LEFT JOIN cache_entries ce ON up.download_url = ce.url
          WHERE ce.url IS NULL
-           AND p.upstream_url IS NOT NULL
-           AND p.upstream_url != ''
-         GROUP BY p.upstream_url, p.manager
+           AND up.download_url IS NOT NULL
+           AND up.download_url != ''
+         GROUP BY up.download_url, up.distro
          ORDER BY client_count DESC
          LIMIT 500"
     )
@@ -247,7 +260,7 @@ async fn find_uncached_packages(db: &Database) -> anyhow::Result<Vec<PrefetchCan
 
 /// Fetch a single URL and cache it
 async fn prefetch_url(
-    client: &Client<HttpConnector, BoxBody>,
+    client: &Client<hyper_rustls::HttpsConnector<HttpConnector>, BoxBody>,
     url: &str,
     storage: &dyn CacheStorage,
     timeout_secs: u64,
@@ -317,7 +330,9 @@ async fn prefetch_url(
         .await
         .map_err(|e| format!("Failed to write cache: {}", e))?;
 
-    // Write metadata sidecar
+    // Write metadata sidecar — must match the CacheEntry struct so that
+    // ProxyState::load_meta() can deserialize it for X-Cache headers.
+    let now = chrono::Utc::now().timestamp();
     let cache_path = storage.base_dir()
         .map(|base| base.join(&cache_key).to_string_lossy().to_string())
         .unwrap_or_else(|| cache_key.clone());
@@ -326,8 +341,11 @@ async fn prefetch_url(
         "cache_path": cache_path,
         "content_type": parts.headers.get("content-type").and_then(|v| v.to_str().ok()),
         "content_length": bytes.len(),
-        "cached_at": chrono::Utc::now().timestamp(),
-        "prefetched": true,
+        "etag": parts.headers.get("etag").and_then(|v| v.to_str().ok()),
+        "last_modified": parts.headers.get("last-modified").and_then(|v| v.to_str().ok()),
+        "cached_at": now,
+        "last_accessed": now,
+        "hit_count": 0u64,
     });
 
     let meta_bytes = serde_json::to_vec_pretty(&meta)
@@ -337,12 +355,32 @@ async fn prefetch_url(
     Ok(bytes.len() as u64)
 }
 
-/// Convert a URL to a storage key for the prefetch namespace
+/// Convert a URL to a storage key, matching the proxy's key derivation.
+///
+/// Uses backend-aware path mapping (e.g., `pacman/core/os/x86_64/...`) when a
+/// package manager backend matches the URL, falling back to
+/// `other/{host}/{path}` for unrecognized URLs. This MUST match the key scheme
+/// used by `ProxyState::url_to_cache_key` in proxy.rs, or prefetched files
+/// won't be found on cache hit.
 fn url_to_cache_key(url: &str) -> String {
+    use monopsony_common::package_manager::get_available_backends;
+
+    let backends = get_available_backends();
+    for backend in &backends {
+        for pattern in backend.upstream_url_patterns() {
+            if pattern.matches(url) {
+                if let Some(relative) = backend.url_to_cache_path(url) {
+                    return relative;
+                }
+            }
+        }
+    }
+
+    // Generic fallback (same logic as ProxyState::url_to_cache_key)
     let parsed = url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://invalid").unwrap());
     let host = parsed.host_str().unwrap_or("unknown");
     let path = parsed.path().trim_start_matches('/');
-    format!("prefetch/{}/{}", host, path)
+    format!("other/{}/{}", host, path)
 }
 
 #[cfg(test)]
@@ -360,20 +398,21 @@ mod tests {
 
     #[test]
     fn test_url_to_cache_key() {
+        // pacman backend matches archlinux.org → key starts with "pacman/"
         let key = url_to_cache_key(
             "https://repo.archlinux.org/os/x86_64/linux-6.1.pkg.tar.zst",
         );
-        assert!(key.contains("prefetch"));
-        assert!(key.contains("repo.archlinux.org"));
+        assert!(key.starts_with("pacman/"));
         assert!(key.contains("linux-6.1.pkg.tar.zst"));
     }
 
     #[test]
     fn test_url_to_cache_key_complex() {
+        // No backend matches archive.ubuntu.com on Arch → falls back to other/{host}/{path}
         let key = url_to_cache_key(
             "http://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-image_5.15.0-1_amd64.deb",
         );
-        assert!(key.starts_with("prefetch/archive.ubuntu.com/"));
+        assert!(key.starts_with("other/archive.ubuntu.com/"));
         assert!(key.contains("linux-image_5.15.0-1_amd64.deb"));
     }
 }
