@@ -3,6 +3,7 @@
 //! This module provides a trait-based abstraction for different package managers,
 //! allowing uniform handling of package installation, inventory, and proxy configuration.
 
+mod apk;
 mod apt;
 mod bsd_privilege;
 mod dnf;
@@ -15,6 +16,7 @@ mod winget;
 mod choco;
 mod scoop;
 
+pub use apk::ApkBackend;
 pub use apt::AptBackend;
 pub use dnf::DnfBackend;
 pub use mport::MportBackend;
@@ -41,6 +43,7 @@ pub enum PackageManagerKind {
     Pkg,
     PkgAdd,
     Pkgin,
+    Apk,
     Winget,
     Choco,
     Scoop,
@@ -56,6 +59,7 @@ impl PackageManagerKind {
             PackageManagerKind::Pkg => "pkg",
             PackageManagerKind::PkgAdd => "pkg_add",
             PackageManagerKind::Pkgin => "pkgin",
+            PackageManagerKind::Apk => "apk",
             PackageManagerKind::Winget => "winget",
             PackageManagerKind::Choco => "choco",
             PackageManagerKind::Scoop => "scoop",
@@ -73,6 +77,7 @@ impl PackageManagerKind {
             "pkg" => Some(PackageManagerKind::Pkg),
             "pkg_add" => Some(PackageManagerKind::PkgAdd),
             "pkgin" => Some(PackageManagerKind::Pkgin),
+            "apk" => Some(PackageManagerKind::Apk),
             "winget" => Some(PackageManagerKind::Winget),
             "choco" => Some(PackageManagerKind::Choco),
             "scoop" => Some(PackageManagerKind::Scoop),
@@ -265,6 +270,7 @@ pub fn get_available_backends() -> Vec<Box<dyn PackageManagerBackend>> {
         Box::new(PkgBackend::new()),
         Box::new(PkgAddBackend::new()),
         Box::new(PkginBackend::new()),
+        Box::new(ApkBackend::new()),
         Box::new(WingetBackend::new()),
         Box::new(ChocoBackend::new()),
         Box::new(ScoopBackend::new()),
@@ -283,6 +289,7 @@ pub fn get_backend(kind: PackageManagerKind) -> Option<Box<dyn PackageManagerBac
         PackageManagerKind::Pkg => Some(Box::new(PkgBackend::new())),
         PackageManagerKind::PkgAdd => Some(Box::new(PkgAddBackend::new())),
         PackageManagerKind::Pkgin => Some(Box::new(PkginBackend::new())),
+        PackageManagerKind::Apk => Some(Box::new(ApkBackend::new())),
         PackageManagerKind::Winget => Some(Box::new(WingetBackend::new())),
         PackageManagerKind::Choco => Some(Box::new(ChocoBackend::new())),
         PackageManagerKind::Scoop => Some(Box::new(ScoopBackend::new())),
