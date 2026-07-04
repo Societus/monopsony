@@ -157,7 +157,10 @@ mod tests {
 
     #[test]
     fn test_sign_and_verify() {
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&{
+            let mut rng = rand::thread_rng();
+            rand::Rng::gen(&mut rng)
+        });
 
         let mut manifest = make_test_manifest();
         assert!(manifest.signature.is_none());
@@ -171,7 +174,10 @@ mod tests {
 
     #[test]
     fn test_tamper_fails_verification() {
-        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&{
+            let mut rng = rand::thread_rng();
+            rand::Rng::gen(&mut rng)
+        });
         let mut manifest = make_test_manifest();
         manifest.sign(&signing_key);
         assert!(manifest.verify());

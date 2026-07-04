@@ -142,6 +142,7 @@ pub async fn handle_pair_init(
     // Clone what the background task needs
     let tls_manager = state.tls_manager.clone();
     let db = state.db.clone();
+    let mirror_manager = state.mirror_manager.clone();
     let grpc_addr_config = state.grpc_addr.clone();
     let grpc_addr_override = req.grpc_addr_override.clone();
     let code_for_task = pairing_code.clone();
@@ -153,7 +154,7 @@ pub async fn handle_pair_init(
     let pairing_manager = state.pairing_manager.clone();
     let pairing_manager_for_error = pairing_manager.clone();
     let join_handle = tokio::spawn(async move {
-        if let Err(e) = run_pairing_listener(code_for_task, tls_manager, db, grpc_addr_config, grpc_addr_override, pairing_manager).await {
+        if let Err(e) = run_pairing_listener(code_for_task, tls_manager, db, mirror_manager, grpc_addr_config, grpc_addr_override, pairing_manager).await {
             let mut lock = pairing_manager_for_error.lock().await;
             if let Some(ref mut session) = *lock {
                 if session.status == PairingStatus::Waiting {
@@ -258,6 +259,7 @@ async fn run_pairing_listener(
     pairing_code: String,
     tls_manager: std::sync::Arc<monopsony_control::tls::TlsManager>,
     db: Option<std::sync::Arc<monopsony_db::Database>>,
+    mirror_manager: Option<std::sync::Arc<monopsony_mirror::MirrorManager>>,
     grpc_addr_config: String,
     grpc_addr_override: Option<String>,
     pairing_manager: std::sync::Arc<tokio::sync::Mutex<Option<PairingSession>>>,
@@ -340,6 +342,15 @@ async fn run_pairing_listener(
                     .await?;
                 db.record_pairing(&registered, chrono::Utc::now()).await?;
                 info!("Client registered and paired in DB: {}", registered.0);
+
+                // Auto-create mirror configs for the client's package managers
+                if let Some(ref mirror_mgr) = mirror_manager {
+                    let created = mirror_mgr.ensure_mirrors_for_package_managers(&req.package_managers).await;
+                    if created > 0 {
+                        info!(client = %req.hostname, created = created, "Auto-created mirror configs from pairing");
+                    }
+                }
+
                 registered
             } else {
                 warn!("No database available — generating UUID without DB registration");

@@ -33,11 +33,18 @@ pub struct MonopsonyGrpc {
     db: Arc<Database>,
     tls_manager: Arc<TlsManager>,
     shadow_manager: Option<Arc<ShadowPackageManager>>,
+    mirror_manager: Option<Arc<MirrorManager>>,
 }
 
 impl MonopsonyGrpc {
     pub fn new(db: Arc<Database>, tls_manager: Arc<TlsManager>, shadow_manager: Option<Arc<ShadowPackageManager>>) -> Self {
-        Self { db, tls_manager, shadow_manager }
+        Self { db, tls_manager, shadow_manager, mirror_manager: None }
+    }
+
+    /// Set the mirror manager (called from start() where the manager is already available).
+    pub fn with_mirror_manager(mut self, mirror_manager: Option<Arc<MirrorManager>>) -> Self {
+        self.mirror_manager = mirror_manager;
+        self
     }
 
     async fn handle_register(&self, req: RegisterRequest) -> Result<RegisterResponse> {
@@ -61,6 +68,14 @@ impl MonopsonyGrpc {
             .context("Failed to register client")?;
 
         debug!(client_id = %client_id, "Client registered successfully");
+
+        // Auto-create mirror configs for any package managers the client reports
+        if let Some(ref mirror_mgr) = self.mirror_manager {
+            let created = mirror_mgr.ensure_mirrors_for_package_managers(&req.package_managers).await;
+            if created > 0 {
+                info!(client_id = %client_id, created = created, "Auto-created mirror configs from client registration");
+            }
+        }
 
         // Generate client certificate
         let (cert, key) = self.tls_manager.generate_client_cert(&client_id.to_string())?;
@@ -330,13 +345,15 @@ impl MonopsonyControl for MonopsonyGrpc {
         let db = self.db.clone();
         let tls_manager = self.tls_manager.clone();
         let shadow_manager = self.shadow_manager.clone();
+        let mirror_manager = self.mirror_manager.clone();
         let mut stream = request.into_inner();
 
         let output = async_stream::stream! {
             while let Some(msg) = stream.next().await {
                 match msg {
                     Ok(client_msg) => {
-                        let grpc = MonopsonyGrpc::new(db.clone(), tls_manager.clone(), shadow_manager.clone());
+                        let grpc = MonopsonyGrpc::new(db.clone(), tls_manager.clone(), shadow_manager.clone())
+                            .with_mirror_manager(mirror_manager.clone());
                         yield grpc.dispatch_client_message(client_msg).await;
                     }
                     Err(status) => {
@@ -705,7 +722,8 @@ pub async fn start(
 ) -> Result<()> {
     info!(addr = %addr, "gRPC server starting (mTLS required)");
 
-    let grpc = MonopsonyGrpc::new(db.clone(), tls_manager.clone(), shadow_manager);
+    let grpc = MonopsonyGrpc::new(db.clone(), tls_manager.clone(), shadow_manager)
+        .with_mirror_manager(mirror_manager.clone());
 
     let tls_config = tls_manager.tonic_server_tls_config(Some(addr.ip()))?;
 

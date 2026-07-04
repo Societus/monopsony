@@ -142,6 +142,38 @@ impl Default for MirrorConfig {
     }
 }
 
+/// Return a default MirrorConfig for a package manager string, or None if the
+/// package manager has no known distro mirror (e.g. Windows package managers).
+///
+/// The upstream URLs are reliable, well-known public mirrors.
+fn default_mirror_config_for_pm(pm: &str) -> Option<MirrorConfig> {
+    let (distro, upstream) = match pm {
+        "pacman" => ("archlinux", "https://geo.mirror.pkgbuild.com"),
+        "apt" => ("debian", "http://deb.debian.org/debian"),
+        "dnf" => ("fedora", "https://dl.fedoraproject.org/pub/fedora/linux"),
+        // Non-mirrored package managers — no default distro mirror
+        _ => return None,
+    };
+
+    Some(MirrorConfig {
+        distro: distro.to_string(),
+        upstream_url: upstream.to_string(),
+        local_path: PathBuf::from(format!("mirrors/{}", distro)),
+        sync_enabled: false, // Don't auto-sync until admin reviews
+        sync_interval_secs: 86400,
+        bandwidth_limit_bps: None,
+        include_patterns: Vec::new(),
+        exclude_patterns: Vec::new(),
+        public: false,
+        per_ip_rps: 0,
+        max_concurrent_per_ip: 0,
+        last_sync: None,
+        sync_status: "idle".to_string(),
+        total_bytes: 0,
+        hash_policy: "fail-closed".to_string(),
+    })
+}
+
 /// Manages all mirror configurations and sync tasks
 #[derive(Clone)]
 pub struct MirrorManager {
@@ -335,6 +367,68 @@ impl MirrorManager {
         let len_before = guard.len();
         guard.retain(|c| c.distro != distro);
         guard.len() != len_before
+    }
+
+    /// Ensure mirror configs exist for all package managers a client reports.
+    ///
+    /// Called during client registration/pairing. For each known package manager
+    /// kind (apt, dnf, pacman), if no mirror config exists for the corresponding
+    /// distro, one is auto-created with sensible defaults and persisted to both
+    /// the in-memory list and the database.
+    ///
+    /// Returns the number of new mirror configs created.
+    pub async fn ensure_mirrors_for_package_managers(
+        &self,
+        package_managers: &[String],
+    ) -> usize {
+        let mut created = 0;
+
+        for pm_str in package_managers {
+            let Some(config) = default_mirror_config_for_pm(pm_str) else {
+                continue; // Not a Linux package manager with a known mirror
+            };
+
+            // Check if this distro already has a config
+            let existing = self.get_config(&config.distro).await;
+            if existing.is_some() {
+                continue;
+            }
+
+            info!(
+                distro = %config.distro,
+                upstream = %config.upstream_url,
+                "Auto-creating mirror config from client package manager: {}",
+                pm_str
+            );
+
+            // Persist to DB
+            if let Some(db) = &self.db {
+                let upsert = monopsony_db::db::MirrorUpsertConfig {
+                    distro: config.distro.clone(),
+                    upstream_url: config.upstream_url.clone(),
+                    local_path: config.local_path.to_string_lossy().to_string(),
+                    sync_enabled: config.sync_enabled,
+                    sync_interval_secs: config.sync_interval_secs as i64,
+                    bandwidth_limit_bps: None,
+                    include_patterns: serde_json::json!([]),
+                    exclude_patterns: serde_json::json!([]),
+                    public: config.public,
+                };
+                if let Err(e) = db.upsert_mirror_config(&upsert).await {
+                    warn!(distro = %config.distro, error = %e, "Failed to persist auto-mirror to DB");
+                }
+            }
+
+            // Update in-memory
+            self.upsert_config(config).await;
+            created += 1;
+        }
+
+        if created > 0 {
+            info!("Auto-created {} mirror config(s) from client registration", created);
+        }
+
+        created
     }
 
     /// Trigger immediate sync for a distro
