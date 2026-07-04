@@ -88,6 +88,8 @@ message PackageEntry {
     string name = 2;
     string version = 3;
     string arch = 4;
+    int64 installed_at = 5;    // epoch seconds (0 = unknown)
+    string install_source = 6; // "proxy", "direct", or "" (unknown)
 }
 
 message Command {

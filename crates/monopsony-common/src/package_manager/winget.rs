@@ -61,6 +61,7 @@ impl PackageManagerBackend for WingetBackend {
                     version,
                     architecture: None,
                     manager: PackageManagerKind::Winget,
+                    installed_at: 0,
                 });
             }
         }

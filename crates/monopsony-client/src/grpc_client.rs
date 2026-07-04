@@ -147,7 +147,13 @@ impl MonopsonyGrpcClient {
         client_id: &str,
         packages: &[PackageRef],
         full_sync: bool,
+        report_telemetry: bool,
     ) -> anyhow::Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
         let entries: Vec<PackageEntry> = packages
             .iter()
             .map(|p| PackageEntry {
@@ -155,6 +161,8 @@ impl MonopsonyGrpcClient {
                 name: p.name.clone(),
                 version: p.version.clone().unwrap_or_default(),
                 arch: p.architecture.clone().unwrap_or_default(),
+                installed_at: if report_telemetry { now } else { 0 },
+                install_source: if report_telemetry { "proxy".to_string() } else { String::new() },
             })
             .collect();
 

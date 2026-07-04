@@ -56,6 +56,7 @@ impl PackageManagerBackend for ChocoBackend {
                     version: Some(parts[1].to_string()),
                     architecture: None,
                     manager: PackageManagerKind::Choco,
+                    installed_at: 0,
                 });
             }
         }

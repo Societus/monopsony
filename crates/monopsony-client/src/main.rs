@@ -195,6 +195,10 @@ async fn run_daemon(
 
     // Validate auto-update config if present and enabled
     let auto_update_config = client_config.as_ref().map(|c| c.auto_update.clone());
+    let report_telemetry = client_config
+        .as_ref()
+        .map(|c| c.client.report_install_telemetry)
+        .unwrap_or(true);
     if let Some(ref au_cfg) = auto_update_config {
         if au_cfg.enabled {
             auto_update::validate_schedule(&au_cfg.schedule)
@@ -350,7 +354,7 @@ async fn run_daemon(
                         }
                     }
 
-                    match client.report_inventory(&client_id_for_task, &all_packages, true).await {
+                    match client.report_inventory(&client_id_for_task, &all_packages, true, report_telemetry).await {
                         Ok(_) => info!("Inventory reported ({} packages)", all_packages.len()),
                         Err(e) => {
                             warn!("Inventory report failed, reconnecting: {}", e);

@@ -97,8 +97,13 @@ impl std::fmt::Display for PackageManagerKind {
 pub struct PackageRef {
     pub name: String,
     pub version: Option<String>,
+    #[serde(default)]
     pub architecture: Option<String>,
     pub manager: PackageManagerKind,
+    /// Epoch seconds when this version was confirmed installed (0 = unknown).
+    /// Populated by client inventory scans; stored by server if telemetry enabled.
+    #[serde(default)]
+    pub installed_at: i64,
 }
 
 /// URL pattern for matching upstream package URLs

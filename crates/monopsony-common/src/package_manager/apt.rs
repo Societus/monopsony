@@ -61,6 +61,7 @@ impl PackageManagerBackend for AptBackend {
                     version: Some(version),
                     architecture: arch,
                     manager: PackageManagerKind::Apt,
+                    installed_at: 0,
                 });
             }
         }

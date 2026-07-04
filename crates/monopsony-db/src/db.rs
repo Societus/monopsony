@@ -425,7 +425,11 @@ impl Database {
             )
             .bind(client_id.0)
             .bind(package_id)
-            .bind(now)
+            .bind(if pkg.installed_at > 0 {
+                chrono::DateTime::from_timestamp(pkg.installed_at, 0).unwrap_or(now)
+            } else {
+                now
+            })
             .execute(&mut *tx)
             .await?;
         }

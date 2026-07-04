@@ -55,6 +55,7 @@ impl PackageManagerBackend for ScoopBackend {
                     version: Some(parts[1].to_string()),
                     architecture: None,
                     manager: PackageManagerKind::Scoop,
+                    installed_at: 0,
                 });
             }
         }

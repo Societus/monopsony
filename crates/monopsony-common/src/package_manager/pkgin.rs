@@ -57,6 +57,7 @@ impl PackageManagerBackend for PkginBackend {
                         version: Some(version.to_string()),
                         architecture: None,
                         manager: PackageManagerKind::Pkgin,
+                    installed_at: 0,
                     });
                 }
             }

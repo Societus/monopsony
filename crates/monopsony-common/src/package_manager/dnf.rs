@@ -78,6 +78,7 @@ impl PackageManagerBackend for DnfBackend {
                         version: Some(parts[1].to_string()),
                         architecture: Some(parts[2].to_string()),
                         manager: PackageManagerKind::Dnf,
+                    installed_at: 0,
                     });
                 }
             }
@@ -101,6 +102,7 @@ impl PackageManagerBackend for DnfBackend {
                         version: Some(version.to_string()),
                         architecture: arch,
                         manager: PackageManagerKind::Dnf,
+                    installed_at: 0,
                     });
                 }
             }

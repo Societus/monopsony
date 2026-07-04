@@ -59,6 +59,7 @@ impl PackageManagerBackend for PacmanBackend {
                     version: Some(line[pos + 1..].to_string()),
                     architecture: None,
                     manager: PackageManagerKind::Pacman,
+                    installed_at: 0,
                 });
             }
         }

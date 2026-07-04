@@ -34,16 +34,23 @@ pub struct MonopsonyGrpc {
     tls_manager: Arc<TlsManager>,
     shadow_manager: Option<Arc<ShadowPackageManager>>,
     mirror_manager: Option<Arc<MirrorManager>>,
+    telemetry_enabled: bool,
 }
 
 impl MonopsonyGrpc {
     pub fn new(db: Arc<Database>, tls_manager: Arc<TlsManager>, shadow_manager: Option<Arc<ShadowPackageManager>>) -> Self {
-        Self { db, tls_manager, shadow_manager, mirror_manager: None }
+        Self { db, tls_manager, shadow_manager, mirror_manager: None, telemetry_enabled: true }
     }
 
     /// Set the mirror manager (called from start() where the manager is already available).
     pub fn with_mirror_manager(mut self, mirror_manager: Option<Arc<MirrorManager>>) -> Self {
         self.mirror_manager = mirror_manager;
+        self
+    }
+
+    /// Set telemetry enabled flag from server config.
+    pub fn with_telemetry(mut self, enabled: bool) -> Self {
+        self.telemetry_enabled = enabled;
         self
     }
 
@@ -151,6 +158,7 @@ impl MonopsonyGrpc {
                         Some(entry.arch.clone())
                     },
                     manager,
+                    installed_at: if self.telemetry_enabled { entry.installed_at } else { 0 },
                 })
             })
             .collect();
@@ -210,6 +218,7 @@ impl MonopsonyGrpc {
                         Some(entry.arch.clone())
                     },
                     manager,
+                    installed_at: if self.telemetry_enabled { entry.installed_at } else { 0 },
                 })
             })
             .collect();
@@ -719,11 +728,13 @@ pub async fn start(
     tls_manager: Arc<TlsManager>,
     mirror_manager: Option<Arc<MirrorManager>>,
     shadow_manager: Option<Arc<ShadowPackageManager>>,
+    telemetry_enabled: bool,
 ) -> Result<()> {
     info!(addr = %addr, "gRPC server starting (mTLS required)");
 
     let grpc = MonopsonyGrpc::new(db.clone(), tls_manager.clone(), shadow_manager)
-        .with_mirror_manager(mirror_manager.clone());
+        .with_mirror_manager(mirror_manager.clone())
+        .with_telemetry(telemetry_enabled);
 
     let tls_config = tls_manager.tonic_server_tls_config(Some(addr.ip()))?;
 

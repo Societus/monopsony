@@ -59,6 +59,8 @@ pub struct ServerConfig {
     pub scan: ScanConfig,
     #[serde(default)]
     pub node: NodeConfig,
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +91,18 @@ pub struct DatabaseConfig {
 
 fn default_max_connections() -> u32 {
     10
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TelemetryConfig {
+    /// Enable install success tracking via inventory reports.
+    /// When false, server ignores installed_at fields.
+    #[serde(default = "default_true")]
+    pub install_tracking: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Node deployment tier — controls storage and scanning requirements.
@@ -224,10 +238,6 @@ pub struct DiscoveryConfig {
     /// mDNS service name
     #[serde(default = "default_mdns_service_name")]
     pub mdns_service_name: String,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 fn default_mdns_service_name() -> String {
@@ -404,6 +414,9 @@ pub struct ClientIdentityConfig {
     /// Client hostname (auto-detected if not set)
     #[serde(default)]
     pub hostname: Option<String>,
+    /// When false, omit install timestamps from inventory reports.
+    #[serde(default = "default_true")]
+    pub report_install_telemetry: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -853,6 +866,7 @@ mod tests {
             shadow_trust: ShadowPackageTrustConfig::default(),
             scan: ScanConfig::default(),
             node: NodeConfig::default(),
+            telemetry: TelemetryConfig::default(),
         }
     }
 

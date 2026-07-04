@@ -57,6 +57,7 @@ impl PackageManagerBackend for PkgBackend {
                     version: Some(parts[1].to_string()),
                     architecture: None,
                     manager: PackageManagerKind::Pkg,
+                    installed_at: 0,
                 });
             }
         }

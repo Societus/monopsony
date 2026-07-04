@@ -101,6 +101,7 @@ impl PackageManagerBackend for ApkBackend {
                     version: Some(version.to_string()),
                     architecture: arch,
                     manager: PackageManagerKind::Apk,
+                    installed_at: 0,
                 });
             }
         }

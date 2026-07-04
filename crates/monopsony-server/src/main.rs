@@ -324,6 +324,25 @@ async fn main() -> anyhow::Result<()> {
     let storage_for_proxy = storage.clone();
     // Scan config will be loaded from TOML config file in future sprint
     let scan_config_for_proxy = None;
+
+    // Read telemetry config from TOML
+    let telemetry_enabled = {
+        match std::fs::read_to_string(&args.config) {
+            Ok(content) => {
+                #[derive(serde::Deserialize)]
+                struct TelemetryWrapper {
+                    #[serde(default)]
+                    telemetry: monopsony_common::config::TelemetryConfig,
+                }
+                toml::from_str::<TelemetryWrapper>(&content)
+                    .map(|w| w.telemetry.install_tracking)
+                    .unwrap_or(true)
+            }
+            Err(_) => true,
+        }
+    };
+    info!("Install telemetry: {}", if telemetry_enabled { "enabled" } else { "disabled" });
+
     let proxy_handle = tokio::spawn(async move {
         if let Err(e) = proxy::run_proxy(http_addr, storage_for_proxy, db_clone, auth_mode, scan_config_for_proxy, None).await {
             error!("HTTP proxy error: {}", e);
@@ -386,7 +405,7 @@ async fn main() -> anyhow::Result<()> {
         let shadow_for_grpc = shared_shadow_manager.clone();
         let tls_for_grpc = tls_manager.clone();
         let grpc_handle = tokio::spawn(async move {
-            if let Err(e) = grpc::start(grpc_addr, db_for_grpc, tls_for_grpc, mirror_for_grpc, shadow_for_grpc).await {
+            if let Err(e) = grpc::start(grpc_addr, db_for_grpc, tls_for_grpc, mirror_for_grpc, shadow_for_grpc, telemetry_enabled).await {
                 error!("gRPC server error: {}", e);
             }
         });

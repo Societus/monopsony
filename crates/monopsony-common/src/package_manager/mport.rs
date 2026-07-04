@@ -57,6 +57,7 @@ impl PackageManagerBackend for MportBackend {
                         version: Some(version.to_string()),
                         architecture: None,
                         manager: PackageManagerKind::Mport,
+                    installed_at: 0,
                     });
                 }
             } else {
@@ -65,6 +66,7 @@ impl PackageManagerBackend for MportBackend {
                     version: None,
                     architecture: None,
                     manager: PackageManagerKind::Mport,
+                    installed_at: 0,
                 });
             }
         }
