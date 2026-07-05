@@ -115,12 +115,12 @@ impl PackageManagerBackend for DnfBackend {
         vec![
             UrlPattern::new(r"https?://[^/]*(?:fedoraproject|centos|redhat)\.org/.*\.rpm", 100, "Fedora/CentOS/RHEL packages").expect("valid regex"),
             UrlPattern::new(r"https?://[^/]*rpmfusion\.org/.*\.rpm", 100, "RPM Fusion packages").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*repo\.almalinux\.org/.*\.rpm", 100, "AlmaLinux packages").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*repo\.rockylinux\.org/.*\.rpm", 100, "Rocky Linux packages").expect("valid regex"),
+            UrlPattern::new(r"https?://[^/]*almalinux\.org/.*\.rpm", 100, "AlmaLinux packages").expect("valid regex"),
+            UrlPattern::new(r"https?://[^/]*rockylinux\.org/.*\.rpm", 100, "Rocky Linux packages").expect("valid regex"),
             UrlPattern::new(r"https?://[^/]*(?:fedoraproject|centos|redhat)\.org/.*\.(?:xml|sqlite(?:\.bz2)?|json)", 90, "Fedora/CentOS/RHEL metadata").expect("valid regex"),
             UrlPattern::new(r"https?://[^/]*rpmfusion\.org/.*\.(?:xml|sqlite(?:\.bz2)?|json)", 90, "RPM Fusion metadata").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*repo\.almalinux\.org/.*\.(?:xml|sqlite(?:\.bz2)?|json)", 90, "AlmaLinux metadata").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*repo\.rockylinux\.org/.*\.(?:xml|sqlite(?:\.bz2)?|json)", 90, "Rocky Linux metadata").expect("valid regex"),
+            UrlPattern::new(r"https?://[^/]*almalinux\.org/.*\.(?:xml|sqlite(?:\.bz2)?|json)", 90, "AlmaLinux metadata").expect("valid regex"),
+            UrlPattern::new(r"https?://[^/]*rockylinux\.org/.*\.(?:xml|sqlite(?:\.bz2)?|json)", 90, "Rocky Linux metadata").expect("valid regex"),
         ]
     }
 
