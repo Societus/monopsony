@@ -93,12 +93,18 @@ fn default_max_connections() -> u32 {
     10
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TelemetryConfig {
     /// Enable install success tracking via inventory reports.
     /// When false, server ignores installed_at fields.
     #[serde(default = "default_true")]
     pub install_tracking: bool,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self { install_tracking: true }
+    }
 }
 
 fn default_true() -> bool {
