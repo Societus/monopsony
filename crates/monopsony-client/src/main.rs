@@ -7,9 +7,30 @@ use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tracing::{info, warn, Level};
+use tracing::{debug, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 use anyhow::Context;
+
+// Platform-conditional default paths for config and certificate directories.
+fn default_config_path() -> String {
+    if cfg!(windows) {
+        std::env::var("ProgramData")
+            .map(|d| format!("{}\\monopsony\\client.toml", d))
+            .unwrap_or_else(|_| "C:\\ProgramData\\monopsony\\client.toml".to_string())
+    } else {
+        "/etc/monopsony/client.toml".to_string()
+    }
+}
+
+fn default_cert_dir() -> String {
+    if cfg!(windows) {
+        std::env::var("APPDATA")
+            .map(|d| format!("{}\\monopsony", d))
+            .unwrap_or_else(|_| "C:\\Users\\%USERNAME%\\AppData\\Roaming\\monopsony".to_string())
+    } else {
+        "~/.config/monopsony".to_string()
+    }
+}
 
 mod proxy;
 mod grpc_client;
@@ -23,12 +44,16 @@ mod auto_update;
 #[command(propagate_version = true)]
 struct Args {
     /// Path to TOML configuration file
-    #[arg(short, long, default_value = "/etc/monopsony/client.toml")]
-    config: String,
+    #[arg(short, long)]
+    config: Option<String>,
 
     /// Directory for client certificates and pairing data
-    #[arg(long, default_value = "~/.config/monopsony")]
-    cert_dir: String,
+    #[arg(long)]
+    cert_dir: Option<String>,
+
+    /// Enable debug logging (shows all trace-level output from proxy, gRPC, discovery)
+    #[arg(short, long)]
+    debug: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -122,18 +147,31 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
+    let log_level = if args.debug { Level::DEBUG } else { Level::INFO };
     let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+        .with_max_level(log_level)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    // Expand tilde in cert_dir
-    let cert_dir = shellexpand::tilde(&args.cert_dir).to_string();
-    let cert_dir = PathBuf::from(cert_dir);
+    // Resolve cert_dir — platform-aware defaults. Windows uses APPDATA; Linux uses ~/.config/monopsony.
+    let cert_dir_raw = args
+        .cert_dir
+        .clone()
+        .unwrap_or_else(default_cert_dir);
+
+    let cert_dir = if cfg!(windows) {
+        PathBuf::from(cert_dir_raw) // Windows: APPDATA paths don't need tilde expansion
+    } else {
+        shellexpand::tilde(&cert_dir_raw).to_string()
+            .parse::<PathBuf>()
+            .unwrap_or_else(|_| PathBuf::from(cert_dir_raw))
+    };
+    // Resolve config path — platform-aware default if not provided via --config
+    let config_path = args.config.clone().unwrap_or_else(default_config_path);
 
     match args.command {
         Some(Commands::Daemon { proxy_addr, server, timeout_ms }) => {
-            run_daemon(proxy_addr, server, timeout_ms, cert_dir, &args.config).await?;
+            run_daemon(proxy_addr, server, timeout_ms, cert_dir, &config_path).await?;
         }
         Some(Commands::Discover { timeout_secs, tracker_url, peer_url, distro }) => {
             run_discover(timeout_secs, tracker_url, peer_url, &distro).await?;
@@ -172,6 +210,11 @@ async fn run_daemon(
     config_path: &str,
 ) -> anyhow::Result<()> {
     info!("Starting Monopsony Client v{}", env!("CARGO_PKG_VERSION"));
+
+    // Log system info for diagnostics
+    debug!("Platform: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+    debug!("Config path: {}", config_path);
+    debug!("Cert dir: {}", cert_dir.display());
 
     // Load client config (optional — daemon works without one using CLI args)
     let client_config = match std::fs::read_to_string(config_path) {
@@ -600,16 +643,18 @@ async fn run_pair(
     Ok(())
 }
 
+#[cfg(unix)]
 async fn run_mirror(
     server: &str,
     distro: &str,
     mirror_url: Option<&str>,
 ) -> anyhow::Result<()> {
-    use monopsony_common::package_manager::{get_available_backends, PackageManagerKind};
+    {
+        use monopsony_common::package_manager::{get_available_backends, PackageManagerKind};
 
-    let mirror_base = mirror_url
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("http://{}/mirror/{}/", server, distro));
+        let mirror_base = mirror_url
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("http://{}/mirror/{}/", server, distro));
 
     let kind = match distro.to_lowercase().as_str() {
         "archlinux" | "arch" => PackageManagerKind::Pacman,
@@ -689,7 +734,7 @@ async fn run_mirror(
                 _ => {
                     anyhow::bail!("Mirror configuration not yet implemented for {:?}", kind);
                 }
-            }
+            } // end match kind (#[cfg(unix)])
 
             println!("Mirror configuration complete for {}.", distro);
             println!("Note: You may need to run the package manager update command (e.g., apt update, pacman -Sy).");
@@ -699,8 +744,31 @@ async fn run_mirror(
             println!("No compatible package manager detected for {} on this system.", distro);
             println!("Manual configuration: point your package manager at {}", mirror_base);
         }
-    }
+    } // end match backend
 
+    } // end #[cfg(unix)] block
+
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn run_mirror(
+    server: &str,
+    distro: &str,
+    mirror_url: Option<&str>,
+) -> anyhow::Result<()> {
+    let mirror_base = mirror_url
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("http://{}/mirror/{}/", server, distro));
+
+    info!("Mirror subcommand not supported on Windows — set HTTP_PROXY manually.");
+    println!("Windows: configure your package manager to use the Monopsony proxy manually:");
+    println!();
+    println!("  winget/choco/scoop: Set system proxy via netsh winhttp");
+    println!("    netsh winhttp set proxy {}", mirror_base);
+    println!();
+    println!("  Or use environment variable for current session:");
+    println!("    set HTTP_PROXY={}", mirror_base);
     Ok(())
 }
 
