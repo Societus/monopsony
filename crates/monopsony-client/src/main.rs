@@ -2,6 +2,7 @@
 
 mod shadow;
 mod shadow_cli;
+mod proxy_toggle;
 
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
@@ -37,6 +38,7 @@ mod grpc_client;
 mod discovery;
 mod trust;
 mod auto_update;
+mod self_update;
 
 #[derive(Parser, Debug)]
 #[command(name = "monopsony-client", version)]
@@ -136,6 +138,205 @@ enum Commands {
         #[command(subcommand)]
         cmd: shadow_cli::PackageCommand,
     },
+    /// Manage proxy configuration for package managers, Docker, and shadow packages
+    Proxy {
+        #[command(subcommand)]
+        cmd: ProxyCommand,
+    },
+    /// Self-update monopsony (server or client) from GitHub releases via the shadow system
+    SelfUpdate {
+        #[command(subcommand)]
+        cmd: SelfUpdateMode,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SelfUpdateMode {
+    /// Check for available updates and show version info
+    Check,
+    /// Download and apply the latest update (atomic swap + health check)
+    Apply,
+}
+
+/// Detect which binary we are by examining argv[0]
+fn detect_binary_type() -> &'static str {
+    if let Some(argv0) = std::env::args().next() {
+        let name = std::path::Path::new(&argv0)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        match name {
+            "monopsony-server" => "server",
+            _ => "client",
+        }
+    } else {
+        "unknown"
+    }
+}
+
+async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
+    let binary_type = detect_binary_type();
+    
+    match cmd {
+        SelfUpdateMode::Check => {
+            info!("Checking for {} updates...", binary_type);
+            
+            // Get current version from env var set by cargo at build time
+            let current_version = env!("CARGO_PKG_VERSION").to_string();
+            println!("Current {}: {}", binary_type, current_version);
+            
+            let result = self_update::check_for_update(&current_version).await;
+            
+            match result {
+                Ok(result) => {
+                    if let Some(latest) = &result.latest_version {
+                        println!("Update available: {} -> {}", result.current_version, latest);
+                        if let Some(url) = &result.changelog_url {
+                            println!("Changelog: {}", url);
+                        }
+                        std::process::exit(1); // Exit code 1 indicates update available
+                    } else {
+                        println!("You are running the latest version of monopsony {}.", binary_type);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to check for updates: {}", e);
+                    std::process::exit(2);
+                }
+            }
+        }
+        
+        SelfUpdateMode::Apply => {
+            info!("Applying {} update...", binary_type);
+            
+            let current_version = env!("CARGO_PKG_VERSION").to_string();
+            
+            let result = self_update::check_for_update(&current_version).await;
+            
+            match result {
+                Ok(result) => {
+                    if result.latest_version.is_none() {
+                        println!("Already at latest version. Nothing to do.");
+                        return Ok(());
+                    }
+                    
+                    // Check if we have an asset URL for this platform
+                    let asset_url = match result.asset_url {
+                        Some(url) => url,
+                        None => {
+                            eprintln!("No compatible release asset found for this platform.");
+                            eprintln!("Available at: {}", result.changelog_url.as_deref().unwrap_or("GitHub releases"));
+                            std::process::exit(3);
+                        }
+                    };
+                    
+                    // Determine current binary path
+                    let current_exe = std::env::current_exe()
+                        .context("Failed to get current executable path")?;
+                    
+                    let target_dir = current_exe.parent()
+                        .context("Failed to get parent directory of binary")?
+                        .to_path_buf();
+                    
+                    println!("Downloading update from: {}", asset_url);
+                    println!("Installing to: {}", current_exe.display());
+
+                    // Try parsing the default recipe for the managed pipeline
+                    let recipe = toml::from_str::<monopsony_common::shadow_types::ShadowRecipe>(
+                        monopsony_common::shadow_types::DEFAULT_MONOPSONY_RECIPE,
+                    ).ok();
+
+                    if recipe.is_some() {
+                        // Managed update with full safety pipeline
+                        let mut ctx = self_update::UpdateContext::new(
+                            recipe,
+                            current_exe,
+                            target_dir,
+                            current_version,
+                            result.latest_version.as_deref().unwrap_or("unknown").to_string(),
+                            asset_url,
+                        );
+
+                        match self_update::apply_update_managed(&mut ctx).await {
+                            Ok(self_update::UpdateOutcome::Success) => {
+                                println!("Update applied successfully! Restart monopsony to use the new version.");
+                            }
+                            Ok(self_update::UpdateOutcome::RolledBack(reason)) => {
+                                eprintln!("Update rolled back: {}", reason);
+                                eprintln!("Your system has been restored to the previous version.");
+                                std::process::exit(5);
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to apply update: {}", e);
+                                std::process::exit(4);
+                            }
+                        }
+                    } else {
+                        // Fallback: raw download + swap (no health check)
+                        match self_update::apply_update(
+                            &current_exe,
+                            &target_dir,
+                            &asset_url,
+                            result.latest_version.as_deref().unwrap_or("unknown"),
+                        ).await {
+                            Ok(()) => {
+                                println!("Update applied successfully! Restart monopsony to use the new version.");
+                            }
+                            Err(e) => {
+                                eprintln!("Failed to apply update: {}", e);
+                                std::process::exit(4);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to check for updates: {}", e);
+                    std::process::exit(2);
+                }
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+#[derive(Subcommand, Debug)]
+enum ProxyCommand {
+    /// Show current proxy status for all subsystems
+    Status,
+    /// Enable proxying for specified subsystems
+    On {
+        /// Enable specific package manager (pacman, apt, dnf, apk, winget, choco, scoop)
+        #[arg(long)]
+        pm: Option<String>,
+        /// Enable Docker registry mirror
+        #[arg(long)]
+        docker: bool,
+        /// Enable shadow package trust
+        #[arg(long)]
+        shadow: bool,
+        /// Enable all detected subsystems
+        #[arg(long)]
+        all: bool,
+        /// Server address for proxy configuration
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// Disable proxying for specified subsystems
+    Off {
+        /// Disable specific package manager
+        #[arg(long)]
+        pm: Option<String>,
+        /// Disable Docker registry mirror
+        #[arg(long)]
+        docker: bool,
+        /// Disable shadow package trust
+        #[arg(long)]
+        shadow: bool,
+        /// Disable all subsystems
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[tokio::main]
@@ -194,12 +395,56 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Package { cmd }) => {
             run_shadow_package(cmd)?;
         }
+        Some(Commands::SelfUpdate { cmd }) => {
+            run_self_update(cmd).await?;
+        }
+        Some(Commands::Proxy { cmd }) => {
+            run_proxy_command(cmd, &cert_dir).await?;
+        }
         None => {
             info!("No command specified. Use --help for usage.");
         }
     }
 
     Ok(())
+}
+
+/// Resolve server address using the fallback chain:
+/// 1. cert_dir/server.json (from pairing)
+/// 2. mDNS discovery
+/// 3. Error if all fail
+async fn resolve_server_addr(cert_dir: &Path) -> anyhow::Result<String> {
+    // Try server.json from pairing
+    let server_json_path = cert_dir.join("server.json");
+    if server_json_path.exists() {
+        match std::fs::read_to_string(&server_json_path) {
+            Ok(content) => {
+                if let Ok(info) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(grpc_addr) = info.get("grpc_addr").and_then(|v| v.as_str()) {
+                        if !grpc_addr.is_empty() {
+                            info!("Using server from pairing: {}", grpc_addr);
+                            return Ok(grpc_addr.to_string());
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Failed to read server.json: {}", e);
+            }
+        }
+    }
+
+    // Fall back to mDNS
+    info!("Discovering server via mDNS...");
+    let disc = discovery::ClientDiscovery::new("monopsony");
+    let found = disc.discover_one(Duration::from_secs(10)).await
+        .map_err(|e| anyhow::anyhow!(
+            "Server discovery failed (no --server provided, no server.json, and mDNS failed). \
+             Is the server running and on the same network? Error: {}", e
+        ))?;
+    let addr = format!("{}:{}", found.address, found.grpc_port);
+    info!("Discovered server at {}", addr);
+    Ok(addr)
 }
 
 async fn run_daemon(
@@ -270,15 +515,20 @@ async fn run_daemon(
             addr
         }
         None => {
-            info!("Discovering server via mDNS...");
-            let disc = discovery::ClientDiscovery::new("monopsony");
-            let found = disc.discover_one(Duration::from_secs(10)).await
-                .map_err(|e| anyhow::anyhow!(
-                    "Server discovery failed (no --server provided). Is the server running and on the same network? Error: {}", e
-                ))?;
-            let addr = format!("{}:{}", found.address, found.grpc_port);
-            info!("Discovered server at {}", addr);
-            addr
+            // Try config file first
+            if let Some(ref config) = client_config {
+                if let Some(ref addr) = config.server.address {
+                    let full_addr = format!("{}:{}", addr, config.server.grpc_port);
+                    info!("Using server from config: {}", full_addr);
+                    full_addr
+                } else {
+                    // Try server.json from pairing, then mDNS
+                    resolve_server_addr(&cert_dir).await?
+                }
+            } else {
+                // Try server.json from pairing, then mDNS
+                resolve_server_addr(&cert_dir).await?
+            }
         }
     };
 
@@ -620,7 +870,7 @@ async fn run_pair(
     let managers: Vec<String> = backends.iter().map(|b| b.kind().as_str().to_string()).collect();
 
     info!("Pairing with server: {}", server);
-    let (client_id, certs) = grpc_client::MonopsonyGrpcClient::pair(
+    let (client_id, certs, grpc_addr) = grpc_client::MonopsonyGrpcClient::pair(
         server,
         code,
         &hostname,
@@ -635,9 +885,21 @@ async fn run_pair(
     certs.save(cert_dir)?;
     std::fs::write(cert_dir.join("client_id"), &client_id)?;
 
+    // Persist server connection info for future daemon connections.
+    let server_info = serde_json::json!({
+        "grpc_addr": grpc_addr,
+        "paired_addr": server,
+        "paired_at": chrono::Utc::now().to_rfc3339(),
+    });
+    std::fs::write(
+        cert_dir.join("server.json"),
+        serde_json::to_string_pretty(&server_info)?,
+    )?;
+
     info!("Pairing complete!");
     info!("  Client ID: {}", client_id);
     info!("  Certificates saved to: {}", cert_dir.display());
+    info!("  Server address saved to: {}/server.json", cert_dir.display());
     println!("Pairing complete! Client ID: {}", client_id);
 
     Ok(())
@@ -911,6 +1173,110 @@ fn run_shadow_package(cmd: shadow_cli::PackageCommand) -> anyhow::Result<()> {
                         Err(e) => eprintln!("Cannot read {}: {}", path, e),
                     }
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_proxy_command(cmd: ProxyCommand, cert_dir: &Path) -> anyhow::Result<()> {
+    match cmd {
+        ProxyCommand::Status => {
+            println!("Monopsony Proxy Status");
+            println!("═══════════════════════════════════════════════");
+
+            // Show server connection info
+            let server_json_path = cert_dir.join("server.json");
+            if server_json_path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&server_json_path) {
+                    if let Ok(info) = serde_json::from_str::<serde_json::Value>(&content) {
+                        let grpc_addr = info.get("grpc_addr").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let paired_at = info.get("paired_at").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        println!("Server:           {}", grpc_addr);
+                        println!("Paired at:        {}", paired_at);
+                    }
+                }
+            } else {
+                println!("Server:           not paired (no server.json)");
+            }
+            println!();
+
+            // Check subsystems
+            let results = proxy_toggle::proxy_status(cert_dir).await;
+            if results.is_empty() {
+                println!("No subsystems detected.");
+            } else {
+                for r in &results {
+                    let status = if r.success { "ON  ✓" } else { "OFF ✗" };
+                    println!("  {:<16} {}  {}", r.subsystem, status, r.message);
+                }
+            }
+        }
+        ProxyCommand::On { pm, docker, shadow, all, server } => {
+            let target = if all {
+                proxy_toggle::ToggleTarget::All
+            } else if let Some(name) = pm {
+                proxy_toggle::ToggleTarget::Pm(name)
+            } else if docker {
+                proxy_toggle::ToggleTarget::Docker
+            } else if shadow {
+                proxy_toggle::ToggleTarget::Shadow
+            } else {
+                anyhow::bail!("Specify at least one of --all, --pm <name>, --docker, --shadow");
+            };
+
+            // Resolve server address
+            let server_addr = if let Some(s) = server {
+                s
+            } else {
+                resolve_server_addr(cert_dir).await.unwrap_or_else(|_| "127.0.0.1:3128".to_string())
+            };
+
+            let results = proxy_toggle::proxy_on(target, &server_addr).await;
+            let mut succeeded = 0;
+            let mut failed = 0;
+            for r in &results {
+                if r.success {
+                    println!("✓ {}: {}", r.subsystem, r.message);
+                    succeeded += 1;
+                } else {
+                    println!("✗ {}: {}", r.subsystem, r.message);
+                    failed += 1;
+                }
+            }
+            println!("\n{} succeeded, {} failed", succeeded, failed);
+            if failed > 0 {
+                anyhow::bail!("{} actions failed", failed);
+            }
+        }
+        ProxyCommand::Off { pm, docker, shadow, all } => {
+            let target = if all {
+                proxy_toggle::ToggleTarget::All
+            } else if let Some(name) = pm {
+                proxy_toggle::ToggleTarget::Pm(name)
+            } else if docker {
+                proxy_toggle::ToggleTarget::Docker
+            } else if shadow {
+                proxy_toggle::ToggleTarget::Shadow
+            } else {
+                anyhow::bail!("Specify at least one of --all, --pm <name>, --docker, --shadow");
+            };
+
+            let results = proxy_toggle::proxy_off(target).await;
+            let mut succeeded = 0;
+            let mut failed = 0;
+            for r in &results {
+                if r.success {
+                    println!("✓ {}: {}", r.subsystem, r.message);
+                    succeeded += 1;
+                } else {
+                    println!("✗ {}: {}", r.subsystem, r.message);
+                    failed += 1;
+                }
+            }
+            println!("\n{} succeeded, {} failed", succeeded, failed);
+            if failed > 0 {
+                anyhow::bail!("{} actions failed", failed);
             }
         }
     }

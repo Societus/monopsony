@@ -7,7 +7,7 @@
 ```
 Monopsony is a centralized package caching proxy system - like Windows Update's LAN sharing but for all package managers across all OSes. A central server pre-fetches and caches packages from upstream repositories, and clients redirect their package managers through it via a local HTTP proxy.
 **Target scale:** SMB/office (20-200 clients, single server)
-**Git state:** Forgejo: base.societus.club/societus/monopsony.git. Local: ~/projects/monopsony. **v1.0.0-rc1. 363 tests passing. Sprint 18 complete. Release CI done.**
+**Git state:** Forgejo: base.societus.club/societus/monopsony.git. Local: ~/projects/monopsony. **v1.0.0-rc1. 426 tests passing. Sprint 18 complete. Release CI done. 15 PM backends (all planned implemented).**
 ## Build & Run
 ```
 bash
@@ -38,7 +38,7 @@ cargo test                     # Run tests
 | `monopsony-tracker` | Compiles clean | HTTP API, recipe admin routes (quarantine reinstate/remove), graceful shutdown |
 
 Full workspace: `cargo check` passes, 0 errors, warnings only (dead_code in shadow modules -- not yet wired to gRPC handlers).
-Tests: 363 passed, 0 failed, 1 ignored. Clippy: clean on new crates (3 pre-existing dead_code warnings in shadow/db).
+Tests: 426 passed, 0 failed, 2 ignored. Clippy: clean on new crates (3 pre-existing dead_code warnings in shadow/db).
 
 ## Release Status
 
@@ -220,7 +220,7 @@ The server's HTTP proxy is the most complete module. It:
 | 6b | gRPC Inventory Reporting | **Done** | ReportInventory RPC + bidirectional ControlStream |
 | 7 | Pairing mechanism | **Done** | 6-char code exchange on plaintext TCP port 50052, protobuf-framed. Server generates client cert, client saves + reconnects via mTLS |
 | 8 | Client daemon mode + CLI | **Done** | Daemon requires paired certs, heartbeat loop + inventory reporting work. Exponential backoff reconnect (1s→60s). Configure subcommand executes ProxyConfigActions. |
-| 9 | Additional package managers | **Done** | All 6 backends implemented (apt, dnf, pacman, winget, choco, scoop) |
+| 9 | Additional package managers | **Done** | All 15 backends implemented (apt, dnf, pacman, apk, winget, choco, scoop, mport, pkg, pkg_add, pkgin, zypper, xbps, emerge, nix) |
 | 10 | Pre-fetch scheduler | **Done** | prefetch.rs: inventory-driven prefetch with priority (client_count DESC), bounded concurrency (buffer_unordered), per-request timeout, SSRF validation, bandwidth throttle, atomic writes, response size limit. |
 | 11 | Hardening + Public Mirror Network | **Done** | Phase 1 complete: graceful shutdown (broadcast + 30s drain timeout), Prometheus metrics wired (proxy/gRPC/prefetch + mirror sync/serve), rate limiting middleware (token-bucket per-IP), auth middleware (X-Monopsony-Key for private mirrors), mirror manifest endpoint, SHA-256 hash verification during sync. Phase 2+3 design in `docs/research/public-mirror-network.md`. |
 | 12 | Distribution mirror support | **Done** | mirror.rs module, DB schema + CRUD, client `Mirror` subcommand, Mirror HTTP router (:3129), sync loop, gRPC MirrorControl service (5 RPCs: ListMirrors, TriggerMirrorSync, GetMirrorStatus, UpsertMirrorConfig, DeleteMirrorConfig). |

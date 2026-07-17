@@ -7,26 +7,34 @@ mod apk;
 mod apt;
 mod bsd_privilege;
 mod dnf;
+mod emerge;
 mod mport;
+mod nix;
 mod pacman;
 mod pkg;
 mod pkg_add;
 mod pkgin;
-mod winget;
-mod choco;
 mod scoop;
+mod winget;
+mod xbps;
+mod zypper;
+mod choco;
 
 pub use apk::ApkBackend;
 pub use apt::AptBackend;
 pub use dnf::DnfBackend;
+pub use emerge::EmergeBackend;
 pub use mport::MportBackend;
+pub use nix::NixBackend;
 pub use pacman::PacmanBackend;
 pub use pkg::PkgBackend;
 pub use pkg_add::PkgAddBackend;
 pub use pkgin::PkginBackend;
-pub use winget::WingetBackend;
-pub use choco::ChocoBackend;
 pub use scoop::ScoopBackend;
+pub use winget::WingetBackend;
+pub use xbps::XbpsBackend;
+pub use zypper::ZypperBackend;
+pub use choco::ChocoBackend;
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -47,6 +55,10 @@ pub enum PackageManagerKind {
     Winget,
     Choco,
     Scoop,
+    Zypper,
+    Xbps,
+    Emerge,
+    Nix,
 }
 
 impl PackageManagerKind {
@@ -63,6 +75,10 @@ impl PackageManagerKind {
             PackageManagerKind::Winget => "winget",
             PackageManagerKind::Choco => "choco",
             PackageManagerKind::Scoop => "scoop",
+            PackageManagerKind::Zypper => "zypper",
+            PackageManagerKind::Xbps => "xbps",
+            PackageManagerKind::Emerge => "emerge",
+            PackageManagerKind::Nix => "nix",
         }
     }
 
@@ -81,6 +97,10 @@ impl PackageManagerKind {
             "winget" => Some(PackageManagerKind::Winget),
             "choco" => Some(PackageManagerKind::Choco),
             "scoop" => Some(PackageManagerKind::Scoop),
+            "zypper" => Some(PackageManagerKind::Zypper),
+            "xbps" => Some(PackageManagerKind::Xbps),
+            "emerge" => Some(PackageManagerKind::Emerge),
+            "nix" => Some(PackageManagerKind::Nix),
             _ => None,
         }
     }
@@ -284,6 +304,10 @@ pub fn get_all_backends() -> Vec<Box<dyn PackageManagerBackend>> {
         Box::new(WingetBackend::new()),
         Box::new(ChocoBackend::new()),
         Box::new(ScoopBackend::new()),
+        Box::new(ZypperBackend::new()),
+        Box::new(XbpsBackend::new()),
+        Box::new(EmergeBackend::new()),
+        Box::new(NixBackend::new()),
     ]
 }
 
@@ -312,6 +336,10 @@ pub fn get_backend(kind: PackageManagerKind) -> Option<Box<dyn PackageManagerBac
         PackageManagerKind::Winget => Some(Box::new(WingetBackend::new())),
         PackageManagerKind::Choco => Some(Box::new(ChocoBackend::new())),
         PackageManagerKind::Scoop => Some(Box::new(ScoopBackend::new())),
+        PackageManagerKind::Zypper => Some(Box::new(ZypperBackend::new())),
+        PackageManagerKind::Xbps => Some(Box::new(XbpsBackend::new())),
+        PackageManagerKind::Emerge => Some(Box::new(EmergeBackend::new())),
+        PackageManagerKind::Nix => Some(Box::new(NixBackend::new())),
     }
 }
 

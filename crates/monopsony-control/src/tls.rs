@@ -173,13 +173,18 @@ impl TlsManager {
         &self,
         bind_addr: Option<std::net::IpAddr>,
     ) -> anyhow::Result<tonic::transport::ServerTlsConfig> {
-        let (cert_pem, key_pem) = self.generate_server_cert(bind_addr)?;
+        self.tonic_server_tls_config_with_sans(bind_addr, &[])
+    }
+
+    /// Build a ServerTlsConfig with additional SAN entries from config.
+    pub fn tonic_server_tls_config_with_sans(
+        &self,
+        bind_addr: Option<std::net::IpAddr>,
+        additional_sans: &[String],
+    ) -> anyhow::Result<tonic::transport::ServerTlsConfig> {
+        let (cert_pem, key_pem) = self.generate_server_cert_with_sans(bind_addr, additional_sans)?;
         let cert_str = String::from_utf8(cert_pem)?;
         let key_str = String::from_utf8(key_pem)?;
-        // Include the CA cert in the identity so the server presents the full
-        // chain (leaf + CA) during the TLS handshake. Without this, clients
-        // that only have the CA as a trusted root see "UnknownIssuer" because
-        // the leaf's issuer (CA) is not sent alongside it.
         let chain = format!("{}\n{}", cert_str, self.ca_cert_pem);
         let identity = tonic::transport::Identity::from_pem(&chain, &key_str);
         let ca_cert = tonic::transport::Certificate::from_pem(&self.ca_cert_pem);
@@ -189,31 +194,57 @@ impl TlsManager {
     }
 
     /// Generate an in-memory server leaf certificate signed by the CA.
-    ///
-    /// Returns `(cert_pem, key_pem)` as byte vectors. The certificate has
-    /// SAN `monopsony-server` plus the bind IP address (if provided) and
-    /// EKU `serverAuth`, valid until 2036-01-01.
-    ///
-    /// Includes SubjectKeyIdentifier and AuthorityKeyIdentifier extensions
-    /// required for proper chain validation by webpki/rustls.
     pub fn generate_server_cert(
         &self,
         bind_addr: Option<std::net::IpAddr>,
     ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        self.generate_server_cert_with_sans(bind_addr, &[])
+    }
+
+    /// Generate a server leaf certificate with additional SAN entries.
+    pub fn generate_server_cert_with_sans(
+        &self,
+        bind_addr: Option<std::net::IpAddr>,
+        additional_sans: &[String],
+    ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
         let mut san_types: Vec<rcgen::SanType> =
             vec![rcgen::SanType::DnsName("monopsony-server".try_into()?)];
-        
-        // If bind_addr is 0.0.0.0 or ::, try to detect the actual LAN IP to include in SAN
+
         if let Some(ip) = bind_addr {
             if ip.is_unspecified() {
-                // Try to find a non-loopback, non-link-local IP
-                if let Ok(lan_ip) = Self::detect_lan_ip() {
-                    san_types.push(rcgen::SanType::IpAddress(lan_ip));
+                for iface in pnet::datalink::interfaces() {
+                    for iface_ip in iface.ips {
+                        let addr = iface_ip.ip();
+                        let is_link_local = match addr {
+                            std::net::IpAddr::V4(v4) => v4.is_link_local(),
+                            std::net::IpAddr::V6(v6) => v6.is_unicast_link_local(),
+                        };
+                        if !addr.is_loopback() && !is_link_local {
+                            san_types.push(rcgen::SanType::IpAddress(addr));
+                        }
+                    }
                 }
             } else {
                 san_types.push(rcgen::SanType::IpAddress(ip));
             }
         }
+
+        for san in additional_sans {
+            if let Ok(ip) = san.parse::<std::net::IpAddr>() {
+                san_types.push(rcgen::SanType::IpAddress(ip));
+            } else {
+                san_types.push(rcgen::SanType::DnsName(san.as_str().try_into()?));
+            }
+        }
+
+        // Deduplicate
+        let mut seen = std::collections::HashSet::new();
+        san_types.retain(|san| match san {
+            rcgen::SanType::DnsName(name) => seen.insert(format!("dns:{}", name)),
+            rcgen::SanType::IpAddress(ip) => seen.insert(format!("ip:{}", ip)),
+            _ => true,
+        });
+
         let mut params = CertificateParams::new(Vec::<String>::new())?;
         params.subject_alt_names = san_types;
         params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
@@ -222,9 +253,7 @@ impl TlsManager {
             .push(rcgen::DnType::CommonName, "Monopsony Server");
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         params.not_after = rcgen::date_time_ymd(2036, 1, 1);
-        // Use ExplicitNoCa to ensure SubjectKeyIdentifier extension is included
         params.is_ca = IsCa::ExplicitNoCa;
-        // Enable AuthorityKeyIdentifier extension for proper chain building
         params.use_authority_key_identifier_extension = true;
 
         let key = KeyPair::generate()?;

@@ -17,6 +17,7 @@ use monopsony_shadow::ShadowPackageManager;
 use monopsony_admin::{AdminState, DashboardConfig};
 
 mod setup;
+mod self_update;
 
 
 #[derive(Parser, Debug)]
@@ -177,6 +178,11 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+    /// Self-update monopsony server from GitHub releases via the shadow system
+    SelfUpdate {
+        #[command(subcommand)]
+        cmd: SelfUpdateMode,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -194,6 +200,14 @@ enum ApiKeyCommands {
         /// Key ID to revoke
         key_id: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum SelfUpdateMode {
+    /// Check for available updates and show version info
+    Check,
+    /// Download and apply the latest update (atomic swap + health check)
+    Apply,
 }
 
 #[tokio::main]
@@ -237,6 +251,9 @@ async fn main() -> anyhow::Result<()> {
             setup::run_setup(&args.config)?;
         }
         return Ok(());
+    }
+    if let Some(Commands::SelfUpdate { cmd }) = args.command {
+        return self_update::run_self_update(cmd).await;
     }
 
     info!("Starting Monopsony Server v{}", env!("CARGO_PKG_VERSION"));
@@ -404,8 +421,40 @@ async fn main() -> anyhow::Result<()> {
         let mirror_for_grpc = shared_mirror_manager.clone();
         let shadow_for_grpc = shared_shadow_manager.clone();
         let tls_for_grpc = tls_manager.clone();
+
+        // Read TLS SANs and access control from config file
+        let (tls_sans, access_control) = match std::fs::read_to_string(&args.config) {
+            Ok(content) => {
+                #[derive(serde::Deserialize)]
+                struct CfgWrapper {
+                    #[serde(default)]
+                    tls: TlsSanWrapper,
+                    #[serde(default)]
+                    access_control: monopsony_common::config::AccessControlConfig,
+                }
+                #[derive(serde::Deserialize, Default)]
+                struct TlsSanWrapper {
+                    #[serde(default)]
+                    san_names: Vec<String>,
+                }
+                match toml::from_str::<CfgWrapper>(&content) {
+                    Ok(w) => (w.tls.san_names, Some(w.access_control)),
+                    Err(_) => (Vec::new(), None),
+                }
+            }
+            Err(_) => (Vec::new(), None),
+        };
+        if !tls_sans.is_empty() {
+            info!(sans = ?tls_sans, "Additional TLS SANs from config");
+        }
+        if let Some(ref ac) = access_control {
+            if ac.enabled {
+                info!(cidrs = ?ac.allowed_cidrs, "Access control enabled");
+            }
+        }
+
         let grpc_handle = tokio::spawn(async move {
-            if let Err(e) = grpc::start(grpc_addr, db_for_grpc, tls_for_grpc, mirror_for_grpc, shadow_for_grpc, telemetry_enabled).await {
+            if let Err(e) = grpc::start(grpc_addr, db_for_grpc, tls_for_grpc, mirror_for_grpc, shadow_for_grpc, telemetry_enabled, &tls_sans, access_control).await {
                 error!("gRPC server error: {}", e);
             }
         });

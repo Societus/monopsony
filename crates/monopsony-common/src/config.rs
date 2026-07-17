@@ -61,6 +61,8 @@ pub struct ServerConfig {
     pub node: NodeConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub access_control: AccessControlConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,6 +111,83 @@ impl Default for TelemetryConfig {
 
 fn default_true() -> bool {
     true
+}
+
+// ============================================================================
+// Access Control Configuration
+// ============================================================================
+
+fn default_allowed_cidrs() -> Vec<String> {
+    vec![
+        "10.0.0.0/8".to_string(),
+        "172.16.0.0/12".to_string(),
+        "192.168.0.0/16".to_string(),
+        "100.64.0.0/10".to_string(),
+    ]
+}
+
+/// IP-based access control for client connections.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessControlConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_allowed_cidrs")]
+    pub allowed_cidrs: Vec<String>,
+    #[serde(default = "default_true")]
+    pub restrict_pairing: bool,
+    #[serde(default = "default_true")]
+    pub log_rejected: bool,
+}
+
+impl Default for AccessControlConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_cidrs: default_allowed_cidrs(),
+            restrict_pairing: true,
+            log_rejected: true,
+        }
+    }
+}
+
+/// Check if an IP is allowed by the access control config.
+pub fn is_ip_allowed(ip: std::net::IpAddr, config: &AccessControlConfig) -> bool {
+    if !config.enabled { return true; }
+    config.allowed_cidrs.iter().any(|cidr| ip_in_cidr(ip, cidr))
+}
+
+/// CIDR matching for IPv4 and IPv6.
+pub fn ip_in_cidr(ip: std::net::IpAddr, cidr: &str) -> bool {
+    let (network, prefix_len) = match cidr.split_once('/') {
+        Some((net, prefix)) => (net, prefix.parse::<u32>().ok()),
+        None => (cidr, None),
+    };
+    if prefix_len.is_none() {
+        return network.parse::<std::net::IpAddr>().map_or(false, |addr| addr == ip);
+    }
+    let prefix_len = prefix_len.unwrap();
+    match ip {
+        std::net::IpAddr::V4(addr) => {
+            let net: std::net::Ipv4Addr = match network.parse() { Ok(n) => n, Err(_) => return false };
+            if prefix_len > 32 { return false; }
+            let mask = if prefix_len == 0 { 0u32 } else { !0u32 << (32 - prefix_len) };
+            (u32::from(addr) & mask) == (u32::from(net) & mask)
+        }
+        std::net::IpAddr::V6(addr) => {
+            let net: std::net::Ipv6Addr = match network.parse() { Ok(n) => n, Err(_) => return false };
+            if prefix_len > 128 { return false; }
+            let ab = addr.octets();
+            let nb = net.octets();
+            let full = (prefix_len / 8) as usize;
+            let rem = prefix_len % 8;
+            if ab[..full] != nb[..full] { return false; }
+            if rem > 0 && full < 16 {
+                let m = !0u8 << (8 - rem);
+                if (ab[full] & m) != (nb[full] & m) { return false; }
+            }
+            true
+        }
+    }
 }
 
 /// Node deployment tier — controls storage and scanning requirements.
@@ -234,6 +313,12 @@ pub struct TlsServerConfig {
     pub server_cert_path: PathBuf,
     /// Path to server private key
     pub server_key_path: PathBuf,
+    /// Additional hostnames/IPs to include in server certificate SAN.
+    /// Ensures TLS handshake succeeds regardless of which address
+    /// the client connects from (public DNS, private IP, mDNS name, etc.).
+    /// Example: san_names = ["monopsony.example.com", "10.10.20.58"]
+    #[serde(default)]
+    pub san_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -436,6 +521,9 @@ pub struct ServerConnectionConfig {
     /// HTTP cache port
     #[serde(default = "default_http_port")]
     pub http_port: u16,
+    /// Alternate addresses to try if primary fails.
+    #[serde(default)]
+    pub alt_addresses: Vec<String>,
 }
 
 fn default_grpc_port() -> u16 {
@@ -855,6 +943,7 @@ mod tests {
                 ca_key_path: PathBuf::from("/tmp/ca.key"),
                 server_cert_path: PathBuf::from("/tmp/server.pem"),
                 server_key_path: PathBuf::from("/tmp/server.key"),
+                san_names: Vec::new(),
             },
             discovery: DiscoveryConfig {
                 mdns_enabled: true,
@@ -873,6 +962,7 @@ mod tests {
             scan: ScanConfig::default(),
             node: NodeConfig::default(),
             telemetry: TelemetryConfig::default(),
+            access_control: AccessControlConfig::default(),
         }
     }
 

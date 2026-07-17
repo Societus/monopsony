@@ -10,6 +10,82 @@ pub enum ShadowSource {
     DirectUrl,
 }
 
+/// Default self-update recipe baked into every Monopsony install.
+/// This allows monopsony-server and monopsony-client to update themselves
+/// via the same shadow package system used for third-party software.
+pub const DEFAULT_MONOPSONY_RECIPE: &str = r#"
+[package]
+name = "monopsony"
+description = "Monopsony self-update recipe"
+source_type = "github_release"
+source_url = "https://github.com/societus/monopsony"
+
+[install]
+method = "extract"
+target_dir = "/usr/local/bin"
+chmod = ["monopsony-server", "monopsony-client"]
+backup_old = true
+max_backups = 3
+config_paths = ["/etc/monopsony/server.toml", "/etc/monopsony/client.toml"]
+
+# Stop the service before swapping the binary
+pre_update = "systemctl stop monopsony-server 2>/dev/null; true"
+
+# Start the service after successful swap
+post_update = "systemctl start monopsony-server 2>/dev/null; true"
+
+# On failure: ensure service is running with old binary
+on_failure = "systemctl start monopsony-server 2>/dev/null; true"
+
+# Health check: verify the server responds after update
+[install.health_check]
+type = "port"
+port = 50051
+timeout_secs = 30
+
+[version]
+detect_command = "/usr/local/bin/monopsony-server --version 2>&1 || /usr/local/bin/monopsony-client --version 2>&1"
+detect_pattern = "(\\d+\\.\\d+\\.\\d+(?:-rc\\d+)?)"
+
+[asset_selector]
+tag_pattern = "v(\\d+\\.\\d+\\.\\d+(?:-rc\\d+)?)$"
+[[asset_selector.rules]]
+os = "linux"
+arch = "x86_64"
+libc = "glibc"
+pattern = "monopsony-x86_64-unknown-linux-gnu.tar.gz$"
+
+[[asset_selector.rules]]
+os = "linux"
+arch = "aarch64"
+libc = "glibc"
+pattern = "monopsony-aarch64-unknown-linux-gnu.tar.gz$"
+
+[[asset_selector.rules]]
+os = "linux"
+arch = "x86_64"
+libc = "musl"
+pattern = "monopsony-x86_64-unknown-linux-musl.tar.gz$"
+
+[[asset_selector.rules]]
+os = "linux"
+arch = "aarch64"
+libc = "musl"
+pattern = "monopsony-aarch64-unknown-linux-musl.tar.gz$"
+
+# Windows builds (PE32+)
+[[asset_selector.rules]]
+os = "windows"
+arch = "x86_64"
+pattern = "monopsony-x86_64-pc-windows-gnu.zip$"
+
+# FreeBSD (for MidnightBSD/mport)
+[[asset_selector.rules]]
+os = "freebsd"
+arch = "x86_64"
+pattern = "monopsony-x86_64-unknown-freebsd.tar.gz$"
+"#;
+
 /// Install method defined in a recipe
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -192,7 +192,7 @@ impl MonopsonyGrpcClient {
     }
 
     /// Perform pairing exchange over plaintext TCP on port 50052.
-    /// Returns (client_id, ClientCerts) on success.
+    /// Returns (client_id, ClientCerts, grpc_addr) on success.
     pub async fn pair(
         server_addr: &str,
         code: &str,
@@ -200,12 +200,10 @@ impl MonopsonyGrpcClient {
         os: &str,
         os_version: &str,
         package_managers: &[String],
-    ) -> anyhow::Result<(String, ClientCerts)> {
+    ) -> anyhow::Result<(String, ClientCerts, String)> {
         use prost::Message;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        // Derive pairing port (50052) from the server address.
-        // Handles: "host", "host:50051", "host:50052", or "host:other"
         let pair_addr = if server_addr.ends_with(":50052") {
             server_addr.to_string()
         } else {
@@ -214,7 +212,6 @@ impl MonopsonyGrpcClient {
         let mut stream = tokio::net::TcpStream::connect(&pair_addr).await
             .map_err(|e| anyhow::anyhow!("Failed to connect to pairing port {}: {}", pair_addr, e))?;
 
-        // Build and send PairRequest (length-prefixed protobuf)
         let req = PairRequest {
             code: code.to_string(),
             hostname: hostname.to_string(),
@@ -227,7 +224,6 @@ impl MonopsonyGrpcClient {
         stream.write_all(&len.to_le_bytes()).await?;
         stream.write_all(&req_bytes).await?;
 
-        // Read PairResponse (length-prefixed)
         let mut len_buf = [0u8; 4];
         stream.read_exact(&mut len_buf).await?;
         let resp_len = u32::from_le_bytes(len_buf) as usize;
@@ -243,8 +239,15 @@ impl MonopsonyGrpcClient {
             ca_cert_pem: resp.ca_cert_pem,
         };
 
-        info!("Paired successfully, client_id={}", resp.client_id);
-        Ok((resp.client_id, certs))
+        let grpc_addr = if !resp.grpc_addr.is_empty() {
+            resp.grpc_addr
+        } else {
+            let host = server_addr.split(':').next().unwrap_or(server_addr);
+            format!("{}:50051", host)
+        };
+
+        info!("Paired successfully, client_id={}, grpc_addr={}", resp.client_id, grpc_addr);
+        Ok((resp.client_id, certs, grpc_addr))
     }
 
     #[allow(dead_code)] // Will be used by Status subcommand

@@ -22,7 +22,7 @@ set -euo pipefail
 # Globals
 # ---------------------------------------------------------------------------
 readonly VERSION="0.1.0"
-readonly DOWNLOAD_BASE="https://github.com/Societus/monopsony/releases/download"
+readonly DOWNLOAD_BASE="https://base.societus.club/societus/monopsony/releases/download"
 readonly BINARY_NAME="monopsony-server"
 readonly INSTALL_DIR="/usr/bin"
 readonly CONFIG_DIR="/etc/monopsony"
@@ -77,7 +77,7 @@ detect_os() {
         echo "arch:rolling"
     elif uname -s | grep -qi "freebsd"; then
         error "FreeBSD is not supported. Monopsony uses musl-static Linux binaries."
-        error "Use a Linux jail/VM or check https://github.com/Societus/monopsony for native support."
+        error "Use a Linux jail/VM or check https://base.societus.club/societus/monopsony for native support."
         exit 1
     else
         error "Unsupported OS. Please install manually."
@@ -897,7 +897,7 @@ setup_service_systemd() {
             cat > "/etc/systemd/system/monopsony-server.service" <<'SERVICE'
 [Unit]
 Description=Monopsony Caching Proxy Server
-Documentation=https://github.com/Societus/monopsony
+Documentation=https://base.societus.club/societus/monopsony
 After=network-online.target postgresql.service
 Wants=network-online.target
 

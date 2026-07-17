@@ -1,0 +1,5 @@
+//! Monopsony Client Library
+//!
+//! This library exposes internal modules for use by other crates (e.g., server self-update).
+
+pub mod self_update;

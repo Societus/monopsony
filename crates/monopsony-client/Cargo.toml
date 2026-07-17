@@ -1,7 +1,7 @@
 [package]
 name = "monopsony-client"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
 
 [[bin]]
@@ -39,6 +39,9 @@ rand = "0.8"
 toml = { workspace = true }
 cron = "0.12"
 chrono-tz = "0.9"
+flate2 = "1"
+tar = "0.4"
+zip = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

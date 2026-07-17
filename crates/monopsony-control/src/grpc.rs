@@ -729,6 +729,8 @@ pub async fn start(
     mirror_manager: Option<Arc<MirrorManager>>,
     shadow_manager: Option<Arc<ShadowPackageManager>>,
     telemetry_enabled: bool,
+    additional_tls_sans: &[String],
+    access_control: Option<monopsony_common::config::AccessControlConfig>,
 ) -> Result<()> {
     info!(addr = %addr, "gRPC server starting (mTLS required)");
 
@@ -736,7 +738,9 @@ pub async fn start(
         .with_mirror_manager(mirror_manager.clone())
         .with_telemetry(telemetry_enabled);
 
-    let tls_config = tls_manager.tonic_server_tls_config(Some(addr.ip()))?;
+    let tls_config = tls_manager.tonic_server_tls_config_with_sans(Some(addr.ip()), additional_tls_sans)?;
+
+    let _ = access_control; // wired in future: tonic interceptor
 
     let mut builder = tonic::transport::Server::builder()
         .tls_config(tls_config).context("Failed to configure TLS")?;

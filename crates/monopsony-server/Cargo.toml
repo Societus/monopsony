@@ -1,7 +1,7 @@
 [package]
 name = "monopsony-server"
 version.workspace = true
-edition.workspace = true
+edition = "2021"
 license.workspace = true
 
 [[bin]]
@@ -16,6 +16,7 @@ monopsony-control = { path = "../monopsony-control" }
 monopsony-mirror = { path = "../monopsony-mirror" }
 monopsony-shadow = { path = "../monopsony-shadow" }
 monopsony-admin = { path = "../monopsony-admin" }
+monopsony-client = { path = "../monopsony-client" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

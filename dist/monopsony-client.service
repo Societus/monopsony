@@ -1,6 +1,6 @@
 [Unit]
 Description=Monopsony Client Daemon
-Documentation=https://github.com/Societus/monopsony
+Documentation=https://base.societus.club/societus/monopsony
 After=network-online.target
 Wants=network-online.target
 
