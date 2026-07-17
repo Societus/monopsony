@@ -283,24 +283,24 @@
 
 <!-- Add mirror modal -->
 {#if showAdd}
-  <div class="fixed inset-0 z-50 flex items-center justify-center" style="background-color: rgba(0,0,0,0.6);" onclick={() => (showAdd = false)} role="presentation">
-    <div class="card w-full max-w-md p-6 space-y-4" style="background-color: var(--color-bg-surface);" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+  <div class="fixed inset-0 z-50 flex items-center justify-center" style="background-color: rgba(0,0,0,0.6);" onclick={() => (showAdd = false)} onkeydown={(e) => e.key === 'Escape' && (showAdd = false)} role="presentation">
+    <div class="card w-full max-w-md p-6 space-y-4" style="background-color: var(--color-bg-surface);" onclick={(e) => e.stopPropagation()} onkeydown={(e) => e.stopPropagation()} role="dialog" aria-modal="true" tabindex="-1">
       <div class="flex items-center justify-between">
         <h2 class="text-sm font-semibold">Add Mirror</h2>
         <button class="btn-ghost rounded p-1" onclick={() => (showAdd = false)}><X size={16} /></button>
       </div>
       <div class="space-y-3">
         <div>
-          <label class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Distro name</label>
-          <input class="input" bind:value={newDistro} placeholder="archlinux" />
+          <label for="mirror-distro" class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Distro name</label>
+          <input id="mirror-distro" class="input" bind:value={newDistro} placeholder="archlinux" />
         </div>
         <div>
-          <label class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Upstream URL</label>
-          <input class="input font-mono text-xs" bind:value={newUpstream} placeholder="https://mirror.example.com/archlinux" />
+          <label for="mirror-upstream" class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Upstream URL</label>
+          <input id="mirror-upstream" class="input font-mono text-xs" bind:value={newUpstream} placeholder="https://mirror.example.com/archlinux" />
         </div>
         <div>
-          <label class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Sync interval (seconds)</label>
-          <input class="input" type="number" bind:value={newSyncInterval} />
+          <label for="mirror-interval" class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Sync interval (seconds)</label>
+          <input id="mirror-interval" class="input" type="number" bind:value={newSyncInterval} />
         </div>
         <label class="flex items-center gap-2">
           <input type="checkbox" bind:checked={newPublic} class="w-4 h-4 accent-[var(--color-accent)]" />

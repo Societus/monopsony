@@ -14,6 +14,7 @@
   import XCircle from 'lucide-svelte/icons/x-circle';
   import Info from 'lucide-svelte/icons/info';
   import Loader from 'lucide-svelte/icons/loader-circle';
+  import HelpTooltip from '$lib/components/HelpTooltip.svelte';
 
   let recipe = $state(EMPTY_RECIPE);
   let clientValidation = $state<ClientValidationResult>({ errors: [], warnings: [] });
@@ -230,7 +231,6 @@
           style="background-color: var(--color-bg-base); color: var(--color-text-primary);"
           spellcheck="false"
           autocomplete="off"
-          autocorrect="off"
           autocapitalize="off"
         ></textarea>
       </div>
@@ -301,11 +301,31 @@
           </span>
         </div>
         <div class="text-xs space-y-1" style="color: var(--color-text-muted);">
-          <div><code style="color: var(--color-accent);">[package]</code> — name, source_type, source_url</div>
-          <div><code style="color: var(--color-accent);">[install]</code> — method, target_dir</div>
-          <div><code style="color: var(--color-accent);">[version]</code> — detect_command, detect_pattern</div>
-          <div><code style="color: var(--color-accent);">[asset_selector]</code> — tag_pattern, rules</div>
-          <div><code style="color: var(--color-accent);">[direct_url]</code> — version_discovery, asset_url_template</div>
+          <div class="flex items-center gap-1">
+            <code style="color: var(--color-accent);">[package]</code>
+            <HelpTooltip helpKey="section:package" label="[package] section" />
+            <span class="ml-1">— name, source_type, source_url</span>
+          </div>
+          <div class="flex items-center gap-1">
+            <code style="color: var(--color-accent);">[install]</code>
+            <HelpTooltip helpKey="section:install" label="[install] section" />
+            <span class="ml-1">— method, target_dir</span>
+          </div>
+          <div class="flex items-center gap-1">
+            <code style="color: var(--color-accent);">[version]</code>
+            <HelpTooltip helpKey="section:version" label="[version] section" />
+            <span class="ml-1">— detect_command, detect_pattern</span>
+          </div>
+          <div class="flex items-center gap-1">
+            <code style="color: var(--color-accent);">[asset_selector]</code>
+            <HelpTooltip helpKey="section:asset_selector" label="[asset_selector] section" />
+            <span class="ml-1">— tag_pattern, rules</span>
+          </div>
+          <div class="flex items-center gap-1">
+            <code style="color: var(--color-accent);">[direct_url]</code>
+            <HelpTooltip helpKey="section:direct_url" label="[direct_url] section" />
+            <span class="ml-1">— version_discovery, asset_url_template</span>
+          </div>
         </div>
       </div>
     </div>

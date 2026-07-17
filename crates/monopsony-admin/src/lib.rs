@@ -8,6 +8,7 @@ pub mod cache;
 pub mod clients;
 pub mod features;
 pub mod health;
+pub mod help;
 pub mod mirrors;
 pub mod pairing;
 pub mod recipe;
@@ -145,6 +146,8 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/api/v1/features", axum::routing::put(features::handle_update_features))
         .route("/api/v1/features/monetization", get(features::handle_get_monetization))
         .route("/api/v1/features/monetization", axum::routing::put(features::handle_update_monetization))
+        // Help system
+        .route("/api/v1/help/:key", get(help::handle_get_help))
         // Protected by auth middleware
         .layer(from_fn_with_state(state.clone(), auth::auth_middleware));
 

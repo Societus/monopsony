@@ -6,6 +6,7 @@
   import RefreshCw from 'lucide-svelte/icons/refresh-cw';
   import AlertTriangle from 'lucide-svelte/icons/alert-triangle';
   import CheckCircle from 'lucide-svelte/icons/check-circle';
+  import HelpTooltip from '$lib/components/HelpTooltip.svelte';
 
   let config = $state<ConfigResponse | null>(null);
   let editedToml = $state('');
@@ -52,7 +53,10 @@
 
 <div class="space-y-6">
   <div class="flex items-center justify-between">
-    <h1 class="text-xl font-semibold">Settings</h1>
+    <div class="flex items-center gap-1.5">
+      <h1 class="text-xl font-semibold">Settings</h1>
+      <HelpTooltip helpKey="gui:settings.editor" label="Settings page" />
+    </div>
     <div class="flex gap-2">
       <button class="btn btn-ghost" onclick={load} disabled={loading}>
         <RefreshCw size={14} />

@@ -127,16 +127,16 @@
       </div>
       <div class="grid grid-cols-2 gap-4">
         <div>
-          <label class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Lightning Address</label>
-          <input class="input font-mono text-xs" bind:value={lightning} placeholder="node@walletofsatoshi.com" />
+          <label for="mon-lightning" class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Lightning Address</label>
+          <input id="mon-lightning" class="input font-mono text-xs" bind:value={lightning} placeholder="node@walletofsatoshi.com" />
         </div>
         <div>
-          <label class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Bitcoin Address</label>
-          <input class="input font-mono text-xs" bind:value={bitcoin} placeholder="bc1q..." />
+          <label for="mon-bitcoin" class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Bitcoin Address</label>
+          <input id="mon-bitcoin" class="input font-mono text-xs" bind:value={bitcoin} placeholder="bc1q..." />
         </div>
         <div>
-          <label class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">OpenAlias</label>
-          <input class="input font-mono text-xs" bind:value={openalias} placeholder="donation.example.com" />
+          <label for="mon-openalias" class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">OpenAlias</label>
+          <input id="mon-openalias" class="input font-mono text-xs" bind:value={openalias} placeholder="donation.example.com" />
         </div>
       </div>
     </div>
@@ -152,20 +152,20 @@
       </p>
       <div class="grid grid-cols-2 gap-4">
         <div class="col-span-2">
-          <label class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Bounty Fund Address (Lightning)</label>
-          <input class="input font-mono text-xs" bind:value={bountyAddr} placeholder="bounty@lightning.example.com" />
+          <label for="mon-bounty-addr" class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Bounty Fund Address (Lightning)</label>
+          <input id="mon-bounty-addr" class="input font-mono text-xs" bind:value={bountyAddr} placeholder="bounty@lightning.example.com" />
         </div>
         <div>
-          <label class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Critical (sats)</label>
-          <input class="input text-xs" type="number" bind:value={bountyCritical} placeholder="1000000" />
+          <label for="mon-bounty-critical" class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Critical (sats)</label>
+          <input id="mon-bounty-critical" class="input text-xs" type="number" bind:value={bountyCritical} placeholder="1000000" />
         </div>
         <div>
-          <label class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">High (sats)</label>
-          <input class="input text-xs" type="number" bind:value={bountyHigh} placeholder="250000" />
+          <label for="mon-bounty-high" class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">High (sats)</label>
+          <input id="mon-bounty-high" class="input text-xs" type="number" bind:value={bountyHigh} placeholder="250000" />
         </div>
         <div>
-          <label class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Medium (sats)</label>
-          <input class="input text-xs" type="number" bind:value={bountyMedium} placeholder="50000" />
+          <label for="mon-bounty-medium" class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Medium (sats)</label>
+          <input id="mon-bounty-medium" class="input text-xs" type="number" bind:value={bountyMedium} placeholder="50000" />
         </div>
       </div>
     </div>
@@ -185,8 +185,8 @@
       </label>
       {#if v4vEnabled}
         <div>
-          <label class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Default boost amount (sats)</label>
-          <input class="input text-xs" type="number" bind:value={v4vBoost} placeholder="100" />
+          <label for="mon-v4v-boost" class="text-xs font-medium block mb-1" style="color: var(--color-text-muted);">Default boost amount (sats)</label>
+          <input id="mon-v4v-boost" class="input text-xs" type="number" bind:value={v4vBoost} placeholder="100" />
         </div>
       {/if}
     </div>

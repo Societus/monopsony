@@ -65,6 +65,7 @@
     class="fixed inset-0 z-50 flex items-center justify-center"
     style="background-color: rgba(0, 0, 0, 0.6);"
     onclick={close}
+    onkeydown={(e) => e.key === 'Escape' && close()}
     role="presentation"
   >
     <!-- Modal -->
@@ -72,8 +73,10 @@
       class="card w-full max-w-lg p-6 space-y-4"
       style="background-color: var(--color-bg-surface);"
       onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => e.stopPropagation()}
       role="dialog"
       aria-modal="true"
+      tabindex="-1"
     >
       <div class="flex items-center justify-between">
         <div class="flex items-center gap-2">
