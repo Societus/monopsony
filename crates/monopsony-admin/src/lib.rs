@@ -27,12 +27,21 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use rust_embed::RustEmbed;
 use monopsony_control::tls::TlsManager;
 use monopsony_db::Database;
 use monopsony_mirror::mirror::MirrorManager;
 use monopsony_shadow::ShadowPackageManager;
 use serde::{Deserialize, Serialize};
 use tower_cookies::CookieManagerLayer;
+
+/// Embedded dashboard build output. At compile time, rust-embed reads
+/// the `dashboard/build/` directory relative to the workspace root and
+/// bakes every file into the binary. This eliminates the need for a
+/// separate dashboard install step on production servers.
+#[derive(RustEmbed)]
+#[folder = "../../dashboard/build/"]
+struct DashboardAsset;
 
 /// Shared state passed to all admin API handlers.
 #[derive(Clone)]
@@ -163,12 +172,13 @@ pub fn admin_router(state: AdminState) -> Router {
         .with_state(state)
 }
 
-/// Serve the SvelteKit SPA from the dashboard build directory.
+/// Serve the SvelteKit SPA from embedded assets compiled into the binary.
 ///
-/// Tries to serve from `dashboard/build/` relative to the crate workspace,
-/// or falls back to a JSON message if the dashboard hasn't been built.
+/// Uses rust-embed to serve files baked in at compile time from
+/// `dashboard/build/`. Falls back to disk-based serving from the source
+/// tree when running in dev mode (cargo run from workspace root).
 async fn handle_spa_fallback(
-    State(state): State<AdminState>,
+    State(_state): State<AdminState>,
     req: Request,
 ) -> Response {
     use axum::body::Body;
@@ -182,67 +192,79 @@ async fn handle_spa_fallback(
         .strip_prefix("dashboard/")
         .unwrap_or_else(|| raw_path.trim_start_matches('/'));
 
-    // If path is empty or just "dashboard", serve index.html
-    let path = if path.is_empty() || path == "dashboard" { "index.html" } else { path };
+    // Normalize: empty or "dashboard" → index.html (SPA entry point)
+    let asset_path = if path.is_empty() || path == "dashboard" {
+        "index.html"
+    } else {
+        path
+    };
 
-    // Try to find the dashboard build directory
-    // Check several locations
-    let candidates = [
+    // Try embedded assets first (production binary)
+    if let Some(file) = DashboardAsset::get(asset_path) {
+        let mime = mime_guess::from_path(asset_path)
+            .first_or_octet_stream()
+            .essence_str()
+            .to_string();
+        return Response::builder()
+            .header(header::CONTENT_TYPE, mime)
+            .body(Body::from(file.data.into_owned()))
+            .unwrap();
+    }
+
+    // SPA fallback: unknown routes serve index.html (client-side routing)
+    if let Some(file) = DashboardAsset::get("index.html") {
+        return Response::builder()
+            .header(header::CONTENT_TYPE, "text/html")
+            .body(Body::from(file.data.into_owned()))
+            .unwrap();
+    }
+
+    // Dev mode fallback: try disk-based serving from source tree
+    let disk_candidates = [
         PathBuf::from("dashboard/build"),
         PathBuf::from("../dashboard/build"),
-        state.cache_dir.join("../dashboard/build"),
         PathBuf::from("/opt/monopsony/dashboard/build"),
     ];
 
-    let build_dir = candidates.iter().find(|d| d.join("index.html").exists());
+    let build_dir = disk_candidates.iter().find(|d| d.join("index.html").exists());
 
-    match build_dir {
-        Some(dir) => {
-            // Serve static files from the build directory
-            let file_path = if path.is_empty() || path == "index.html" {
-                dir.join("index.html")
-            } else {
-                dir.join(path)
-            };
+    if let Some(dir) = build_dir {
+        let file_path = if asset_path == "index.html" {
+            dir.join("index.html")
+        } else {
+            let p = dir.join(asset_path);
+            if p.exists() { p } else { dir.join("index.html") }
+        };
 
-            // For SPA routing: if the file doesn't exist, serve index.html
-            let file_path = if file_path.exists() {
-                file_path
-            } else {
-                dir.join("index.html")
-            };
-
-            match tokio::fs::read(&file_path).await {
-                Ok(contents) => {
-                    let mime = mime_guess::from_path(&file_path)
-                        .first_or_octet_stream()
-                        .essence_str()
-                        .to_string();
-                    Response::builder()
-                        .header(header::CONTENT_TYPE, mime)
-                        .body(Body::from(contents))
-                        .unwrap()
-                }
-                Err(_) => {
-                    Response::builder()
-                        .status(404)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(
-                            r#"{"error":"Dashboard build not found. Run 'npm run build' in dashboard/."}"#,
-                        ))
-                        .unwrap()
-                }
+        match tokio::fs::read(&file_path).await {
+            Ok(contents) => {
+                let mime = mime_guess::from_path(&file_path)
+                    .first_or_octet_stream()
+                    .essence_str()
+                    .to_string();
+                Response::builder()
+                    .header(header::CONTENT_TYPE, mime)
+                    .body(Body::from(contents))
+                    .unwrap()
+            }
+            Err(_) => {
+                Response::builder()
+                    .status(404)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"error":"Dashboard file not found."}"#,
+                    ))
+                    .unwrap()
             }
         }
-        None => {
-            // Dashboard not built — return a helpful message
-            Response::builder()
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(
-                    r#"{"error":"Dashboard not built. Run 'cd dashboard && npm install && npm run build' first."}"#,
-                ))
-                .unwrap()
-        }
+    } else {
+        Response::builder()
+            .status(404)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":"Dashboard not built. Run 'cd dashboard && npm install && npm run build' before compiling the server."}"#,
+            ))
+            .unwrap()
     }
 }
 

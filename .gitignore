@@ -54,3 +54,4 @@ patch_install.py
 dashboard/.svelte-kit/
 dashboard/build/
 dashboard/node_modules/
+dashboard/node_modules/

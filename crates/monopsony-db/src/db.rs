@@ -310,6 +310,17 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+        // Server settings (feature flags, monetization) — single-row key/value
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS server_settings (
+                key         TEXT PRIMARY KEY,
+                value       JSONB NOT NULL,
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
         info!("Database migrations complete");
         Ok(())
     }
@@ -1409,6 +1420,38 @@ impl Database {
             }
             None => Ok(None),
         }
+    }
+
+    // ─── Server Settings ──────────────────────────────────────────────
+
+    /// Get a JSON setting by key. Returns None if not found.
+    pub async fn get_setting(&self, key: &str) -> Result<Option<serde_json::Value>> {
+        let row = sqlx::query("SELECT value FROM server_settings WHERE key = $1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        match row {
+            Some(r) => {
+                let value: serde_json::Value = r.try_get("value")?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Set a JSON setting by key. Upserts (insert or update).
+    pub async fn set_setting(&self, key: &str, value: &serde_json::Value) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO server_settings (key, value, updated_at)
+             VALUES ($1, $2, now())
+             ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 

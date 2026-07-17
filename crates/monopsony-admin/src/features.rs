@@ -3,11 +3,18 @@
 //! Manages server-level feature flags: shadow package support on mirrors,
 //! storage/bandwidth quotas, client trust modes, and public server
 //! funding mechanisms (donations, bounties, V4V).
+//!
+//! Settings are persisted in the `server_settings` table as JSONB values
+//! under keys `feature_flags` and `monetization`.
 
 use axum::{extract::State, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use crate::AdminState;
+
+const FEATURE_FLAGS_KEY: &str = "feature_flags";
+const MONETIZATION_KEY: &str = "monetization";
 
 // ─── Feature Flags ───────────────────────────────────────────────────
 
@@ -45,22 +52,48 @@ fn default_auto_blacklist_threshold() -> i64 {
 }
 
 /// GET /api/v1/features — get current feature flags.
-pub async fn handle_get_features(State(_state): State<AdminState>) -> impl IntoResponse {
-    // TODO: load from server.toml or DB. For now, return defaults.
-    Json(FeatureFlags::default())
+pub async fn handle_get_features(State(state): State<AdminState>) -> impl IntoResponse {
+    let flags = match &state.db {
+        Some(db) => {
+            match db.get_setting(FEATURE_FLAGS_KEY).await {
+                Ok(Some(val)) => serde_json::from_value::<FeatureFlags>(val).unwrap_or_default(),
+                Ok(None) => FeatureFlags::default(),
+                Err(e) => {
+                    warn!("Failed to load feature flags: {e}");
+                    FeatureFlags::default()
+                }
+            }
+        }
+        None => FeatureFlags::default(),
+    };
+    Json(flags)
 }
 
 /// PUT /api/v1/features — update feature flags.
 pub async fn handle_update_features(
-    State(_state): State<AdminState>,
+    State(state): State<AdminState>,
     Json(req): Json<FeatureFlags>,
 ) -> impl IntoResponse {
-    // TODO: persist to config and apply at runtime
-    Json(serde_json::json!({
-        "success": true,
-        "features": req,
-        "message": "Feature flags updated (requires restart for some changes)"
-    }))
+    match &state.db {
+        Some(db) => {
+            let val = serde_json::to_value(&req).unwrap_or_default();
+            match db.set_setting(FEATURE_FLAGS_KEY, &val).await {
+                Ok(()) => Json(serde_json::json!({
+                    "success": true,
+                    "features": req,
+                    "message": "Feature flags saved"
+                })),
+                Err(e) => Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Failed to save: {e}")
+                })),
+            }
+        }
+        None => Json(serde_json::json!({
+            "success": false,
+            "error": "Database not available"
+        })),
+    }
 }
 
 // ─── Monetization ────────────────────────────────────────────────────
@@ -97,19 +130,46 @@ pub struct MonetizationConfig {
 }
 
 /// GET /api/v1/features/monetization — get monetization config.
-pub async fn handle_get_monetization(State(_state): State<AdminState>) -> impl IntoResponse {
-    Json(MonetizationConfig::default())
+pub async fn handle_get_monetization(State(state): State<AdminState>) -> impl IntoResponse {
+    let config = match &state.db {
+        Some(db) => {
+            match db.get_setting(MONETIZATION_KEY).await {
+                Ok(Some(val)) => serde_json::from_value::<MonetizationConfig>(val).unwrap_or_default(),
+                Ok(None) => MonetizationConfig::default(),
+                Err(e) => {
+                    warn!("Failed to load monetization config: {e}");
+                    MonetizationConfig::default()
+                }
+            }
+        }
+        None => MonetizationConfig::default(),
+    };
+    Json(config)
 }
 
 /// PUT /api/v1/features/monetization — update monetization config.
 pub async fn handle_update_monetization(
-    State(_state): State<AdminState>,
+    State(state): State<AdminState>,
     Json(req): Json<MonetizationConfig>,
 ) -> impl IntoResponse {
-    // TODO: persist to config
-    Json(serde_json::json!({
-        "success": true,
-        "config": req,
-        "message": "Monetization config updated"
-    }))
+    match &state.db {
+        Some(db) => {
+            let val = serde_json::to_value(&req).unwrap_or_default();
+            match db.set_setting(MONETIZATION_KEY, &val).await {
+                Ok(()) => Json(serde_json::json!({
+                    "success": true,
+                    "config": req,
+                    "message": "Monetization config saved"
+                })),
+                Err(e) => Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("Failed to save: {e}")
+                })),
+            }
+        }
+        None => Json(serde_json::json!({
+            "success": false,
+            "error": "Database not available"
+        })),
+    }
 }

@@ -648,7 +648,7 @@ update_config_db_url() {
         # Replace the *** placeholder with the actual password using sed
         local escaped_pw
         escaped_pw=$(printf '%s\n' "$password" | sed 's/[&/\]/\\&/g')
-        sed -i "s|postgres://monopsony:\*\*\*@localhost/monopsony|postgres://monopsony:${escaped_pw}@localhost/monopsony|" "${config_file}"
+        sed -i "s|postgres://monopsony:***@localhost/monopsony|postgres://monopsony:${escaped_pw}@localhost/monopsony|" "${config_file}"
         ok "Updated database URL in config."
     fi
 }
@@ -754,7 +754,7 @@ update_config_db_url_ext() {
     if [[ -f "${config_file}" ]]; then
         local escaped_password
         escaped_password="$(printf '%s' "${password}" | sed 's/[&\/\\]/\\&/g')"
-        sed -i "s|url = \"postgres://monopsony:CHANGE_ME@localhost/monopsony\"|url = \"postgres://monopsony:${escaped_password}@${host}:${port}/monopsony\"|" "${config_file}"
+        sed -i "s|url = \"postgres://monopsony:***@localhost/monopsony\"|url = \"postgres://monopsony:${escaped_password}@${host}:${port}/monopsony\"|" "${config_file}"
         ok "Updated database URL in config."
     fi
 }

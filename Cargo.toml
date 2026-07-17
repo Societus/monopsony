@@ -92,7 +92,7 @@ tonic-build = "0.12"
 monopsony-common = { path = "crates/monopsony-common" }
 
 # Dashboard / Admin
-rust-embed = { version = "8", features = ["compression"] }
+rust-embed = { version = "8" }
 mime_guess = "2"
 bcrypt = "0.16"
 tower-cookies = "0.10"
