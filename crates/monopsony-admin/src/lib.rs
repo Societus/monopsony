@@ -15,6 +15,7 @@ pub mod recipe;
 pub mod settings;
 pub mod shadow;
 pub mod tracker;
+pub mod ws_tunnel;
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -165,9 +166,16 @@ pub fn admin_router(state: AdminState) -> Router {
     let spa = Router::new()
         .fallback(handle_spa_fallback);
 
+    // WebSocket tunnel — NOT behind auth middleware.
+    // The tunnel carries the gRPC mTLS handshake as opaque bytes; the gRPC
+    // server's TLS stack authenticates the client. Dashboard auth is irrelevant.
+    let ws = Router::new()
+        .route("/ws/tunnel", get(ws_tunnel::handle_ws_tunnel));
+
     Router::new()
         .merge(api)
         .merge(spa)
+        .merge(ws)
         .layer(CookieManagerLayer::new())
         .with_state(state)
 }

@@ -24,7 +24,7 @@ repository = "https://base.societus.club/societus/monopsony"
 tokio = { version = "1", features = ["full"] }
 
 # HTTP
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tower = "0.5"
 tower-http = "0.6"
 hyper = { version = "1", features = ["full"] }
@@ -95,4 +95,5 @@ monopsony-common = { path = "crates/monopsony-common" }
 rust-embed = { version = "8" }
 mime_guess = "2"
 bcrypt = "0.16"
+tokio-tungstenite = "0.24"
 tower-cookies = "0.10"

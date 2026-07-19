@@ -3,6 +3,7 @@
 mod shadow;
 mod shadow_cli;
 mod proxy_toggle;
+mod ws_transport;
 
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
@@ -545,8 +546,14 @@ async fn run_daemon(
         .domain_name("monopsony-server")
         .assume_http2(true);
 
-    // Connect using standard connect() with TLS
-    let mut grpc_client = grpc_client::MonopsonyGrpcClient::connect(&server_addr, Some(tls)).await?;
+    // Connect — use WebSocket tunnel if address starts with wss:// or ws://,
+    // otherwise direct TCP with mTLS.
+    let mut grpc_client = if server_addr.starts_with("wss://") || server_addr.starts_with("ws://") {
+        info!("Using WebSocket tunnel transport");
+        grpc_client::MonopsonyGrpcClient::connect_ws(&server_addr, Some(tls)).await?
+    } else {
+        grpc_client::MonopsonyGrpcClient::connect(&server_addr, Some(tls)).await?
+    };
 
     // Get client ID from stored file or register
     let client_id = {
@@ -605,17 +612,33 @@ async fn run_daemon(
                 ))
                 .domain_name("monopsony-server");
 
-            let mut client = match grpc_client::MonopsonyGrpcClient::connect(&server_addr_for_task, Some(tls)).await {
-                Ok(c) => {
-                    info!("Connected to server");
-                    backoff = Duration::from_secs(1); // reset on success
-                    c
+            let mut client = if server_addr_for_task.starts_with("wss://") || server_addr_for_task.starts_with("ws://") {
+                match grpc_client::MonopsonyGrpcClient::connect_ws(&server_addr_for_task, Some(tls)).await {
+                    Ok(c) => {
+                        info!("Connected to server via WebSocket tunnel");
+                        backoff = Duration::from_secs(1);
+                        c
+                    }
+                    Err(e) => {
+                        warn!("WS connection failed (retry in {:?}): {}", backoff, e);
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        continue;
+                    }
                 }
-                Err(e) => {
-                    warn!("Connection failed (retry in {:?}): {}", backoff, e);
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
-                    continue;
+            } else {
+                match grpc_client::MonopsonyGrpcClient::connect(&server_addr_for_task, Some(tls)).await {
+                    Ok(c) => {
+                        info!("Connected to server");
+                        backoff = Duration::from_secs(1); // reset on success
+                        c
+                    }
+                    Err(e) => {
+                        warn!("Connection failed (retry in {:?}): {}", backoff, e);
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        continue;
+                    }
                 }
             };
 

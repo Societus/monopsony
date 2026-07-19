@@ -28,6 +28,7 @@ hex = { workspace = true }
 bcrypt = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
+futures-util = "0.3"
 sqlx = { workspace = true }
 prost = { workspace = true }
 getrandom = "0.2"

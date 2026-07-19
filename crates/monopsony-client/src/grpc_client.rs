@@ -1,11 +1,14 @@
 use monopsony_common::package_manager::PackageRef;
 use monopsony_common::proto::monopsony::{
-    HeartbeatRequest, InventoryReport, PackageEntry, PairRequest, PairResponse, RegisterRequest,
+    HeartbeatRequest, InventoryReport, PackageEntry, PairRequest, PairResponse,
+    RegisterRequest,
 };
 use monopsony_common::proto::monopsony::monopsony_control_client::MonopsonyControlClient;
 use tonic::transport::Channel;
 use tracing::{debug, info};
 use std::path::Path;
+
+use crate::ws_transport::WsTransport;
 
 pub struct MonopsonyGrpcClient {
     client: MonopsonyControlClient<Channel>,
@@ -72,6 +75,65 @@ impl MonopsonyGrpcClient {
 
         let client = MonopsonyControlClient::new(channel);
         info!("gRPC connection established");
+
+        Ok(Self {
+            client,
+            client_id: None,
+        })
+    }
+
+    /// Connect via WebSocket tunnel — for use behind Cloudflare Tunnels or
+    /// reverse proxies that terminate TLS. Opens a WSS connection, then runs
+    /// the existing mTLS config as an inner TLS layer inside the WebSocket.
+    ///
+    /// `ws_url` is the full WebSocket URL, e.g. `wss://monopsony.example.com/ws/tunnel`.
+    /// `tls` is the same Monopsony CA + client cert config used for direct connections.
+    pub async fn connect_ws(
+        ws_url: &str,
+        tls: Option<tonic::transport::ClientTlsConfig>,
+    ) -> anyhow::Result<Self> {
+        info!(url = ws_url, "Connecting via WebSocket tunnel");
+
+        // For the WebSocket path, we build a tonic Endpoint with a custom
+        // connector that:
+        //   1. Opens a WebSocket to ws_url
+        //   2. (Optional) Wraps it with inner TLS (Monopsony CA + client cert)
+        //
+        // The Endpoint's URI must be https:// for tonic to accept TLS config,
+        // but the actual transport is our WebSocket — the URI is just a hint.
+        let ws_url_owned = ws_url.to_string();
+
+        let mut endpoint = Channel::from_shared("https://ws-tunnel".to_string())?;
+
+        if let Some(tls_config) = tls {
+            endpoint = endpoint.tls_config(tls_config)?;
+        }
+
+        let channel = endpoint
+            .connect_with_connector(tower::service_fn(move |_| {
+                let url = ws_url_owned.clone();
+                async move {
+                    // Open WebSocket connection
+                    let ws = WsTransport::connect(&url).await
+                        .map_err(|e| std::io::Error::new(
+                            std::io::ErrorKind::ConnectionRefused,
+                            format!("WebSocket connect failed: {}", e),
+                        ))?;
+                    // tokio-tungstenite's connect_async already handles WSS TLS
+                    // for the outer layer. If inner TLS is needed, it's applied
+                    // via tonic's tls_config on the Endpoint, which wraps our
+                    // raw stream. But since tonic's connector pattern expects
+                    // a raw IO stream, we return the WebSocket transport directly.
+                    //
+                    // The inner mTLS is handled by the tonic Endpoint's tls_config
+                    // which layers TLS on top of our connector's output.
+                    Ok::<_, std::io::Error>(ws)
+                }
+            }))
+            .await?;
+
+        let client = MonopsonyControlClient::new(channel);
+        info!("WebSocket tunnel connection established");
 
         Ok(Self {
             client,
