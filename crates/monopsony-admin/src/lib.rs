@@ -28,11 +28,11 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use rust_embed::RustEmbed;
 use monopsony_control::tls::TlsManager;
 use monopsony_db::Database;
 use monopsony_mirror::mirror::MirrorManager;
 use monopsony_shadow::ShadowPackageManager;
+use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tower_cookies::CookieManagerLayer;
 
@@ -57,6 +57,9 @@ pub struct AdminState {
     pub tailscale: Arc<auth::TailscaleDetector>,
     /// The server's gRPC listen address (e.g. "0.0.0.0:50051") used in PairResponse.
     pub grpc_addr: String,
+    /// Optional WebSocket tunnel URL (e.g. "wss://monopsony.example.com/ws/tunnel").
+    /// When set, included in PairResponse so clients know to use WS transport.
+    pub ws_url: Option<String>,
     /// Active pairing session (code, status, deadline) managed by the pairing module.
     pub pairing_manager: Arc<tokio::sync::Mutex<Option<pairing::PairingSession>>>,
     /// Handle to the spawned pairing listener task — aborted on cancel to free port 50052.
@@ -112,21 +115,48 @@ pub fn admin_router(state: AdminState) -> Router {
         // Cache
         .route("/api/v1/cache", get(cache::handle_list_cache))
         .route("/api/v1/cache/stats", get(cache::handle_cache_stats))
-        .route("/api/v1/cache/:key", axum::routing::delete(cache::handle_purge_entry))
+        .route(
+            "/api/v1/cache/:key",
+            axum::routing::delete(cache::handle_purge_entry),
+        )
         .route("/api/v1/cache/purge", post(cache::handle_purge))
         .route("/api/v1/scan/results", get(cache::handle_scan_results))
         // Shadow
         .route("/api/v1/shadow/packages", get(shadow::handle_list_packages))
-        .route("/api/v1/shadow/packages", post(shadow::handle_register_package))
-        .route("/api/v1/shadow/packages/:id", axum::routing::delete(shadow::handle_unregister_package))
-        .route("/api/v1/shadow/packages/:id/recipe", get(shadow::handle_get_recipe))
-        .route("/api/v1/shadow/packages/:id/check", post(shadow::handle_check_updates))
-        .route("/api/v1/shadow/packages/:id/apply", post(shadow::handle_apply_update))
-        .route("/api/v1/shadow/packages/:id/rollback", post(shadow::handle_rollback_update))
+        .route(
+            "/api/v1/shadow/packages",
+            post(shadow::handle_register_package),
+        )
+        .route(
+            "/api/v1/shadow/packages/:id",
+            axum::routing::delete(shadow::handle_unregister_package),
+        )
+        .route(
+            "/api/v1/shadow/packages/:id/recipe",
+            get(shadow::handle_get_recipe),
+        )
+        .route(
+            "/api/v1/shadow/packages/:id/check",
+            post(shadow::handle_check_updates),
+        )
+        .route(
+            "/api/v1/shadow/packages/:id/apply",
+            post(shadow::handle_apply_update),
+        )
+        .route(
+            "/api/v1/shadow/packages/:id/rollback",
+            post(shadow::handle_rollback_update),
+        )
         .route("/api/v1/shadow/history", get(shadow::handle_history))
         // Recipe
-        .route("/api/v1/shadow/recipe/validate", post(recipe::handle_validate))
-        .route("/api/v1/shadow/recipe/estimate", post(recipe::handle_estimate))
+        .route(
+            "/api/v1/shadow/recipe/validate",
+            post(recipe::handle_validate),
+        )
+        .route(
+            "/api/v1/shadow/recipe/estimate",
+            post(recipe::handle_estimate),
+        )
         // Settings
         .route("/api/v1/config", get(settings::handle_get_config))
         .route("/api/v1/config", post(settings::handle_update_config))
@@ -135,27 +165,60 @@ pub fn admin_router(state: AdminState) -> Router {
         // Clients
         .route("/api/v1/clients", get(clients::handle_list_clients))
         .route("/api/v1/clients/:id", get(clients::handle_get_client))
-        .route("/api/v1/clients/:id/inventory", get(clients::handle_client_inventory))
+        .route(
+            "/api/v1/clients/:id/inventory",
+            get(clients::handle_client_inventory),
+        )
         // Mirrors
         .route("/api/v1/mirrors", get(mirrors::handle_list_mirrors))
         .route("/api/v1/mirrors", post(mirrors::handle_upsert_mirror))
-        .route("/api/v1/mirrors/:distro", axum::routing::delete(mirrors::handle_delete_mirror))
-        .route("/api/v1/mirrors/:distro/sync", post(mirrors::handle_trigger_sync))
-        .route("/api/v1/mirrors/:distro/status", get(mirrors::handle_mirror_status))
+        .route(
+            "/api/v1/mirrors/:distro",
+            axum::routing::delete(mirrors::handle_delete_mirror),
+        )
+        .route(
+            "/api/v1/mirrors/:distro/sync",
+            post(mirrors::handle_trigger_sync),
+        )
+        .route(
+            "/api/v1/mirrors/:distro/status",
+            get(mirrors::handle_mirror_status),
+        )
         // Tracker
-        .route("/api/v1/tracker/status", get(tracker::handle_tracker_status))
-        .route("/api/v1/tracker/mirrors", get(tracker::handle_tracker_mirrors))
-        .route("/api/v1/tracker/reputation/:npub", get(tracker::handle_tracker_reputation))
-        .route("/api/v1/tracker/reports", get(tracker::handle_tracker_reports))
+        .route(
+            "/api/v1/tracker/status",
+            get(tracker::handle_tracker_status),
+        )
+        .route(
+            "/api/v1/tracker/mirrors",
+            get(tracker::handle_tracker_mirrors),
+        )
+        .route(
+            "/api/v1/tracker/reputation/:npub",
+            get(tracker::handle_tracker_reputation),
+        )
+        .route(
+            "/api/v1/tracker/reports",
+            get(tracker::handle_tracker_reports),
+        )
         // Pairing
         .route("/api/v1/pair/init", post(pairing::handle_pair_init))
         .route("/api/v1/pair/status", get(pairing::handle_pair_status))
         .route("/api/v1/pair/cancel", post(pairing::handle_pair_cancel))
         // Features & Monetization
         .route("/api/v1/features", get(features::handle_get_features))
-        .route("/api/v1/features", axum::routing::put(features::handle_update_features))
-        .route("/api/v1/features/monetization", get(features::handle_get_monetization))
-        .route("/api/v1/features/monetization", axum::routing::put(features::handle_update_monetization))
+        .route(
+            "/api/v1/features",
+            axum::routing::put(features::handle_update_features),
+        )
+        .route(
+            "/api/v1/features/monetization",
+            get(features::handle_get_monetization),
+        )
+        .route(
+            "/api/v1/features/monetization",
+            axum::routing::put(features::handle_update_monetization),
+        )
         // Help system
         .route("/api/v1/help/:key", get(help::handle_get_help))
         // Protected by auth middleware
@@ -163,14 +226,16 @@ pub fn admin_router(state: AdminState) -> Router {
 
     // The SPA fallback serves static files from the dashboard build directory.
     // If the dashboard isn't built yet, it returns a simple JSON message.
-    let spa = Router::new()
-        .fallback(handle_spa_fallback);
+    let spa = Router::new().fallback(handle_spa_fallback);
 
-    // WebSocket tunnel — NOT behind auth middleware.
-    // The tunnel carries the gRPC mTLS handshake as opaque bytes; the gRPC
-    // server's TLS stack authenticates the client. Dashboard auth is irrelevant.
+    // WebSocket tunnels — NOT behind auth middleware.
+    // - /ws/tunnel: carries the gRPC mTLS handshake as opaque bytes; the gRPC
+    //   server's TLS stack authenticates the client.
+    // - /ws/pair: relays the plaintext pairing exchange; the pairing code is
+    //   the credential.
     let ws = Router::new()
-        .route("/ws/tunnel", get(ws_tunnel::handle_ws_tunnel));
+        .route("/ws/tunnel", get(ws_tunnel::handle_ws_tunnel))
+        .route("/ws/pair", get(ws_tunnel::handle_ws_pair));
 
     Router::new()
         .merge(api)
@@ -185,10 +250,7 @@ pub fn admin_router(state: AdminState) -> Router {
 /// Uses rust-embed to serve files baked in at compile time from
 /// `dashboard/build/`. Falls back to disk-based serving from the source
 /// tree when running in dev mode (cargo run from workspace root).
-async fn handle_spa_fallback(
-    State(_state): State<AdminState>,
-    req: Request,
-) -> Response {
+async fn handle_spa_fallback(State(_state): State<AdminState>, req: Request) -> Response {
     use axum::body::Body;
     use axum::http::header;
 
@@ -234,14 +296,20 @@ async fn handle_spa_fallback(
         PathBuf::from("/opt/monopsony/dashboard/build"),
     ];
 
-    let build_dir = disk_candidates.iter().find(|d| d.join("index.html").exists());
+    let build_dir = disk_candidates
+        .iter()
+        .find(|d| d.join("index.html").exists());
 
     if let Some(dir) = build_dir {
         let file_path = if asset_path == "index.html" {
             dir.join("index.html")
         } else {
             let p = dir.join(asset_path);
-            if p.exists() { p } else { dir.join("index.html") }
+            if p.exists() {
+                p
+            } else {
+                dir.join("index.html")
+            }
         };
 
         match tokio::fs::read(&file_path).await {
@@ -255,15 +323,11 @@ async fn handle_spa_fallback(
                     .body(Body::from(contents))
                     .unwrap()
             }
-            Err(_) => {
-                Response::builder()
-                    .status(404)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"error":"Dashboard file not found."}"#,
-                    ))
-                    .unwrap()
-            }
+            Err(_) => Response::builder()
+                .status(404)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"error":"Dashboard file not found."}"#))
+                .unwrap(),
         }
     } else {
         Response::builder()

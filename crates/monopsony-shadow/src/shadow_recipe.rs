@@ -3,15 +3,36 @@ use std::path::Path;
 
 #[derive(Debug)]
 pub enum RecipeError {
-    InvalidToml { source: toml::de::Error },
+    InvalidToml {
+        source: toml::de::Error,
+    },
     Io(std::io::Error),
-    InvalidRegex { field: String, pattern: String, error: String },
-    AssetPatternNoMatch { pattern: String, available: Vec<String> },
-    VersionCommandFailed { command: String, exit_code: i32, output: String },
-    PathNotAbsolute { path: String },
-    PathNotWritable { path: String },
-    ServiceNotFound { name: String },
-    MissingField { field: String },
+    InvalidRegex {
+        field: String,
+        pattern: String,
+        error: String,
+    },
+    AssetPatternNoMatch {
+        pattern: String,
+        available: Vec<String>,
+    },
+    VersionCommandFailed {
+        command: String,
+        exit_code: i32,
+        output: String,
+    },
+    PathNotAbsolute {
+        path: String,
+    },
+    PathNotWritable {
+        path: String,
+    },
+    ServiceNotFound {
+        name: String,
+    },
+    MissingField {
+        field: String,
+    },
 }
 
 impl std::fmt::Display for RecipeError {
@@ -19,14 +40,25 @@ impl std::fmt::Display for RecipeError {
         match self {
             Self::InvalidToml { source } => write!(f, "invalid TOML: {source}"),
             Self::Io(e) => write!(f, "IO error: {e}"),
-            Self::InvalidRegex { field, pattern, error } => {
+            Self::InvalidRegex {
+                field,
+                pattern,
+                error,
+            } => {
                 write!(f, "invalid regex in '{field}' pattern '{pattern}': {error}")
             }
             Self::AssetPatternNoMatch { pattern, available } => {
                 write!(f, "asset pattern '{pattern}' matches none of {available:?}")
             }
-            Self::VersionCommandFailed { command, exit_code, output } => {
-                write!(f, "version command '{command}' failed (exit {exit_code}): {output}")
+            Self::VersionCommandFailed {
+                command,
+                exit_code,
+                output,
+            } => {
+                write!(
+                    f,
+                    "version command '{command}' failed (exit {exit_code}): {output}"
+                )
             }
             Self::PathNotAbsolute { path } => write!(f, "path not absolute: {path}"),
             Self::PathNotWritable { path } => write!(f, "path not writable: {path}"),
@@ -56,8 +88,10 @@ pub fn parse_recipe_str(toml: &str) -> Result<ShadowRecipe, RecipeError> {
 pub fn validate_recipe_quick(recipe: &ShadowRecipe) -> Result<(), Vec<RecipeError>> {
     let mut errors = Vec::new();
 
-    // target_dir must be absolute
-    if !recipe.install.target_dir.starts_with('/') {
+    // target_dir must be absolute or tilde-relative (`~/...`).
+    // Tilde paths are per-user install targets (e.g. ~/.local/lib/<pkg>);
+    // they expand against the invoking user's home at execution time.
+    if !recipe.install.target_dir.starts_with('/') && !recipe.install.target_dir.starts_with("~/") {
         errors.push(RecipeError::PathNotAbsolute {
             path: recipe.install.target_dir.clone(),
         });
@@ -121,9 +155,7 @@ pub fn generate_registration_template(
         }
     ));
 
-    out.push_str(&format!(
-        "# Detected architecture: {detected_arch}\n"
-    ));
+    out.push_str(&format!("# Detected architecture: {detected_arch}\n"));
     if let Some(v) = detected_version {
         out.push_str(&format!("# Detected version: {v}\n"));
     }
@@ -246,7 +278,9 @@ mod tests {
         .join("\n");
         let recipe = parse_recipe_str(&toml).unwrap();
         let errors = validate_recipe_quick(&recipe).unwrap_err();
-        assert!(errors.iter().any(|e| matches!(e, RecipeError::PathNotAbsolute { .. })));
+        assert!(errors
+            .iter()
+            .any(|e| matches!(e, RecipeError::PathNotAbsolute { .. })));
     }
 
     #[test]

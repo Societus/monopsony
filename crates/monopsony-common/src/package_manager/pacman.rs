@@ -1,6 +1,6 @@
 //! Pacman package manager backend implementation
 
-use crate::{PackageRef, PackageManagerBackend, PackageManagerKind, ProxyConfigAction, UrlPattern};
+use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 use std::path::PathBuf;
 
@@ -69,18 +69,78 @@ impl PackageManagerBackend for PacmanBackend {
 
     fn upstream_url_patterns(&self) -> Vec<UrlPattern> {
         vec![
-            UrlPattern::new(r"https?://[^/]*archlinux\.org/.*\.pkg\.tar\..*", 100, "Arch Linux packages").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*mirror\.archlinux\.com/.*\.pkg\.tar\..*", 100, "Arch Linux mirror packages").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*geo\.mirror\.pkgbuild\.com/.*\.pkg\.tar\..*", 100, "pkgbuild.com mirror packages").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*archlinux\.org/.*\.db", 90, "Arch Linux repo database").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*archlinux\.org/.*\.files", 90, "Arch Linux repo files").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*mirror\.archlinux\.com/.*\.db", 90, "Arch mirror repo database").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*mirror\.archlinux\.com/.*\.files", 90, "Arch mirror repo files").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*geo\.mirror\.pkgbuild\.com/.*\.db", 90, "pkgbuild mirror repo database").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*geo\.mirror\.pkgbuild\.com/.*\.files", 90, "pkgbuild mirror repo files").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*archlinux\.org/.*\.sig", 80, "Arch Linux signatures").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*mirror\.archlinux\.com/.*\.sig", 80, "Arch mirror signatures").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*geo\.mirror\.pkgbuild\.com/.*\.sig", 80, "pkgbuild mirror signatures").expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*archlinux\.org/.*\.pkg\.tar\..*",
+                100,
+                "Arch Linux packages",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*mirror\.archlinux\.com/.*\.pkg\.tar\..*",
+                100,
+                "Arch Linux mirror packages",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*geo\.mirror\.pkgbuild\.com/.*\.pkg\.tar\..*",
+                100,
+                "pkgbuild.com mirror packages",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*archlinux\.org/.*\.db",
+                90,
+                "Arch Linux repo database",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*archlinux\.org/.*\.files",
+                90,
+                "Arch Linux repo files",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*mirror\.archlinux\.com/.*\.db",
+                90,
+                "Arch mirror repo database",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*mirror\.archlinux\.com/.*\.files",
+                90,
+                "Arch mirror repo files",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*geo\.mirror\.pkgbuild\.com/.*\.db",
+                90,
+                "pkgbuild mirror repo database",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*geo\.mirror\.pkgbuild\.com/.*\.files",
+                90,
+                "pkgbuild mirror repo files",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*archlinux\.org/.*\.sig",
+                80,
+                "Arch Linux signatures",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*mirror\.archlinux\.com/.*\.sig",
+                80,
+                "Arch mirror signatures",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*geo\.mirror\.pkgbuild\.com/.*\.sig",
+                80,
+                "pkgbuild mirror signatures",
+            )
+            .expect("valid regex"),
         ]
     }
 
@@ -92,7 +152,10 @@ impl PackageManagerBackend for PacmanBackend {
     fn proxy_config(&self, proxy_addr: &str) -> ProxyConfigAction {
         ProxyConfigAction::WriteFile {
             path: PathBuf::from("/etc/pacman.d/monopsony-proxy.conf"),
-            content: format!("XferCommand = /usr/bin/curl -x {} -f %u -o %o\n", proxy_addr),
+            content: format!(
+                "XferCommand = /usr/bin/curl -x {} -f %u -o %o\n",
+                proxy_addr
+            ),
         }
     }
 

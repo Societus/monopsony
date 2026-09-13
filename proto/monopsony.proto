@@ -121,6 +121,7 @@ message PairResponse {
     bytes client_key_pem = 3;
     bytes ca_cert_pem = 4;
     string grpc_addr = 5;               // Server gRPC address for future mTLS connections
+    string ws_url = 6;                  // WebSocket tunnel URL (wss://host/ws/tunnel) for clients behind CF/proxy
 }
 
 // Mirror management RPCs

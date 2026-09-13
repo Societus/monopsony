@@ -51,9 +51,21 @@ impl MirrorManifest {
         use ed25519_dalek::Signer;
         let canonical = self.canonical_json();
         let signature = signing_key.sign(canonical.as_bytes());
-        self.signature = Some(signature.to_bytes().iter().map(|b| format!("{:02x}", b)).collect());
+        self.signature = Some(
+            signature
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect(),
+        );
         let verifying = ed25519_dalek::VerifyingKey::from(signing_key);
-        self.public_key = Some(verifying.to_bytes().iter().map(|b| format!("{:02x}", b)).collect());
+        self.public_key = Some(
+            verifying
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect(),
+        );
     }
 
     /// Verify the manifest signature.
@@ -89,7 +101,9 @@ impl MirrorManifest {
         );
 
         let canonical = self.canonical_json();
-        verifying_key.verify(canonical.as_bytes(), &signature).is_ok()
+        verifying_key
+            .verify(canonical.as_bytes(), &signature)
+            .is_ok()
     }
 }
 

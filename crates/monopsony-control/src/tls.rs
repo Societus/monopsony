@@ -182,7 +182,8 @@ impl TlsManager {
         bind_addr: Option<std::net::IpAddr>,
         additional_sans: &[String],
     ) -> anyhow::Result<tonic::transport::ServerTlsConfig> {
-        let (cert_pem, key_pem) = self.generate_server_cert_with_sans(bind_addr, additional_sans)?;
+        let (cert_pem, key_pem) =
+            self.generate_server_cert_with_sans(bind_addr, additional_sans)?;
         let cert_str = String::from_utf8(cert_pem)?;
         let key_str = String::from_utf8(key_pem)?;
         let chain = format!("{}\n{}", cert_str, self.ca_cert_pem);

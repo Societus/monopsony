@@ -32,18 +32,22 @@ fn build_https_client() -> HttpClient {
     Client::builder(TokioExecutor::new()).build(connector)
 }
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+use futures::StreamExt;
+use parking_lot::Mutex;
 use tracing::{debug, error, info, trace, warn};
 
 use monopsony_common::{PackageManagerBackend, PackageManagerKind};
 
-use crate::cache_storage::CacheStorage;
-use monopsony_db::Database;
+use crate::cache_storage::{ByteRange, CacheStorage, SpoolHandle};
 use crate::security::RateLimiter;
+use monopsony_db::Database;
 
 /// Cache metadata for a cached package
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -68,6 +72,14 @@ pub struct ProxyState {
     pub db: Option<Arc<Database>>,
     pub scan_config: Option<monopsony_common::config::ScanConfig>,
     pub node_config: Option<monopsony_common::config::ServerConfig>,
+    /// Per-cache-key in-flight fetch coordination. A second request for the
+    /// same key waits for the winner's fetch and then serves from cache.
+    pub inflight: Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    /// Streaming limits (max body size, upstream stall timeout, janitor knobs).
+    pub limits: monopsony_common::config::ProxyLimitsConfig,
+    /// Permit upstreams on private/loopback IPs (SSRF guard bypass). Needed
+    /// when Monopsony caches from LAN-internal mirrors. Default: false.
+    pub allow_private_upstreams: bool,
 }
 
 impl ProxyState {
@@ -84,11 +96,17 @@ impl ProxyState {
             db,
             scan_config: None,
             node_config: None,
+            inflight: Arc::new(Mutex::new(HashMap::new())),
+            limits: monopsony_common::config::ProxyLimitsConfig::default(),
+            allow_private_upstreams: false,
         }
     }
 
     /// Find a backend that matches the given URL
-    pub fn find_backend_for_url(&self, url: &str) -> Option<(PackageManagerKind, &dyn PackageManagerBackend)> {
+    pub fn find_backend_for_url(
+        &self,
+        url: &str,
+    ) -> Option<(PackageManagerKind, &dyn PackageManagerBackend)> {
         for backend in &self.backends {
             for pattern in backend.upstream_url_patterns() {
                 if pattern.matches(url) {
@@ -116,9 +134,8 @@ impl ProxyState {
 
     /// Convert a URL to a cache file path (filesystem only, for path traversal validation).
     pub fn url_to_cache_path(&self, url: &str) -> Option<PathBuf> {
-        self.url_to_cache_key(url).and_then(|key| {
-            self.storage.base_dir().map(|base| base.join(&key))
-        })
+        self.url_to_cache_key(url)
+            .and_then(|key| self.storage.base_dir().map(|base| base.join(&key)))
     }
 
     /// Load cache metadata via storage backend
@@ -191,8 +208,12 @@ fn normalize_url_scheme(url: &str) -> String {
 }
 
 /// Handle HTTP proxy requests
+#[axum::debug_handler]
 pub async fn handle_proxy_request(
-    State((state, rate_limiter)): State<(Arc<ProxyState>, Option<Arc<crate::security::RateLimiter>>)>,
+    State((state, rate_limiter)): State<(
+        Arc<ProxyState>,
+        Option<Arc<crate::security::RateLimiter>>,
+    )>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> impl IntoResponse {
@@ -243,34 +264,36 @@ pub async fn handle_proxy_request(
         return proxy_passthrough(&state, request).await;
     }
 
-    // Get the full URL from the request
-    let raw_url = if uri.scheme().is_some() {
+    // Get the full URL from the request. The scheme is preserved as-sent:
+    // the fetch must honor http-only mirrors. Scheme normalization happens
+    // only at DB-lookup boundaries (prefetch stores https:// URLs).
+    let url = if uri.scheme().is_some() {
         uri.to_string()
     } else {
         // For proxy requests, the URI should be absolute
         format!("http://{}", uri)
     };
 
-    // Normalize scheme to HTTPS for package URLs.
-    //
-    // Forward-proxy semantics deliver absolute-URI request lines, and package
-    // managers configured via XferCommand/proxy often send http:// even though
-    // upstreams serve over HTTPS. The prefetch module stores URLs as https://
-    // (from upstream_packages.download_url). Without normalization, a request
-    // for http://X never matches a prefetched https://X entry in the DB,
-    // causing duplicate fetches and cache misses.
-    let url = normalize_url_scheme(&raw_url);
-
     // SSRF prevention: validate URL host doesn't resolve to private IP
     if let Ok(parsed) = url::Url::parse(&url) {
         if let Err(e) = crate::security::validate_url_host(&parsed) {
-            warn!("SSRF blocked: {} — {}", url, e);
-            return Response::builder()
-                .status(StatusCode::FORBIDDEN)
-                .body(Body::from("Request blocked: destination resolves to private network"))
-                .unwrap_or_else(|_| {
-                    Response::new(Body::from("Request blocked: destination resolves to private network"))
-                });
+            if !state.allow_private_upstreams {
+                warn!("SSRF blocked: {} — {}", url, e);
+                return Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .body(Body::from(
+                        "Request blocked: destination resolves to private network",
+                    ))
+                    .unwrap_or_else(|_| {
+                        Response::new(Body::from(
+                            "Request blocked: destination resolves to private network",
+                        ))
+                    });
+            }
+            debug!(
+                "Private upstream allowed (allow_private_upstreams): {} — {}",
+                url, e
+            );
         }
     }
 
@@ -279,7 +302,7 @@ pub async fn handle_proxy_request(
 
     let response = if is_package {
         debug!("Package URL detected: {}", url);
-        handle_cached_request(&state, request, &url).await
+        handle_cached_request(state.clone(), request, &url).await
     } else {
         debug!("Non-package URL, passing through: {}", url);
         proxy_passthrough(&state, request).await
@@ -297,7 +320,7 @@ pub async fn handle_proxy_request(
 
 /// Handle a request with caching
 async fn handle_cached_request(
-    state: &ProxyState,
+    state: Arc<ProxyState>,
     request: Request<Body>,
     url: &str,
 ) -> Response<Body> {
@@ -305,158 +328,199 @@ async fn handle_cached_request(
         Some(key) => key,
         None => {
             warn!("Could not determine cache key for URL: {}", url);
-            return proxy_passthrough(state, request).await;
+            return proxy_passthrough(&state, request).await;
         }
     };
 
-    let cache_path = state.storage.base_dir()
-        .map(|base| base.join(&cache_key));
+    let cache_path = state.storage.base_dir().map(|base| base.join(&cache_key));
 
-    // Check DB first for authoritative cache state
-    let db_entry = if let Some(db) = &state.db {
-        match db.get_cache_entry(url).await {
-            Ok(Some(entry)) => {
-                debug!("DB cache entry found for: {}", url);
-                Some(entry)
+    // Join loop: serve from cache when possible; if another request is
+    // already fetching this key, wait for it and re-check (bounded so a
+    // pathological sequence cannot spin forever).
+    let mut joins: u8 = 0;
+    loop {
+        // Check DB first for authoritative cache state. The lookup URL is
+        // scheme-normalized because prefetch stores https:// URLs while PMs
+        // configured via proxy env may send http:// for the same object.
+        let db_entry = if let Some(db) = &state.db {
+            let lookup_url = normalize_url_scheme(url);
+            match db.get_cache_entry(&lookup_url).await {
+                Ok(Some(entry)) => {
+                    debug!("DB cache entry found for: {}", url);
+                    Some(entry)
+                }
+                Ok(None) => {
+                    debug!("DB: no entry for: {}", url);
+                    None
+                }
+                Err(e) => {
+                    trace!("DB lookup failed for {}: {}", url, e);
+                    None
+                }
             }
-            Ok(None) => {
-                debug!("DB: no entry for: {}", url);
-                None
+        } else {
+            None
+        };
+        let db_cached = db_entry.is_some();
+
+        // Validate cache path doesn't escape cache directory (path traversal prevention, filesystem only).
+        // DB-less mode (no database configured) falls back to storage existence.
+        let exists = state.storage.exists(&cache_key).await.unwrap_or(false);
+        let authoritative = db_cached || state.db.is_none();
+        let path_valid = if let Some(ref path) = cache_path {
+            authoritative
+                && exists
+                && crate::security::validate_cache_path(&path.to_string_lossy(), &state.cache_dir)
+        } else {
+            // S3 backend: no path traversal concern
+            authoritative && exists
+        };
+
+        if path_valid {
+            // Parse Range before the await-heavy serve path: `&Request<Body>`
+            // is not Send and cannot be held across awaits.
+            let range = parse_range_header(request.headers().get(header::RANGE));
+            if let Some(response) = serve_cache_hit(&state, range, &cache_key, url).await {
+                return response;
             }
-            Err(e) => {
-                trace!("DB lookup failed for {}: {}", url, e);
-                None
+            // read_stream failed below the DB/exists checks — treat as a
+            // miss and fall through to fetch.
+        }
+
+        monopsony_common::metrics::cache_request_miss();
+        debug!("Cache miss for: {}", url);
+
+        // In-flight coalescing: if another request is already fetching this
+        // key, wait for it and re-check the cache instead of starting a
+        // duplicate upstream download. Bounded: after 2 joins we fetch
+        // ourselves regardless.
+        if joins < 2 {
+            if let Some(waiter) = register_waiter(&state.inflight, &cache_key) {
+                info!("Joining in-flight fetch for {}", url);
+                wait_for_fetcher(&waiter, Duration::from_secs(600)).await;
+                joins += 1;
+                continue;
             }
         }
-    } else {
-        None
-    };
-    let db_cached = db_entry.is_some();
 
-    // Validate cache path doesn't escape cache directory (path traversal prevention, filesystem only)
-    let exists = state.storage.exists(&cache_key).await.unwrap_or(false);
-    let path_valid = if let Some(ref path) = cache_path {
-        db_cached && exists && crate::security::validate_cache_path(&path.to_string_lossy(), &state.cache_dir)
-    } else {
-        // S3 backend: no path traversal concern
-        db_cached && exists
-    };
-    
-    // Serve from storage if cached
-    if path_valid {
-        debug!("Cache hit for: {}", url);
-        monopsony_common::metrics::cache_request_hit();
-        
-        state.update_access(&cache_key, url).await;
+        // We are the fetcher for this key.
+        return fetch_and_stream_cache_miss(state, request, url, cache_key, cache_path).await;
+    }
+}
 
-        // Load metadata for content type
-        let meta = state.load_meta(&cache_key).await;
-        let content_type = meta
-            .as_ref()
-            .and_then(|m| m.content_type.clone())
-            .unwrap_or_else(|| "application/octet-stream".to_string());
+/// Serve a validated cache hit as a streaming response. Returns None when the
+/// storage read fails or a security policy blocks serving — the caller then
+/// treats the request as a miss.
+///
+/// `range` is pre-parsed (the caller extracts it from the request because
+/// `&Request<Body>` is not Send and cannot be held across awaits here).
+async fn serve_cache_hit(
+    state: &ProxyState,
+    range: ByteRange,
+    cache_key: &str,
+    url: &str,
+) -> Option<Response<Body>> {
+    debug!("Cache hit for: {}", url);
+    monopsony_common::metrics::cache_request_hit();
 
-        // Read cached file via storage backend
-        match state.storage.read(&cache_key).await {
-            Ok(data) => {
-                // Tamper detection: verify SHA256 if we have a stored hash
-                if let Some(ref entry) = db_entry {
-                    if let Some(ref stored_hash) = entry.sha256 {
-                        use sha2::{Sha256, Digest};
-                        let mut hasher = Sha256::new();
-                        hasher.update(&data);
-                        let actual_hash = format!("{:x}", hasher.finalize());
-                        if actual_hash != *stored_hash {
-                            warn!(
-                                "Tamper detected for {}: stored hash {} != actual {}",
-                                url, stored_hash, actual_hash
-                            );
-                            monopsony_common::metrics::cache_request_miss();
-                            return Response::builder()
-                                .status(StatusCode::SERVICE_UNAVAILABLE)
-                                .header("X-Tamper-Detected", "true")
-                                .body(Body::from("Cached content integrity check failed"))
-                                .unwrap_or_else(|_| {
-                                    Response::new(Body::from("Integrity check failed"))
-                                });
-                        }
-                    }
+    state.update_access(cache_key, url).await;
+
+    // Load metadata for content type
+    let meta = state.load_meta(cache_key).await;
+    let content_type = meta
+        .as_ref()
+        .and_then(|m| m.content_type.clone())
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    // Open a streaming read for the requested range (full object when no
+    // Range header). This replaces the old whole-file `read()` — serving
+    // a 1 GB cached package must not buffer it in RAM.
+    match state.storage.read_stream(cache_key, range.clone()).await {
+        Ok((stream, total)) => {
+            let partial = stream_requested_partial(&range, total);
+            let serve_len = if partial {
+                range.end.min(total) - range.start
+            } else {
+                total
+            };
+
+            let mut builder = Response::builder()
+                .status(if partial {
+                    StatusCode::PARTIAL_CONTENT
+                } else {
+                    StatusCode::OK
+                })
+                .header(header::CONTENT_TYPE, &content_type)
+                .header(header::CONTENT_LENGTH, serve_len)
+                .header(header::ACCEPT_RANGES, "bytes");
+
+            if partial {
+                builder = builder.header(
+                    header::CONTENT_RANGE,
+                    format!(
+                        "bytes {}-{}/{}",
+                        range.start,
+                        range.end.min(total).saturating_sub(1),
+                        total
+                    ),
+                );
+            }
+
+            // Add cache headers
+            if let Some(m) = &meta {
+                if let Some(etag) = &m.etag {
+                    builder = builder.header(header::ETAG, etag);
                 }
-
-                let mut builder = Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_TYPE, &content_type)
-                    .header(header::CONTENT_LENGTH, data.len());
-
-                // Add cache headers
-                if let Some(m) = &meta {
-                    if let Some(etag) = &m.etag {
-                        builder = builder.header(header::ETAG, etag);
-                    }
-                    if let Some(lm) = &m.last_modified {
-                        builder = builder.header(header::LAST_MODIFIED, lm);
-                    }
-                    builder = builder.header("X-Cache", "HIT");
+                if let Some(lm) = &m.last_modified {
+                    builder = builder.header(header::LAST_MODIFIED, lm);
                 }
+            }
+            builder = builder.header("X-Cache", "HIT");
 
-                // Scan policy enforcement: query DB for scan status on HIT
-                if let Some(db) = &state.db {
-                    if let Ok(Some(scan_row)) =
-                        db.get_latest_scan_result(&cache_key).await
-                    {
-                        builder =
-                            builder.header("X-Scan-Status", &scan_row.scan_status);
+            // Scan policy enforcement: query DB for scan status on HIT
+            if let Some(db) = &state.db {
+                if let Ok(Some(scan_row)) = db.get_latest_scan_result(&cache_key).await {
+                    builder = builder.header("X-Scan-Status", &scan_row.scan_status);
 
-                        if let Some(ref scan_cfg) = state.scan_config {
-                            let yara_rules: Vec<String> = scan_row
-                                .yara_matches
-                                .as_ref()
-                                .and_then(|v| {
-                                    v.as_array().map(|arr| {
-                                        arr.iter()
-                                            .filter_map(|v| {
-                                                v.get("rule")
-                                                    .and_then(|r| r.as_str())
-                                                    .map(String::from)
-                                            })
-                                            .collect()
-                                    })
+                    if let Some(ref scan_cfg) = state.scan_config {
+                        let yara_rules: Vec<String> = scan_row
+                            .yara_matches
+                            .as_ref()
+                            .and_then(|v| {
+                                v.as_array().map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|v| {
+                                            v.get("rule").and_then(|r| r.as_str()).map(String::from)
+                                        })
+                                        .collect()
                                 })
-                                .unwrap_or_default();
+                            })
+                            .unwrap_or_default();
 
-                            let scan_info =
-                                crate::scan_policy::ScanInfo {
-                                    status: scan_row.scan_status.clone(),
-                                    clamav_result: scan_row.clamav_result,
-                                    yara_rules,
-                                    max_entropy: scan_row.max_entropy,
-                                    cves: vec![],
-                                    cves_in_installed: vec![],
-                                };
+                        let scan_info = crate::scan_policy::ScanInfo {
+                            status: scan_row.scan_status.clone(),
+                            clamav_result: scan_row.clamav_result,
+                            yara_rules,
+                            max_entropy: scan_row.max_entropy,
+                            cves: vec![],
+                            cves_in_installed: vec![],
+                        };
 
-                            let client_ctx =
-                                crate::scan_policy::ClientContext {
-                                    installed_version: None,
-                                    force: false,
-                                };
+                        let client_ctx = crate::scan_policy::ClientContext {
+                            installed_version: None,
+                            force: false,
+                        };
 
-                            let decision = crate::scan_policy::evaluate_policy(
-                                &scan_info,
-                                &client_ctx,
-                                scan_cfg,
-                            );
+                        let decision =
+                            crate::scan_policy::evaluate_policy(&scan_info, &client_ctx, scan_cfg);
 
-                            match &decision {
-                                crate::scan_policy::PolicyDecision::Block(
-                                    reason,
-                                ) => {
-                                    monopsony_common::metrics::scan_policy_decision("block");
-                                    return builder
+                        match &decision {
+                            crate::scan_policy::PolicyDecision::Block(reason) => {
+                                monopsony_common::metrics::scan_policy_decision("block");
+                                return Some(
+                                    builder
                                         .status(StatusCode::FORBIDDEN)
-                                        .header(
-                                            "X-Scan-Block-Reason",
-                                            format!("{:?}", reason),
-                                        )
+                                        .header("X-Scan-Block-Reason", format!("{:?}", reason))
                                         .body(Body::from(format!(
                                             "Package blocked by scan policy: {:?}",
                                             reason
@@ -465,68 +529,126 @@ async fn handle_cached_request(
                                             Response::new(Body::from(
                                                 "Package blocked by scan policy",
                                             ))
-                                        });
-                                }
-                                crate::scan_policy::PolicyDecision::Warn(
-                                    warning,
-                                ) => {
-                                    monopsony_common::metrics::scan_policy_decision("warn");
-                                    builder = builder.header(
-                                        "X-Scan-Warning",
-                                        format!("{:?}", warning),
-                                    );
-                                }
-                                crate::scan_policy::PolicyDecision::Allow => {}
+                                        }),
+                                );
                             }
+                            crate::scan_policy::PolicyDecision::Warn(warning) => {
+                                monopsony_common::metrics::scan_policy_decision("warn");
+                                builder =
+                                    builder.header("X-Scan-Warning", format!("{:?}", warning));
+                            }
+                            crate::scan_policy::PolicyDecision::Allow => {}
                         }
                     }
                 }
+            }
 
-                monopsony_common::metrics::cache_bytes_served(data.len() as u64);
-                return builder.body(Body::from(data)).unwrap_or_else(|_| {
-                    Response::new(Body::from("Failed to build response"))
-                });
-            }
-            Err(e) => {
-                warn!("Failed to read cached file {}: {}", cache_key, e);
-            }
+            monopsony_common::metrics::cache_bytes_served(serve_len);
+            let body = Body::from_stream(stream);
+            return Some(
+                builder
+                    .body(body)
+                    .unwrap_or_else(|_| Response::new(Body::from("Failed to build response"))),
+            );
+        }
+        Err(e) => {
+            warn!("Failed to open cached object {}: {}", cache_key, e);
+            // Signal the caller to treat this as a miss and refetch —
+            // the entry may be corrupt or the range malformed.
+            None
         }
     }
+}
 
-    debug!("Cache miss for: {}", url);
-    monopsony_common::metrics::cache_request_miss();
+/// Fetch from upstream and stream to the client while teeing to a spool.
+/// Called only when we won the in-flight race for this cache key.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_and_stream_cache_miss(
+    state: Arc<ProxyState>,
+    request: Request<Body>,
+    url: &str,
+    cache_key: String,
+    cache_path: Option<PathBuf>,
+) -> Response<Body> {
+    // We are the fetcher for this key. On EVERY return path below, the
+    // in-flight entry must be cleared so waiters wake and future requests
+    // can fetch. `clear_fetcher` notifies waiters.
 
-    // Fetch from upstream
-    let upstream_response = match fetch_upstream(state, request, url).await {
+    // HEAD must never populate the cache (a HEAD response has no body —
+    // caching it would poison the entry with a 0-byte file).
+    if request.method() == Method::HEAD {
+        clear_fetcher(&state.inflight, &cache_key);
+        match fetch_upstream(&state, request, url).await {
+            Ok(mut response) => {
+                response
+                    .headers_mut()
+                    .insert("X-Cache", "MISS".parse().unwrap());
+                response
+            }
+            Err(e) => {
+                error!("Upstream HEAD failed for {}: {}", url, e);
+                Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Body::from("Upstream request failed"))
+                    .unwrap_or_else(|_| Response::new(Body::from("Upstream request failed")))
+            }
+        }
+    } else {
+        fetch_and_stream_get(state, request, url, cache_key, cache_path).await
+    }
+}
+
+/// GET/other-body path of `fetch_and_stream_cache_miss`.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_and_stream_get(
+    state: Arc<ProxyState>,
+    request: Request<Body>,
+    url: &str,
+    cache_key: String,
+    cache_path: Option<PathBuf>,
+) -> Response<Body> {
+    let _ = &request; // request body is forwarded by fetch_upstream below
+
+    // Fetch from upstream with the body UNBUFFERED.
+    let upstream_response = match fetch_upstream(&state, request, url).await {
         Ok(response) => response,
         Err(e) => {
             error!("Upstream request failed for {}: {}", url, e);
+            clear_fetcher(&state.inflight, &cache_key);
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from("Upstream request failed"))
-                .unwrap_or_else(|_| {
-                    Response::new(Body::from("Upstream request failed"))
-                });
+                .unwrap_or_else(|_| Response::new(Body::from("Upstream request failed")));
         }
     };
 
-    // Only cache successful responses
-    if !upstream_response.status().is_success() {
-        debug!("Upstream returned non-success status, not caching");
-        return upstream_response;
+    // Only cache plain 200s. A 206 Partial Content is NOT the full object —
+    // caching it as the full key would poison the cache with a byte range.
+    // Other non-success statuses pass through uncached.
+    if upstream_response.status() != StatusCode::OK {
+        debug!(
+            "Upstream returned {} for {} — passing through without caching",
+            upstream_response.status(),
+            url
+        );
+        clear_fetcher(&state.inflight, &cache_key);
+        let mut response = upstream_response;
+        response
+            .headers_mut()
+            .insert("X-Cache", "MISS".parse().unwrap());
+        return response;
     }
 
     // Extract response headers for metadata
-    let headers = upstream_response.headers();
+    let headers = upstream_response.headers().clone();
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let content_length = headers
+    let upstream_content_length = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+        .and_then(|s| s.parse::<u64>().ok());
     let etag = headers
         .get(header::ETAG)
         .and_then(|v| v.to_str().ok())
@@ -536,149 +658,514 @@ async fn handle_cached_request(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    // Collect response body
-    let (parts, body) = upstream_response.into_parts();
-    let bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
+    // Pre-flight size check via Content-Length when present. Bodies without
+    // Content-Length are checked by the streamed-bytes counter in the tee task.
+    if let Some(cl) = upstream_content_length {
+        if cl > state.limits.max_response_bytes {
+            warn!(
+                "Response too large for {}: {} bytes (max {})",
+                url, cl, state.limits.max_response_bytes
+            );
+            clear_fetcher(&state.inflight, &cache_key);
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .header("X-Size-Rejected", "true")
+                .body(Body::from(
+                    "Response exceeds maximum cacheable size and is not served through the cache",
+                ))
+                .unwrap_or_else(|_| Response::new(Body::from("Response too large")));
+        }
+    }
+
+    // Begin the spool: everything streams upstream → spool + client with
+    // O(1) memory. The object becomes visible in the cache only on commit.
+    let spool = match state.storage.spool(&cache_key).await {
+        Ok(s) => s,
         Err(e) => {
-            error!("Failed to read upstream response body: {}", e);
-            return Response::from_parts(parts, Body::from("Failed to read upstream response"));
+            error!("Failed to open spool for {}: {}", cache_key, e);
+            clear_fetcher(&state.inflight, &cache_key);
+            return Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(Body::from("Cache storage unavailable"))
+                .unwrap_or_else(|_| Response::new(Body::from("Cache storage unavailable")));
         }
     };
 
-    // Save to cache via storage backend
-    match state.storage.write(&cache_key, &bytes).await {
-        Ok(_meta) => {
-            info!("Cached: {} -> {}", url, cache_key);
-            monopsony_common::metrics::cache_bytes_cached(bytes.len() as u64);
+    let (parts, upstream_body) = upstream_response.into_parts();
 
-            // Save metadata
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
+    // Tee task: reads the upstream body frame by frame, appending each chunk
+    // to the spool while forwarding it to the client. On clean EOF it commits
+    // the spool (atomic publish) and records metadata + DB + scan dispatch.
+    // On any error (upstream abort, stall, oversize, client disconnect) it
+    // aborts the spool — nothing partial is ever cached.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(16);
+    let tee_ctx = TeeContext {
+        state: state.clone(),
+        cache_key: cache_key.clone(),
+        cache_path: cache_path.clone(),
+        url: url.to_string(),
+        content_type,
+        upstream_content_length,
+        etag,
+        last_modified,
+    };
+    tokio::spawn(run_tee(upstream_body, spool, tx, tee_ctx));
 
-            let entry = CacheEntry {
-                url: url.to_string(),
-                cache_path: cache_path
-                    .as_ref()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|| cache_key.clone()),
-                content_type,
-                content_length,
-                etag,
-                last_modified,
-                cached_at: now,
-                last_accessed: now,
-                hit_count: 1,
-            };
-
-            if let Err(e) = state.save_meta(&cache_key, &entry).await {
-                warn!("Failed to save cache metadata: {}", e);
-            }
-
-            if let Some(db) = &state.db {
-                if let Err(e) = db
-                    .record_cache_miss(&monopsony_db::db::CacheMissConfig {
-                        url: url.to_string(),
-                        cache_path: entry.cache_path.clone(),
-                        content_type: entry.content_type.clone(),
-                        content_length: entry.content_length as i64,
-                        etag: entry.etag.clone(),
-                        last_modified: entry.last_modified.clone(),
-                        cached_at: entry.cached_at as i64,
-                    })
-                    .await
-                {
-                    trace!("Failed to record cache miss in DB for {}: {}", url, e);
-                }
-            }
-
-            // Fire-and-forget malware scan dispatch
-            if let Some(ref scan_cfg) = state.scan_config {
-                if scan_cfg.enabled {
-                    let scan_bytes = bytes.clone();
-                    let scan_path = cache_path
-                        .as_ref()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(|| state.cache_dir.join(&cache_key));
-                    let scan_config = scan_cfg.clone();
-                    let scan_db = state.db.clone();
-                    let scan_storage = state.storage.clone();
-                    let scan_cache_key = cache_key.clone();
-                    let scan_url = url.to_owned();
-                    let retention_days = state.node_config.as_ref()
-                        .and_then(|n| n.cache.s3.as_ref())
-                        .map(|s3| s3.retention_days)
-                        .unwrap_or(0);
-
-                    tokio::spawn(async move {
-                        let (result, record) = crate::scan::run_scan(
-                            &scan_bytes,
-                            &scan_path,
-                            None, // package_name extracted from URL in future sprint
-                            None, // package_version
-                            &scan_config,
-                        )
-                        .await;
-
-                        if let Some(db) = &scan_db {
-                            if let Err(e) = db.record_scan_result(&record).await {
-                                tracing::warn!("Failed to record scan result: {}", e);
-                            }
-                            // Compute and store SHA256 for tamper detection
-                            use sha2::{Sha256, Digest};
-                            let mut hasher = Sha256::new();
-                            hasher.update(&scan_bytes);
-                            let hash = format!("{:x}", hasher.finalize());
-                            if let Err(e) = db.update_cache_sha256(&scan_url, &hash).await {
-                                tracing::warn!("Failed to store SHA256 for {}: {}", scan_url, e);
-                            }
-                        }
-
-                        // Object Lock: set retention on clean/flagged scans
-                        if retention_days > 0 {
-                            let should_lock = matches!(
-                                result.status,
-                                crate::scan::ScanStatus::Clean | crate::scan::ScanStatus::Flagged
-                            );
-                            if should_lock {
-                                let until = std::time::SystemTime::now()
-                                    + std::time::Duration::from_secs(retention_days as u64 * 86400);
-                                if let Err(e) = scan_storage.set_retention(&scan_cache_key, until).await {
-                                    tracing::warn!(
-                                        "Failed to set Object Lock retention on {}: {}",
-                                        scan_cache_key, e
-                                    );
-                                } else {
-                                    tracing::debug!(
-                                        "Object Lock set for {} days on {}",
-                                        retention_days, scan_cache_key
-                                    );
-                                }
-                            }
-                        }
-                    });
-                }
-            }
-        }
-        Err(e) => {
-            warn!("Failed to write cache file {}: {}", cache_key, e);
-        }
-    }
-
-    // Build response with cache header
-    let mut response = Response::from_parts(parts, Body::from(bytes));
-    response.headers_mut().insert("X-Cache", "MISS".parse().unwrap());
+    // Build the client response: original upstream headers, body piped from
+    // the tee channel.
+    let mut response = Response::from_parts(
+        parts,
+        Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx)),
+    );
+    response
+        .headers_mut()
+        .insert("X-Cache", "MISS".parse().unwrap());
     if let Some(ref scan_cfg) = state.scan_config {
         if scan_cfg.enabled {
-            response.headers_mut().insert(
-                "X-Scan-Status",
-                "pending".parse().unwrap(),
-            );
+            response
+                .headers_mut()
+                .insert("X-Scan-Status", "pending".parse().unwrap());
         }
     }
     response
+}
+
+// ---------------------------------------------------------------------------
+// In-flight fetch coalescing
+// ---------------------------------------------------------------------------
+
+/// Registers the caller as fetcher for `key` if nobody else has; otherwise
+/// returns the waiter to await. Race-free under the mutex.
+fn register_waiter(
+    inflight: &Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>,
+    key: &str,
+) -> Option<Arc<tokio::sync::Notify>> {
+    let mut map = inflight.lock();
+    if let Some(existing) = map.get(key) {
+        Some(existing.clone())
+    } else {
+        map.insert(key.to_string(), Arc::new(tokio::sync::Notify::new()));
+        None
+    }
+}
+
+/// Removes this key's in-flight entry and wakes all waiters.
+fn clear_fetcher(inflight: &Arc<Mutex<HashMap<String, Arc<tokio::sync::Notify>>>>, key: &str) {
+    if let Some(notify) = inflight.lock().remove(key) {
+        notify.notify_waiters();
+    }
+}
+
+/// Waits for the fetcher to finish. The timeout bounds the wait; on timeout
+/// the caller re-checks the cache and may become the fetcher itself.
+async fn wait_for_fetcher(waiter: &tokio::sync::Notify, timeout: Duration) -> bool {
+    tokio::time::timeout(timeout, waiter.notified())
+        .await
+        .is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// Range request parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a Range header into a byte range. Only single `bytes=N-M` ranges
+/// are supported (that's what pacman `curl -C -` and apt send). Returns
+/// `0..u64::MAX` when absent or unparseable — serving the whole object.
+fn parse_range_header(value: Option<&axum::http::HeaderValue>) -> ByteRange {
+    use crate::cache_storage::ByteRange;
+
+    let Some(v) = value else { return 0..u64::MAX };
+    let Some(s) = v.to_str().ok() else {
+        return 0..u64::MAX;
+    };
+
+    let spec = match s.trim().strip_prefix("bytes=") {
+        Some(spec) => spec,
+        None => return 0..u64::MAX,
+    };
+    let (start_s, end_s) = match spec.split_once('-') {
+        Some(pair) => pair,
+        None => return 0..u64::MAX,
+    };
+
+    match (start_s.trim().parse::<u64>(), end_s.trim().parse::<u64>()) {
+        (Ok(start), Ok(end)) if start <= end => start..(end + 1),
+        (Ok(start), Err(_)) => start..u64::MAX, // bytes=N-
+        _ => 0..u64::MAX,
+    }
+}
+
+/// Whether the parsed range plus actual object size means a 206 response.
+fn stream_requested_partial(range: &ByteRange, total: u64) -> bool {
+    range.start > 0 || range.end < total
+}
+
+// ---------------------------------------------------------------------------
+// Tee: upstream body → spool + client
+// ---------------------------------------------------------------------------
+
+/// Everything the tee task needs to finish the cache write after the body
+/// streams through.
+struct TeeContext {
+    state: Arc<ProxyState>,
+    cache_key: String,
+    cache_path: Option<PathBuf>,
+    url: String,
+    content_type: Option<String>,
+    upstream_content_length: Option<u64>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+/// Tee task body: pump upstream chunks to the spool and the client channel.
+///
+/// Termination semantics:
+/// - Upstream EOF + all chunks forwarded → commit spool, write metadata,
+///   record DB rows, dispatch scan, clear in-flight.
+/// - Upstream error / stall > `upstream_stall_secs` / size over limit /
+///   client disconnect (send fails) → abort spool (nothing cached), clear
+///   in-flight.
+#[allow(clippy::too_many_arguments)]
+async fn run_tee(
+    body: axum::body::Body,
+    mut spool: SpoolHandle,
+    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+    ctx: TeeContext,
+) {
+    let stall_timeout = Duration::from_secs(ctx.state.limits.upstream_stall_secs);
+    let max_bytes = ctx.state.limits.max_response_bytes;
+    let mut bytes_seen: u64 = 0;
+    let mut last_progress = Instant::now();
+
+    let mut body = body.into_data_stream();
+    loop {
+        // Per-chunk stall guard: if upstream sends nothing for
+        // `upstream_stall_secs`, give up (bounded by select).
+        let next = tokio::time::timeout(stall_timeout, body.next()).await;
+        match next {
+            Err(_) => {
+                warn!(
+                    "Upstream stalled >{}s for {} — aborting fetch",
+                    stall_timeout.as_secs(),
+                    ctx.url
+                );
+                spool.abort().await;
+                let _ = tx
+                    .send(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "upstream stalled",
+                    )))
+                    .await;
+                clear_fetcher(&ctx.state.inflight, &ctx.cache_key);
+                return;
+            }
+            Ok(None) => break, // clean EOF
+            Ok(Some(Err(e))) => {
+                warn!("Upstream body error for {}: {}", ctx.url, e);
+                spool.abort().await;
+                let _ = tx
+                    .send(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionAborted,
+                        "upstream body error",
+                    )))
+                    .await;
+                clear_fetcher(&ctx.state.inflight, &ctx.cache_key);
+                return;
+            }
+            Ok(Some(Ok(chunk))) => {
+                bytes_seen += chunk.len() as u64;
+                if bytes_seen > max_bytes {
+                    warn!(
+                        "Streamed body exceeded max {} bytes for {} — aborting",
+                        max_bytes, ctx.url
+                    );
+                    spool.abort().await;
+                    let _ = tx
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::FileTooLarge,
+                            "response too large",
+                        )))
+                        .await;
+                    clear_fetcher(&ctx.state.inflight, &ctx.cache_key);
+                    return;
+                }
+                spool.write(&chunk);
+                if tx.send(Ok(chunk)).await.is_err() {
+                    // Client disconnected. Keep spooling to completion —
+                    // the cache still benefits from the full fetch — but
+                    // stop forwarding.
+                    debug!("Client disconnected from tee for {}", ctx.url);
+                    if let Err(e) = drain_to_spool(
+                        &mut body,
+                        &mut spool,
+                        stall_timeout,
+                        max_bytes,
+                        &mut bytes_seen,
+                        &mut last_progress,
+                    )
+                    .await
+                    {
+                        warn!(
+                            "Drain after client disconnect failed for {}: {}",
+                            ctx.url, e
+                        );
+                        spool.abort().await;
+                        clear_fetcher(&ctx.state.inflight, &ctx.cache_key);
+                        return;
+                    }
+                    break;
+                }
+                last_progress = Instant::now();
+            }
+        }
+    }
+
+    // Clean EOF — commit.
+    let meta = match spool.commit().await {
+        Ok(m) => m,
+        Err(e) => {
+            error!("Spool commit failed for {}: {}", ctx.url, e);
+            clear_fetcher(&ctx.state.inflight, &ctx.cache_key);
+            return;
+        }
+    };
+
+    info!(
+        "Cached: {} -> {} ({} bytes, sha256 {})",
+        ctx.url,
+        ctx.cache_key,
+        meta.size_bytes,
+        &meta.checksum_sha256[..12.min(meta.checksum_sha256.len())]
+    );
+    monopsony_common::metrics::cache_bytes_cached(meta.size_bytes);
+
+    // Filesystem metadata sidecar (content-type, etag, last-modified, hits)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let entry = CacheEntry {
+        url: ctx.url.clone(),
+        cache_path: ctx
+            .cache_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| ctx.cache_key.clone()),
+        content_type: ctx.content_type.clone(),
+        content_length: meta.size_bytes,
+        etag: ctx.etag.clone(),
+        last_modified: ctx.last_modified.clone(),
+        cached_at: now,
+        last_accessed: now,
+        hit_count: 1,
+    };
+    if let Err(e) = ctx.state.save_meta(&ctx.cache_key, &entry).await {
+        warn!("Failed to save cache metadata: {}", e);
+    }
+
+    if let Some(db) = &ctx.state.db {
+        if let Err(e) = db
+            .record_cache_miss(&monopsony_db::db::CacheMissConfig {
+                url: ctx.url.clone(),
+                cache_path: entry.cache_path.clone(),
+                content_type: entry.content_type.clone(),
+                content_length: entry.content_length as i64,
+                etag: entry.etag.clone(),
+                last_modified: entry.last_modified.clone(),
+                cached_at: entry.cached_at as i64,
+            })
+            .await
+        {
+            trace!("Failed to record cache miss in DB for {}: {}", ctx.url, e);
+        }
+        // Store the spool-computed hash for tamper detection on HITs.
+        if let Err(e) = db
+            .update_cache_sha256(&ctx.url, &meta.checksum_sha256)
+            .await
+        {
+            trace!("Failed to store SHA256 for {}: {}", ctx.url, e);
+        }
+    }
+
+    // Fire-and-forget malware scan. The scanner API takes a buffer; for
+    // large objects it reads the committed file from disk instead of RAM.
+    if let Some(scan_cfg) = ctx.state.scan_config.clone() {
+        if scan_cfg.enabled {
+            let scan_state = ctx.state.clone();
+            let scan_key = ctx.cache_key.clone();
+            let scan_path = ctx
+                .cache_path
+                .clone()
+                .unwrap_or_else(|| scan_state.cache_dir.join(&scan_key));
+            let scan_url = ctx.url.clone();
+            let sha = meta.checksum_sha256.clone();
+            let retention_days = scan_state
+                .node_config
+                .as_ref()
+                .and_then(|n| n.cache.s3.as_ref())
+                .map(|s3| s3.retention_days)
+                .unwrap_or(0);
+
+            tokio::spawn(async move {
+                // Read the committed object back for scanning. Objects up to
+                // SCAN_BUFFER_LIMIT are read whole; larger objects skip
+                // ClamAV/entropy scanning (YARA scans the file path directly).
+                const SCAN_BUFFER_LIMIT: u64 = 256 * 1024 * 1024;
+                let scan_bytes: Option<Vec<u8>> = if meta.size_bytes <= SCAN_BUFFER_LIMIT {
+                    scan_state.storage.read(&scan_key).await.ok()
+                } else {
+                    debug!(
+                        "Object {} ({} bytes) exceeds scan buffer limit — YARA-only scan",
+                        scan_url, meta.size_bytes
+                    );
+                    None
+                };
+
+                let (result, record) = match scan_bytes {
+                    Some(ref bytes) => {
+                        crate::scan::run_scan(
+                            bytes, &scan_path,
+                            None, // package_name extracted from URL in future sprint
+                            None, // package_version
+                            &scan_cfg,
+                        )
+                        .await
+                    }
+                    None => {
+                        // Large-object path: YARA + CVE only (ClamAV/entropy
+                        // need the buffer). run_scan with empty data gives
+                        // ClamAV/entropy vacuous results; YARA scans the file.
+                        crate::scan::run_scan(&[], &scan_path, None, None, &scan_cfg).await
+                    }
+                };
+
+                if let Some(db) = &scan_state.db {
+                    if let Err(e) = db.record_scan_result(&record).await {
+                        tracing::warn!("Failed to record scan result: {}", e);
+                    }
+                    let _ = sha; // hash already stored at commit time
+                }
+
+                // Object Lock: set retention on clean/flagged scans
+                if retention_days > 0 {
+                    let should_lock = matches!(
+                        result.status,
+                        crate::scan::ScanStatus::Clean | crate::scan::ScanStatus::Flagged
+                    );
+                    if should_lock {
+                        let until = std::time::SystemTime::now()
+                            + std::time::Duration::from_secs(retention_days as u64 * 86400);
+                        if let Err(e) = scan_state.storage.set_retention(&scan_key, until).await {
+                            tracing::warn!(
+                                "Failed to set Object Lock retention on {}: {}",
+                                scan_key,
+                                e
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    clear_fetcher(&ctx.state.inflight, &ctx.cache_key);
+}
+
+/// Continue spooling after the client has disconnected. Same guards as the
+/// main loop (stall, size) minus the forwarding.
+async fn drain_to_spool(
+    body: &mut (impl futures::Stream<Item = Result<bytes::Bytes, axum::Error>> + Unpin),
+    spool: &mut SpoolHandle,
+    stall_timeout: Duration,
+    max_bytes: u64,
+    bytes_seen: &mut u64,
+    _last_progress: &mut Instant,
+) -> anyhow::Result<()> {
+    loop {
+        let next = tokio::time::timeout(stall_timeout, body.next()).await;
+        match next {
+            Err(_) => anyhow::bail!("upstream stalled during drain"),
+            Ok(None) => return Ok(()),
+            Ok(Some(Err(e))) => anyhow::bail!("upstream error during drain: {}", e),
+            Ok(Some(Ok(chunk))) => {
+                *bytes_seen += chunk.len() as u64;
+                if *bytes_seen > max_bytes {
+                    anyhow::bail!("body exceeded max size during drain");
+                }
+                spool.write(&chunk);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Staged-part janitor
+// ---------------------------------------------------------------------------
+
+/// Remove orphaned multipart staging files (`<dest>#<N>`) older than `ttl`.
+///
+/// object_store's local backend writes spooled data to a staged sibling file
+/// and atomically renames on commit. A crashed or killed upload leaves the
+/// staged file behind forever — this sweep reclaims that space. Only applies
+/// to filesystem-backed caches (S3 aborts clean up server-side).
+async fn sweep_staged_parts(state: &ProxyState, ttl: Duration) -> anyhow::Result<()> {
+    let Some(root) = state.storage.base_dir() else {
+        return Ok(()); // S3 backend: multipart aborts handle cleanup
+    };
+    let cutoff = std::time::SystemTime::now() - ttl;
+    let mut removed = 0usize;
+    let mut reclaimed: u64 = 0;
+
+    sweep_dir(&root, cutoff, &mut removed, &mut reclaimed).await?;
+
+    if removed > 0 {
+        info!(
+            "Janitor removed {} orphaned staged part(s), {:.1} MiB reclaimed",
+            removed,
+            reclaimed as f64 / (1024.0 * 1024.0)
+        );
+    }
+    Ok(())
+}
+
+async fn sweep_dir(
+    dir: &std::path::Path,
+    cutoff: std::time::SystemTime,
+    removed: &mut usize,
+    reclaimed: &mut u64,
+) -> anyhow::Result<()> {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(e) => e,
+        Err(_) => return Ok(()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path.is_dir() {
+            Box::pin(sweep_dir(&path, cutoff, removed, reclaimed)).await?;
+        } else {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            // Staged uploads look like `pkg.tar.zst#1` (or #2, #3 on retry).
+            if let Some(idx) = name_str.rfind('#') {
+                let suffix = &name_str[idx + 1..];
+                if !suffix.bytes().all(|b| b.is_ascii_digit()) || suffix.is_empty() {
+                    continue;
+                }
+                if let Ok(meta) = entry.metadata().await {
+                    if meta.modified().map(|m| m < cutoff).unwrap_or(false) {
+                        let size = meta.len();
+                        if tokio::fs::remove_file(&path).await.is_ok() {
+                            *removed += 1;
+                            *reclaimed += size;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Pass through request to upstream without caching
@@ -697,9 +1184,7 @@ async fn proxy_passthrough(state: &ProxyState, request: Request<Body>) -> Respon
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from("Upstream request failed"))
-                .unwrap_or_else(|_| {
-                    Response::new(Body::from("Upstream request failed"))
-                })
+                .unwrap_or_else(|_| Response::new(Body::from("Upstream request failed")))
         }
     }
 }
@@ -710,17 +1195,22 @@ async fn fetch_upstream(
     request: Request<Body>,
     url: &str,
 ) -> Result<Response<Body>, anyhow::Error> {
-    let mut upstream_request = Request::builder()
-        .method(request.method().clone())
-        .uri(url);
+    let mut upstream_request = Request::builder().method(request.method().clone()).uri(url);
 
     // Copy relevant headers
     for (name, value) in request.headers() {
         // Skip hop-by-hop headers
         if matches!(
             name.as_str(),
-            "host" | "connection" | "keep-alive" | "proxy-authenticate" 
-            | "proxy-authorization" | "te" | "trailers" | "transfer-encoding" | "upgrade"
+            "host"
+                | "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailers"
+                | "transfer-encoding"
+                | "upgrade"
         ) {
             continue;
         }
@@ -732,24 +1222,15 @@ async fn fetch_upstream(
     debug!("Fetching from upstream: {}", url);
     let response = state.client.request(upstream_request).await?;
 
-    // Convert response body with size limit
-    let (parts, body) = response.into_parts();
-    let bytes = body.collect().await?.to_bytes();
-
-    // Enforce max response body size
-    if bytes.len() as u64 > crate::security::MAX_RESPONSE_BODY_SIZE {
-        warn!(
-            "Response body too large: {} bytes (max: {})",
-            bytes.len(),
-            crate::security::MAX_RESPONSE_BODY_SIZE
-        );
-        return Err(anyhow::anyhow!(
-            "Response body exceeds maximum allowed size ({} bytes)",
-            crate::security::MAX_RESPONSE_BODY_SIZE
-        ));
-    }
-
-    Ok(Response::from_parts(parts, Body::from(bytes)))
+    // Return the response with its body UNBUFFERED. Size limits are enforced
+    // by the callers: the cached path checks Content-Length up front and the
+    // streamed-bytes counter in the tee task; non-package passthrough wraps
+    // the body in a Limited adapter with the global cap.
+    //
+    // `Incoming` (hyper's response body) implements the http-body traits
+    // directly; `Body::new` adopts it with zero copies.
+    let (parts, incoming) = response.into_parts();
+    Ok(Response::from_parts(parts, Body::new(incoming)))
 }
 
 /// Start the HTTP proxy server
@@ -760,6 +1241,7 @@ pub async fn run_proxy(
     auth_mode: monopsony_common::config::AuthMode,
     scan_config: Option<monopsony_common::config::ScanConfig>,
     node_config: Option<monopsony_common::config::ServerConfig>,
+    limits: Option<monopsony_common::config::ProxyLimitsConfig>,
 ) -> anyhow::Result<()> {
     storage.init_dirs().await?;
 
@@ -776,17 +1258,39 @@ pub async fn run_proxy(
             .expect("state should be uniquely owned at this point")
             .node_config = Some(cfg.clone());
     }
-    
+    // Wire streaming limits (max body size, stall timeout, janitor cadence)
+    if let Some(ref cfg) = limits {
+        Arc::get_mut(&mut state)
+            .expect("state should be uniquely owned at this point")
+            .limits = cfg.clone();
+    }
+
+    // Spawn the staged-part janitor: sweeps orphaned `#N` multipart staging
+    // files left behind by crashed uploads.
+    let janitor_state = state.clone();
+    tokio::spawn(async move {
+        let sweep_secs = janitor_state.limits.stale_part_sweep_secs.max(60);
+        let sweep_every = Duration::from_secs(sweep_secs);
+        let ttl = Duration::from_secs(janitor_state.limits.stale_part_ttl_secs.max(sweep_secs));
+        let mut interval = tokio::time::interval(sweep_every);
+        loop {
+            interval.tick().await;
+            if let Err(e) = sweep_staged_parts(&janitor_state, ttl).await {
+                warn!("Staged-part janitor sweep failed: {}", e);
+            }
+        }
+    });
+
     // Create rate limiter and spawn cleanup task
     let limiter = crate::security::create_default_rate_limiter();
     let limiter_clone = limiter.clone();
-    tokio::spawn(crate::security::run_rate_limiter_cleanup(limiter_clone, 120));
+    tokio::spawn(crate::security::run_rate_limiter_cleanup(
+        limiter_clone,
+        120,
+    ));
 
     // Create auth middleware state
-    let auth_state = Arc::new(monopsony_control::auth::AuthState {
-        auth_mode,
-        db,
-    });
+    let auth_state = Arc::new(monopsony_control::auth::AuthState { auth_mode, db });
 
     let app = create_proxy_router(state, Some(limiter), auth_state);
 
@@ -805,20 +1309,24 @@ pub async fn run_proxy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache_storage::FilesystemStorage;
+    use crate::object_store_backend::ObjectStoreBackend;
 
     #[test]
     fn test_url_to_cache_path() {
         // ProxyState::new() builds an HTTPS client which needs the ring CryptoProvider
         let _ = rustls::crypto::ring::default_provider().install_default();
         let temp_dir = std::env::temp_dir().join("monopsony-test-cache");
-        let storage = Arc::new(FilesystemStorage::new(temp_dir));
+        std::fs::create_dir_all(&temp_dir).expect("create test cache dir");
+        let storage = Arc::new(
+            ObjectStoreBackend::local(temp_dir, 0).expect("local backend should construct"),
+        );
         let state = ProxyState::new(storage, None);
 
         // Test with a known apt URL pattern
-        let url = "http://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-image_5.15.0-1_amd64.deb";
+        let url =
+            "http://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-image_5.15.0-1_amd64.deb";
         let path = state.url_to_cache_path(url);
-        
+
         // Should produce a cache path
         assert!(path.is_some());
     }
@@ -862,7 +1370,12 @@ pub async fn scan_cache_stats(cache_dir: &std::path::Path) -> CacheStats {
     let mut dir_entries: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(mut read_dir) = tokio::fs::read_dir(cache_dir).await {
         while let Ok(Some(entry)) = read_dir.next_entry().await {
-            if entry.file_type().await.map(|ft| ft.is_dir()).unwrap_or(false) {
+            if entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_dir())
+                .unwrap_or(false)
+            {
                 dir_entries.push(entry.path());
             }
         }
@@ -870,7 +1383,8 @@ pub async fn scan_cache_stats(cache_dir: &std::path::Path) -> CacheStats {
 
     // Now scan each subdirectory (backend dirs)
     for dir in &dir_entries {
-        let backend_name = dir.file_name()
+        let backend_name = dir
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("unknown");
 
@@ -916,12 +1430,8 @@ pub async fn scan_cache_stats(cache_dir: &std::path::Path) -> CacheStats {
     entries_by_hits.sort_by(|a, b| b.hit_count.cmp(&a.hit_count));
     let top_by_hits = entries_by_hits.iter().take(10).cloned().collect();
 
-    let oldest_entry = all_entries.iter()
-        .min_by_key(|e| e.cached_at)
-        .cloned();
-    let newest_entry = all_entries.iter()
-        .max_by_key(|e| e.cached_at)
-        .cloned();
+    let oldest_entry = all_entries.iter().min_by_key(|e| e.cached_at).cloned();
+    let newest_entry = all_entries.iter().max_by_key(|e| e.cached_at).cloned();
 
     CacheStats {
         cache_dir: cache_dir.to_string_lossy().to_string(),

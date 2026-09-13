@@ -52,7 +52,9 @@ pub fn init_v4v_schema(conn: &Connection) {
         );",
     )
     .expect("V4V schema creation failed");
-    info!("V4V schema initialized (bounty_pool, bounty_delegations, bounty_proposals, audit_badges)");
+    info!(
+        "V4V schema initialized (bounty_pool, bounty_delegations, bounty_proposals, audit_badges)"
+    );
 }
 
 /// Check if V4V tables exist (i.e., were created at startup).
@@ -63,7 +65,8 @@ pub fn v4v_tables_exist(conn: &Connection) -> bool {
         [],
         |row| row.get::<_, i64>(0),
     )
-    .unwrap_or(0) > 0
+    .unwrap_or(0)
+        > 0
 }
 
 #[cfg(test)]
@@ -99,10 +102,14 @@ mod tests {
 
         // Verify other tables
         let _: i64 = conn
-            .query_row("SELECT COUNT(*) FROM bounty_delegations", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM bounty_delegations", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         let _: i64 = conn
-            .query_row("SELECT COUNT(*) FROM bounty_proposals", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM bounty_proposals", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         let _: i64 = conn
             .query_row("SELECT COUNT(*) FROM audit_badges", [], |row| row.get(0))

@@ -48,11 +48,7 @@ pub async fn auth_middleware(
 }
 
 /// Token auth: check X-Monopsony-Key header against stored hashes
-async fn token_auth(
-    state: Arc<AuthState>,
-    req: Request<Body>,
-    next: Next,
-) -> Response<Body> {
+async fn token_auth(state: Arc<AuthState>, req: Request<Body>, next: Next) -> Response<Body> {
     let key = req
         .headers()
         .get("X-Monopsony-Key")

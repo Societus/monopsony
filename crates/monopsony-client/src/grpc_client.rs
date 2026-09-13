@@ -1,12 +1,11 @@
 use monopsony_common::package_manager::PackageRef;
-use monopsony_common::proto::monopsony::{
-    HeartbeatRequest, InventoryReport, PackageEntry, PairRequest, PairResponse,
-    RegisterRequest,
-};
 use monopsony_common::proto::monopsony::monopsony_control_client::MonopsonyControlClient;
+use monopsony_common::proto::monopsony::{
+    HeartbeatRequest, InventoryReport, PackageEntry, PairRequest, PairResponse, RegisterRequest,
+};
+use std::path::Path;
 use tonic::transport::Channel;
 use tracing::{debug, info};
-use std::path::Path;
 
 use crate::ws_transport::WsTransport;
 
@@ -47,7 +46,10 @@ impl ClientCerts {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(cert_dir.join("client.key"), std::fs::Permissions::from_mode(0o600))?;
+            std::fs::set_permissions(
+                cert_dir.join("client.key"),
+                std::fs::Permissions::from_mode(0o600),
+            )?;
         }
 
         info!("Client certificates saved to {}", cert_dir.display());
@@ -56,14 +58,29 @@ impl ClientCerts {
 }
 
 impl MonopsonyGrpcClient {
-    pub async fn connect(addr: &str, tls: Option<tonic::transport::ClientTlsConfig>) -> anyhow::Result<Self> {
-        info!(addr = addr, tls_enabled = tls.is_some(), "Connecting to monopsony server via gRPC");
+    pub async fn connect(
+        addr: &str,
+        tls: Option<tonic::transport::ClientTlsConfig>,
+    ) -> anyhow::Result<Self> {
+        info!(
+            addr = addr,
+            tls_enabled = tls.is_some(),
+            "Connecting to monopsony server via gRPC"
+        );
 
         let endpoint = if let Some(tls_config) = tls {
-            let uri = if addr.starts_with("https://") { addr.to_string() } else { format!("https://{}", addr) };
+            let uri = if addr.starts_with("https://") {
+                addr.to_string()
+            } else {
+                format!("https://{}", addr)
+            };
             Channel::from_shared(uri)?.tls_config(tls_config)?
         } else {
-            let uri = if addr.starts_with("http://") || addr.starts_with("https://") { addr.to_string() } else { format!("http://{}", addr) };
+            let uri = if addr.starts_with("http://") || addr.starts_with("https://") {
+                addr.to_string()
+            } else {
+                format!("http://{}", addr)
+            };
             Channel::from_shared(uri)?
         };
 
@@ -114,11 +131,12 @@ impl MonopsonyGrpcClient {
                 let url = ws_url_owned.clone();
                 async move {
                     // Open WebSocket connection
-                    let ws = WsTransport::connect(&url).await
-                        .map_err(|e| std::io::Error::new(
+                    let ws = WsTransport::connect(&url).await.map_err(|e| {
+                        std::io::Error::new(
                             std::io::ErrorKind::ConnectionRefused,
                             format!("WebSocket connect failed: {}", e),
-                        ))?;
+                        )
+                    })?;
                     // tokio-tungstenite's connect_async already handles WSS TLS
                     // for the outer layer. If inner TLS is needed, it's applied
                     // via tonic's tls_config on the Endpoint, which wraps our
@@ -224,7 +242,11 @@ impl MonopsonyGrpcClient {
                 version: p.version.clone().unwrap_or_default(),
                 arch: p.architecture.clone().unwrap_or_default(),
                 installed_at: if report_telemetry { now } else { 0 },
-                install_source: if report_telemetry { "proxy".to_string() } else { String::new() },
+                install_source: if report_telemetry {
+                    "proxy".to_string()
+                } else {
+                    String::new()
+                },
             })
             .collect();
 
@@ -254,7 +276,8 @@ impl MonopsonyGrpcClient {
     }
 
     /// Perform pairing exchange over plaintext TCP on port 50052.
-    /// Returns (client_id, ClientCerts, grpc_addr) on success.
+    /// Returns (client_id, ClientCerts, grpc_addr, ws_url) on success.
+    /// `ws_url` is `Some` when the server is configured for WebSocket tunneling.
     pub async fn pair(
         server_addr: &str,
         code: &str,
@@ -262,7 +285,7 @@ impl MonopsonyGrpcClient {
         os: &str,
         os_version: &str,
         package_managers: &[String],
-    ) -> anyhow::Result<(String, ClientCerts, String)> {
+    ) -> anyhow::Result<(String, ClientCerts, String, Option<String>)> {
         use prost::Message;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -271,8 +294,11 @@ impl MonopsonyGrpcClient {
         } else {
             format!("{}:50052", server_addr.trim_end_matches(":50051"))
         };
-        let mut stream = tokio::net::TcpStream::connect(&pair_addr).await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to pairing port {}: {}", pair_addr, e))?;
+        let mut stream = tokio::net::TcpStream::connect(&pair_addr)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to connect to pairing port {}: {}", pair_addr, e)
+            })?;
 
         let req = PairRequest {
             code: code.to_string(),
@@ -308,8 +334,158 @@ impl MonopsonyGrpcClient {
             format!("{}:50051", host)
         };
 
-        info!("Paired successfully, client_id={}, grpc_addr={}", resp.client_id, grpc_addr);
-        Ok((resp.client_id, certs, grpc_addr))
+        info!(
+            "Paired successfully, client_id={}, grpc_addr={}",
+            resp.client_id, grpc_addr
+        );
+        let ws_url = if resp.ws_url.is_empty() {
+            None
+        } else {
+            Some(resp.ws_url)
+        };
+        Ok((resp.client_id, certs, grpc_addr, ws_url))
+    }
+
+    /// Perform pairing exchange over a WebSocket tunnel.
+    ///
+    /// Used when the server is behind Cloudflare Tunnels or a reverse proxy
+    /// that terminates TLS — the plaintext pairing exchange (length-prefixed
+    /// protobuf) is sent as binary WebSocket frames through the server's
+    /// `/ws/pair` relay endpoint, which forwards them to the local pairing
+    /// listener on port 50052.
+    ///
+    /// `ws_pair_url` is the full WebSocket URL, e.g.
+    /// `wss://monopsony.example.com/ws/pair`.
+    ///
+    /// Returns (client_id, ClientCerts, grpc_addr) on success.
+    pub async fn pair_ws(
+        ws_pair_url: &str,
+        code: &str,
+        hostname: &str,
+        os: &str,
+        os_version: &str,
+        package_managers: &[String],
+    ) -> anyhow::Result<(String, ClientCerts, String, Option<String>)> {
+        use futures_util::{SinkExt, StreamExt};
+        use prost::Message;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        info!(
+            url = ws_pair_url,
+            "Connecting to pairing endpoint via WebSocket tunnel"
+        );
+
+        let (ws_stream, response) = tokio_tungstenite::connect_async(ws_pair_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("WebSocket pairing connect failed: {}", e))?;
+
+        debug!(status = %response.status(), "Pairing WS connected");
+
+        let (mut ws_tx, mut ws_rx) = ws_stream.split();
+
+        // Build the PairRequest as length-prefixed protobuf, exactly the same
+        // wire format as the TCP pairing exchange: [u32 LE length][protobuf bytes]
+        let req = PairRequest {
+            code: code.to_string(),
+            hostname: hostname.to_string(),
+            os: os.to_string(),
+            os_version: os_version.to_string(),
+            package_managers: package_managers.to_vec(),
+        };
+        let req_bytes = req.encode_to_vec();
+        let len = req_bytes.len() as u32;
+
+        let mut frame = len.to_le_bytes().to_vec();
+        frame.extend_from_slice(&req_bytes);
+
+        ws_tx
+            .send(WsMessage::Binary(frame))
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to send pairing request over WS: {}", e))?;
+
+        // Receive the PairResponse. The server sends [u32 LE length][protobuf bytes]
+        // as a single binary frame. Accumulate until we have both the length header
+        // and the full payload.
+        let mut buf = Vec::with_capacity(512);
+        let resp = loop {
+            match ws_rx.next().await {
+                Some(Ok(WsMessage::Binary(data))) => {
+                    buf.extend_from_slice(&data);
+
+                    // Need at least 4 bytes for the length prefix
+                    if buf.len() < 4 {
+                        continue;
+                    }
+
+                    let resp_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+
+                    // Sanity check
+                    if resp_len > 65536 {
+                        anyhow::bail!("Pairing response too large: {} bytes", resp_len);
+                    }
+
+                    if buf.len() < 4 + resp_len {
+                        // Need more data — the relay may split across frames
+                        continue;
+                    }
+
+                    let resp_bytes = &buf[4..4 + resp_len];
+                    break PairResponse::decode(resp_bytes)
+                        .map_err(|e| anyhow::anyhow!("Failed to decode pair response: {}", e))?;
+                }
+                Some(Ok(WsMessage::Close(_))) => {
+                    anyhow::bail!("Pairing WebSocket closed before response received");
+                }
+                Some(Ok(_)) => {
+                    // Ping/Pong/Text — ignore and keep waiting
+                    continue;
+                }
+                Some(Err(e)) => {
+                    anyhow::bail!("Pairing WebSocket error: {}", e);
+                }
+                None => {
+                    anyhow::bail!("Pairing WebSocket stream ended before response received");
+                }
+            }
+        };
+
+        // Close the WebSocket cleanly now that we have the response
+        let _ = ws_tx.close().await;
+
+        let certs = ClientCerts {
+            client_cert_pem: resp.client_cert_pem,
+            client_key_pem: resp.client_key_pem,
+            ca_cert_pem: resp.ca_cert_pem,
+        };
+
+        // The grpc_addr from the server tells us where to connect for ongoing
+        // control-plane traffic. When pairing over WS, the server should return
+        // a wss:// or ws:// URL here (Phase 4); if it doesn't, fall back to
+        // deriving a direct TCP address from the WS URL host.
+        let grpc_addr = if !resp.grpc_addr.is_empty() {
+            resp.grpc_addr
+        } else {
+            // Extract host from the ws/wss URL
+            let host = ws_pair_url
+                .strip_prefix("wss://")
+                .or_else(|| ws_pair_url.strip_prefix("ws://"))
+                .unwrap_or(ws_pair_url)
+                .split('/')
+                .next()
+                .unwrap_or("127.0.0.1:50051");
+            format!("wss://{}/ws/tunnel", host)
+        };
+
+        info!(
+            "Paired via WS, client_id={}, grpc_addr={}",
+            resp.client_id, grpc_addr
+        );
+        let ws_url = if resp.ws_url.is_empty() {
+            None
+        } else {
+            Some(resp.ws_url)
+        };
+        Ok((resp.client_id, certs, grpc_addr, ws_url))
     }
 
     #[allow(dead_code)] // Will be used by Status subcommand

@@ -188,7 +188,13 @@ impl TailscaleDetector {
         // If there are web handlers configured, the server is in serve mode.
         // We check for Funnel eligibility by looking at the AllowFunnel flag.
         let web = parsed.get("Web");
-        if web.is_none() || web.unwrap().as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        if web.is_none()
+            || web
+                .unwrap()
+                .as_object()
+                .map(|o| o.is_empty())
+                .unwrap_or(true)
+        {
             return (false, false);
         }
 
@@ -200,7 +206,11 @@ impl TailscaleDetector {
                     for (_path, handler) in handlers {
                         // Check for Funnel flag in the serve config
                         // The serve-config API returns funnel info at the host level
-                        if handler.get("Funnel").and_then(|f| f.as_bool()).unwrap_or(false) {
+                        if handler
+                            .get("Funnel")
+                            .and_then(|f| f.as_bool())
+                            .unwrap_or(false)
+                        {
                             has_funnel = true;
                         }
                     }
@@ -209,7 +219,11 @@ impl TailscaleDetector {
         }
 
         // Also check the top-level Funnel field
-        if parsed.get("Funnel").and_then(|f| f.as_bool()).unwrap_or(false) {
+        if parsed
+            .get("Funnel")
+            .and_then(|f| f.as_bool())
+            .unwrap_or(false)
+        {
             has_funnel = true;
         }
 
@@ -307,7 +321,10 @@ impl SessionStore {
     #[allow(dead_code)]
     pub async fn evict_expired(&self) {
         let now = Instant::now();
-        self.sessions.write().await.retain(|_, s| now < s.expires_at);
+        self.sessions
+            .write()
+            .await
+            .retain(|_, s| now < s.expires_at);
     }
 }
 
@@ -519,8 +536,8 @@ pub async fn handle_auth_status(
     let client_ip = extract_client_ip(&req);
     let ctx = evaluate_auth(&state, &client_ip).await;
 
-    let credentials_configured = state.dashboard_config.username.is_some()
-        && state.dashboard_config.password_hash.is_some();
+    let credentials_configured =
+        state.dashboard_config.username.is_some() && state.dashboard_config.password_hash.is_some();
 
     let auth_required = !ctx.authenticated;
 

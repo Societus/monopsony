@@ -4,7 +4,7 @@
 //! It uses RPM packages and shares the underlying libzypp library with
 //! SUSE's enterprise tools. URL patterns match openSUSE download mirrors.
 
-use crate::{PackageRef, PackageManagerBackend, PackageManagerKind, ProxyConfigAction, UrlPattern};
+use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 use std::path::PathBuf;
 
@@ -197,13 +197,14 @@ mod tests {
             "https://download.opensuse.org/tumbleweed/repo/oss/x86_64/bash-5.2.15-3.1.x86_64.rpm"
         )));
         // Repo metadata
-        assert!(patterns.iter().any(|p| p.matches(
-            "https://download.opensuse.org/tumbleweed/repo/oss/repodata/repomd.xml"
-        )));
+        assert!(patterns
+            .iter()
+            .any(|p| p
+                .matches("https://download.opensuse.org/tumbleweed/repo/oss/repodata/repomd.xml")));
         // SUSE internal
-        assert!(patterns.iter().any(|p| p.matches(
-            "https://download.suse.de/ibs/SUSE/Downloads/SLE/15/x86_64/test.rpm"
-        )));
+        assert!(patterns.iter().any(
+            |p| p.matches("https://download.suse.de/ibs/SUSE/Downloads/SLE/15/x86_64/test.rpm")
+        ));
         // Non-matching
         assert!(!patterns
             .iter()

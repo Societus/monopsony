@@ -23,11 +23,14 @@ pub enum NatType {
     /// No NAT — public IP directly reachable
     Public,
     /// Full cone NAT — any external host can reach mapped port
-    #[allow(dead_code)] FullCone,
+    #[allow(dead_code)]
+    FullCone,
     /// Restricted cone NAT
-    #[allow(dead_code)] RestrictedCone,
+    #[allow(dead_code)]
+    RestrictedCone,
     /// Port-restricted cone NAT
-    #[allow(dead_code)] PortRestrictedCone,
+    #[allow(dead_code)]
+    PortRestrictedCone,
     /// Symmetric NAT — different mapping per destination
     Symmetric,
     /// Could not determine
@@ -143,9 +146,8 @@ fn parse_xor_mapped_address(data: &[u8], transaction_id: &[u8]) -> Option<Socket
                     return None;
                 }
                 let raw_port = u16::from_be_bytes([attr_data[2], attr_data[3]]);
-                let raw_ip = u32::from_be_bytes([
-                    attr_data[4], attr_data[5], attr_data[6], attr_data[7],
-                ]);
+                let raw_ip =
+                    u32::from_be_bytes([attr_data[4], attr_data[5], attr_data[6], attr_data[7]]);
 
                 let port = if attr_type == 0x0020 {
                     raw_port ^ 0x2112
@@ -237,7 +239,9 @@ fn probe_stun_server(server: &str) -> Option<SocketAddr> {
     debug!("STUN: resolved {} -> {}", server, stun_addr);
 
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.set_read_timeout(Some(std::time::Duration::from_secs(3))).ok()?;
+    socket
+        .set_read_timeout(Some(std::time::Duration::from_secs(3)))
+        .ok()?;
     let _local_addr = socket.local_addr().ok()?;
 
     let request = encode_binding_request();
@@ -281,7 +285,10 @@ pub fn detect_nat() -> NatInfo {
         None => NatType::Unknown,
     };
 
-    info!("NAT detection: external={:?}, type={}", external_addr, nat_type);
+    info!(
+        "NAT detection: external={:?}, type={}",
+        external_addr, nat_type
+    );
 
     NatInfo {
         external_addr,
@@ -340,8 +347,9 @@ mod tests {
     #[test]
     fn test_parse_xor_mapped_address_ipv4() {
         // Construct a minimal STUN Binding Response with XOR-MAPPED-ADDRESS
-        let transaction_id: [u8; 12] = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
-                                          0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C];
+        let transaction_id: [u8; 12] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C,
+        ];
 
         // XOR-MAPPED-ADDRESS attribute: 203.0.113.1:12345
         // Port XOR: 12345 ^ 0x2112 = 0x309D ^ 0x2112 = 0x118F = 4495
@@ -365,7 +373,7 @@ mod tests {
         response.extend_from_slice(&(attr_data.len() as u16).to_be_bytes()); // Message length
         response.extend_from_slice(&[0x21, 0x12, 0xA4, 0x42]); // Magic cookie
         response.extend_from_slice(&transaction_id); // Transaction ID
-        // Attribute
+                                                     // Attribute
         response.extend_from_slice(&[0x00, 0x20]); // XOR-MAPPED-ADDRESS type
         response.extend_from_slice(&(attr_data.len() as u16).to_be_bytes()); // Attribute length
         response.extend_from_slice(&attr_data);
@@ -374,7 +382,10 @@ mod tests {
         assert!(result.is_some());
         let addr = result.unwrap();
         assert_eq!(addr.port(), 12345);
-        assert_eq!(addr.ip(), std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 1)));
+        assert_eq!(
+            addr.ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 1))
+        );
     }
 
     #[test]

@@ -1,6 +1,10 @@
 //! Cache management endpoints.
 
-use axum::{extract::{Path, State}, response::IntoResponse, Json};
+use axum::{
+    extract::{Path, State},
+    response::IntoResponse,
+    Json,
+};
 
 use crate::AdminState;
 
@@ -9,17 +13,20 @@ pub async fn handle_list_cache(State(state): State<AdminState>) -> impl IntoResp
     if let Some(ref db) = state.db {
         match db.list_cache_entries().await {
             Ok(entries) => {
-                let result: Vec<serde_json::Value> = entries.iter().map(|e| {
-                    serde_json::json!({
-                        "url": e.url,
-                        "content_type": e.content_type,
-                        "content_length": e.content_length,
-                        "cached_at": e.cached_at,
-                        "last_accessed": e.last_accessed,
-                        "hit_count": e.hit_count,
-                        "sha256": e.sha256,
+                let result: Vec<serde_json::Value> = entries
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "url": e.url,
+                            "content_type": e.content_type,
+                            "content_length": e.content_length,
+                            "cached_at": e.cached_at,
+                            "last_accessed": e.last_accessed,
+                            "hit_count": e.hit_count,
+                            "sha256": e.sha256,
+                        })
                     })
-                }).collect();
+                    .collect();
                 Json(serde_json::Value::Array(result))
             }
             Err(_) => Json(serde_json::json!([])),
@@ -33,13 +40,11 @@ pub async fn handle_list_cache(State(state): State<AdminState>) -> impl IntoResp
 pub async fn handle_cache_stats(State(state): State<AdminState>) -> impl IntoResponse {
     if let Some(ref db) = state.db {
         match db.cache_stats().await {
-            Ok((total_entries, total_size_bytes)) => {
-                Json(serde_json::json!({
-                    "cache_dir": state.cache_dir.to_string_lossy(),
-                    "total_entries": total_entries,
-                    "total_size_bytes": total_size_bytes,
-                }))
-            }
+            Ok((total_entries, total_size_bytes)) => Json(serde_json::json!({
+                "cache_dir": state.cache_dir.to_string_lossy(),
+                "total_entries": total_entries,
+                "total_size_bytes": total_size_bytes,
+            })),
             Err(e) => {
                 tracing::error!("Failed to query cache stats: {}", e);
                 Json(serde_json::json!({
@@ -65,7 +70,9 @@ pub async fn handle_purge_entry(
     State(state): State<AdminState>,
     Path(key): Path<String>,
 ) -> impl IntoResponse {
-    let key = urlencoding::decode(&key).map(|s| s.to_string()).unwrap_or(key);
+    let key = urlencoding::decode(&key)
+        .map(|s| s.to_string())
+        .unwrap_or(key);
 
     if let Some(ref db) = state.db {
         match db.delete_cache_entry(&key).await {

@@ -9,10 +9,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
-use tracing::{warn, debug};
+use tracing::{debug, warn};
 
-/// Maximum response body size (512 MB) — prevents disk exhaustion from malicious upstreams
-pub const MAX_RESPONSE_BODY_SIZE: u64 = 512 * 1024 * 1024;
+/// Maximum response body size (4 GiB) — guards against disk exhaustion from
+/// malicious upstreams while admitting bare-metal packages (linux-firmware
+/// ≈ 1 GB+ single files). Enforced via Content-Length when present and a
+/// streamed-bytes counter otherwise — never by buffering the body in RAM.
+pub const MAX_RESPONSE_BODY_SIZE: u64 = 4 * 1024 * 1024 * 1024;
 
 /// Default rate limit: 100 requests per window
 #[allow(dead_code)] // Will be used as default in rate limit config
@@ -204,11 +207,7 @@ impl RateLimiter {
     /// Get current request count for an IP (for metrics).
     pub fn request_count(&self, ip: &IpAddr) -> usize {
         let state = self.state.lock();
-        state
-            .requests
-            .get(ip)
-            .map(|v| v.len())
-            .unwrap_or(0)
+        state.requests.get(ip).map(|v| v.len()).unwrap_or(0)
     }
 
     /// Periodic cleanup of stale entries. Call from a background task.
@@ -222,8 +221,6 @@ impl RateLimiter {
         });
     }
 }
-
-
 
 /// Periodic cleanup task for stale rate limiter entries.
 #[allow(dead_code)] // Called from background task
@@ -244,7 +241,6 @@ pub fn create_default_rate_limiter() -> Arc<RateLimiter> {
     ))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,8 +257,12 @@ mod tests {
         assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
         assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))));
         assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
-        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0))));
-        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0))));
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfc00, 0, 0, 0, 0, 0, 0, 0
+        ))));
+        assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 0
+        ))));
         assert!(is_private_ip(&IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
 
         // Should allow
@@ -270,7 +270,9 @@ mod tests {
         assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
         assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(172, 15, 0, 1)))); // Just below RFC 1918
         assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(172, 32, 0, 1)))); // Just above RFC 1918
-        assert!(!is_private_ip(&IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0, 0, 0, 0, 0, 0)))); // Google DNS
+        assert!(!is_private_ip(&IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x4860, 0, 0, 0, 0, 0, 0
+        )))); // Google DNS
     }
 
     #[test]
@@ -304,7 +306,11 @@ mod tests {
 
         // Path traversal — should fail
         assert!(!validate_cache_path(
-            &cache_dir.join("..").join("etc").join("passwd").to_string_lossy(),
+            &cache_dir
+                .join("..")
+                .join("etc")
+                .join("passwd")
+                .to_string_lossy(),
             &cache_dir
         ));
     }

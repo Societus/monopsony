@@ -116,10 +116,7 @@ impl GitMirrorManager {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(MirrorError::RefNotFound(format!(
-                "{}: {}",
-                ref_arg, stderr
-            )));
+            return Err(MirrorError::RefNotFound(format!("{}: {}", ref_arg, stderr)));
         }
 
         let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -129,11 +126,7 @@ impl GitMirrorManager {
     /// List all tags in a mirror, sorted by creation date (newest first)
     pub async fn list_tags(&self, repo_path: &Path) -> Result<Vec<String>, MirrorError> {
         let output = Command::new("git")
-            .args([
-                "tag",
-                "-l",
-                "--sort=-creatordate",
-            ])
+            .args(["tag", "-l", "--sort=-creatordate"])
             .current_dir(repo_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -191,10 +184,7 @@ impl GitMirrorManager {
 
         // Use git archive to extract files at the given ref
         let output = Command::new("git")
-            .args([
-                "archive",
-                refspec,
-            ])
+            .args(["archive", refspec])
             .current_dir(repo_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -225,11 +215,7 @@ impl GitMirrorManager {
             stdin.write_all(&output.stdout).await?;
         }
 
-        debug!(
-            "Created worktree at {} for ref {}",
-            dest.display(),
-            refspec
-        );
+        debug!("Created worktree at {} for ref {}", dest.display(), refspec);
         Ok(())
     }
 
@@ -266,8 +252,12 @@ mod tests {
         tokio::fs::create_dir_all(&mirror_dir).await.unwrap();
 
         // Create two fake mirror dirs
-        tokio::fs::create_dir_all(mirror_dir.join("active-repo")).await.unwrap();
-        tokio::fs::create_dir_all(mirror_dir.join("stale-repo")).await.unwrap();
+        tokio::fs::create_dir_all(mirror_dir.join("active-repo"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(mirror_dir.join("stale-repo"))
+            .await
+            .unwrap();
 
         let mgr = GitMirrorManager::new(mirror_dir);
         let removed = mgr.gc(&["active-repo".to_string()]).await.unwrap();
@@ -284,8 +274,12 @@ mod tests {
         let mirror_dir = tmp.path().join("mirrors");
         tokio::fs::create_dir_all(&mirror_dir).await.unwrap();
 
-        tokio::fs::create_dir_all(mirror_dir.join("repo-a")).await.unwrap();
-        tokio::fs::create_dir_all(mirror_dir.join("repo-b")).await.unwrap();
+        tokio::fs::create_dir_all(mirror_dir.join("repo-a"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(mirror_dir.join("repo-b"))
+            .await
+            .unwrap();
 
         let mgr = GitMirrorManager::new(mirror_dir);
         let removed = mgr

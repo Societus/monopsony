@@ -114,17 +114,15 @@ pub fn init_reputation_tables(conn: &rusqlite::Connection) {
 pub const BASE_REPUTATION: f64 = 50.0;
 
 /// Get current reputation for an operator (computed from events).
-pub fn get_reputation(
-    db: &rusqlite::Connection,
-    npub: &str,
-) -> f64 {
-    let event_sum: f64 = db.query_row(
-        "SELECT COALESCE(SUM(weight), 0.0) FROM reputation_events
+pub fn get_reputation(db: &rusqlite::Connection, npub: &str) -> f64 {
+    let event_sum: f64 = db
+        .query_row(
+            "SELECT COALESCE(SUM(weight), 0.0) FROM reputation_events
          WHERE operator_npub = ?1 AND disputed = 0",
-        params![npub],
-        |row| row.get(0),
-    )
-    .unwrap_or(0.0);
+            params![npub],
+            |row| row.get(0),
+        )
+        .unwrap_or(0.0);
 
     (BASE_REPUTATION + event_sum).clamp(0.0, 100.0)
 }
@@ -142,23 +140,31 @@ pub async fn record_event(
     disputable: bool,
 ) -> Result<i64, String> {
     let now = chrono::Utc::now().timestamp();
-    let expires_at = if disputable { Some(now + 14 * 86400) } else { None };
+    let expires_at = if disputable {
+        Some(now + 14 * 86400)
+    } else {
+        None
+    };
 
     db.execute(
         "INSERT INTO reputation_events (operator_npub, event_type, source_npub, weight,
             mirror_id, details, disputed, expires_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
-        params![operator_npub, event_type.to_string(), source_npub, weight,
-            mirror_id, details, expires_at],
+        params![
+            operator_npub,
+            event_type.to_string(),
+            source_npub,
+            weight,
+            mirror_id,
+            details,
+            expires_at
+        ],
     )
     .map_err(|e| format!("DB error: {}", e))?;
 
-    let id: i64 = db.query_row(
-        "SELECT last_insert_rowid()",
-        [],
-        |row| row.get(0),
-    )
-    .unwrap_or(0);
+    let id: i64 = db
+        .query_row("SELECT last_insert_rowid()", [], |row| row.get(0))
+        .unwrap_or(0);
 
     let reputation = get_reputation(db, operator_npub);
     let _ = db.execute(
@@ -180,12 +186,13 @@ pub fn open_dispute(
     respondent_npub: &str,
     evidence: &str,
 ) -> Result<i64, String> {
-    let disputed: i64 = db.query_row(
-        "SELECT disputed FROM reputation_events WHERE id = ?1",
-        params![event_id],
-        |row| row.get(0),
-    )
-    .map_err(|e| format!("Event not found: {}", e))?;
+    let disputed: i64 = db
+        .query_row(
+            "SELECT disputed FROM reputation_events WHERE id = ?1",
+            params![event_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| format!("Event not found: {}", e))?;
 
     if disputed != 0 {
         return Err("Event already disputed".to_string());
@@ -200,12 +207,9 @@ pub fn open_dispute(
     )
     .map_err(|e| format!("DB error: {}", e))?;
 
-    let dispute_id: i64 = db.query_row(
-        "SELECT last_insert_rowid()",
-        [],
-        |row| row.get(0),
-    )
-    .unwrap_or(0);
+    let dispute_id: i64 = db
+        .query_row("SELECT last_insert_rowid()", [], |row| row.get(0))
+        .unwrap_or(0);
 
     db.execute(
         "UPDATE reputation_events SET disputed = 1 WHERE id = ?1",
@@ -223,13 +227,22 @@ pub fn attest_dispute(
     dispute_id: i64,
     attester_npub: &str,
 ) -> Result<String, String> {
-    let (event_id, mut npubs_json, mut weight, threshold, status): (i64, String, f64, f64, String) = db.query_row(
-        "SELECT event_id, attestation_npubs, attestation_weight, dismissal_threshold, status
+    let (event_id, mut npubs_json, mut weight, threshold, status): (i64, String, f64, f64, String) =
+        db.query_row(
+            "SELECT event_id, attestation_npubs, attestation_weight, dismissal_threshold, status
          FROM reputation_disputes WHERE id = ?1",
-        params![dispute_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-    )
-    .map_err(|e| format!("Dispute not found: {}", e))?;
+            params![dispute_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .map_err(|e| format!("Dispute not found: {}", e))?;
 
     if status != "open" {
         return Err(format!("Dispute is {}", status));
@@ -253,12 +266,13 @@ pub fn attest_dispute(
         )
         .map_err(|e| format!("DB error: {}", e))?;
 
-        let operator_npub: String = db.query_row(
-            "SELECT operator_npub FROM reputation_events WHERE id = ?1",
-            params![event_id],
-            |row| row.get(0),
-        )
-        .unwrap_or_default();
+        let operator_npub: String = db
+            .query_row(
+                "SELECT operator_npub FROM reputation_events WHERE id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
 
         let reputation = get_reputation(db, &operator_npub);
         let _ = db.execute(
@@ -299,28 +313,31 @@ pub async fn handle_get_reputation(
 
     let reputation = get_reputation(&db, &npub);
 
-    let total_uptime: i64 = db.query_row(
-        "SELECT COALESCE(total_uptime, 0) FROM operators WHERE npub = ?1",
-        params![npub],
-        |row| row.get(0),
-    )
-    .unwrap_or(0);
+    let total_uptime: i64 = db
+        .query_row(
+            "SELECT COALESCE(total_uptime, 0) FROM operators WHERE npub = ?1",
+            params![npub],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
 
-    let event_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM reputation_events WHERE operator_npub = ?1",
-        params![npub],
-        |row| row.get(0),
-    )
-    .unwrap_or(0);
+    let event_count: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM reputation_events WHERE operator_npub = ?1",
+            params![npub],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
 
-    let open_disputes: i64 = db.query_row(
-        "SELECT COUNT(*) FROM reputation_disputes d
+    let open_disputes: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM reputation_disputes d
          JOIN reputation_events e ON d.event_id = e.id
          WHERE e.operator_npub = ?1 AND d.status = 'open'",
-        params![npub],
-        |row| row.get(0),
-    )
-    .unwrap_or(0);
+            params![npub],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
 
     Json(ReputationResponse {
         npub,
@@ -328,7 +345,8 @@ pub async fn handle_get_reputation(
         total_uptime,
         event_count,
         open_disputes,
-    }).into_response()
+    })
+    .into_response()
 }
 
 /// POST /reputation/dispute — open a dispute

@@ -65,7 +65,9 @@ impl std::fmt::Display for TrustError {
             TrustError::OperatorSignatureInvalid(e) => {
                 write!(f, "operator signature invalid: {}", e)
             }
-            TrustError::MissingAuthorSignature => write!(f, "author signature required but missing"),
+            TrustError::MissingAuthorSignature => {
+                write!(f, "author signature required but missing")
+            }
             TrustError::AuthorSignatureInvalid(e) => write!(f, "author signature invalid: {}", e),
             TrustError::AuthorKeyNotTrusted { key_id } => {
                 write!(f, "author key {} not in trusted list", key_id)
@@ -463,12 +465,7 @@ mod tests {
             signed_at: chrono::Utc::now(),
         });
 
-        let result = verify_trust(
-            &signed,
-            &TrustPolicy::Paranoid,
-            &verifying_key,
-            &[],
-        );
+        let result = verify_trust(&signed, &TrustPolicy::Paranoid, &verifying_key, &[]);
         assert!(result.is_ok());
     }
 
@@ -479,12 +476,7 @@ mod tests {
         // No author signature
         let signed = sign_recipe("original", test_recipe(), &signing_key);
 
-        let result = verify_trust(
-            &signed,
-            &TrustPolicy::Paranoid,
-            &verifying_key,
-            &[],
-        );
+        let result = verify_trust(&signed, &TrustPolicy::Paranoid, &verifying_key, &[]);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), TrustError::MissingAuthorSignature);
     }

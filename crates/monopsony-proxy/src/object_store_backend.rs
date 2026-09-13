@@ -15,10 +15,11 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
+use object_store::WriteMultipart;
 use sha2::Digest;
 use tracing::{debug, warn};
 
-use crate::cache_storage::{CacheStorage, StorageMeta};
+use crate::cache_storage::{ByteRange, ByteStream, CacheStorage, SpoolHandle, StorageMeta};
 
 // ---------------------------------------------------------------------------
 // ObjectStoreBackend
@@ -69,7 +70,12 @@ impl ObjectStoreBackend {
     /// on-disk layout to the previous `FilesystemStorage`.
     pub fn local(root: PathBuf, retention_days: u32) -> anyhow::Result<Self> {
         let store = object_store::local::LocalFileSystem::new_with_prefix(&root)?;
-        Ok(Self::new(Box::new(store), "local", Some(root), retention_days))
+        Ok(Self::new(
+            Box::new(store),
+            "local",
+            Some(root),
+            retention_days,
+        ))
     }
 
     /// Create an S3-compatible backend from config.
@@ -105,7 +111,12 @@ impl ObjectStoreBackend {
 
         let store = builder.build()?;
 
-        Ok(Self::new(Box::new(store), "s3", None, config.retention_days))
+        Ok(Self::new(
+            Box::new(store),
+            "s3",
+            None,
+            config.retention_days,
+        ))
     }
 
     /// Create an in-memory backend for testing.
@@ -163,6 +174,33 @@ impl std::fmt::Debug for ObjectStoreBackend {
 
 #[async_trait]
 impl CacheStorage for ObjectStoreBackend {
+    async fn spool(&self, key: &str) -> anyhow::Result<SpoolHandle> {
+        let path = Self::obj_path(key);
+        let upload = self.store.put_multipart(&path).await?;
+        Ok(SpoolHandle::new(key, WriteMultipart::new(upload)))
+    }
+
+    async fn read_stream(&self, key: &str, range: ByteRange) -> anyhow::Result<(ByteStream, u64)> {
+        use futures::StreamExt;
+
+        let path = Self::obj_path(key);
+        // Head first for total size (returns NotFound early).
+        let meta = self.store.head(&path).await?;
+        let total = meta.size;
+
+        if range.start >= total {
+            anyhow::bail!("range start {} beyond object size {}", range.start, total);
+        }
+        let end = range.end.min(total);
+        let get_opts = object_store::GetOptions {
+            range: Some(object_store::GetRange::Bounded(range.start..end)),
+            ..Default::default()
+        };
+        let result = self.store.get_opts(&path, get_opts).await?;
+        let stream = result.into_stream().map(|r| r.map_err(|e| e.into()));
+        Ok((stream.boxed(), total))
+    }
+
     async fn write(&self, key: &str, data: &[u8]) -> anyhow::Result<StorageMeta> {
         let path = Self::obj_path(key);
 
@@ -179,12 +217,7 @@ impl CacheStorage for ObjectStoreBackend {
         };
         self.save_sidecar(key, &sidecar).await?;
 
-        debug!(
-            "Wrote {} bytes to {} key {}",
-            data.len(),
-            self.label,
-            key
-        );
+        debug!("Wrote {} bytes to {} key {}", data.len(), self.label, key);
 
         Ok(StorageMeta {
             checksum_sha256: hash,
@@ -443,7 +476,10 @@ mod tests {
     async fn test_total_size() {
         let storage = make_store();
         storage.write("small", b"12345").await.unwrap();
-        storage.write("large", b"12345678901234567890").await.unwrap();
+        storage
+            .write("large", b"12345678901234567890")
+            .await
+            .unwrap();
 
         let size = storage.total_size().await;
         assert_eq!(size, 25);
@@ -516,7 +552,10 @@ mod tests {
         assert_eq!(storage.base_dir().unwrap(), tmp.path());
 
         // Write
-        let meta = storage.write("test/local-key.deb", b"local data").await.unwrap();
+        let meta = storage
+            .write("test/local-key.deb", b"local data")
+            .await
+            .unwrap();
         assert_eq!(meta.size_bytes, 10);
 
         // Read back
@@ -528,7 +567,11 @@ mod tests {
         assert!(!storage.exists("test/nonexistent.deb").await.unwrap());
 
         // Checksum
-        let cs = storage.get_checksum("test/local-key.deb").await.unwrap().unwrap();
+        let cs = storage
+            .get_checksum("test/local-key.deb")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(cs.len(), 64);
 
         // Delete
@@ -551,6 +594,10 @@ mod tests {
         };
         // Constructor should succeed (only builds the client, doesn't connect)
         let result = ObjectStoreBackend::s3(&config);
-        assert!(result.is_ok(), "s3() constructor failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "s3() constructor failed: {:?}",
+            result.err()
+        );
     }
 }

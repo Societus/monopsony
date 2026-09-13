@@ -259,18 +259,10 @@ pub async fn handle_publish(
     Json(req): Json<PublishRecipeRequest>,
 ) -> impl IntoResponse {
     if req.id.is_empty() || req.name.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "id and name required",
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, "id and name required").into_response();
     }
     if req.author_sig.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            "author signature required",
-        )
-            .into_response();
+        return (StatusCode::BAD_REQUEST, "author signature required").into_response();
     }
 
     let db = state.db.lock().await;
@@ -530,7 +522,11 @@ pub async fn handle_report_recipe(
     Json(req): Json<ReportRecipeRequest>,
 ) -> impl IntoResponse {
     if req.reason.is_empty() || req.reporter_key_id.is_empty() {
-        return (StatusCode::BAD_REQUEST, "reason and reporter_key_id required").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "reason and reporter_key_id required",
+        )
+            .into_response();
     }
 
     let db = state.db.lock().await;
@@ -555,7 +551,13 @@ pub async fn handle_report_recipe(
     if let Err(e) = db.execute(
         "INSERT INTO recipe_reports (recipe_id, reporter_key_id, reason, reporter_sig, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![recipe_id, req.reporter_key_id, req.reason, req.reporter_sig, now],
+        params![
+            recipe_id,
+            req.reporter_key_id,
+            req.reason,
+            req.reporter_sig,
+            now
+        ],
     ) {
         warn!("Recipe report DB error: {}", e);
         return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
@@ -578,14 +580,20 @@ pub async fn handle_report_recipe(
              VALUES (?1, ?2, ?3, ?4)",
             params![
                 recipe_id,
-                format!("auto-quarantined: {} reports from distinct operators", distinct_reporters),
+                format!(
+                    "auto-quarantined: {} reports from distinct operators",
+                    distinct_reporters
+                ),
                 now,
                 distinct_reporters,
             ],
         ) {
             warn!("Quarantine DB error: {}", e);
         } else {
-            info!("Recipe {} quarantined ({} reports)", recipe_id, distinct_reporters);
+            info!(
+                "Recipe {} quarantined ({} reports)",
+                recipe_id, distinct_reporters
+            );
         }
     }
 
@@ -593,9 +601,7 @@ pub async fn handle_report_recipe(
 }
 
 /// GET /recipes/quarantined — list quarantined recipes (admin)
-pub async fn handle_list_quarantined(
-    State(state): State<Arc<TrackerState>>,
-) -> impl IntoResponse {
+pub async fn handle_list_quarantined(State(state): State<Arc<TrackerState>>) -> impl IntoResponse {
     let db = state.db.lock().await;
     let mut stmt = match db.prepare(
         "SELECT recipe_id, reason, quarantined_at, report_count
@@ -641,9 +647,18 @@ pub async fn handle_quarantine_remove(
     }
 
     // Also remove the recipe itself and its votes/reports
-    let _ = db.execute("DELETE FROM recipe_votes WHERE recipe_id = ?1", params![recipe_id]);
-    let _ = db.execute("DELETE FROM recipe_reports WHERE recipe_id = ?1", params![recipe_id]);
-    let _ = db.execute("DELETE FROM shadow_recipes WHERE id = ?1", params![recipe_id]);
+    let _ = db.execute(
+        "DELETE FROM recipe_votes WHERE recipe_id = ?1",
+        params![recipe_id],
+    );
+    let _ = db.execute(
+        "DELETE FROM recipe_reports WHERE recipe_id = ?1",
+        params![recipe_id],
+    );
+    let _ = db.execute(
+        "DELETE FROM shadow_recipes WHERE id = ?1",
+        params![recipe_id],
+    );
 
     info!("permanently removed quarantined recipe {recipe_id}");
     (StatusCode::OK, "removed").into_response()
@@ -759,7 +774,10 @@ pub async fn handle_publish_annotation(
 
     match res {
         Ok(_) => {
-            info!("published annotation for {} {}->{}", body.package_name, body.from_version, body.to_version);
+            info!(
+                "published annotation for {} {}->{}",
+                body.package_name, body.from_version, body.to_version
+            );
             (StatusCode::OK, "annotation published").into_response()
         }
         Err(e) => {
@@ -817,7 +835,10 @@ pub fn recipe_router() -> Router<Arc<TrackerState>> {
         .route("/recipes/:id/vote", post(handle_vote))
         .route("/recipes/:id/report", post(handle_report_recipe))
         .route("/recipes/quarantined/:id", delete(handle_quarantine_remove))
-        .route("/recipes/quarantined/:id/reinstate", post(handle_quarantine_reinstate))
+        .route(
+            "/recipes/quarantined/:id/reinstate",
+            post(handle_quarantine_reinstate),
+        )
         .route("/annotations/publish", post(handle_publish_annotation))
         .route("/annotations/fetch", get(handle_fetch_annotations))
 }
@@ -829,8 +850,8 @@ pub fn recipe_router() -> Router<Arc<TrackerState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{init_schema, TrackerState};
     use crate::auth::{AuthState, TrackerAuthMode};
+    use crate::{init_schema, TrackerState};
     use axum::body::Body;
     use axum::http::{Request, StatusCode as AxumStatusCode};
     use tower::ServiceExt;
@@ -899,7 +920,11 @@ mod tests {
         let status = resp.status();
         let body_bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         if status != AxumStatusCode::OK {
-            eprintln!("GET /recipes/hash1 returned {}: {}", status, String::from_utf8_lossy(&body_bytes));
+            eprintln!(
+                "GET /recipes/hash1 returned {}: {}",
+                status,
+                String::from_utf8_lossy(&body_bytes)
+            );
         }
         assert_eq!(status, AxumStatusCode::OK, "GET should return 200");
 
@@ -1022,7 +1047,11 @@ mod tests {
         // Check score
         let db = state.db.lock().await;
         let score = recipe_score(&db, "hash_v");
-        assert!(score > 0.0, "score after upvote should be positive, got {}", score);
+        assert!(
+            score > 0.0,
+            "score after upvote should be positive, got {}",
+            score
+        );
 
         // Downvote (replaces upvote)
         drop(db);
@@ -1043,7 +1072,11 @@ mod tests {
 
         let db = state.db.lock().await;
         let score = recipe_score(&db, "hash_v");
-        assert!(score < 0.0, "score after downvote should be negative, got {}", score);
+        assert!(
+            score < 0.0,
+            "score after downvote should be negative, got {}",
+            score
+        );
     }
 
     #[tokio::test]
@@ -1126,7 +1159,10 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
         let results: Vec<RecipeSearchResult> = serde_json::from_slice(&body).unwrap();
-        assert!(results.is_empty(), "quarantined recipe should be hidden from search");
+        assert!(
+            results.is_empty(),
+            "quarantined recipe should be hidden from search"
+        );
     }
 
     #[tokio::test]
@@ -1334,7 +1370,11 @@ mod tests {
         // Verify recipe gone completely
         let db = state.db.lock().await;
         let count: i64 = db
-            .query_row("SELECT COUNT(*) FROM shadow_recipes WHERE id = 'hash_rem'", [], |row| row.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM shadow_recipes WHERE id = 'hash_rem'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(count, 0, "recipe should be permanently removed");
         assert!(!is_quarantined(&db, "hash_rem"));

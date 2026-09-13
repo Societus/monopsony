@@ -363,6 +363,7 @@ bind = "0.0.0.0:3128"
 
 [grpc]
 bind = "0.0.0.0:50051"
+# ws_url = "wss://monopsony.example.com/ws/tunnel"  # Set for Cloudflare Tunnel mode
 
 [database]
 url = "postgres://monopsony:CHANGE_ME@localhost/monopsony"
@@ -377,6 +378,7 @@ ca_path = "/var/lib/monopsony/ca.pem"
 ca_key_path = "/var/lib/monopsony/ca.key"
 server_cert_path = "/var/lib/monopsony/server.pem"
 server_key_path = "/var/lib/monopsony/server.key"
+# san_names = ["monopsony.example.com"]  # Add your public hostname for CF Tunnel mode
 
 [discovery]
 mdns_enabled = true
@@ -645,10 +647,13 @@ update_config_db_url() {
     local config_file="${CONFIG_DIR}/server.toml"
 
     if [[ -f "${config_file}" ]]; then
-        # Replace the *** placeholder with the actual password using sed
+        # Replace the CHANGE_ME placeholder with the actual password.
+        # We use CHANGE_ME (not ***) because GNU sed has a known parser bug
+        # where literal *** inside URL-like strings fails to match.
+        # Escape sed-special characters in the password.
         local escaped_pw
-        escaped_pw=$(printf '%s\n' "$password" | sed 's/[&/\]/\\&/g')
-        sed -i "s|postgres://monopsony:***@localhost/monopsony|postgres://monopsony:${escaped_pw}@localhost/monopsony|" "${config_file}"
+        escaped_pw=$(printf '%s' "${password}" | sed 's/[&|/]/\\&/g')
+        sed -i "s|CHANGE_ME|${escaped_pw}|" "${config_file}"
         ok "Updated database URL in config."
     fi
 }
@@ -737,7 +742,7 @@ setup_external_postgres() {
     echo "GRANT ALL PRIVILEGES ON DATABASE monopsony TO monopsony;"
     echo ""
     echo "Then update /etc/monopsony/server.toml:"
-    echo "  url = \"postgres://monopsony:${password}@${host}:${port}/monopsony\""
+    echo "  url = \"postgres://monopsony:CHANGE_ME@${host}:${port}/monopsony\""
     echo ""
     echo "Also ensure pg_hba.conf allows connections from this server."
     echo "And postgresql.conf has: listen_addresses = '*'"
@@ -752,9 +757,14 @@ update_config_db_url_ext() {
     local config_file="${CONFIG_DIR}/server.toml"
 
     if [[ -f "${config_file}" ]]; then
+        # Replace the CHANGE_ME placeholder and host/port with actual values.
+        # Use CHANGE_ME (not ***) because GNU sed can't reliably match ***
+        # in URL-like contexts.
         local escaped_password
-        escaped_password="$(printf '%s' "${password}" | sed 's/[&\/\\]/\\&/g')"
-        sed -i "s|url = \"postgres://monopsony:***@localhost/monopsony\"|url = \"postgres://monopsony:${escaped_password}@${host}:${port}/monopsony\"|" "${config_file}"
+        escaped_password="$(printf '%s' "${password}" | sed 's/[&|/]/\\&/g')"
+        local escaped_host
+        escaped_host="$(printf '%s' "${host}" | sed 's/[&|/]/\\&/g')"
+        sed -i "s|postgres://monopsony:CHANGE_ME@localhost/monopsony|postgres://monopsony:${escaped_password}@${escaped_host}:${port}/monopsony|" "${config_file}"
         ok "Updated database URL in config."
     fi
 }
@@ -855,34 +865,45 @@ EOF
 # Service setup
 # ---------------------------------------------------------------------------
 setup_service() {
+    local cf_mode="${1:-false}"
     local os_ver
     os_ver="$(detect_os | cut -d: -f1)"
 
     case "${os_ver}" in
         alpine)
-            setup_service_openrc
+            setup_service_openrc "${cf_mode}"
             ;;
         void)
-            setup_service_runit
+            setup_service_runit "${cf_mode}"
             ;;
         gentoo)
             # Gentoo can use either systemd or OpenRC
             if command -v systemctl >/dev/null 2>&1; then
-                setup_service_systemd
+                setup_service_systemd "${cf_mode}"
             else
-                setup_service_openrc
+                setup_service_openrc "${cf_mode}"
             fi
             ;;
         *)
-            setup_service_systemd
+            setup_service_systemd "${cf_mode}"
             ;;
     esac
 }
 
 setup_service_systemd() {
+    local cf_mode="${1:-false}"
     info "Setting up systemd service..."
 
     local service_file="${CONFIG_DIR}/monopsony-server.service"
+
+    # Build ExecStart — in CF Tunnel mode, bind all ports to localhost
+    # so they're not exposed to the network. Only cloudflared's outbound
+    # connection reaches them.
+    local exec_start="/usr/bin/monopsony-server --config /etc/monopsony/server.toml"
+    if [[ "${cf_mode}" == "true" ]]; then
+        exec_start="${exec_start} --http-addr 127.0.0.1:3128 --grpc-addr 127.0.0.1:50051 --dashboard-addr 127.0.0.1:3130 --metrics-addr 127.0.0.1:9090 --mirror-addr 127.0.0.1:3129"
+        info "CF Tunnel mode: binding all ports to localhost"
+    fi
 
     # Copy service file
     if [[ -f "/usr/lib/systemd/system/monopsony-server.service" ]]; then
@@ -894,7 +915,7 @@ setup_service_systemd() {
             cp "${dist_service}" "/etc/systemd/system/monopsony-server.service"
         else
             # Generate inline
-            cat > "/etc/systemd/system/monopsony-server.service" <<'SERVICE'
+            cat > "/etc/systemd/system/monopsony-server.service" <<SERVICE
 [Unit]
 Description=Monopsony Caching Proxy Server
 Documentation=https://base.societus.club/societus/monopsony
@@ -903,8 +924,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/monopsony-server --config /etc/monopsony/server.toml
-ExecReload=/bin/kill -HUP $MAINPID
+ExecStart=${exec_start}
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5
 
@@ -938,17 +959,23 @@ SERVICE
 }
 
 setup_service_openrc() {
+    local cf_mode="${1:-false}"
     info "Setting up OpenRC service..."
 
-    cat > "/etc/init.d/monopsony-server" <<'OPENRC'
+    local command_args="--config /etc/monopsony/server.toml"
+    if [[ "${cf_mode}" == "true" ]]; then
+        command_args="${command_args} --http-addr 127.0.0.1:3128 --grpc-addr 127.0.0.1:50051 --dashboard-addr 127.0.0.1:3130 --metrics-addr 127.0.0.1:9090 --mirror-addr 127.0.0.1:3129"
+    fi
+
+    cat > "/etc/init.d/monopsony-server" <<OPENRC
 #!/sbin/openrc-run
 
 name="monopsony-server"
 description="Monopsony Caching Proxy Server"
 command="/usr/bin/monopsony-server"
-command_args="--config /etc/monopsony/server.toml"
+command_args="${command_args}"
 command_user="monopsony:monopsony"
-pidfile="/run/${RC_SVCNAME}.pid"
+pidfile="/run/\${RC_SVCNAME}.pid"
 command_background="yes"
 start_stop_daemon_args="--make-pidfile"
 
@@ -967,13 +994,19 @@ OPENRC
 }
 
 setup_service_runit() {
+    local cf_mode="${1:-false}"
     info "Setting up runit service..."
+
+    local exec_cmd="/usr/bin/monopsony-server --config /etc/monopsony/server.toml"
+    if [[ "${cf_mode}" == "true" ]]; then
+        exec_cmd="${exec_cmd} --http-addr 127.0.0.1:3128 --grpc-addr 127.0.0.1:50051 --dashboard-addr 127.0.0.1:3130 --metrics-addr 127.0.0.1:9090 --mirror-addr 127.0.0.1:3129"
+    fi
 
     mkdir -p /etc/sv/monopsony-server
 
-    cat > "/etc/sv/monopsony-server/run" <<'RUNIT'
+    cat > "/etc/sv/monopsony-server/run" <<RUNIT
 #!/bin/sh
-exec chpst -u monopsony:monopsony /usr/bin/monopsony-server --config /etc/monopsony/server.toml 2>&1
+exec chpst -u monopsony:monopsony ${exec_cmd} 2>&1
 RUNIT
     chmod 755 "/etc/sv/monopsony-server/run"
 
@@ -1376,6 +1409,9 @@ do_reconfigure() {
         info "Keeping existing TLS certificates."
     fi
 
+    # Cloudflare Tunnel (re)configuration
+    setup_cloudflare_tunnel || true
+
     # Restart service
     systemctl restart monopsony-server 2>/dev/null || warn "Service restart failed."
 
@@ -1389,6 +1425,263 @@ read_line() {
     local prompt="$1" default="$2"
     read -rp "${prompt}" input
     echo "${input:-${default}}"
+}
+
+# ---------------------------------------------------------------------------
+# Cloudflare Tunnel setup
+# ---------------------------------------------------------------------------
+# When the server runs behind a Cloudflare Tunnel, only the dashboard port
+# (3130) needs to be exposed. The dashboard already serves /ws/tunnel and
+# /ws/pair relay endpoints that proxy all gRPC and pairing traffic over
+# WebSocket binary frames. This means the server can function fully with
+# zero exposed ports besides the tunnel — all client connections arrive via
+# WSS through Cloudflare's edge.
+#
+# The tunnel connector (cloudflared) runs as a systemd service that
+# establishes an outbound connection to CF's edge, so no inbound ports
+# need to be opened on the host firewall.
+
+setup_cloudflare_tunnel() {
+    echo ""
+    echo "=========================================="
+    echo "  Cloudflare Tunnel Setup"
+    echo "=========================================="
+    echo ""
+    echo "  A Cloudflare Tunnel exposes your Monopsony server"
+    echo "  through a single public hostname without opening any"
+    echo "  inbound ports. All traffic (dashboard, pairing, gRPC"
+    echo "  control plane) flows through WSS connections."
+    echo ""
+
+    # Prompt: will this server be behind CF Tunnels?
+    read -r -p "Will this server be behind a Cloudflare Tunnel? [y/N]: " cf_confirm
+    if [[ "${cf_confirm,,}" != "y" ]]; then
+        info "Skipping Cloudflare Tunnel setup."
+        return 1
+    fi
+
+    # --- Collect tunnel details ---
+    echo ""
+    echo "  You need a Cloudflare Tunnel token. Get one at:"
+    echo "    https://one.dash.cloudflare.com/ → Networks → Tunnels → Create Tunnel"
+    echo ""
+    read -r -p "Paste your Cloudflare Tunnel token: " cf_token
+    if [[ -z "${cf_token}" ]]; then
+        error "No tunnel token provided. Skipping CF Tunnel setup."
+        return 1
+    fi
+
+    local cf_hostname
+    cf_hostname="$(read_line "Public hostname for this server (e.g. monopsony.example.com): " "")"
+    if [[ -z "${cf_hostname}" ]]; then
+        error "No hostname provided. Skipping CF Tunnel setup."
+        return 1
+    fi
+
+    # --- Install cloudflared if not present ---
+    if ! command -v cloudflared &>/dev/null; then
+        info "Installing cloudflared..."
+        local os_ver arch
+        os_ver="$(detect_os | cut -d: -f1)"
+        arch="$(detect_arch)"
+
+        case "${os_ver}" in
+            arch)
+                pacman -S --noconfirm cloudflared 2>/dev/null || install_cloudflared_binary "${arch}"
+                ;;
+            debian|ubuntu)
+                # Download the .deb directly (works without adding repos)
+                install_cloudflared_binary "${arch}"
+                ;;
+            rocky|almalinux|rhel|centos)
+                install_cloudflared_binary "${arch}"
+                ;;
+            alpine)
+                install_cloudflared_binary "${arch}"
+                ;;
+            *)
+                install_cloudflared_binary "${arch}"
+                ;;
+        esac
+    else
+        ok "cloudflared already installed: $(cloudflared --version 2>&1)"
+    fi
+
+    if ! command -v cloudflared &>/dev/null; then
+        error "Failed to install cloudflared. Install manually from https://github.com/cloudflare/cloudflared/releases"
+        error "Then run: cloudflared service install ${cf_token}"
+        return 1
+    fi
+
+    # --- Configure the tunnel service ---
+    # cloudflared runs as a systemd service. The token-based connector
+    # doesn't need a local config.yml — all routing is configured in the
+    # Cloudflare dashboard.
+    info "Configuring cloudflared service..."
+
+    local cf_service_file="/etc/systemd/system/cloudflared.service"
+    cat > "${cf_service_file}" <<CFSERVICE
+[Unit]
+Description=Cloudflare Tunnel (cloudflared)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/cloudflared tunnel --no-autoupdate run --token ${cf_token}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+CFSERVICE
+    chmod 644 "${cf_service_file}"
+    ok "Created cloudflared service at ${cf_service_file}"
+
+    # Enable and start
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable cloudflared 2>/dev/null || warn "Failed to enable cloudflared service."
+    systemctl start cloudflared 2>/dev/null || warn "Failed to start cloudflared service."
+
+    sleep 2
+    if systemctl is-active --quiet cloudflared 2>/dev/null; then
+        ok "cloudflared service is running."
+    else
+        warn "cloudflared service may not have started. Check: journalctl -u cloudflared"
+    fi
+
+    # --- Configure server.toml for CF Tunnel mode ---
+    local config_file="${CONFIG_DIR}/server.toml"
+    if [[ -f "${config_file}" ]]; then
+        info "Configuring server.toml for Cloudflare Tunnel mode..."
+
+        local ws_url="wss://${cf_hostname}/ws/tunnel"
+
+        # Add or replace ws_url in [grpc] section
+        if grep -q "^ws_url" "${config_file}" 2>/dev/null; then
+            sed -i "s|^ws_url.*|ws_url = \"${ws_url}\"|" "${config_file}"
+        else
+            # Insert ws_url after the [grpc] bind line
+            sed -i "/^\[grpc\]/,/^\[/ { /^bind/a ws_url = \"${ws_url}\"
+            }" "${config_file}"
+        fi
+
+        # Add TLS SAN for the public hostname (so the inner mTLS cert matches)
+        if grep -q "^san_names" "${config_file}" 2>/dev/null; then
+            sed -i "s|^san_names.*|san_names = [\"${cf_hostname}\"]|" "${config_file}"
+        else
+            sed -i "/^\[tls\]/,/^\[/ { /server_key_path/a san_names = [\"${cf_hostname}\"]
+            }" "${config_file}"
+        fi
+
+        ok "ws_url set to ${ws_url}"
+        ok "TLS SAN includes ${cf_hostname}"
+
+        # Enable always_require_login for dashboard (security: public hostname)
+        if ! grep -q "always_require_login" "${config_file}" 2>/dev/null; then
+            echo "" >> "${config_file}"
+            echo "[dashboard]" >> "${config_file}"
+            echo "always_require_login = true" >> "${config_file}"
+        else
+            sed -i "s|always_require_login.*|always_require_login = true|" "${config_file}"
+        fi
+        ok "Dashboard login required (public hostname)"
+    fi
+
+    # --- Set dashboard password if not already set ---
+    if ! grep -q "password_hash" "${config_file}" 2>/dev/null || \
+       grep -q 'password_hash.*""' "${config_file}" 2>/dev/null; then
+        echo ""
+        warn "Dashboard has no password set. Since this server will be"
+        warn "publicly accessible via ${cf_hostname}, a password is REQUIRED."
+        echo ""
+        "${INSTALL_DIR}/${BINARY_NAME}" dashboard-set-password 2>/dev/null || {
+            warn "Could not set password via CLI. Set it manually:"
+            warn "  ${BINARY_NAME} dashboard-set-password"
+        }
+    fi
+
+    # --- Regenerate server cert with the new SAN ---
+    info "Regenerating server certificate with ${cf_hostname} SAN..."
+    if [[ -f "${LIB_DIR}/ca.pem" && -f "${LIB_DIR}/ca.key" ]]; then
+        generate_server_cert "${LIB_DIR}/ca.pem" "${LIB_DIR}/ca.key"
+    else
+        warn "CA not found. Run --reconfigure to bootstrap TLS."
+    fi
+
+    echo ""
+    echo "=========================================="
+    echo "  Cloudflare Tunnel Configured"
+    echo "=========================================="
+    echo ""
+    echo "  Public URL:     https://${cf_hostname}"
+    echo "  Dashboard:      https://${cf_hostname}/dashboard"
+    echo "  WS Tunnel:      wss://${cf_hostname}/ws/tunnel"
+    echo "  WS Pairing:     wss://${cf_hostname}/ws/pair"
+    echo ""
+    echo "  All ports are bound to localhost — no inbound"
+    echo "  firewall rules needed."
+    echo ""
+    echo "  Configure your public DNS / Cloudflare Tunnel"
+    echo "  routing to point to http://localhost:3130"
+    echo ""
+    echo "=========================================="
+
+    return 0
+}
+
+# Install cloudflared binary from GitHub releases (fallback for all distros)
+install_cloudflared_binary() {
+    local arch="$1"
+    local cf_arch
+    case "${arch}" in
+        x86_64)  cf_arch="amd64" ;;
+        aarch64) cf_arch="arm64" ;;
+        *)       cf_arch="amd64" ;;
+    esac
+
+    local os_ver
+    os_ver="$(detect_os | cut -d: -f1)"
+
+    local pkg_type="linux"
+    local url
+
+    case "${os_ver}" in
+        debian|ubuntu)
+            url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}.deb"
+            ;;
+        rocky|almalinux|rhel|centos)
+            url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}.rpm"
+            ;;
+        *)
+            # Generic binary
+            url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}"
+            ;;
+    esac
+
+    local tmpfile
+    tmpfile="$(mktemp)"
+
+    info "Downloading cloudflared from ${url}..."
+    if curl -fsSL --retry 3 -o "${tmpfile}" "${url}"; then
+        case "${os_ver}" in
+            debian|ubuntu)
+                dpkg -i "${tmpfile}" 2>/dev/null || { error "Failed to install cloudflared .deb"; rm -f "${tmpfile}"; return 1; }
+                ;;
+            rocky|almalinux|rhel|centos)
+                rpm -i "${tmpfile}" 2>/dev/null || { error "Failed to install cloudflared .rpm"; rm -f "${tmpfile}"; return 1; }
+                ;;
+            *)
+                install -m 755 "${tmpfile}" /usr/bin/cloudflared || { error "Failed to install cloudflared binary"; rm -f "${tmpfile}"; return 1; }
+                ;;
+        esac
+        ok "cloudflared installed."
+    else
+        error "Failed to download cloudflared from ${url}"
+        rm -f "${tmpfile}"
+        return 1
+    fi
+    rm -f "${tmpfile}"
 }
 
 # ---------------------------------------------------------------------------
@@ -1468,7 +1761,14 @@ main() {
             esac
 
             download_binary
-            setup_service
+
+            # Cloudflare Tunnel setup (interactive — prompts the user)
+            local cf_enabled=false
+            if setup_cloudflare_tunnel; then
+                cf_enabled=true
+            fi
+
+            setup_service "${cf_enabled}"
             wait_for_health
             print_info
             ;;

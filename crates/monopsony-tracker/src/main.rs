@@ -102,8 +102,8 @@ pub struct DiscoveredMirror {
 struct MirrorRecord {
     mirror_id: String,
     distro: String,
-    transport: String,         // JSON array stored as string
-    endpoints: String,         // JSON array stored as string
+    transport: String, // JSON array stored as string
+    endpoints: String, // JSON array stored as string
     capacity_bytes: Option<u64>,
     bandwidth_bps: Option<u64>,
     uptime_seconds: Option<u64>,
@@ -113,7 +113,7 @@ struct MirrorRecord {
     lon: Option<f64>,
     bytes_served_24h: Option<u64>,
     requests_24h: Option<u64>,
-    announced_at: i64,         // epoch seconds
+    announced_at: i64, // epoch seconds
     operator_npub: Option<String>,
     nat_type: Option<String>,
 }
@@ -146,11 +146,16 @@ fn score_mirror(
     };
 
     // Freshness: time since last sync → score (0s=100, >24h=0)
-    let freshness_score = mirror.last_sync
+    let freshness_score = mirror
+        .last_sync
         .as_ref()
-        .and_then(|ls| ls.parse::<i64>().ok().or_else(|| {
-            chrono::DateTime::parse_from_rfc3339(ls).ok().map(|dt| dt.timestamp())
-        }))
+        .and_then(|ls| {
+            ls.parse::<i64>().ok().or_else(|| {
+                chrono::DateTime::parse_from_rfc3339(ls)
+                    .ok()
+                    .map(|dt| dt.timestamp())
+            })
+        })
         .map(|ls_epoch| {
             let age_secs = (now_epoch - ls_epoch).max(0);
             (100.0 * (1.0 - (age_secs as f64 / 86400.0).min(1.0))).max(0.0)
@@ -158,12 +163,14 @@ fn score_mirror(
         .unwrap_or(25.0); // No sync info → low-neutral
 
     // Reliability: uptime → score (30d=100, 0=0)
-    let reliability_score = mirror.uptime_seconds
+    let reliability_score = mirror
+        .uptime_seconds
         .map(|up| 100.0 * (up as f64 / 2_592_000.0).min(1.0))
         .unwrap_or(50.0);
 
     // Capacity: bandwidth → score (100MB/s=100, 0=0)
-    let capacity_score = mirror.bandwidth_bps
+    let capacity_score = mirror
+        .bandwidth_bps
         .map(|bw| 100.0 * (bw as f64 / 104_857_600.0).min(1.0))
         .unwrap_or(50.0);
 
@@ -300,7 +307,11 @@ fn ensure_operators_table(conn: &rusqlite::Connection) {
 // ---------------------------------------------------------------------------
 
 /// Check if a mirror_id or its operator is blacklisted.
-pub fn is_blacklisted(db: &rusqlite::Connection, mirror_id: &str, operator_npub: Option<&str>) -> bool {
+pub fn is_blacklisted(
+    db: &rusqlite::Connection,
+    mirror_id: &str,
+    operator_npub: Option<&str>,
+) -> bool {
     let now = chrono::Utc::now().timestamp();
     let mirror_blocked: bool = db.query_row(
         "SELECT COUNT(*) FROM blacklist WHERE mirror_id = ?1 AND (expires_at IS NULL OR expires_at > ?2)",
@@ -327,7 +338,12 @@ pub fn is_blacklisted(db: &rusqlite::Connection, mirror_id: &str, operator_npub:
 }
 
 /// Auto-blacklist a mirror if hash_mismatch reports exceed threshold.
-pub fn check_auto_blacklist(db: &rusqlite::Connection, mirror_id: &str, threshold: i64, window_hours: i64) -> bool {
+pub fn check_auto_blacklist(
+    db: &rusqlite::Connection,
+    mirror_id: &str,
+    threshold: i64,
+    window_hours: i64,
+) -> bool {
     let cutoff = chrono::Utc::now().timestamp() - (window_hours * 3600);
     let count: i64 = db.query_row(
         "SELECT COUNT(*) FROM reports WHERE mirror_id = ?1 AND report_type = 'hash_mismatch' AND created_at > ?2",
@@ -376,14 +392,24 @@ async fn handle_blacklist_add(
     Json(req): Json<BlacklistRequest>,
 ) -> impl IntoResponse {
     if req.mirror_id.is_none() && req.operator_npub.is_none() {
-        return (StatusCode::BAD_REQUEST, "must provide mirror_id or operator_npub").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "must provide mirror_id or operator_npub",
+        )
+            .into_response();
     }
     let db = state.db.lock().await;
     let now = chrono::Utc::now().timestamp();
     match db.execute(
         "INSERT INTO blacklist (mirror_id, operator_npub, reason, source, created_at, expires_at)
          VALUES (?1, ?2, ?3, 'manual', ?4, ?5)",
-        params![req.mirror_id, req.operator_npub, req.reason, now, req.expires_at],
+        params![
+            req.mirror_id,
+            req.operator_npub,
+            req.reason,
+            now,
+            req.expires_at
+        ],
     ) {
         Ok(_) => (StatusCode::OK, "blacklisted").into_response(),
         Err(e) => {
@@ -415,9 +441,7 @@ async fn handle_blacklist_remove(
 }
 
 /// GET /blacklist — list blacklist entries
-async fn handle_blacklist_list(
-    State(state): State<Arc<TrackerState>>,
-) -> impl IntoResponse {
+async fn handle_blacklist_list(State(state): State<Arc<TrackerState>>) -> impl IntoResponse {
     let db = state.db.lock().await;
     let mut stmt = match db.prepare(
         "SELECT id, mirror_id, operator_npub, reason, source, auto_threshold, created_at, expires_at
@@ -429,20 +453,21 @@ async fn handle_blacklist_list(
             return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
         }
     };
-    let rows = stmt.query_map([], |row| {
-        Ok(BlacklistEntry {
-            id: row.get(0)?,
-            mirror_id: row.get(1).ok(),
-            operator_npub: row.get(2).ok(),
-            reason: row.get(3)?,
-            source: row.get(4)?,
-            auto_threshold: row.get(5).ok(),
-            created_at: row.get(6)?,
-            expires_at: row.get(7).ok(),
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(BlacklistEntry {
+                id: row.get(0)?,
+                mirror_id: row.get(1).ok(),
+                operator_npub: row.get(2).ok(),
+                reason: row.get(3)?,
+                source: row.get(4)?,
+                auto_threshold: row.get(5).ok(),
+                created_at: row.get(6)?,
+                expires_at: row.get(7).ok(),
+            })
         })
-    })
-    .map(|r| r.filter_map(|r| r.ok()).collect::<Vec<_>>())
-    .unwrap_or_default();
+        .map(|r| r.filter_map(|r| r.ok()).collect::<Vec<_>>())
+        .unwrap_or_default();
 
     Json(rows).into_response()
 }
@@ -468,7 +493,9 @@ async fn handle_announce(
     let endpoints_json = serde_json::to_string(&req.endpoints).unwrap_or_default();
     let now = chrono::Utc::now().timestamp();
     let (lat, lon) = req.lat_lon.unwrap_or((0.0, 0.0));
-    let (bytes_24h, reqs_24h) = req.stats.as_ref()
+    let (bytes_24h, reqs_24h) = req
+        .stats
+        .as_ref()
         .map(|s| (s.bytes_served_24h, s.requests_24h))
         .unwrap_or((None, None));
     let operator_npub = req.operator_npub.as_deref();
@@ -509,16 +536,32 @@ async fn handle_announce(
             announced_at = excluded.announced_at,
             operator_npub = excluded.operator_npub",
         params![
-            req.mirror_id, req.distro, transport_json, endpoints_json,
-            req.capacity_bytes, req.bandwidth_bps, req.uptime_seconds,
-            req.packages, req.last_sync, lat, lon,
-            bytes_24h, reqs_24h, now, operator_npub
+            req.mirror_id,
+            req.distro,
+            transport_json,
+            endpoints_json,
+            req.capacity_bytes,
+            req.bandwidth_bps,
+            req.uptime_seconds,
+            req.packages,
+            req.last_sync,
+            lat,
+            lon,
+            bytes_24h,
+            reqs_24h,
+            now,
+            operator_npub
         ],
     );
 
     match result {
         Ok(_) => {
-            info!("Announce: {} (distro={}, operator={})", req.mirror_id, req.distro, operator_npub.unwrap_or("none"));
+            info!(
+                "Announce: {} (distro={}, operator={})",
+                req.mirror_id,
+                req.distro,
+                operator_npub.unwrap_or("none")
+            );
             (StatusCode::OK, "announced").into_response()
         }
         Err(e) => {
@@ -544,14 +587,18 @@ async fn handle_discover(
                     bandwidth_bps, uptime_seconds, packages, last_sync, lat, lon,
                     bytes_served_24h, requests_24h, announced_at, operator_npub, nat_type
              FROM mirrors WHERE distro = ?1 AND transport LIKE ?2
-             ORDER BY announced_at DESC"
+             ORDER BY announced_at DESC",
         ) {
             Ok(s) => s,
-            Err(e) => { error!("Discover DB prepare: {}", e); return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response(); }
+            Err(e) => {
+                error!("Discover DB prepare: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+            }
         };
         stmt.query_map(params![query.distro, format!("%\"{}\"%", tf)], |row| {
             Ok(row_to_mirror(row))
-        }).map(|r| r.filter_map(|r| r.ok()).collect())
+        })
+        .map(|r| r.filter_map(|r| r.ok()).collect())
         .unwrap_or_default()
     } else {
         let mut stmt = match db.prepare(
@@ -559,19 +606,22 @@ async fn handle_discover(
                     bandwidth_bps, uptime_seconds, packages, last_sync, lat, lon,
                     bytes_served_24h, requests_24h, announced_at, operator_npub, nat_type
              FROM mirrors WHERE distro = ?1
-             ORDER BY announced_at DESC"
+             ORDER BY announced_at DESC",
         ) {
             Ok(s) => s,
-            Err(e) => { error!("Discover DB prepare: {}", e); return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response(); }
+            Err(e) => {
+                error!("Discover DB prepare: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "db error").into_response();
+            }
         };
-        stmt.query_map(params![query.distro], |row| {
-            Ok(row_to_mirror(row))
-        }).map(|r| r.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default()
+        stmt.query_map(params![query.distro], |row| Ok(row_to_mirror(row)))
+            .map(|r| r.filter_map(|r| r.ok()).collect())
+            .unwrap_or_default()
     };
 
     // Filter out blacklisted mirrors
-    let rows: Vec<MirrorRecord> = rows.into_iter()
+    let rows: Vec<MirrorRecord> = rows
+        .into_iter()
         .filter(|m| !is_blacklisted(&db, &m.mirror_id, m.operator_npub.as_deref()))
         .collect();
 
@@ -580,36 +630,44 @@ async fn handle_discover(
     let now_epoch = chrono::Utc::now().timestamp();
 
     // Score and rank mirrors, expand endpoints into individual results
-    let mut scored: Vec<DiscoveredMirror> = rows.iter()
+    let mut scored: Vec<DiscoveredMirror> = rows
+        .iter()
         .flat_map(|m| {
             let score = score_mirror(m, query.lat, query.lon, now_epoch);
-            let endpoints: Vec<String> = serde_json::from_str(&m.endpoints)
-                .unwrap_or_default();
-            let transports: Vec<String> = serde_json::from_str(&m.transport)
-                .unwrap_or_default();
+            let endpoints: Vec<String> = serde_json::from_str(&m.endpoints).unwrap_or_default();
+            let transports: Vec<String> = serde_json::from_str(&m.transport).unwrap_or_default();
 
-            endpoints.into_iter().enumerate().map(move |(i, ep)| {
-                DiscoveredMirror {
+            endpoints
+                .into_iter()
+                .enumerate()
+                .map(move |(i, ep)| DiscoveredMirror {
                     mirror_id: m.mirror_id.clone(),
                     endpoint: ep,
-                    transport: transports.get(i).cloned().unwrap_or_else(|| "http".to_string()),
+                    transport: transports
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| "http".to_string()),
                     packages: m.packages,
                     last_sync: m.last_sync.clone(),
                     score,
                     latency_ms: None,
-                }
-            })
+                })
         })
         .collect();
 
     // Sort by score descending
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored.truncate(limit);
 
     Json(DiscoverResponse {
         mirrors: scored,
         ttl: 3600,
-    }).into_response()
+    })
+    .into_response()
 }
 
 /// GET /health — tracker health check
@@ -641,7 +699,10 @@ async fn handle_report_with_auto_blacklist(
 // ---------------------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "monopsony-tracker", about = "Monopsony mirror discovery tracker")]
+#[command(
+    name = "monopsony-tracker",
+    about = "Monopsony mirror discovery tracker"
+)]
 struct Cli {
     /// Address to bind (default 0.0.0.0:3130)
     #[arg(long, default_value = "0.0.0.0:3130")]
@@ -673,21 +734,22 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("monopsony_tracker=info".parse()?)
+                .add_directive("monopsony_tracker=info".parse()?),
         )
         .init();
 
     // Parse auth mode
-    let auth_mode = TrackerAuthMode::from_str(&cli.auth_mode)
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let auth_mode = TrackerAuthMode::from_str(&cli.auth_mode).map_err(|e| anyhow::anyhow!(e))?;
 
-    let valid_keys = cli.api_keys
+    let valid_keys = cli
+        .api_keys
         .as_deref()
         .map(|s| s.split(',').map(|k| k.trim().to_string()).collect())
         .unwrap_or_default();
 
     let jwt_config = if auth_mode == TrackerAuthMode::Jwt {
-        let issuers = cli.jwt_issuers
+        let issuers = cli
+            .jwt_issuers
             .as_deref()
             .map(|s| s.split(',').map(|i| i.trim().to_string()).collect())
             .unwrap_or_default();
@@ -740,7 +802,11 @@ async fn main() -> anyhow::Result<()> {
                 "DELETE FROM mirrors WHERE announced_at < ?1",
                 params![cutoff],
             ) {
-                Ok(n) => { if n > 0 { info!("Purged {} stale mirrors", n); } }
+                Ok(n) => {
+                    if n > 0 {
+                        info!("Purged {} stale mirrors", n);
+                    }
+                }
                 Err(e) => warn!("Purge error: {}", e),
             }
         }
@@ -765,15 +831,19 @@ async fn main() -> anyhow::Result<()> {
         .route("/reputation/attest", post(reputation::handle_attest))
         .route("/blacklist", post(handle_blacklist_add))
         .route("/blacklist", get(handle_blacklist_list))
-        .route("/blacklist/{id}", axum::routing::delete(handle_blacklist_remove))
+        .route(
+            "/blacklist/{id}",
+            axum::routing::delete(handle_blacklist_remove),
+        )
         .merge(recipes::recipe_router());
 
-    let app = protected
-        .merge(open)
-        .with_state(state);
+    let app = protected.merge(open).with_state(state);
 
     let listener = tokio::net::TcpListener::bind(cli.addr).await?;
-    info!("Monopsony tracker listening on {} (auth={})", cli.addr, cli.auth_mode);
+    info!(
+        "Monopsony tracker listening on {} (auth={})",
+        cli.addr, cli.auth_mode
+    );
 
     let shutdown = async {
         tokio::signal::ctrl_c().await.unwrap();
@@ -846,7 +916,10 @@ mod tests {
             .route("/reputation/attest", post(reputation::handle_attest))
             .route("/blacklist", post(handle_blacklist_add))
             .route("/blacklist", get(handle_blacklist_list))
-            .route("/blacklist/{id}", axum::routing::delete(handle_blacklist_remove))
+            .route(
+                "/blacklist/{id}",
+                axum::routing::delete(handle_blacklist_remove),
+            )
             .merge(recipes::recipe_router());
 
         protected.merge(open).with_state(state)
@@ -860,7 +933,8 @@ mod tests {
             "endpoints": ["http://127.0.0.1:3129"],
             "lat_lon": [40.7128, -74.0060],
             "operator_npub": "deadbeef01"
-        }).to_string()
+        })
+        .to_string()
     }
 
     #[tokio::test]
@@ -876,7 +950,11 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), AxumStatusCode::OK, "open mode should accept announce without key");
+        assert_eq!(
+            resp.status(),
+            AxumStatusCode::OK,
+            "open mode should accept announce without key"
+        );
     }
 
     #[tokio::test]
@@ -892,7 +970,11 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), AxumStatusCode::UNAUTHORIZED, "token mode should reject without key");
+        assert_eq!(
+            resp.status(),
+            AxumStatusCode::UNAUTHORIZED,
+            "token mode should reject without key"
+        );
     }
 
     #[tokio::test]
@@ -909,7 +991,11 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), AxumStatusCode::OK, "token mode should accept with valid key");
+        assert_eq!(
+            resp.status(),
+            AxumStatusCode::OK,
+            "token mode should accept with valid key"
+        );
     }
 
     #[tokio::test]
@@ -926,7 +1012,11 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), AxumStatusCode::UNAUTHORIZED, "token mode should reject wrong key");
+        assert_eq!(
+            resp.status(),
+            AxumStatusCode::UNAUTHORIZED,
+            "token mode should reject wrong key"
+        );
     }
 
     #[tokio::test]
@@ -953,7 +1043,11 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), AxumStatusCode::OK, "jwt mode should accept valid token");
+        assert_eq!(
+            resp.status(),
+            AxumStatusCode::OK,
+            "jwt mode should accept valid token"
+        );
     }
 
     #[tokio::test]
@@ -980,7 +1074,11 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), AxumStatusCode::UNAUTHORIZED, "jwt mode should reject expired token");
+        assert_eq!(
+            resp.status(),
+            AxumStatusCode::UNAUTHORIZED,
+            "jwt mode should reject expired token"
+        );
     }
 
     #[tokio::test]
@@ -996,7 +1094,11 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), AxumStatusCode::UNAUTHORIZED, "jwt mode should reject without token");
+        assert_eq!(
+            resp.status(),
+            AxumStatusCode::UNAUTHORIZED,
+            "jwt mode should reject without token"
+        );
     }
 
     #[tokio::test]
@@ -1012,7 +1114,11 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), AxumStatusCode::OK, "discover should be open in any auth mode");
+        assert_eq!(
+            resp.status(),
+            AxumStatusCode::OK,
+            "discover should be open in any auth mode"
+        );
     }
 
     #[tokio::test]
@@ -1027,7 +1133,11 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), AxumStatusCode::OK, "health should be open in any auth mode");
+        assert_eq!(
+            resp.status(),
+            AxumStatusCode::OK,
+            "health should be open in any auth mode"
+        );
     }
 
     #[tokio::test]
@@ -1042,7 +1152,8 @@ mod tests {
             "endpoints": ["http://127.0.0.1:3129"],
             "operator_npub": "abc123",
             "display_name": "Test Operator"
-        }).to_string();
+        })
+        .to_string();
 
         let req = Request::builder()
             .method("POST")
@@ -1056,18 +1167,22 @@ mod tests {
 
         // Verify operator was created in DB
         let db = state.db.lock().await;
-        let count: i64 = db.query_row(
-            "SELECT COUNT(*) FROM operators WHERE npub = 'abc123'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM operators WHERE npub = 'abc123'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1, "operator should be auto-created");
 
-        let display_name: String = db.query_row(
-            "SELECT display_name FROM operators WHERE npub = 'abc123'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let display_name: String = db
+            .query_row(
+                "SELECT display_name FROM operators WHERE npub = 'abc123'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(display_name, "Test Operator");
     }
 
@@ -1128,8 +1243,17 @@ mod tests {
             nat_type: None,
         };
         // Client at same location
-        let score = score_mirror(&mirror, Some(33.5), Some(-112.0), chrono::Utc::now().timestamp());
-        assert!(score > 80.0, "Same-location score should be high, got {}", score);
+        let score = score_mirror(
+            &mirror,
+            Some(33.5),
+            Some(-112.0),
+            chrono::Utc::now().timestamp(),
+        );
+        assert!(
+            score > 80.0,
+            "Same-location score should be high, got {}",
+            score
+        );
     }
 
     #[test]
@@ -1144,7 +1268,7 @@ mod tests {
             uptime_seconds: None,
             packages: None,
             last_sync: None,
-            lat: Some(-33.8688),  // Sydney
+            lat: Some(-33.8688), // Sydney
             lon: Some(151.2093),
             bytes_served_24h: None,
             requests_24h: None,
@@ -1153,10 +1277,19 @@ mod tests {
             nat_type: None,
         };
         // Client in NYC
-        let score = score_mirror(&mirror, Some(40.7128), Some(-74.006), chrono::Utc::now().timestamp());
+        let score = score_mirror(
+            &mirror,
+            Some(40.7128),
+            Some(-74.006),
+            chrono::Utc::now().timestamp(),
+        );
         // Very far → proximity near 0, no last_sync → freshness 25, no uptime → 50, no bw → 50
         // = 0.4*~0 + 0.3*25 + 0.2*50 + 0.1*50 = 22.5, minus NAT unknown penalty = ~14.5
-        assert!(score < 35.0, "Far-away stale mirror should score low, got {}", score);
+        assert!(
+            score < 35.0,
+            "Far-away stale mirror should score low, got {}",
+            score
+        );
     }
 
     #[test]
@@ -1195,18 +1328,32 @@ mod tests {
                 bytes_served_24h, requests_24h, announced_at, operator_npub)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
-                req.mirror_id, req.distro, transport_json, endpoints_json,
-                req.capacity_bytes, req.bandwidth_bps, req.uptime_seconds,
-                req.packages, req.last_sync, 33.5, -112.0,
-                10_000_000, 500, now, req.operator_npub
+                req.mirror_id,
+                req.distro,
+                transport_json,
+                endpoints_json,
+                req.capacity_bytes,
+                req.bandwidth_bps,
+                req.uptime_seconds,
+                req.packages,
+                req.last_sync,
+                33.5,
+                -112.0,
+                10_000_000,
+                500,
+                now,
+                req.operator_npub
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM mirrors WHERE distro = 'archlinux'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM mirrors WHERE distro = 'archlinux'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -1224,7 +1371,8 @@ mod tests {
             "expected_hash": "abc123",
             "actual_hash": "def456",
             "timestamp": chrono::Utc::now().timestamp()
-        }).to_string();
+        })
+        .to_string();
 
         let req = Request::builder()
             .method("POST")
@@ -1255,7 +1403,8 @@ mod tests {
             "mirror_id": "",
             "report_type": "slow_response",
             "timestamp": chrono::Utc::now().timestamp()
-        }).to_string();
+        })
+        .to_string();
 
         let req = Request::builder()
             .method("POST")

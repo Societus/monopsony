@@ -122,10 +122,7 @@ async fn fetch_upstream(
 }
 
 /// Attempt to serve from cache. Returns `Some(response)` on cache hit.
-async fn try_cache(
-    state: &DockerState,
-    key: &str,
-) -> Option<Response<Body>> {
+async fn try_cache(state: &DockerState, key: &str) -> Option<Response<Body>> {
     if !state.storage.exists(key).await.unwrap_or(false) {
         return None;
     }
@@ -416,10 +413,10 @@ mod tests {
     #[tokio::test]
     async fn test_try_cache_miss_then_hit() {
         let dir = tempfile::tempdir().unwrap();
-        let storage: Arc<dyn CacheStorage> =
-            Arc::new(crate::cache_storage::FilesystemStorage::new(
-                dir.path().to_path_buf(),
-            ));
+        let storage: Arc<dyn CacheStorage> = Arc::new(
+            crate::object_store_backend::ObjectStoreBackend::local(dir.path().to_path_buf(), 0)
+                .unwrap(),
+        );
         let state = DockerState::new(storage);
 
         let key = "docker/v2/test/blobs/sha256:abc";

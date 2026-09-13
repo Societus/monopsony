@@ -8,12 +8,10 @@ use crate::AdminState;
 /// GET /api/v1/config — read the full server configuration.
 pub async fn handle_get_config(State(state): State<AdminState>) -> impl IntoResponse {
     match std::fs::read_to_string(&state.config_path) {
-        Ok(content) => {
-            Json(serde_json::json!({
-                "path": state.config_path.display().to_string(),
-                "toml": content,
-            }))
-        }
+        Ok(content) => Json(serde_json::json!({
+            "path": state.config_path.display().to_string(),
+            "toml": content,
+        })),
         Err(e) => Json(serde_json::json!({
             "error": format!("Could not read config: {}", e),
             "path": state.config_path.display().to_string(),
@@ -28,18 +26,28 @@ pub async fn handle_update_config(
 ) -> impl IntoResponse {
     let request: serde_json::Value = match serde_json::from_str(&body) {
         Ok(v) => v,
-        Err(e) => return Json(serde_json::json!({"success": false, "message": format!("Invalid request: {}", e)})),
+        Err(e) => {
+            return Json(
+                serde_json::json!({"success": false, "message": format!("Invalid request: {}", e)}),
+            )
+        }
     };
 
     let toml_content = request.get("toml").and_then(|v| v.as_str()).unwrap_or("");
 
     if let Err(e) = toml::from_str::<toml::Value>(toml_content) {
-        return Json(serde_json::json!({"success": false, "message": format!("Invalid TOML: {}", e)}));
+        return Json(
+            serde_json::json!({"success": false, "message": format!("Invalid TOML: {}", e)}),
+        );
     }
 
     match std::fs::write(&state.config_path, toml_content) {
-        Ok(_) => Json(serde_json::json!({"success": true, "message": "Config updated. Restart server to apply."})),
-        Err(e) => Json(serde_json::json!({"success": false, "message": format!("Write failed: {}", e)})),
+        Ok(_) => Json(
+            serde_json::json!({"success": true, "message": "Config updated. Restart server to apply."}),
+        ),
+        Err(e) => {
+            Json(serde_json::json!({"success": false, "message": format!("Write failed: {}", e)}))
+        }
     }
 }
 
@@ -69,5 +77,8 @@ pub struct NodeConfigResponse {
 
 /// GET /api/v1/config/node — read node tier configuration.
 pub async fn handle_get_node_config(State(_state): State<AdminState>) -> impl IntoResponse {
-    Json(NodeConfigResponse { tier: "private".into(), name: None })
+    Json(NodeConfigResponse {
+        tier: "private".into(),
+        name: None,
+    })
 }

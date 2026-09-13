@@ -40,7 +40,6 @@ impl Default for PurgeConfig {
 pub async fn start_purge_task(db: Arc<Database>, config: PurgeConfig) -> anyhow::Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(86400));
 
-
     loop {
         if let Err(e) = run_purge(&db, &config).await {
             error!("Cache purge failed: {}", e);
@@ -62,12 +61,11 @@ async fn run_purge(db: &Database, config: &PurgeConfig) -> anyhow::Result<()> {
         .timestamp();
 
     // Find old cache entries from database
-    let old_entries = sqlx::query(
-        "SELECT url, cache_path FROM cache_entries WHERE last_accessed < $1",
-    )
-    .bind(cutoff_timestamp)
-    .fetch_all(db.pool())
-    .await?;
+    let old_entries =
+        sqlx::query("SELECT url, cache_path FROM cache_entries WHERE last_accessed < $1")
+            .bind(cutoff_timestamp)
+            .fetch_all(db.pool())
+            .await?;
 
     let mut purged_count = 0;
     let mut purged_bytes = 0u64;
@@ -79,7 +77,9 @@ async fn run_purge(db: &Database, config: &PurgeConfig) -> anyhow::Result<()> {
         // Derive the storage key from the cache path
         let cache_key = {
             let path = PathBuf::from(&cache_path);
-            config.storage.base_dir()
+            config
+                .storage
+                .base_dir()
                 .and_then(|base| path.strip_prefix(&base).ok())
                 .map(|rel| rel.to_string_lossy().to_string())
                 .unwrap_or(cache_path.clone())
@@ -162,7 +162,8 @@ async fn evict_oldest_entries(
         // Derive storage key from path
         let cache_key = {
             let path = PathBuf::from(&cache_path);
-            storage.base_dir()
+            storage
+                .base_dir()
                 .and_then(|base| path.strip_prefix(&base).ok())
                 .map(|rel| rel.to_string_lossy().to_string())
                 .unwrap_or_else(|| cache_path.clone())

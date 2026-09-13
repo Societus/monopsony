@@ -8,12 +8,19 @@ use monopsony_common::package_manager::{get_available_backends, matches_package_
 fn test_server_proxy_state_finds_backend() {
     // Verify that the proxy state can find backends for known URLs
     let backends = get_available_backends();
-    assert!(!backends.is_empty(), "At least one backend should be available");
+    assert!(
+        !backends.is_empty(),
+        "At least one backend should be available"
+    );
 
     // Test that each backend's patterns work
     for backend in &backends {
         let patterns = backend.upstream_url_patterns();
-        assert!(!patterns.is_empty(), "Backend {:?} should have URL patterns", backend.kind());
+        assert!(
+            !patterns.is_empty(),
+            "Backend {:?} should have URL patterns",
+            backend.kind()
+        );
 
         // Each pattern should compile and be usable
         for pattern in &patterns {

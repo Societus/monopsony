@@ -137,7 +137,10 @@ pub async fn handle_pair_init(
         error: None,
     };
 
-    info!("Pairing session started: code={}, expires at {}", pairing_code, deadline);
+    info!(
+        "Pairing session started: code={}, expires at {}",
+        pairing_code, deadline
+    );
 
     // Clone what the background task needs
     let tls_manager = state.tls_manager.clone();
@@ -145,6 +148,7 @@ pub async fn handle_pair_init(
     let mirror_manager = state.mirror_manager.clone();
     let grpc_addr_config = state.grpc_addr.clone();
     let grpc_addr_override = req.grpc_addr_override.clone();
+    let ws_url = state.ws_url.clone();
     let code_for_task = pairing_code.clone();
 
     *session_lock = Some(session.clone());
@@ -154,7 +158,18 @@ pub async fn handle_pair_init(
     let pairing_manager = state.pairing_manager.clone();
     let pairing_manager_for_error = pairing_manager.clone();
     let join_handle = tokio::spawn(async move {
-        if let Err(e) = run_pairing_listener(code_for_task, tls_manager, db, mirror_manager, grpc_addr_config, grpc_addr_override, pairing_manager).await {
+        if let Err(e) = run_pairing_listener(
+            code_for_task,
+            tls_manager,
+            db,
+            mirror_manager,
+            grpc_addr_config,
+            grpc_addr_override,
+            ws_url,
+            pairing_manager,
+        )
+        .await
+        {
             let mut lock = pairing_manager_for_error.lock().await;
             if let Some(ref mut session) = *lock {
                 if session.status == PairingStatus::Waiting {
@@ -196,7 +211,8 @@ pub async fn handle_pair_status(State(state): State<AdminState>) -> impl IntoRes
         Some(session) => {
             // Check if session has expired
             let now_ms = chrono::Utc::now().timestamp_millis();
-            let is_expired = now_ms > session.deadline_ms && session.status == PairingStatus::Waiting;
+            let is_expired =
+                now_ms > session.deadline_ms && session.status == PairingStatus::Waiting;
 
             let status = if is_expired {
                 PairingStatus::Expired
@@ -262,6 +278,7 @@ async fn run_pairing_listener(
     mirror_manager: Option<std::sync::Arc<monopsony_mirror::MirrorManager>>,
     grpc_addr_config: String,
     grpc_addr_override: Option<String>,
+    ws_url: Option<String>,
     pairing_manager: std::sync::Arc<tokio::sync::Mutex<Option<PairingSession>>>,
 ) -> anyhow::Result<()> {
     use prost::Message;
@@ -272,7 +289,10 @@ async fn run_pairing_listener(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind pairing port {}: {}", pair_addr, e))?;
 
-    info!("Pairing listener on {} ({}s timeout)", pair_addr, PAIRING_TIMEOUT_SECS);
+    info!(
+        "Pairing listener on {} ({}s timeout)",
+        pair_addr, PAIRING_TIMEOUT_SECS
+    );
 
     // Use tokio::time::timeout — this is the fix for the instant-timeout bug.
     // The old code used tokio::select! with sleep_until, which resolved the
@@ -345,7 +365,9 @@ async fn run_pairing_listener(
 
                 // Auto-create mirror configs for the client's package managers
                 if let Some(ref mirror_mgr) = mirror_manager {
-                    let created = mirror_mgr.ensure_mirrors_for_package_managers(&req.package_managers).await;
+                    let created = mirror_mgr
+                        .ensure_mirrors_for_package_managers(&req.package_managers)
+                        .await;
                     if created > 0 {
                         info!(client = %req.hostname, created = created, "Auto-created mirror configs from pairing");
                     }
@@ -370,15 +392,18 @@ async fn run_pairing_listener(
             // Derive the gRPC address to send to the client.
             // Prefer the override, then the socket's local address, then the config.
             let grpc_addr = grpc_addr_override.unwrap_or_else(|| {
-                let local = socket.local_addr().map(|a| a.ip().to_string()).unwrap_or_else(|_| {
-                    // Fall back to the configured bind address, replacing 0.0.0.0
-                    grpc_addr_config
-                        .split(':')
-                        .next()
-                        .filter(|ip| ip != &"0.0.0.0")
-                        .unwrap_or("127.0.0.1")
-                        .to_string()
-                });
+                let local = socket
+                    .local_addr()
+                    .map(|a| a.ip().to_string())
+                    .unwrap_or_else(|_| {
+                        // Fall back to the configured bind address, replacing 0.0.0.0
+                        grpc_addr_config
+                            .split(':')
+                            .next()
+                            .filter(|ip| ip != &"0.0.0.0")
+                            .unwrap_or("127.0.0.1")
+                            .to_string()
+                    });
                 // Extract port from grpc_addr_config (e.g. "0.0.0.0:50051" → "50051")
                 let port = grpc_addr_config.rsplit(':').next().unwrap_or("50051");
                 format!("{}:{}", local, port)
@@ -391,13 +416,17 @@ async fn run_pairing_listener(
                 client_key_pem,
                 ca_cert_pem,
                 grpc_addr,
+                ws_url: ws_url.clone().unwrap_or_default(),
             };
             let resp_bytes = resp.encode_to_vec();
             let resp_len = resp_bytes.len() as u32;
             socket.write_all(&resp_len.to_le_bytes()).await?;
             socket.write_all(&resp_bytes).await?;
 
-            info!("Pairing certificates sent to {} (client_id={})", addr, new_client_id);
+            info!(
+                "Pairing certificates sent to {} (client_id={})",
+                addr, new_client_id
+            );
 
             // Update session status
             update_pairing_session(

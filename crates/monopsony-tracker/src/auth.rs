@@ -156,9 +156,7 @@ fn validate_jwt(token: &str, config: &Option<JwtConfig>) -> Result<JwtClaims, St
     )
     .map_err(|e| format!("JWT decode error: {}", e))?;
 
-    if !cfg.trusted_issuers.is_empty()
-        && !cfg.trusted_issuers.contains(&token_data.claims.iss)
-    {
+    if !cfg.trusted_issuers.is_empty() && !cfg.trusted_issuers.contains(&token_data.claims.iss) {
         return Err("Untrusted issuer".to_string());
     }
 
@@ -192,9 +190,18 @@ mod tests {
 
     #[test]
     fn test_auth_mode_from_str() {
-        assert_eq!(TrackerAuthMode::from_str("open").unwrap(), TrackerAuthMode::Open);
-        assert_eq!(TrackerAuthMode::from_str("token").unwrap(), TrackerAuthMode::Token);
-        assert_eq!(TrackerAuthMode::from_str("jwt").unwrap(), TrackerAuthMode::Jwt);
+        assert_eq!(
+            TrackerAuthMode::from_str("open").unwrap(),
+            TrackerAuthMode::Open
+        );
+        assert_eq!(
+            TrackerAuthMode::from_str("token").unwrap(),
+            TrackerAuthMode::Token
+        );
+        assert_eq!(
+            TrackerAuthMode::from_str("jwt").unwrap(),
+            TrackerAuthMode::Jwt
+        );
         assert!(TrackerAuthMode::from_str("bogus").is_err());
     }
 

@@ -9,16 +9,15 @@ use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 // Crate imports
-use monopsony_db::Database;
-use monopsony_proxy::{cache_storage, object_store_backend, proxy, prefetch, purge};
-use monopsony_control::{announce, discovery, grpc, metrics, tls};
-use monopsony_mirror::mirror;
-use monopsony_shadow::ShadowPackageManager;
 use monopsony_admin::{AdminState, DashboardConfig};
+use monopsony_control::{announce, discovery, grpc, metrics, tls};
+use monopsony_db::Database;
+use monopsony_mirror::mirror;
+use monopsony_proxy::{cache_storage, object_store_backend, prefetch, proxy, purge};
+use monopsony_shadow::ShadowPackageManager;
 
-mod setup;
 mod self_update;
-
+mod setup;
 
 #[derive(Parser, Debug)]
 #[command(name = "monopsony-server", version)]
@@ -58,7 +57,10 @@ struct Args {
     mirror_addr: String,
 
     /// PostgreSQL connection URL
-    #[arg(long, default_value = "postgres://monopsony:***@localhost/monopsony")]
+    #[arg(
+        long,
+        default_value = "postgres://monopsony:CHANGE_ME@localhost/monopsony"
+    )]
     database_url: String,
 
     /// Run without a database (limited features: no client management, no inventory)
@@ -148,15 +150,15 @@ enum Commands {
         /// Dashboard/admin API address of the running server
         #[arg(short, long)]
         server: String,
-        
+
         /// Admin API port (default: 3130)
         #[arg(long, default_value = "3130")]
         admin_port: u16,
-        
+
         /// Optional: admin username for authenticated dashboard
         #[arg(long)]
         admin_user: Option<String>,
-        
+
         /// Optional: admin password for authenticated dashboard
         #[arg(long)]
         admin_pass: Option<String>,
@@ -226,8 +228,20 @@ async fn main() -> anyhow::Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     // Handle CLI subcommands
-    if let Some(Commands::Pair { server, admin_port, admin_user, admin_pass }) = &args.command {
-        return handle_pair_via_admin_api(server, *admin_port, admin_user.as_deref(), admin_pass.as_deref()).await;
+    if let Some(Commands::Pair {
+        server,
+        admin_port,
+        admin_user,
+        admin_pass,
+    }) = &args.command
+    {
+        return handle_pair_via_admin_api(
+            server,
+            *admin_port,
+            admin_user.as_deref(),
+            admin_pass.as_deref(),
+        )
+        .await;
     }
     if let Some(Commands::ApiKey { action }) = &args.command {
         return handle_api_key_command(action, &args.database_url).await;
@@ -263,12 +277,9 @@ async fn main() -> anyhow::Result<()> {
     info!("Dashboard: {}", args.dashboard_addr);
     info!("Cache directory: {}", args.cache_dir);
 
-    let http_addr: SocketAddr = args.http_addr.parse()
-        .expect("Invalid HTTP proxy address");
-    let grpc_addr: SocketAddr = args.grpc_addr.parse()
-        .expect("Invalid gRPC address");
-    let metrics_addr: SocketAddr = args.metrics_addr.parse()
-        .expect("Invalid metrics address");
+    let http_addr: SocketAddr = args.http_addr.parse().expect("Invalid HTTP proxy address");
+    let grpc_addr: SocketAddr = args.grpc_addr.parse().expect("Invalid gRPC address");
+    let metrics_addr: SocketAddr = args.metrics_addr.parse().expect("Invalid metrics address");
 
     let cache_dir = PathBuf::from(&args.cache_dir);
 
@@ -276,15 +287,14 @@ async fn main() -> anyhow::Result<()> {
         warn!("Could not create cache directory: {}", e);
     }
 
-    let tls_dir = args.tls_cert_dir
+    let tls_dir = args
+        .tls_cert_dir
         .as_deref()
         .map(PathBuf::from)
         .unwrap_or_else(|| cache_dir.join("tls"));
 
-    let tls_manager = tls::TlsManager::load_or_create(
-        &tls_dir.join("ca.crt"),
-        &tls_dir.join("ca.key"),
-    )?;
+    let tls_manager =
+        tls::TlsManager::load_or_create(&tls_dir.join("ca.crt"), &tls_dir.join("ca.key"))?;
     info!("CA fingerprint: {}", tls_manager.ca_fingerprint());
 
     let tls_manager = Arc::new(tls_manager);
@@ -300,7 +310,10 @@ async fn main() -> anyhow::Result<()> {
                 Some(Arc::new(database))
             }
             Err(e) => {
-                warn!("Failed to connect to database: {}. Continuing with file-only caching.", e);
+                warn!(
+                    "Failed to connect to database: {}. Continuing with file-only caching.",
+                    e
+                );
                 None
             }
         }
@@ -310,7 +323,10 @@ async fn main() -> anyhow::Result<()> {
         "s3" => {
             let s3_config = monopsony_common::config::S3Config {
                 endpoint: args.s3_endpoint.clone().unwrap_or_default(),
-                region: args.s3_region.clone().unwrap_or_else(|| "us-east-1".to_string()),
+                region: args
+                    .s3_region
+                    .clone()
+                    .unwrap_or_else(|| "us-east-1".to_string()),
                 bucket: args.s3_bucket.clone().unwrap_or_default(),
                 access_key: args.s3_access_key.clone().unwrap_or_default(),
                 secret_key: args.s3_secret_key.clone().unwrap_or_default(),
@@ -332,9 +348,12 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let db_clone = db.clone();
-    let auth_mode: monopsony_common::config::AuthMode = args.auth_mode.parse()
-        .unwrap_or_else(|_| {
-            warn!("Invalid auth_mode '{}', defaulting to 'open'", args.auth_mode);
+    let auth_mode: monopsony_common::config::AuthMode =
+        args.auth_mode.parse().unwrap_or_else(|_| {
+            warn!(
+                "Invalid auth_mode '{}', defaulting to 'open'",
+                args.auth_mode
+            );
             monopsony_common::config::AuthMode::Open
         });
     info!("Auth mode: {}", auth_mode);
@@ -358,32 +377,83 @@ async fn main() -> anyhow::Result<()> {
             Err(_) => true,
         }
     };
-    info!("Install telemetry: {}", if telemetry_enabled { "enabled" } else { "disabled" });
+    info!(
+        "Install telemetry: {}",
+        if telemetry_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+
+    // Read streaming proxy limits from TOML (falls back to defaults).
+    let proxy_limits = {
+        match std::fs::read_to_string(&args.config) {
+            Ok(content) => {
+                #[derive(serde::Deserialize, Default)]
+                struct CacheWrapper {
+                    #[serde(default)]
+                    cache: CacheLimitsOnly,
+                }
+                #[derive(serde::Deserialize, Default)]
+                struct CacheLimitsOnly {
+                    #[serde(default)]
+                    proxy_limits: monopsony_common::config::ProxyLimitsConfig,
+                }
+                toml::from_str::<CacheWrapper>(&content)
+                    .ok()
+                    .map(|w| w.cache.proxy_limits)
+            }
+            Err(_) => None,
+        }
+    };
+    info!(
+        "Proxy limits: max_body={} MiB, upstream_stall={}s",
+        proxy_limits
+            .as_ref()
+            .map(|l| l.max_response_bytes / (1024 * 1024))
+            .unwrap_or(4096),
+        proxy_limits
+            .as_ref()
+            .map(|l| l.upstream_stall_secs)
+            .unwrap_or(120)
+    );
 
     let proxy_handle = tokio::spawn(async move {
-        if let Err(e) = proxy::run_proxy(http_addr, storage_for_proxy, db_clone, auth_mode, scan_config_for_proxy, None).await {
+        if let Err(e) = proxy::run_proxy(
+            http_addr,
+            storage_for_proxy,
+            db_clone,
+            auth_mode,
+            scan_config_for_proxy,
+            None,
+            proxy_limits,
+        )
+        .await
+        {
             error!("HTTP proxy error: {}", e);
         }
     });
 
     // Initialize mirror manager (before gRPC so we can share it)
     let mirror_dir = PathBuf::from(&args.mirror_dir);
-    let shared_mirror_manager = if mirror_dir.exists() || tokio::fs::create_dir_all(&mirror_dir).await.is_ok() {
-        let mgr = mirror::MirrorManager::new(mirror_dir.clone(), db.clone());
-        if let Err(e) = mgr.load_config().await {
-            warn!("Could not load mirror config: {}", e);
-        }
-        // Also load any configs persisted in the DB (auto-created from client
-        // pairing, or manually added via dashboard on a previous run).
-        if let Err(e) = mgr.load_from_db().await {
-            warn!("Could not load mirror configs from DB: {}", e);
-        }
-        info!("Mirror directory: {}", mirror_dir.display());
-        Some(Arc::new(mgr))
-    } else {
-        warn!("Mirror directory not available, mirror support disabled");
-        None
-    };
+    let shared_mirror_manager =
+        if mirror_dir.exists() || tokio::fs::create_dir_all(&mirror_dir).await.is_ok() {
+            let mgr = mirror::MirrorManager::new(mirror_dir.clone(), db.clone());
+            if let Err(e) = mgr.load_config().await {
+                warn!("Could not load mirror config: {}", e);
+            }
+            // Also load any configs persisted in the DB (auto-created from client
+            // pairing, or manually added via dashboard on a previous run).
+            if let Err(e) = mgr.load_from_db().await {
+                warn!("Could not load mirror configs from DB: {}", e);
+            }
+            info!("Mirror directory: {}", mirror_dir.display());
+            Some(Arc::new(mgr))
+        } else {
+            warn!("Mirror directory not available, mirror support disabled");
+            None
+        };
 
     // Initialize shadow package manager
     let shadow_dir = PathBuf::from(&args.shadow_dir);
@@ -393,7 +463,8 @@ async fn main() -> anyhow::Result<()> {
             warn!("Could not create shadow directory: {}", e);
         }
         let signing_key_path = shadow_dir.join("signing.key");
-        let signing_key = monopsony_shadow::shadow_signing::load_or_generate_signing_key(Some(&signing_key_path));
+        let signing_key =
+            monopsony_shadow::shadow_signing::load_or_generate_signing_key(Some(&signing_key_path));
         let cache_dir = shadow_dir.join("cache");
         let poll_interval = std::time::Duration::from_secs(args.shadow_poll_interval);
 
@@ -405,7 +476,10 @@ async fn main() -> anyhow::Result<()> {
             poll_interval,
             shadow_git_mirror_dir,
         );
-        info!("Shadow package manager initialized (key: {})", shadow_dir.join("signing.key").display());
+        info!(
+            "Shadow package manager initialized (key: {})",
+            shadow_dir.join("signing.key").display()
+        );
 
         // Start background polling
         let mgr_arc = Arc::new(mgr);
@@ -454,7 +528,18 @@ async fn main() -> anyhow::Result<()> {
         }
 
         let grpc_handle = tokio::spawn(async move {
-            if let Err(e) = grpc::start(grpc_addr, db_for_grpc, tls_for_grpc, mirror_for_grpc, shadow_for_grpc, telemetry_enabled, &tls_sans, access_control).await {
+            if let Err(e) = grpc::start(
+                grpc_addr,
+                db_for_grpc,
+                tls_for_grpc,
+                mirror_for_grpc,
+                shadow_for_grpc,
+                telemetry_enabled,
+                &tls_sans,
+                access_control,
+            )
+            .await
+            {
                 error!("gRPC server error: {}", e);
             }
         });
@@ -503,10 +588,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Start mirror sync + HTTP router (using shared mirror manager)
     let mirror_handle = if let Some(ref mm) = shared_mirror_manager {
-        let mirror_state = mirror::MirrorState::new(
-            (**mm).clone(),
-            mirror_dir.clone(),
-        );
+        let mirror_state = mirror::MirrorState::new((**mm).clone(), mirror_dir.clone());
 
         // Spawn sync task
         let sync_mgr = (**mm).clone();
@@ -521,8 +603,8 @@ async fn main() -> anyhow::Result<()> {
         let max_rps = mirror_state.manager.max_per_ip_rps().await;
         let any_private = mirror_state.manager.has_private_mirrors().await;
         let mirror_router = mirror::create_mirror_router(mirror_state, max_rps, any_private);
-        let mirror_listen_addr: SocketAddr = args.mirror_addr.parse()
-            .expect("Invalid mirror address");
+        let mirror_listen_addr: SocketAddr =
+            args.mirror_addr.parse().expect("Invalid mirror address");
         let mirror_listener = tokio::net::TcpListener::bind(mirror_listen_addr).await?;
         info!("Mirror HTTP listening on {}", mirror_listen_addr);
 
@@ -556,8 +638,10 @@ async fn main() -> anyhow::Result<()> {
                     args.mirror_addr.clone(),
                     args.tracker_interval,
                 );
-                info!("Tracker announce task starting ({} tracker(s), interval={}s)", 
-                    url_count, args.tracker_interval);
+                info!(
+                    "Tracker announce task starting ({} tracker(s), interval={}s)",
+                    url_count, args.tracker_interval
+                );
                 Some(tokio::spawn(async move {
                     announcer.run().await;
                 }))
@@ -592,13 +676,17 @@ async fn main() -> anyhow::Result<()> {
     let cache_dir_for_metrics = cache_dir.clone();
     let db_for_metrics = db.clone();
     let metrics_handle = tokio::spawn(async move {
-        if let Err(e) = metrics::run_metrics_server(metrics_addr, db_for_metrics, cache_dir_for_metrics).await {
+        if let Err(e) =
+            metrics::run_metrics_server(metrics_addr, db_for_metrics, cache_dir_for_metrics).await
+        {
             error!("Metrics server error: {}", e);
         }
     });
 
     // Start admin dashboard API server
-    let dashboard_addr: SocketAddr = args.dashboard_addr.parse()
+    let dashboard_addr: SocketAddr = args
+        .dashboard_addr
+        .parse()
         .expect("Invalid dashboard address");
     // Parse dashboard config from the TOML config file
     let dashboard_config = {
@@ -608,18 +696,41 @@ async fn main() -> anyhow::Result<()> {
             dashboard: DashboardConfig,
         }
         match std::fs::read_to_string(&args.config) {
-            Ok(content) => {
-                match toml::from_str::<ConfigWrapper>(&content) {
-                    Ok(wrapped) => wrapped.dashboard,
-                    Err(_) => DashboardConfig::default(),
-                }
-            }
+            Ok(content) => match toml::from_str::<ConfigWrapper>(&content) {
+                Ok(wrapped) => wrapped.dashboard,
+                Err(_) => DashboardConfig::default(),
+            },
             Err(_) => DashboardConfig::default(),
         }
     };
-    info!("Dashboard enabled: {}, credentials configured: {}",
+    info!(
+        "Dashboard enabled: {}, credentials configured: {}",
         dashboard_config.enabled,
-        dashboard_config.username.is_some() && dashboard_config.password_hash.is_some());
+        dashboard_config.username.is_some() && dashboard_config.password_hash.is_some()
+    );
+
+    // Read WebSocket tunnel URL from [grpc] section (optional)
+    let ws_url = match std::fs::read_to_string(&args.config) {
+        Ok(content) => {
+            #[derive(serde::Deserialize)]
+            struct GrpcWrapper {
+                #[serde(default)]
+                grpc: GrpcWsWrapper,
+            }
+            #[derive(serde::Deserialize, Default)]
+            struct GrpcWsWrapper {
+                #[serde(default)]
+                ws_url: Option<String>,
+            }
+            toml::from_str::<GrpcWrapper>(&content)
+                .ok()
+                .and_then(|w| w.grpc.ws_url)
+        }
+        Err(_) => None,
+    };
+    if let Some(ref url) = ws_url {
+        info!("WebSocket tunnel URL from config: {}", url);
+    }
 
     let admin_state = AdminState {
         db: db.clone(),
@@ -631,6 +742,7 @@ async fn main() -> anyhow::Result<()> {
         dashboard_config: Arc::new(dashboard_config),
         tailscale: Arc::new(monopsony_admin::auth::TailscaleDetector::new()),
         grpc_addr: args.grpc_addr.clone(),
+        ws_url,
         pairing_manager: Arc::new(tokio::sync::Mutex::new(None)),
         pairing_task: Arc::new(tokio::sync::Mutex::new(None)),
     };
@@ -671,7 +783,9 @@ async fn main() -> anyhow::Result<()> {
     // Drain order: mirror → announce → prefetch → purge → proxy → metrics
     if let Some(h) = mirror_handle {
         let r = tokio::time::timeout(drain_timeout, h).await;
-        if r.is_err() { warn!("Mirror drain timed out"); }
+        if r.is_err() {
+            warn!("Mirror drain timed out");
+        }
     }
     if let Some(h) = announce_handle {
         // Announce is fire-and-forget; abort on shutdown
@@ -680,12 +794,16 @@ async fn main() -> anyhow::Result<()> {
     let remaining = drain_timeout.saturating_sub(drain_start.elapsed());
     if let Some(h) = prefetch_handle {
         let r = tokio::time::timeout(remaining, h).await;
-        if r.is_err() { warn!("Prefetch drain timed out"); }
+        if r.is_err() {
+            warn!("Prefetch drain timed out");
+        }
     }
     let remaining = drain_timeout.saturating_sub(drain_start.elapsed());
     if let Some(h) = purge_handle {
         let r = tokio::time::timeout(remaining, h).await;
-        if r.is_err() { warn!("Purge drain timed out"); }
+        if r.is_err() {
+            warn!("Purge drain timed out");
+        }
     }
     let remaining = drain_timeout.saturating_sub(drain_start.elapsed());
     let _ = tokio::time::timeout(remaining, proxy_handle).await;
@@ -708,12 +826,16 @@ async fn handle_pair_via_admin_api(
     admin_user: Option<&str>,
     admin_pass: Option<&str>,
 ) -> anyhow::Result<()> {
-    info!("Initiating pairing via admin API on {}:{}", server, admin_port);
+    info!(
+        "Initiating pairing via admin API on {}:{}",
+        server, admin_port
+    );
 
     let client = reqwest::Client::new();
     let url = format!("http://{}:{}/api/v1/pair/init", server, admin_port);
 
-    let mut req = client.post(&url)
+    let mut req = client
+        .post(&url)
         .header("Content-Type", "application/json")
         .body("{}");
 
@@ -721,7 +843,9 @@ async fn handle_pair_via_admin_api(
         req = req.basic_auth(user, Some(pass));
     }
 
-    let resp = req.send().await
+    let resp = req
+        .send()
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to reach admin API at {}: {}", url, e))?;
 
     let status = resp.status();
@@ -731,14 +855,18 @@ async fn handle_pair_via_admin_api(
         // A session is already active — extract the existing code
         let parsed: serde_json::Value = serde_json::from_str(&body)
             .map_err(|e| anyhow::anyhow!("Failed to parse conflict response: {}", e))?;
-        let code = parsed.get("code")
+        let code = parsed
+            .get("code")
             .and_then(|v| v.as_str())
             .unwrap_or("UNKNOWN");
         println!("A pairing session is already active!");
         println!("Code: {}", code);
         println!();
         println!("Client command:");
-        println!("  monopsony-client pair --server {}:50052 --code {}", server, code);
+        println!(
+            "  monopsony-client pair --server {}:50052 --code {}",
+            server, code
+        );
         return Ok(());
     }
 
@@ -749,11 +877,13 @@ async fn handle_pair_via_admin_api(
     let parsed: serde_json::Value = serde_json::from_str(&body)
         .map_err(|e| anyhow::anyhow!("Failed to parse pairing response: {}", e))?;
 
-    let code = parsed.get("code")
+    let code = parsed
+        .get("code")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("Missing code in pairing response"))?;
 
-    let cli_command = parsed.get("cli_command")
+    let cli_command = parsed
+        .get("cli_command")
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
@@ -767,7 +897,10 @@ async fn handle_pair_via_admin_api(
     println!("On the client machine, run:");
     println!("  {}", cli_command.replace("<SERVER_IP>", server));
     println!();
-    println!("Or pair from the dashboard at http://{}:{}/dashboard", server, admin_port);
+    println!(
+        "Or pair from the dashboard at http://{}:{}/dashboard",
+        server, admin_port
+    );
 
     Ok(())
 }
@@ -798,24 +931,29 @@ async fn handle_api_key_command(action: &ApiKeyCommands, database_url: &str) -> 
                 println!("No API keys found.");
                 return Ok(());
             }
-            println!("{:<40} {:<20} {:<20} {:<20}",
-                "KEY ID", "LABEL", "CREATED", "LAST USED");
+            println!(
+                "{:<40} {:<20} {:<20} {:<20}",
+                "KEY ID", "LABEL", "CREATED", "LAST USED"
+            );
             println!("{}", "-".repeat(100));
             for k in keys {
-                let last_used = k.last_used
+                let last_used = k
+                    .last_used
                     .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_else(|| "never".to_string());
-                println!("{:<40} {:<20} {:<20} {:<20}",
+                println!(
+                    "{:<40} {:<20} {:<20} {:<20}",
                     k.id.0,
                     k.label,
                     k.created_at.format("%Y-%m-%d %H:%M"),
-                    last_used);
+                    last_used
+                );
             }
         }
         ApiKeyCommands::Revoke { key_id } => {
             let key_id = monopsony_common::ApiKeyId(
                 uuid::Uuid::parse_str(key_id)
-                    .map_err(|e| anyhow::anyhow!("Invalid key ID: {}", e))?
+                    .map_err(|e| anyhow::anyhow!("Invalid key ID: {}", e))?,
             );
             let revoked = db.revoke_api_key(&key_id).await?;
             if revoked {
@@ -837,7 +975,11 @@ async fn handle_cache_stats_command(cache_dir: &str) -> anyhow::Result<()> {
     println!("=========================");
     println!("Cache directory: {}", stats.cache_dir);
     println!("Total entries:   {}", stats.total_entries);
-    println!("Total size:      {} ({:.2} MB)", stats.total_size_bytes, stats.total_size_bytes as f64 / (1024.0 * 1024.0));
+    println!(
+        "Total size:      {} ({:.2} MB)",
+        stats.total_size_bytes,
+        stats.total_size_bytes as f64 / (1024.0 * 1024.0)
+    );
     println!("Meta files:      {}", stats.total_meta_files);
     println!();
 
@@ -846,10 +988,12 @@ async fn handle_cache_stats_command(cache_dir: &str) -> anyhow::Result<()> {
         println!("  {:<20} {:>10} {:>15}", "Backend", "Entries", "Size");
         println!("  {}", "-".repeat(48));
         for bs in &stats.by_backend {
-            println!("  {:<20} {:>10} {:>14.2} MB",
+            println!(
+                "  {:<20} {:>10} {:>14.2} MB",
                 bs.backend,
                 bs.entry_count,
-                bs.total_size_bytes as f64 / (1024.0 * 1024.0));
+                bs.total_size_bytes as f64 / (1024.0 * 1024.0)
+            );
         }
         println!();
     }

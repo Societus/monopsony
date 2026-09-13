@@ -2,7 +2,9 @@
 //!
 //! These tests verify the URL filtering logic without requiring a running server.
 
-use monopsony_common::package_manager::{get_available_backends, matches_package_url, PackageManagerBackend};
+use monopsony_common::package_manager::{
+    get_available_backends, matches_package_url, PackageManagerBackend,
+};
 
 #[test]
 fn test_available_backends_filtering() {

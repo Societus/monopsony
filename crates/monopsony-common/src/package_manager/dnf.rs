@@ -1,6 +1,6 @@
 //! DNF package manager backend implementation
 
-use crate::{PackageRef, PackageManagerBackend, PackageManagerKind, ProxyConfigAction, UrlPattern};
+use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 use std::path::PathBuf;
 
@@ -36,7 +36,11 @@ impl PackageManagerBackend for DnfBackend {
 
         let output = if use_rpm {
             tokio::process::Command::new("rpm")
-                .args(["-qa", "--queryformat", "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n"])
+                .args([
+                    "-qa",
+                    "--queryformat",
+                    "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\n",
+                ])
                 .output()
                 .await
                 .map_err(|_| crate::Error::CommandFailed {
@@ -55,7 +59,11 @@ impl PackageManagerBackend for DnfBackend {
         };
 
         if !output.status.success() {
-            let cmd = if use_rpm { "rpm -qa" } else { "dnf list installed" };
+            let cmd = if use_rpm {
+                "rpm -qa"
+            } else {
+                "dnf list installed"
+            };
             return Err(crate::Error::CommandFailed {
                 command: cmd.to_string(),
                 exit_code: output.status.code(),
@@ -78,14 +86,17 @@ impl PackageManagerBackend for DnfBackend {
                         version: Some(parts[1].to_string()),
                         architecture: Some(parts[2].to_string()),
                         manager: PackageManagerKind::Dnf,
-                    installed_at: 0,
+                        installed_at: 0,
                     });
                 }
             }
         } else {
             for line in stdout.lines() {
                 let line = line.trim();
-                if line.is_empty() || line.starts_with("Installed") || line.starts_with("Last metadata") {
+                if line.is_empty()
+                    || line.starts_with("Installed")
+                    || line.starts_with("Last metadata")
+                {
                     continue;
                 }
                 let parts: Vec<&str> = line.split_whitespace().collect();
@@ -102,7 +113,7 @@ impl PackageManagerBackend for DnfBackend {
                         version: Some(version.to_string()),
                         architecture: arch,
                         manager: PackageManagerKind::Dnf,
-                    installed_at: 0,
+                        installed_at: 0,
                     });
                 }
             }

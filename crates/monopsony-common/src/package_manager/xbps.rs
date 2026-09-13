@@ -4,7 +4,7 @@
 //! It comes in glibc and musl variants. XBPS respects standard http_proxy /
 //! https_proxy environment variables, making proxy configuration straightforward.
 
-use crate::{PackageRef, PackageManagerBackend, PackageManagerKind, ProxyConfigAction, UrlPattern};
+use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 use std::path::PathBuf;
 
@@ -194,12 +194,12 @@ mod tests {
         assert!(patterns.iter().any(|p| p.matches(
             "https://repo-default.voidlinux.org/current/x86_64/bash-5.2.15_1.x86_64.xbps.sig"
         )));
-        assert!(patterns.iter().any(|p| p.matches(
-            "https://repo-default.voidlinux.org/current/x86_64/x86_64-repodata"
-        )));
-        assert!(!patterns.iter().any(|p| p.matches(
-            "https://archlinux.org/packages/x86_64/bash.tar.zst"
-        )));
+        assert!(patterns.iter().any(
+            |p| p.matches("https://repo-default.voidlinux.org/current/x86_64/x86_64-repodata")
+        ));
+        assert!(!patterns
+            .iter()
+            .any(|p| p.matches("https://archlinux.org/packages/x86_64/bash.tar.zst")));
     }
 
     #[test]

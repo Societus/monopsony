@@ -7,10 +7,10 @@ use ed25519_dalek::SigningKey;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
 
-use monopsony_db::Database;
 use crate::shadow_cache::ShadowCache;
 use crate::shadow_git_mirror::GitMirrorManager;
 use crate::shadow_source::{GithubReleaseSource, UpdateSource};
+use monopsony_db::Database;
 
 #[allow(dead_code)]
 pub struct ShadowPackageManager {

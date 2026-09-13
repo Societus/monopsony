@@ -1,6 +1,10 @@
 //! Shadow package management endpoints.
 
-use axum::{extract::{Path, State}, response::IntoResponse, Json};
+use axum::{
+    extract::{Path, State},
+    response::IntoResponse,
+    Json,
+};
 use serde::Deserialize;
 use sqlx::Row;
 
@@ -12,7 +16,7 @@ pub async fn handle_list_packages(State(state): State<AdminState>) -> impl IntoR
         let pool = db.pool();
         let rows = sqlx::query(
             "SELECT id, name, version, source_type, source_url \
-             FROM shadow_packages ORDER BY name"
+             FROM shadow_packages ORDER BY name",
         )
         .fetch_all(pool)
         .await;
@@ -55,21 +59,24 @@ pub async fn handle_register_package(
         let install_paths = serde_json::json!([]);
         let config_paths: Option<&serde_json::Value> = None;
 
-        match db.create_shadow_package(
-            &client_uuid,
-            &req.name,
-            "0.0.0",
-            "x86_64",
-            "linux",
-            None,
-            &req.source_type,
-            &req.source_url,
-            "",
-            &install_paths,
-            config_paths,
-            None,
-            None,
-        ).await {
+        match db
+            .create_shadow_package(
+                &client_uuid,
+                &req.name,
+                "0.0.0",
+                "x86_64",
+                "linux",
+                None,
+                &req.source_type,
+                &req.source_url,
+                "",
+                &install_paths,
+                config_paths,
+                None,
+                None,
+            )
+            .await
+        {
             Ok(_) => Json(serde_json::json!({"success": true})),
             Err(e) => Json(serde_json::json!({"success": false, "message": e.to_string()})),
         }
@@ -88,7 +95,9 @@ pub async fn handle_unregister_package(
             if let Some(ref db) = state.db {
                 match db.delete_shadow_package(&uuid).await {
                     Ok(true) => Json(serde_json::json!({"success": true})),
-                    Ok(false) => Json(serde_json::json!({"success": false, "message": "Not found"})),
+                    Ok(false) => {
+                        Json(serde_json::json!({"success": false, "message": "Not found"}))
+                    }
                     Err(e) => Json(serde_json::json!({"success": false, "message": e.to_string()})),
                 }
             } else {
@@ -100,12 +109,18 @@ pub async fn handle_unregister_package(
 }
 
 /// GET /api/v1/shadow/packages/:id/recipe — get recipe for a package.
-pub async fn handle_get_recipe(State(_state): State<AdminState>, Path(id): Path<String>) -> impl IntoResponse {
+pub async fn handle_get_recipe(
+    State(_state): State<AdminState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
     Json(serde_json::json!({"id": id, "recipe": null}))
 }
 
 /// POST /api/v1/shadow/packages/:id/check — check for updates.
-pub async fn handle_check_updates(State(state): State<AdminState>, Path(_id): Path<String>) -> impl IntoResponse {
+pub async fn handle_check_updates(
+    State(state): State<AdminState>,
+    Path(_id): Path<String>,
+) -> impl IntoResponse {
     if state.shadow_manager.is_some() {
         Json(serde_json::json!({"success": true, "message": "Update check queued"}))
     } else {

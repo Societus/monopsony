@@ -3,12 +3,12 @@
 //! Uses the same infrastructure as third-party shadow packages to update
 //! monopsony itself from GitHub releases.
 
-use std::path::PathBuf;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{info, warn, debug};
+use std::path::PathBuf;
+use tracing::{debug, info, warn};
 
 // ─── Managed Update Pipeline Types ─────────────────────────────────
 
@@ -58,14 +58,18 @@ impl UpdateContext {
         let config_paths = recipe
             .as_ref()
             .and_then(|r| r.install.config_paths.as_ref())
-            .map(|paths| {
-                paths.iter().map(PathBuf::from).collect::<Vec<_>>()
-            })
+            .map(|paths| paths.iter().map(PathBuf::from).collect::<Vec<_>>())
             .unwrap_or_default();
 
         Self {
-            recipe, current_path, install_dir, backup_dir,
-            from_version, to_version, asset_url, config_paths,
+            recipe,
+            current_path,
+            install_dir,
+            backup_dir,
+            from_version,
+            to_version,
+            asset_url,
+            config_paths,
             config_snapshots: Vec::new(),
         }
     }
@@ -76,8 +80,7 @@ impl UpdateContext {
 
         if self.current_path.exists() {
             let bin_backup = self.backup_dir.join("binary.bak");
-            std::fs::copy(&self.current_path, &bin_backup)
-                .context("Failed to backup binary")?;
+            std::fs::copy(&self.current_path, &bin_backup).context("Failed to backup binary")?;
             info!("Binary backed up to {}", bin_backup.display());
         }
 
@@ -99,8 +102,11 @@ impl UpdateContext {
             }
         }
 
-        info!("Snapshot created at {} ({} config files)",
-              self.backup_dir.display(), self.config_snapshots.len());
+        info!(
+            "Snapshot created at {} ({} config files)",
+            self.backup_dir.display(),
+            self.config_snapshots.len()
+        );
         Ok(())
     }
 
@@ -128,7 +134,11 @@ impl UpdateContext {
             if snapshot.existed {
                 match std::fs::write(&snapshot.path, &snapshot.original_content) {
                     Ok(()) => info!("Config {} restored", snapshot.path.display()),
-                    Err(e) => warn!("Failed to restore config {}: {}", snapshot.path.display(), e),
+                    Err(e) => warn!(
+                        "Failed to restore config {}: {}",
+                        snapshot.path.display(),
+                        e
+                    ),
                 }
             }
         }
@@ -140,12 +150,18 @@ impl UpdateContext {
     /// Attempt to restore operator config edits after a successful update.
     fn restore_config_edits(&self) -> Result<()> {
         for snapshot in &self.config_snapshots {
-            if !snapshot.existed { continue; }
+            if !snapshot.existed {
+                continue;
+            }
             let current = std::fs::read(&snapshot.path).unwrap_or_default();
-            if current == snapshot.original_content { continue; }
+            if current == snapshot.original_content {
+                continue;
+            }
 
-            warn!("Config {} was modified during update. Restoring operator's version.",
-                  snapshot.path.display());
+            warn!(
+                "Config {} was modified during update. Restoring operator's version.",
+                snapshot.path.display()
+            );
             std::fs::write(&snapshot.path, &snapshot.original_content)?;
         }
         Ok(())
@@ -153,16 +169,25 @@ impl UpdateContext {
 
     /// Prune old backup directories, keeping only max_backups most recent.
     pub fn prune_backups(&self) -> Result<()> {
-        let max = self.recipe.as_ref().map(|r| r.install.max_backups).unwrap_or(3);
+        let max = self
+            .recipe
+            .as_ref()
+            .map(|r| r.install.max_backups)
+            .unwrap_or(3);
 
         let mut backups: Vec<_> = std::fs::read_dir(&self.install_dir)?
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.file_name().to_str().map(|n| n.starts_with("update-backup-")).unwrap_or(false)
+                e.file_name()
+                    .to_str()
+                    .map(|n| n.starts_with("update-backup-"))
+                    .unwrap_or(false)
             })
             .collect();
 
-        if backups.len() <= max { return Ok(()); }
+        if backups.len() <= max {
+            return Ok(());
+        }
 
         backups.sort_by(|a, b| {
             let a_t = a.metadata().and_then(|m| m.modified()).ok();
@@ -184,41 +209,52 @@ fn run_hook(hook_name: &str, command: &str) -> Result<()> {
 
     #[cfg(unix)]
     let result = std::process::Command::new("sh")
-        .arg("-c").arg(command).output();
+        .arg("-c")
+        .arg(command)
+        .output();
 
     #[cfg(windows)]
     let result = std::process::Command::new("cmd")
-        .arg("/C").arg(command).output();
+        .arg("/C")
+        .arg(command)
+        .output();
 
     match result {
         Ok(output) if output.status.success() => {
             if !output.stdout.is_empty() {
-                debug!("{} stdout: {}", hook_name,
-                       String::from_utf8_lossy(&output.stdout).trim());
+                debug!(
+                    "{} stdout: {}",
+                    hook_name,
+                    String::from_utf8_lossy(&output.stdout).trim()
+                );
             }
             Ok(())
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("{} hook failed (exit {}): {}",
-                          hook_name, output.status, stderr.trim());
+            anyhow::bail!(
+                "{} hook failed (exit {}): {}",
+                hook_name,
+                output.status,
+                stderr.trim()
+            );
         }
         Err(e) => anyhow::bail!("Failed to execute {} hook: {}", hook_name, e),
     }
 }
 
 /// Run a health check with timeout polling.
-async fn run_health_check(
-    check: &monopsony_common::shadow_types::HealthCheck,
-) -> Result<()> {
-    use std::time::{Duration, Instant};
+async fn run_health_check(check: &monopsony_common::shadow_types::HealthCheck) -> Result<()> {
     use monopsony_common::shadow_types::HealthCheckType;
+    use std::time::{Duration, Instant};
 
     let timeout = Duration::from_secs(check.timeout_secs);
 
     match check.check_type {
         HealthCheckType::Http => {
-            let url = check.url.as_deref()
+            let url = check
+                .url
+                .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("HTTP health check requires url"))?;
             let client = reqwest::Client::new();
             let start = Instant::now();
@@ -235,7 +271,8 @@ async fn run_health_check(
             }
         }
         HealthCheckType::Port => {
-            let port = check.port
+            let port = check
+                .port
                 .ok_or_else(|| anyhow::anyhow!("Port health check requires port"))?;
             let start = Instant::now();
             loop {
@@ -249,15 +286,25 @@ async fn run_health_check(
             }
         }
         HealthCheckType::Process => {
-            let process = check.process.as_deref()
+            let process = check
+                .process
+                .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("Process health check requires process name"))?;
             let start = Instant::now();
             loop {
                 let output = std::process::Command::new("pgrep")
-                    .arg("-x").arg(process).output()?;
-                if output.status.success() { return Ok(()); }
+                    .arg("-x")
+                    .arg(process)
+                    .output()?;
+                if output.status.success() {
+                    return Ok(());
+                }
                 if start.elapsed() >= timeout {
-                    anyhow::bail!("Process '{}' not running after {}s", process, timeout.as_secs());
+                    anyhow::bail!(
+                        "Process '{}' not running after {}s",
+                        process,
+                        timeout.as_secs()
+                    );
                 }
                 std::thread::sleep(Duration::from_secs(2));
             }
@@ -269,13 +316,11 @@ async fn run_health_check(
 /// Honors recipe fields: pre_update, post_update, on_failure, health_check,
 /// backup_old, config_paths, max_backups.
 pub async fn apply_update_managed(ctx: &mut UpdateContext) -> Result<UpdateOutcome> {
-
     // PHASE 1: PRE-UPDATE
 
     if let Some(ref recipe) = ctx.recipe {
         if let Some(ref pre) = recipe.install.pre_update {
-            run_hook("pre_update", pre)
-                .context("pre_update hook failed — aborting update")?;
+            run_hook("pre_update", pre).context("pre_update hook failed — aborting update")?;
         }
     }
 
@@ -287,20 +332,24 @@ pub async fn apply_update_managed(ctx: &mut UpdateContext) -> Result<UpdateOutco
     info!("Downloading {}...", ctx.asset_url);
     let response = client.get(&ctx.asset_url).send().await?;
     if !response.status().is_success() {
-        anyhow::bail!("Download failed: status {} for {}", response.status(), ctx.asset_url);
+        anyhow::bail!(
+            "Download failed: status {} for {}",
+            response.status(),
+            ctx.asset_url
+        );
     }
     let bytes = response.bytes().await?;
 
     // Extract binary from archive if needed
     let new_path = ctx.install_dir.join(format!(
-        "monopsony-server.new.{}", Utc::now().format("%Y%m%d_%H%M%S")
+        "monopsony-server.new.{}",
+        Utc::now().format("%Y%m%d_%H%M%S")
     ));
 
     if ctx.asset_url.ends_with(".tar.gz") || ctx.asset_url.ends_with(".zip") {
         extract_binary_from_archive(&bytes, &new_path, &ctx.asset_url)?;
     } else {
-        std::fs::write(&new_path, &bytes)
-            .context("Failed to write new binary")?;
+        std::fs::write(&new_path, &bytes).context("Failed to write new binary")?;
     }
 
     #[cfg(unix)]
@@ -355,7 +404,10 @@ pub async fn apply_update_managed(ctx: &mut UpdateContext) -> Result<UpdateOutco
     ctx.restore_config_edits()?;
     ctx.prune_backups()?;
 
-    info!("Update committed successfully: {} → {}", ctx.from_version, ctx.to_version);
+    info!(
+        "Update committed successfully: {} → {}",
+        ctx.from_version, ctx.to_version
+    );
     Ok(UpdateOutcome::Success)
 }
 
@@ -459,18 +511,24 @@ pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckResult
     let current = parse_version(current_version)
         .ok_or_else(|| anyhow::anyhow!("Failed to parse current version: {}", current_version))?;
 
-    let latest = parse_version(&release.tag_name)
-        .ok_or_else(|| anyhow::anyhow!("Failed to parse latest release tag: {}", release.tag_name))?;
+    let latest = parse_version(&release.tag_name).ok_or_else(|| {
+        anyhow::anyhow!("Failed to parse latest release tag: {}", release.tag_name)
+    })?;
 
     match compare_versions(current, latest) {
         std::cmp::Ordering::Less => {
-            info!("Update available: {} -> {}", current_version, release.tag_name);
+            info!(
+                "Update available: {} -> {}",
+                current_version, release.tag_name
+            );
             let (os, arch, libc) = detect_platform();
             let asset_names: Vec<String> = release.assets.iter().map(|a| a.name.clone()).collect();
 
             let asset_url = select_asset_for_platform(&asset_names, &os, &arch, libc.as_deref())
                 .and_then(|name| {
-                    release.assets.iter()
+                    release
+                        .assets
+                        .iter()
                         .find(|a| a.name == name)
                         .map(|a| a.browser_download_url.clone())
                 });
@@ -492,8 +550,10 @@ pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckResult
             })
         }
         std::cmp::Ordering::Greater => {
-            warn!("Current version ({}) is newer than GitHub release ({}). Ignoring.",
-                  current_version, release.tag_name);
+            warn!(
+                "Current version ({}) is newer than GitHub release ({}). Ignoring.",
+                current_version, release.tag_name
+            );
             Ok(UpdateCheckResult {
                 current_version: current_version.to_string(),
                 latest_version: None,
@@ -527,7 +587,10 @@ fn select_asset_for_platform(
         format!("monopsony-{}-unknown-freebsd\\.tar\\.gz$", target_arch)
     } else {
         let libc_str = target_libc.unwrap_or("gnu");
-        format!("monopsony-{}-unknown-linux-{}\\.tar\\.gz$", target_arch, libc_str)
+        format!(
+            "monopsony-{}-unknown-linux-{}\\.tar\\.gz$",
+            target_arch, libc_str
+        )
     };
 
     for name in asset_names {
@@ -561,7 +624,11 @@ pub async fn apply_update(
     info!("Downloading {}...", asset_url);
     let response = client.get(asset_url).send().await?;
     if !response.status().is_success() {
-        anyhow::bail!("Download failed: status {} for {}", response.status(), asset_url);
+        anyhow::bail!(
+            "Download failed: status {} for {}",
+            response.status(),
+            asset_url
+        );
     }
 
     let bytes = response.bytes().await?;
@@ -569,24 +636,28 @@ pub async fn apply_update(
     // Backup current binary
     info!("Backing up current version...");
     let backup_path = target_dir.join(format!(
-        "monopsony-server.bak.{}", Utc::now().format("%Y%m%d_%H%M%S")
+        "monopsony-server.bak.{}",
+        Utc::now().format("%Y%m%d_%H%M%S")
     ));
     if current_path.exists() {
-        std::fs::copy(current_path, &backup_path)
-            .context("Failed to backup current binary")?;
-        info!("Backed up {} -> {}", current_path.display(), backup_path.display());
+        std::fs::copy(current_path, &backup_path).context("Failed to backup current binary")?;
+        info!(
+            "Backed up {} -> {}",
+            current_path.display(),
+            backup_path.display()
+        );
     }
 
     // Write new binary atomically
     let temp_path = target_dir.join(format!(
-        "monopsony-server.new.{}", Utc::now().format("%Y%m%d_%H%M%S")
+        "monopsony-server.new.{}",
+        Utc::now().format("%Y%m%d_%H%M%S")
     ));
 
     if asset_url.ends_with(".tar.gz") || asset_url.ends_with(".zip") {
         extract_binary_from_archive(&bytes, &temp_path, asset_url)?;
     } else {
-        std::fs::write(&temp_path, &bytes)
-            .context("Failed to write new binary")?;
+        std::fs::write(&temp_path, &bytes).context("Failed to write new binary")?;
     }
 
     #[cfg(unix)]
@@ -601,16 +672,14 @@ pub async fn apply_update(
     info!("Swapping binary...");
     #[cfg(unix)]
     {
-        std::fs::rename(&temp_path, current_path)
-            .context("Failed to atomically swap binary")?;
+        std::fs::rename(&temp_path, current_path).context("Failed to atomically swap binary")?;
     }
     #[cfg(windows)]
     {
         if current_path.exists() {
             std::fs::remove_file(current_path)?;
         }
-        std::fs::rename(&temp_path, current_path)
-            .context("Failed to atomically swap binary")?;
+        std::fs::rename(&temp_path, current_path).context("Failed to atomically swap binary")?;
     }
 
     info!("Update applied successfully: {}", version);
@@ -673,9 +742,18 @@ mod tests {
 
     #[test]
     fn test_compare_versions() {
-        assert_eq!(compare_versions((1, 0, 0), (2, 0, 0)), std::cmp::Ordering::Less);
-        assert_eq!(compare_versions((1, 0, 0), (1, 0, 0)), std::cmp::Ordering::Equal);
-        assert_eq!(compare_versions((2, 0, 0), (1, 0, 0)), std::cmp::Ordering::Greater);
+        assert_eq!(
+            compare_versions((1, 0, 0), (2, 0, 0)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            compare_versions((1, 0, 0), (1, 0, 0)),
+            std::cmp::Ordering::Equal
+        );
+        assert_eq!(
+            compare_versions((2, 0, 0), (1, 0, 0)),
+            std::cmp::Ordering::Greater
+        );
     }
 
     #[test]
@@ -702,8 +780,10 @@ mod tests {
             Ok(check) => {
                 if let Some(latest) = check.latest_version {
                     if let Some((major, minor, patch)) = parse_version(&latest) {
-                        assert!(major > 0 || minor > 0 || patch > 0,
-                                "Latest version should be newer than 0.0.1");
+                        assert!(
+                            major > 0 || minor > 0 || patch > 0,
+                            "Latest version should be newer than 0.0.1"
+                        );
                     }
                 }
             }
@@ -773,11 +853,17 @@ mod tests {
 
         // Simulate update modifying config
         std::fs::write(&config_path, b"new = true\n").unwrap();
-        assert_ne!(std::fs::read(&config_path).unwrap(), snapshot.original_content);
+        assert_ne!(
+            std::fs::read(&config_path).unwrap(),
+            snapshot.original_content
+        );
 
         // Restore
         std::fs::write(&config_path, &snapshot.original_content).unwrap();
-        assert_eq!(std::fs::read(&config_path).unwrap(), snapshot.original_content);
+        assert_eq!(
+            std::fs::read(&config_path).unwrap(),
+            snapshot.original_content
+        );
     }
 
     #[test]
@@ -809,9 +895,15 @@ mod tests {
         // max_backups defaults to 3 when recipe is None
         ctx.prune_backups().unwrap();
 
-        let remaining: Vec<_> = std::fs::read_dir(install_dir).unwrap()
+        let remaining: Vec<_> = std::fs::read_dir(install_dir)
+            .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_str().unwrap_or("").starts_with("update-backup-"))
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .unwrap_or("")
+                    .starts_with("update-backup-")
+            })
             .collect();
         assert_eq!(remaining.len(), 3, "Should keep only 3 backups");
     }
@@ -845,7 +937,9 @@ mod tests {
         assert!(recipe.install.on_failure.is_some());
 
         // Health check
-        let hc = recipe.install.health_check
+        let hc = recipe
+            .install
+            .health_check
             .expect("recipe must have health_check");
         assert_eq!(
             hc.check_type,
@@ -871,15 +965,15 @@ mod tests {
         let mut tar_buf = Vec::new();
         {
             let mut tar_builder = tar::Builder::new(&mut tar_buf);
-            tar_builder.append_dir_all("monopsony-2.0.0", &staged_dir).unwrap();
+            tar_builder
+                .append_dir_all("monopsony-2.0.0", &staged_dir)
+                .unwrap();
             tar_builder.finish().unwrap();
         }
         let mut gz_buf = Vec::new();
         {
-            let mut encoder = flate2::write::GzEncoder::new(
-                &mut gz_buf,
-                flate2::Compression::default(),
-            );
+            let mut encoder =
+                flate2::write::GzEncoder::new(&mut gz_buf, flate2::Compression::default());
             std::io::Write::write_all(&mut encoder, &tar_buf).unwrap();
             encoder.finish().unwrap();
         }
@@ -936,10 +1030,8 @@ mod tests {
         }
         let mut gz_buf = Vec::new();
         {
-            let mut encoder = flate2::write::GzEncoder::new(
-                &mut gz_buf,
-                flate2::Compression::default(),
-            );
+            let mut encoder =
+                flate2::write::GzEncoder::new(&mut gz_buf, flate2::Compression::default());
             std::io::Write::write_all(&mut encoder, &tar_buf).unwrap();
             encoder.finish().unwrap();
         }
@@ -977,7 +1069,10 @@ mod tests {
         };
 
         let result = run_health_check(&check).await;
-        assert!(result.is_ok(), "port health check should succeed on open port");
+        assert!(
+            result.is_ok(),
+            "port health check should succeed on open port"
+        );
     }
 
     /// Health check: port timeout — nothing listening, should fail quickly.
@@ -1071,10 +1166,7 @@ mod tests {
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = std::fs::metadata(&bin_path).unwrap().permissions().mode();
-            assert!(
-                perms & 0o111 != 0,
-                "restored binary should be executable"
-            );
+            assert!(perms & 0o111 != 0, "restored binary should be executable");
         }
     }
 
@@ -1178,11 +1270,21 @@ detect_pattern = "(\\d+\\.\\d+\\.\\d+)"
 
         ctx.prune_backups().unwrap();
 
-        let remaining: Vec<_> = std::fs::read_dir(temp.path()).unwrap()
+        let remaining: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_str().unwrap_or("").starts_with("update-backup-"))
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .unwrap_or("")
+                    .starts_with("update-backup-")
+            })
             .collect();
-        assert_eq!(remaining.len(), 5, "should keep 5 backups per recipe max_backups");
+        assert_eq!(
+            remaining.len(),
+            5,
+            "should keep 5 backups per recipe max_backups"
+        );
     }
 
     /// Verify hook execution captures stderr from failing commands.
@@ -1247,19 +1349,12 @@ detect_pattern = "(\\d+\\.\\d+\\.\\d+)"
         );
 
         // Windows
-        let windows_assets = vec![
-            "monopsony-x86_64-pc-windows-gnu.zip".to_string(),
-        ];
+        let windows_assets = vec!["monopsony-x86_64-pc-windows-gnu.zip".to_string()];
         let sel = select_asset_for_platform(&windows_assets, "windows", "x86_64", None);
-        assert_eq!(
-            sel.as_deref(),
-            Some("monopsony-x86_64-pc-windows-gnu.zip")
-        );
+        assert_eq!(sel.as_deref(), Some("monopsony-x86_64-pc-windows-gnu.zip"));
 
         // FreeBSD
-        let bsd_assets = vec![
-            "monopsony-x86_64-unknown-freebsd.tar.gz".to_string(),
-        ];
+        let bsd_assets = vec!["monopsony-x86_64-unknown-freebsd.tar.gz".to_string()];
         let sel = select_asset_for_platform(&bsd_assets, "freebsd", "x86_64", None);
         assert_eq!(
             sel.as_deref(),
@@ -1270,9 +1365,7 @@ detect_pattern = "(\\d+\\.\\d+\\.\\d+)"
     /// Asset selection: no match returns None.
     #[test]
     fn test_asset_selection_no_match() {
-        let assets = vec![
-            "monopsony-armv7-unknown-linux-gnu.tar.gz".to_string(),
-        ];
+        let assets = vec!["monopsony-armv7-unknown-linux-gnu.tar.gz".to_string()];
         let sel = select_asset_for_platform(&assets, "linux", "x86_64", Some("glibc"));
         assert!(sel.is_none(), "should not find a match for wrong arch");
     }
@@ -1296,10 +1389,8 @@ config_paths = ["/etc/app/config.toml", "/etc/app/other.toml"]
 detect_command = "echo 1.0.0"
 detect_pattern = "(\\d+\\.\\d+\\.\\d+)"
 "#;
-        let recipe = toml::from_str::<
-            monopsony_common::shadow_types::ShadowRecipe,
-        >(recipe_toml)
-        .unwrap();
+        let recipe =
+            toml::from_str::<monopsony_common::shadow_types::ShadowRecipe>(recipe_toml).unwrap();
 
         let ctx = UpdateContext::new(
             Some(recipe),
@@ -1311,8 +1402,14 @@ detect_pattern = "(\\d+\\.\\d+\\.\\d+)"
         );
 
         assert_eq!(ctx.config_paths.len(), 2);
-        assert_eq!(ctx.config_paths[0], std::path::PathBuf::from("/etc/app/config.toml"));
-        assert_eq!(ctx.config_paths[1], std::path::PathBuf::from("/etc/app/other.toml"));
+        assert_eq!(
+            ctx.config_paths[0],
+            std::path::PathBuf::from("/etc/app/config.toml")
+        );
+        assert_eq!(
+            ctx.config_paths[1],
+            std::path::PathBuf::from("/etc/app/other.toml")
+        );
 
         // backup_dir should be versioned
         assert!(
@@ -1358,10 +1455,8 @@ detect_pattern = "(\\d+\\.\\d+\\.\\d+)"
         );
 
         // Verify config was backed up
-        let config_backup_name = format!(
-            "{}.bak",
-            config_path.file_name().unwrap().to_string_lossy()
-        );
+        let config_backup_name =
+            format!("{}.bak", config_path.file_name().unwrap().to_string_lossy());
         assert!(
             ctx.backup_dir.join(&config_backup_name).exists(),
             "config backup should exist"

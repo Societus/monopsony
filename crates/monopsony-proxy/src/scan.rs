@@ -154,9 +154,7 @@ pub async fn run_scan(
 
     let blocked_reason = if status == ScanStatus::Infected && config.block_on_malware {
         match &clamav {
-            ClamAvResult::Infected { signature } => {
-                Some(format!("ClamAV: {}", signature))
-            }
+            ClamAvResult::Infected { signature } => Some(format!("ClamAV: {}", signature)),
             _ => {
                 if !yara.matches.is_empty() {
                     Some(format!(
@@ -326,7 +324,10 @@ mod tests {
             matches: vec![],
             error: None,
         };
-        assert_eq!(derive_status(&clamav, &entropy, &yara), ScanStatus::Infected);
+        assert_eq!(
+            derive_status(&clamav, &entropy, &yara),
+            ScanStatus::Infected
+        );
     }
 
     #[test]
@@ -345,7 +346,10 @@ mod tests {
             }],
             error: None,
         };
-        assert_eq!(derive_status(&clamav, &entropy, &yara), ScanStatus::Infected);
+        assert_eq!(
+            derive_status(&clamav, &entropy, &yara),
+            ScanStatus::Infected
+        );
     }
 
     #[test]

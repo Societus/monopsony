@@ -83,7 +83,9 @@ fn parse_github_repo(url: &str) -> Result<String, SourceError> {
 
     let parts: Vec<&str> = path.splitn(3, '/').collect();
     if parts.len() < 2 {
-        return Err(SourceError::Parse(format!("invalid GitHub repo path: {path}")));
+        return Err(SourceError::Parse(format!(
+            "invalid GitHub repo path: {path}"
+        )));
     }
     Ok(format!("{}/{}", parts[0], parts[1]))
 }
@@ -182,10 +184,7 @@ impl UpdateSource for GithubReleaseSource {
         let mut result = Vec::new();
         for asset in assets {
             result.push(ReleaseAsset {
-                name: asset["name"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
+                name: asset["name"].as_str().unwrap_or_default().to_string(),
                 url: asset["browser_download_url"]
                     .as_str()
                     .unwrap_or_default()
@@ -218,11 +217,7 @@ pub struct GitBuildSource {
 }
 
 impl GitBuildSource {
-    pub fn new(
-        mirror_path: PathBuf,
-        branch: Option<String>,
-        source_url: Option<String>,
-    ) -> Self {
+    pub fn new(mirror_path: PathBuf, branch: Option<String>, source_url: Option<String>) -> Self {
         Self {
             mirror_path,
             branch,
@@ -248,9 +243,7 @@ impl UpdateSource for GitBuildSource {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(SourceError::Http(format!(
-                "git tag list failed: {stderr}"
-            )));
+            return Err(SourceError::Http(format!("git tag list failed: {stderr}")));
         }
 
         let tags: Vec<String> = String::from_utf8_lossy(&output.stdout)
@@ -279,9 +272,7 @@ impl UpdateSource for GitBuildSource {
                 .map_err(|e| SourceError::Http(e.to_string()))?;
 
             if output.status.success() {
-                let hash = String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .to_string();
+                let hash = String::from_utf8_lossy(&output.stdout).trim().to_string();
                 if !hash.is_empty() {
                     return Ok(Some(hash));
                 }
@@ -315,14 +306,9 @@ impl UpdateSource for GitBuildSource {
 #[derive(Debug, Clone)]
 pub enum VersionDiscovery {
     /// Scrape an HTML page and extract version with regex
-    ScrapePage {
-        url: String,
-        pattern: String,
-    },
+    ScrapePage { url: String, pattern: String },
     /// Follow a known URL pattern with version embedded
-    UrlPattern {
-        asset_url_template: String,
-    },
+    UrlPattern { asset_url_template: String },
 }
 
 /// Source for direct_url packages (e.g., Tailscale pkgs.tailscale.com)
@@ -457,11 +443,7 @@ mod tests {
 
     #[test]
     fn changelog_url_format() {
-        let source = GithubReleaseSource::new(
-            "https://github.com/Sonarr/Sonarr",
-            None,
-        )
-        .unwrap();
+        let source = GithubReleaseSource::new("https://github.com/Sonarr/Sonarr", None).unwrap();
         assert_eq!(
             source.changelog_url("4.0.6", "4.0.7"),
             Some("https://github.com/Sonarr/Sonarr/compare/4.0.6...4.0.7".into())
@@ -496,7 +478,8 @@ mod tests {
         let source = DirectUrlSource::new(
             "https://pkgs.example.com/stable".into(),
             VersionDiscovery::UrlPattern {
-                asset_url_template: "https://pkgs.example.com/stable/tool_{version}_{arch}.tgz".into(),
+                asset_url_template: "https://pkgs.example.com/stable/tool_{version}_{arch}.tgz"
+                    .into(),
             },
         );
         assert!(source.is_ok());
@@ -507,7 +490,8 @@ mod tests {
         let source = DirectUrlSource::new(
             "https://pkgs.example.com/stable".into(),
             VersionDiscovery::UrlPattern {
-                asset_url_template: "https://pkgs.example.com/stable/tool_{version}_{arch}.tgz".into(),
+                asset_url_template: "https://pkgs.example.com/stable/tool_{version}_{arch}.tgz"
+                    .into(),
             },
         )
         .unwrap();
@@ -537,11 +521,7 @@ mod tests {
 
     #[test]
     fn git_build_no_changelog_without_source_url() {
-        let source = GitBuildSource::new(
-            PathBuf::from("/tmp/mirror"),
-            None,
-            None,
-        );
+        let source = GitBuildSource::new(PathBuf::from("/tmp/mirror"), None, None);
         assert_eq!(source.changelog_url("1.0", "2.0"), None);
     }
 }

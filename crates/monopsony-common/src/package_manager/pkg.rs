@@ -1,6 +1,6 @@
 //! FreeBSD pkg package manager backend implementation
 
-use crate::{PackageRef, PackageManagerBackend, PackageManagerKind, ProxyConfigAction, UrlPattern};
+use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 
 use super::bsd_privilege;
@@ -67,12 +67,8 @@ impl PackageManagerBackend for PkgBackend {
 
     fn upstream_url_patterns(&self) -> Vec<UrlPattern> {
         vec![
-            UrlPattern::new(
-                r"https?://[^/]*freebsd\.org/.*",
-                100,
-                "FreeBSD official",
-            )
-            .expect("valid regex"),
+            UrlPattern::new(r"https?://[^/]*freebsd\.org/.*", 100, "FreeBSD official")
+                .expect("valid regex"),
             UrlPattern::new(
                 r"https?://[^/]*pkg\.freebsd\.org/.*\.pkg",
                 95,

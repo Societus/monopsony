@@ -67,14 +67,10 @@ pub async fn handle_upsert_mirror(
             sync_enabled: req.sync_enabled.unwrap_or(true),
             sync_interval_secs: req.sync_interval_secs.unwrap_or(3600),
             bandwidth_limit_bps: req.bandwidth_limit_bps,
-            include_patterns: serde_json::to_value(
-                req.include_patterns.unwrap_or_default(),
-            )
-            .unwrap_or_default(),
-            exclude_patterns: serde_json::to_value(
-                req.exclude_patterns.unwrap_or_default(),
-            )
-            .unwrap_or_default(),
+            include_patterns: serde_json::to_value(req.include_patterns.unwrap_or_default())
+                .unwrap_or_default(),
+            exclude_patterns: serde_json::to_value(req.exclude_patterns.unwrap_or_default())
+                .unwrap_or_default(),
             public: req.public.unwrap_or(false),
         };
 
@@ -95,7 +91,9 @@ pub async fn handle_upsert_mirror(
     }
 }
 
-fn mirror_config_from_upsert(config: &monopsony_db::db::MirrorUpsertConfig) -> Option<monopsony_mirror::mirror::MirrorConfig> {
+fn mirror_config_from_upsert(
+    config: &monopsony_db::db::MirrorUpsertConfig,
+) -> Option<monopsony_mirror::mirror::MirrorConfig> {
     use monopsony_mirror::mirror::MirrorConfig;
     use std::path::PathBuf;
 
@@ -106,8 +104,10 @@ fn mirror_config_from_upsert(config: &monopsony_db::db::MirrorUpsertConfig) -> O
         sync_enabled: config.sync_enabled,
         sync_interval_secs: config.sync_interval_secs as u64,
         bandwidth_limit_bps: config.bandwidth_limit_bps.map(|v| v as u64),
-        include_patterns: serde_json::from_value(config.include_patterns.clone()).unwrap_or_default(),
-        exclude_patterns: serde_json::from_value(config.exclude_patterns.clone()).unwrap_or_default(),
+        include_patterns: serde_json::from_value(config.include_patterns.clone())
+            .unwrap_or_default(),
+        exclude_patterns: serde_json::from_value(config.exclude_patterns.clone())
+            .unwrap_or_default(),
         public: config.public,
         ..Default::default()
     })
@@ -144,14 +144,20 @@ pub async fn handle_trigger_sync(
 ) -> impl IntoResponse {
     let mgr = match &state.mirror_manager {
         Some(m) => m.clone(),
-        None => return Json(serde_json::json!({"success": false, "message": "Mirror manager not available"})),
+        None => {
+            return Json(
+                serde_json::json!({"success": false, "message": "Mirror manager not available"}),
+            )
+        }
     };
 
     // Verify the mirror exists before spawning
     match mgr.get_config(&distro).await {
         Some(config) => {
             if config.sync_status == "syncing" {
-                return Json(serde_json::json!({"success": false, "message": "Sync already in progress"}));
+                return Json(
+                    serde_json::json!({"success": false, "message": "Sync already in progress"}),
+                );
             }
 
             // Mark as syncing immediately so the UI reflects it
@@ -169,7 +175,9 @@ pub async fn handle_trigger_sync(
                     Err(e) => {
                         warn!("Background sync failed for {}: {}", distro_cloned, e);
                         if let Some(db) = db {
-                            let _ = db.update_mirror_sync_status(&distro_cloned, &format!("error: {}", e)).await;
+                            let _ = db
+                                .update_mirror_sync_status(&distro_cloned, &format!("error: {}", e))
+                                .await;
                         }
                     }
                 }
@@ -177,7 +185,9 @@ pub async fn handle_trigger_sync(
 
             Json(serde_json::json!({"success": true, "message": "Sync started in background"}))
         }
-        None => Json(serde_json::json!({"success": false, "message": format!("Mirror not found: {}", distro)})),
+        None => Json(
+            serde_json::json!({"success": false, "message": format!("Mirror not found: {}", distro)}),
+        ),
     }
 }
 
@@ -188,16 +198,14 @@ pub async fn handle_mirror_status(
 ) -> impl IntoResponse {
     if let Some(ref db) = state.db {
         match db.get_mirror_config(&distro).await {
-            Ok(Some(c)) => {
-                Json(serde_json::json!({
-                    "distro": c.distro,
-                    "sync_status": c.sync_status,
-                    "last_sync": c.last_sync,
-                    "total_bytes": c.total_bytes,
-                    "sync_enabled": c.sync_enabled,
-                    "sync_interval_secs": c.sync_interval_secs,
-                }))
-            }
+            Ok(Some(c)) => Json(serde_json::json!({
+                "distro": c.distro,
+                "sync_status": c.sync_status,
+                "last_sync": c.last_sync,
+                "total_bytes": c.total_bytes,
+                "sync_enabled": c.sync_enabled,
+                "sync_interval_secs": c.sync_interval_secs,
+            })),
             Ok(None) => Json(serde_json::json!({"error": "Mirror not found"})),
             Err(e) => Json(serde_json::json!({"error": e.to_string()})),
         }

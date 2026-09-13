@@ -80,6 +80,12 @@ pub struct HttpServerConfig {
 pub struct GrpcServerConfig {
     /// Bind address for gRPC control plane
     pub bind: String,
+    /// Optional WebSocket tunnel URL for clients behind Cloudflare Tunnels
+    /// or reverse proxies. When set, the server includes this URL in
+    /// PairResponse so paired clients know to connect via WSS instead of
+    /// direct TCP. Example: "wss://monopsony.example.com/ws/tunnel"
+    #[serde(default)]
+    pub ws_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +111,9 @@ pub struct TelemetryConfig {
 
 impl Default for TelemetryConfig {
     fn default() -> Self {
-        Self { install_tracking: true }
+        Self {
+            install_tracking: true,
+        }
     }
 }
 
@@ -152,7 +160,9 @@ impl Default for AccessControlConfig {
 
 /// Check if an IP is allowed by the access control config.
 pub fn is_ip_allowed(ip: std::net::IpAddr, config: &AccessControlConfig) -> bool {
-    if !config.enabled { return true; }
+    if !config.enabled {
+        return true;
+    }
     config.allowed_cidrs.iter().any(|cidr| ip_in_cidr(ip, cidr))
 }
 
@@ -163,27 +173,47 @@ pub fn ip_in_cidr(ip: std::net::IpAddr, cidr: &str) -> bool {
         None => (cidr, None),
     };
     if prefix_len.is_none() {
-        return network.parse::<std::net::IpAddr>().map_or(false, |addr| addr == ip);
+        return network
+            .parse::<std::net::IpAddr>()
+            .map_or(false, |addr| addr == ip);
     }
     let prefix_len = prefix_len.unwrap();
     match ip {
         std::net::IpAddr::V4(addr) => {
-            let net: std::net::Ipv4Addr = match network.parse() { Ok(n) => n, Err(_) => return false };
-            if prefix_len > 32 { return false; }
-            let mask = if prefix_len == 0 { 0u32 } else { !0u32 << (32 - prefix_len) };
+            let net: std::net::Ipv4Addr = match network.parse() {
+                Ok(n) => n,
+                Err(_) => return false,
+            };
+            if prefix_len > 32 {
+                return false;
+            }
+            let mask = if prefix_len == 0 {
+                0u32
+            } else {
+                !0u32 << (32 - prefix_len)
+            };
             (u32::from(addr) & mask) == (u32::from(net) & mask)
         }
         std::net::IpAddr::V6(addr) => {
-            let net: std::net::Ipv6Addr = match network.parse() { Ok(n) => n, Err(_) => return false };
-            if prefix_len > 128 { return false; }
+            let net: std::net::Ipv6Addr = match network.parse() {
+                Ok(n) => n,
+                Err(_) => return false,
+            };
+            if prefix_len > 128 {
+                return false;
+            }
             let ab = addr.octets();
             let nb = net.octets();
             let full = (prefix_len / 8) as usize;
             let rem = prefix_len % 8;
-            if ab[..full] != nb[..full] { return false; }
+            if ab[..full] != nb[..full] {
+                return false;
+            }
             if rem > 0 && full < 16 {
                 let m = !0u8 << (8 - rem);
-                if (ab[full] & m) != (nb[full] & m) { return false; }
+                if (ab[full] & m) != (nb[full] & m) {
+                    return false;
+                }
             }
             true
         }
@@ -266,6 +296,61 @@ pub struct CacheConfig {
     /// S3 backend configuration
     #[serde(default)]
     pub s3: Option<S3Config>,
+    /// Streaming proxy limits (large package handling)
+    #[serde(default)]
+    pub proxy_limits: ProxyLimitsConfig,
+}
+
+/// Limits for the streaming HTTP cache proxy.
+///
+/// Sized for bare-metal package pulls (linux-firmware ≈ 1 GB single files).
+/// Bodies are streamed to disk with O(1) memory; these limits guard against
+/// malicious upstreams and orphaned partial uploads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyLimitsConfig {
+    /// Maximum single response body in bytes, enforced via Content-Length
+    /// when present and a streamed-bytes counter otherwise.
+    #[serde(default = "default_max_response_bytes")]
+    pub max_response_bytes: u64,
+    /// How long an in-flight upstream fetch may stall (no bytes received)
+    /// before the server gives up and returns an error. Entirely separate
+    /// from client-side timeouts.
+    #[serde(default = "default_upstream_stall_secs")]
+    pub upstream_stall_secs: u64,
+    /// Cleanup interval for orphaned partial uploads left by crashes.
+    #[serde(default = "default_stale_part_sweep_secs")]
+    pub stale_part_sweep_secs: u64,
+    /// Age threshold for the stale-part janitor: staged files older than
+    /// this many seconds are considered orphaned and deleted.
+    #[serde(default = "default_stale_part_ttl_secs")]
+    pub stale_part_ttl_secs: u64,
+}
+
+impl Default for ProxyLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_response_bytes: default_max_response_bytes(),
+            upstream_stall_secs: default_upstream_stall_secs(),
+            stale_part_sweep_secs: default_stale_part_sweep_secs(),
+            stale_part_ttl_secs: default_stale_part_ttl_secs(),
+        }
+    }
+}
+
+fn default_max_response_bytes() -> u64 {
+    4 * 1024 * 1024 * 1024 // 4 GiB — linux-firmware et al.
+}
+
+fn default_upstream_stall_secs() -> u64 {
+    120
+}
+
+fn default_stale_part_sweep_secs() -> u64 {
+    3600
+}
+
+fn default_stale_part_ttl_secs() -> u64 {
+    7200
 }
 
 /// S3-compatible storage backend configuration.
@@ -558,6 +643,17 @@ pub struct ProxyConfig {
     /// Timeout before falling back to upstream (ms)
     #[serde(default = "default_fallback_timeout")]
     pub fallback_timeout_ms: u64,
+    /// Total deadline for the retry loop when the server proxy returns a
+    /// transient failure (502/503/504, connection error, or per-attempt
+    /// timeout). The package manager sees a single request that blocks
+    /// up to this long. Default 5 min — sized for large bare-metal
+    /// packages fetched through a cold cache.
+    #[serde(default = "default_retry_deadline")]
+    pub retry_deadline_ms: u64,
+    /// Initial backoff between retries (ms). Doubles each attempt, capped
+    /// at 30 s, ±20% jitter.
+    #[serde(default = "default_retry_backoff_initial_ms")]
+    pub retry_backoff_initial_ms: u64,
 }
 
 fn default_proxy_bind() -> String {
@@ -566,6 +662,14 @@ fn default_proxy_bind() -> String {
 
 fn default_fallback_timeout() -> u64 {
     2000
+}
+
+fn default_retry_deadline() -> u64 {
+    300_000
+}
+
+fn default_retry_backoff_initial_ms() -> u64 {
+    2_000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -637,11 +741,10 @@ impl Default for AutoUpdateConfig {
 
 impl ServerConfig {
     pub fn from_file(path: &std::path::Path) -> crate::Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| crate::Error::Io {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
+        let content = std::fs::read_to_string(path).map_err(|e| crate::Error::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
         let config: Self = Self::from_str_with_path(&content, path)?;
         config.validate().map_err(|errors| {
             crate::Error::Config(format!(
@@ -659,12 +762,7 @@ impl ServerConfig {
         serde_path_to_error::deserialize(de).map_err(|e| {
             let path_str = e.path().to_string();
             let inner = e.into_inner();
-            crate::Error::Config(format!(
-                "in {}: at {}: {}",
-                path.display(),
-                path_str,
-                inner
-            ))
+            crate::Error::Config(format!("in {}: at {}: {}", path.display(), path_str, inner))
         })
     }
 
@@ -698,7 +796,9 @@ impl ServerConfig {
             errors.push(
                 "missing [database].url — add something like url = \"postgres://monopsony:password@localhost/monopsony\"".to_string()
             );
-        } else if !self.database.url.starts_with("postgres://") && !self.database.url.starts_with("postgresql://") {
+        } else if !self.database.url.starts_with("postgres://")
+            && !self.database.url.starts_with("postgresql://")
+        {
             errors.push(format!(
                 "[database].url should start with postgres:// — got \"{}\"",
                 &self.database.url[..self.database.url.len().min(40)]
@@ -712,14 +812,13 @@ impl ServerConfig {
         // [cache] section
         if self.cache.path.as_os_str().is_empty() {
             errors.push(
-                "missing [cache].path — add something like path = \"/var/cache/monopsony\"".to_string()
+                "missing [cache].path — add something like path = \"/var/cache/monopsony\""
+                    .to_string(),
             );
         }
 
         if self.cache.max_size_gb == 0 {
-            warnings.push(
-                "[cache].max_size_gb is 0 — cache will have no size limit".to_string()
-            );
+            warnings.push("[cache].max_size_gb is 0 — cache will have no size limit".to_string());
         }
 
         // [tls] section — warn if paths don't exist (installer creates them)
@@ -741,7 +840,8 @@ impl ServerConfig {
         // Auth mode validation
         if self.server.auth_mode == AuthMode::Mtls {
             errors.push(
-                "auth_mode = \"mtls\" is not yet implemented — use \"open\" or \"token\" for now".to_string()
+                "auth_mode = \"mtls\" is not yet implemented — use \"open\" or \"token\" for now"
+                    .to_string(),
             );
         }
 
@@ -803,11 +903,10 @@ impl ServerConfig {
 
 impl ClientConfig {
     pub fn from_file(path: &std::path::Path) -> crate::Result<Self> {
-        let content = std::fs::read_to_string(path)
-            .map_err(|e| crate::Error::Io {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
+        let content = std::fs::read_to_string(path).map_err(|e| crate::Error::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })?;
         Self::from_str_with_path(&content, path)
     }
 
@@ -817,12 +916,7 @@ impl ClientConfig {
         serde_path_to_error::deserialize(de).map_err(|e| {
             let path_str = e.path().to_string();
             let inner = e.into_inner();
-            crate::Error::Config(format!(
-                "in {}: at {}: {}",
-                path.display(),
-                path_str,
-                inner
-            ))
+            crate::Error::Config(format!("in {}: at {}: {}", path.display(), path_str, inner))
         })
     }
 
@@ -926,6 +1020,7 @@ mod tests {
             },
             grpc: GrpcServerConfig {
                 bind: "0.0.0.0:50051".to_string(),
+                ws_url: None,
             },
             database: DatabaseConfig {
                 url: "postgres://monopsony:pass@localhost/monopsony".to_string(),
@@ -937,6 +1032,7 @@ mod tests {
                 max_size_gb: 50,
                 purge_after_days: 30,
                 s3: None,
+                proxy_limits: ProxyLimitsConfig::default(),
             },
             tls: TlsServerConfig {
                 ca_path: PathBuf::from("/tmp/ca.pem"),
@@ -969,7 +1065,10 @@ mod tests {
     #[test]
     fn test_validate_valid_config() {
         let config = valid_server_config();
-        assert!(config.validate().is_ok(), "Valid config should pass validation");
+        assert!(
+            config.validate().is_ok(),
+            "Valid config should pass validation"
+        );
     }
 
     #[test]
@@ -978,8 +1077,11 @@ mod tests {
         config.server.bind = String::new();
         let errors = config.validate().unwrap_err();
         assert!(
-            errors.iter().any(|e| e.contains("[server]") && e.contains("bind")),
-            "Should flag empty bind: got {:?}", errors
+            errors
+                .iter()
+                .any(|e| e.contains("[server]") && e.contains("bind")),
+            "Should flag empty bind: got {:?}",
+            errors
         );
     }
 
@@ -990,7 +1092,8 @@ mod tests {
         let errors = config.validate().unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("host:port")),
-            "Should flag bad bind format: got {:?}", errors
+            "Should flag bad bind format: got {:?}",
+            errors
         );
     }
 
@@ -1001,7 +1104,8 @@ mod tests {
         let errors = config.validate().unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("postgres://")),
-            "Should flag bad database URL: got {:?}", errors
+            "Should flag bad database URL: got {:?}",
+            errors
         );
     }
 
@@ -1011,8 +1115,11 @@ mod tests {
         config.server.auth_mode = AuthMode::Mtls;
         let errors = config.validate().unwrap_err();
         assert!(
-            errors.iter().any(|e| e.contains("mtls") && e.contains("not yet implemented")),
-            "Should flag mtls as unimplemented: got {:?}", errors
+            errors
+                .iter()
+                .any(|e| e.contains("mtls") && e.contains("not yet implemented")),
+            "Should flag mtls as unimplemented: got {:?}",
+            errors
         );
     }
 
@@ -1023,7 +1130,8 @@ mod tests {
         let errors = config.validate().unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("max_connections")),
-            "Should flag zero max_connections: got {:?}", errors
+            "Should flag zero max_connections: got {:?}",
+            errors
         );
     }
 
@@ -1093,7 +1201,8 @@ trusted_operator_keys = ["op1"]
         let errors = config.validate().unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("S3 storage backend")),
-            "Should flag missing S3: got {:?}", errors
+            "Should flag missing S3: got {:?}",
+            errors
         );
     }
 
@@ -1116,7 +1225,8 @@ trusted_operator_keys = ["op1"]
         let errors = config.validate().unwrap_err();
         assert!(
             errors.iter().any(|e| e.contains("scanning enabled")),
-            "Should flag scan disabled: got {:?}", errors
+            "Should flag scan disabled: got {:?}",
+            errors
         );
     }
 
@@ -1185,8 +1295,14 @@ trusted_operator_keys = ["op1"]
             assert_eq!(tier, parsed);
         }
         // Verify lowercase serialization
-        assert_eq!(serde_json::to_string(&NodeTier::Public).unwrap(), "\"public\"");
-        assert_eq!(serde_json::to_string(&NodeTier::Federated).unwrap(), "\"federated\"");
+        assert_eq!(
+            serde_json::to_string(&NodeTier::Public).unwrap(),
+            "\"public\""
+        );
+        assert_eq!(
+            serde_json::to_string(&NodeTier::Federated).unwrap(),
+            "\"federated\""
+        );
         // Unknown tier should fail
         assert!(serde_json::from_str::<NodeTier>("\"unknown\"").is_err());
     }
@@ -1205,7 +1321,7 @@ trusted_operator_keys = ["op1"]
 
     #[test]
     fn test_sha256_hash_consistency() {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let data = b"hello monopsony";
         let mut hasher = Sha256::new();
         hasher.update(data);
@@ -1220,7 +1336,7 @@ trusted_operator_keys = ["op1"]
 
     #[test]
     fn test_sha256_tamper_detection() {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let data1 = b"original content";
         let data2 = b"tampered content";
         let mut h1 = Sha256::new();
@@ -1234,11 +1350,14 @@ trusted_operator_keys = ["op1"]
 
     #[test]
     fn test_sha256_empty_data() {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(b"");
         let hash = format!("{:x}", hasher.finalize());
         // Known SHA256 of empty string
-        assert_eq!(hash, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        assert_eq!(
+            hash,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 }

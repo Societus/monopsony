@@ -1,0 +1,64 @@
+# Shadow package recipe: i2pd
+# Git source build (no root required at update time; see notes below)
+# Docs: https://monopsony.clubhouse-c21.workers.dev/docs/shadow-packages/
+#
+# i2pd ships prebuilt binaries only from 2.61.0, so this recipe builds from
+# the upstream git tag. Deploys as a user-mode install:
+#   binary:  ~/.local/lib/i2pd/i2pd (symlinked from ~/.local/bin/i2pd)
+#   config:  ~/.i2pd/ (user-managed; NOT touched by this package)
+#
+# Schema notes (validated against ShadowRecipe in
+# monopsony-common/src/shadow_types.rs):
+#   - source_type = "git_build" (ShadowSource::GitBuild)
+#   - [build] is a TOP-LEVEL table (RecipeBuild { steps, requires })
+#   - build.requires entries are checked with `which`, so they must be
+#     executables on PATH, not apt package names
+#   - install.pre_update / post_update are plain hook STRINGS
+#   - health_check supports http|port|process only (no command type), so
+#     version verification lives in [version] instead
+#   - {target_dir} is substituted literally in build steps; a per-user
+#     path requires tilde expansion support in the executor (proposed)
+
+[package]
+name = "i2pd"
+description = "PurpleI2P i2pd - C++ I2P router daemon"
+homepage = "https://geti2p.net"
+source_type = "git_build"
+source_url = "https://github.com/PurpleI2P/i2pd"
+
+[install]
+method = "build"
+# Tilde paths expand to the invoking user's home (executor expansion
+# proposed; falls back to $HOME expansion in the recipe's own steps).
+target_dir = "~/.local/lib/i2pd"
+backup_old = true
+max_backups = 3
+# The daemon's own config lives in ~/.i2pd and is operator-managed:
+# deliberately NOT listed in config_paths so updates never snapshot/restore it.
+# Console binds 127.0.0.1:7070 by default; moved to 7071 on hosts where
+# 7070 is taken (operator config change, not a recipe concern).
+
+pre_update = "pkill -x i2pd || pkill -x i2pd-daemon || true"
+post_update = "ln -sf $HOME/.local/lib/i2pd/i2pd $HOME/.local/bin/i2pd"
+
+[build]
+# `which`-checked before the build starts; all four are in build-essential-ish
+# sets. Library packages (libssl-dev, zlib1g-dev, libboost-*-dev) cannot be
+# `which`-checked - they are validated implicitly when make fails loudly.
+requires = ["g++", "make"]
+steps = [
+    "make -j\"$(nproc)\" BUILD_TYPE=Release",
+    "mkdir -p {target_dir} && cp i2pd {target_dir}/i2pd",
+]
+
+[asset_selector]
+# i2pd tags are plain semver: 2.61.0, 2.60.1, ...
+tag_pattern = '^(\d+\.\d+\.\d+)$'
+
+[version]
+detect_command = "$HOME/.local/lib/i2pd/i2pd --version"
+detect_pattern = "i2pd version (\\d+\\.\\d+\\.\\d+)"
+
+[notifications]
+changelog_url = "https://github.com/PurpleI2P/i2pd/releases/tag/{version}"
+notes = "Built from upstream git tags; prebuilt release binaries were dropped by upstream starting 2.61.0."

@@ -1,6 +1,6 @@
+use serde::Deserialize;
 use std::time::Duration;
 use tracing::{debug, info, warn};
-use serde::Deserialize;
 
 pub struct ClientDiscovery {
     service_name: String,
@@ -97,9 +97,7 @@ impl ClientDiscovery {
         distro: Option<&str>,
         timeout: Duration,
     ) -> anyhow::Result<Vec<DiscoveredMirror>> {
-        let client = reqwest::Client::builder()
-            .timeout(timeout)
-            .build()?;
+        let client = reqwest::Client::builder().timeout(timeout).build()?;
 
         let distro_name = distro.unwrap_or("archlinux");
         let url = format!(
@@ -120,10 +118,7 @@ impl ClientDiscovery {
     }
 
     /// Query peer exchange endpoint (GET /.well-known/monopsony/peers)
-    async fn query_peer_exchange(
-        &self,
-        peer_url: &str,
-    ) -> anyhow::Result<Vec<DiscoveredMirror>> {
+    async fn query_peer_exchange(&self, peer_url: &str) -> anyhow::Result<Vec<DiscoveredMirror>> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()?;
@@ -155,69 +150,70 @@ impl ClientDiscovery {
         info!("Starting mDNS discovery for {}", service_type);
 
         let discovered = tokio::time::timeout(timeout, async {
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<monopsony_common::DiscoveryInfo>> {
-                let daemon = mdns_sd::ServiceDaemon::new()?;
-                let receiver = daemon.browse(&service_type)?;
+            tokio::task::spawn_blocking(
+                move || -> anyhow::Result<Vec<monopsony_common::DiscoveryInfo>> {
+                    let daemon = mdns_sd::ServiceDaemon::new()?;
+                    let receiver = daemon.browse(&service_type)?;
 
-                let mut results = Vec::new();
-                let start = std::time::Instant::now();
+                    let mut results = Vec::new();
+                    let start = std::time::Instant::now();
 
-                loop {
-                    let remaining = browse_timeout.saturating_sub(start.elapsed());
-                    if remaining.is_zero() {
-                        break;
-                    }
-
-                    match receiver.recv_timeout(remaining) {
-                        Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
-                            let address = info
-                                .get_addresses()
-                                .iter()
-                                .next()
-                                .map(|a| a.to_string())
-                                .unwrap_or_default();
-
-                            let port = info.get_port();
-                            let http_port = info
-                                .get_property_val_str("http_port")
-                                .and_then(|s| s.parse::<u16>().ok())
-                                .unwrap_or(port);
-                            let grpc_port = info
-                                .get_property_val_str("grpc_port")
-                                .and_then(|s| s.parse::<u16>().ok())
-                                .unwrap_or(0);
-                            let version = info
-                                .get_property_val_str("version")
-                                .unwrap_or("0.1.0");
-
-                            debug!(
-                                "Resolved: {}:{} (http={}, grpc={}, v={})",
-                                address, port, http_port, grpc_port, version
-                            );
-
-                            results.push(monopsony_common::DiscoveryInfo {
-                                address,
-                                http_port,
-                                grpc_port,
-                                version: version.to_string(),
-                            });
-                        }
-                        Ok(mdns_sd::ServiceEvent::ServiceFound(_, name)) => {
-                            debug!("Found service: {}", name);
-                        }
-                        Ok(mdns_sd::ServiceEvent::SearchStopped(_)) => {
+                    loop {
+                        let remaining = browse_timeout.saturating_sub(start.elapsed());
+                        if remaining.is_zero() {
                             break;
                         }
-                        Ok(_) => {}
-                        Err(e) => {
-                            warn!("mDNS channel error: {}", e);
-                            break;
+
+                        match receiver.recv_timeout(remaining) {
+                            Ok(mdns_sd::ServiceEvent::ServiceResolved(info)) => {
+                                let address = info
+                                    .get_addresses()
+                                    .iter()
+                                    .next()
+                                    .map(|a| a.to_string())
+                                    .unwrap_or_default();
+
+                                let port = info.get_port();
+                                let http_port = info
+                                    .get_property_val_str("http_port")
+                                    .and_then(|s| s.parse::<u16>().ok())
+                                    .unwrap_or(port);
+                                let grpc_port = info
+                                    .get_property_val_str("grpc_port")
+                                    .and_then(|s| s.parse::<u16>().ok())
+                                    .unwrap_or(0);
+                                let version =
+                                    info.get_property_val_str("version").unwrap_or("0.1.0");
+
+                                debug!(
+                                    "Resolved: {}:{} (http={}, grpc={}, v={})",
+                                    address, port, http_port, grpc_port, version
+                                );
+
+                                results.push(monopsony_common::DiscoveryInfo {
+                                    address,
+                                    http_port,
+                                    grpc_port,
+                                    version: version.to_string(),
+                                });
+                            }
+                            Ok(mdns_sd::ServiceEvent::ServiceFound(_, name)) => {
+                                debug!("Found service: {}", name);
+                            }
+                            Ok(mdns_sd::ServiceEvent::SearchStopped(_)) => {
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!("mDNS channel error: {}", e);
+                                break;
+                            }
                         }
                     }
-                }
 
-                Ok(results)
-            })
+                    Ok(results)
+                },
+            )
             .await?
         })
         .await??;
@@ -231,10 +227,9 @@ impl ClientDiscovery {
         timeout: Duration,
     ) -> anyhow::Result<monopsony_common::DiscoveryInfo> {
         let results = self.discover(timeout).await?;
-        results
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("No Monopsony server discovered within timeout. Is the server running?"))
+        results.into_iter().next().ok_or_else(|| {
+            anyhow::anyhow!("No Monopsony server discovered within timeout. Is the server running?")
+        })
     }
 }
 

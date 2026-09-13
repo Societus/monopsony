@@ -101,8 +101,7 @@ impl PublicRateLimiter {
         let mut buckets = self.buckets.lock().unwrap();
         let now = Instant::now();
         buckets.retain(|_, bucket| {
-            bucket.concurrent > 0
-                || now.duration_since(bucket.last_refill).as_secs() < max_age_secs
+            bucket.concurrent > 0 || now.duration_since(bucket.last_refill).as_secs() < max_age_secs
         });
     }
 }

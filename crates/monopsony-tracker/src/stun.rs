@@ -136,7 +136,9 @@ mod tests {
     fn test_nat_penalty_ordering() {
         assert_eq!(NatType::Public.score_penalty(), 0.0);
         assert_eq!(NatType::FullCone.score_penalty(), 0.0);
-        assert!(NatType::RestrictedCone.score_penalty() < NatType::PortRestrictedCone.score_penalty());
+        assert!(
+            NatType::RestrictedCone.score_penalty() < NatType::PortRestrictedCone.score_penalty()
+        );
         assert!(NatType::PortRestrictedCone.score_penalty() < NatType::Symmetric.score_penalty());
         assert!(NatType::Unknown.score_penalty() > 0.0);
     }

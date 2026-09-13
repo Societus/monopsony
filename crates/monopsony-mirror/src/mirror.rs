@@ -22,12 +22,12 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, trace, warn};
 
-use monopsony_db::Database;
 use monopsony_db::db::UpstreamPackageRow;
+use monopsony_db::Database;
 
 /// Boxed body type for hyper client requests
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
@@ -125,8 +125,8 @@ struct MirrorConfigFile {
 }
 
 mod path_serde {
+    use serde::{self, Deserialize, Deserializer, Serializer};
     use std::path::{Path, PathBuf};
-    use serde::{self, Deserialize, Serializer, Deserializer};
 
     pub fn serialize<S: Serializer>(path: &Path, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&path.to_string_lossy())
@@ -211,7 +211,13 @@ impl MirrorManager {
 
     /// Get the max per-IP RPS across all configured mirrors (0 if none)
     pub async fn max_per_ip_rps(&self) -> u32 {
-        self.configs.read().await.iter().map(|c| c.per_ip_rps).max().unwrap_or(0)
+        self.configs
+            .read()
+            .await
+            .iter()
+            .map(|c| c.per_ip_rps)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Returns true if any configured mirror is private (requires auth)
@@ -223,7 +229,10 @@ impl MirrorManager {
     pub async fn load_config(&self) -> anyhow::Result<()> {
         let config_path = self.mirror_dir.join("mirrors.toml");
         if !config_path.exists() {
-            info!("No mirror config file at {}, starting empty", config_path.display());
+            info!(
+                "No mirror config file at {}, starting empty",
+                config_path.display()
+            );
             return Ok(());
         }
 
@@ -244,7 +253,9 @@ impl MirrorManager {
     /// manually added via dashboard). Does not overwrite configs already loaded
     /// from TOML.
     pub async fn load_from_db(&self) -> anyhow::Result<()> {
-        let Some(db) = &self.db else { return Ok(()); };
+        let Some(db) = &self.db else {
+            return Ok(());
+        };
 
         let rows = db.list_mirror_configs().await?;
         if rows.is_empty() {
@@ -266,8 +277,10 @@ impl MirrorManager {
                 sync_enabled: row.sync_enabled,
                 sync_interval_secs: row.sync_interval_secs as u64,
                 bandwidth_limit_bps: row.bandwidth_limit_bps.map(|v| v as u64),
-                include_patterns: serde_json::from_value(row.include_patterns.clone()).unwrap_or_default(),
-                exclude_patterns: serde_json::from_value(row.exclude_patterns.clone()).unwrap_or_default(),
+                include_patterns: serde_json::from_value(row.include_patterns.clone())
+                    .unwrap_or_default(),
+                exclude_patterns: serde_json::from_value(row.exclude_patterns.clone())
+                    .unwrap_or_default(),
                 public: row.public,
                 sync_status: row.sync_status.clone(),
                 last_sync: row.last_sync.map(|dt| dt.timestamp()),
@@ -288,7 +301,9 @@ impl MirrorManager {
     pub async fn save_config(&self) -> anyhow::Result<()> {
         let config_path = self.mirror_dir.join("mirrors.toml");
         let guard = self.configs.read().await;
-        let file = MirrorConfigFile { mirrors: guard.clone() };
+        let file = MirrorConfigFile {
+            mirrors: guard.clone(),
+        };
         let content = toml::to_string_pretty(&file)?;
         tokio::fs::write(&config_path, content).await?;
         info!("Saved {} mirror configuration(s)", guard.len());
@@ -300,46 +315,62 @@ impl MirrorManager {
         let mirror_dir = self.mirror_dir.clone();
         let configs = self.configs.clone();
 
-        // Run initial sync for all enabled mirrors
-        let guard = configs.read().await;
-        for config in guard.iter() {
-            if config.sync_enabled {
-                let distro = config.distro.clone();
-                let upstream = config.upstream_url.clone();
-                let local = config.local_path.clone();
-                let dir = mirror_dir.clone();
-                let cfgs = configs.clone();
+        // Run initial sync for all enabled mirrors.
+        //
+        // Collect the enabled configs under the read guard and drop it BEFORE
+        // syncing: the sync body below acquires write locks to update
+        // sync_status, and a write request queued while this task still holds
+        // a read permit deadlocks against itself (tokio RwLock is fair, so
+        // later reads queue behind the pending write too — which froze
+        // pairing's mirror auto-creation).
+        let initial_configs: Vec<MirrorConfig> = {
+            let guard = configs.read().await;
+            guard.iter().filter(|c| c.sync_enabled).cloned().collect()
+        }; // read guard dropped here
 
-                // Update status
-                {
+        for config in &initial_configs {
+            let distro = config.distro.clone();
+            let upstream = config.upstream_url.clone();
+            let local = config.local_path.clone();
+            let dir = mirror_dir.clone();
+            let cfgs = configs.clone();
+
+            // Update status
+            {
+                let mut w = cfgs.write().await;
+                if let Some(c) = w.iter_mut().find(|c| c.distro == distro) {
+                    c.sync_status = "syncing".to_string();
+                }
+            }
+
+            info!("Starting initial sync for mirror: {}", distro);
+            match sync_mirror(
+                &upstream,
+                &dir.join(&local),
+                &config.exclude_patterns,
+                config.bandwidth_limit_bps,
+                &config.hash_policy,
+            )
+            .await
+            {
+                Ok(bytes) => {
                     let mut w = cfgs.write().await;
                     if let Some(c) = w.iter_mut().find(|c| c.distro == distro) {
-                        c.sync_status = "syncing".to_string();
+                        c.sync_status = "idle".to_string();
+                        c.last_sync = Some(chrono::Utc::now().timestamp());
+                        c.total_bytes = bytes;
                     }
+                    info!("Mirror sync complete for {}: {} bytes", distro, bytes);
                 }
-
-                info!("Starting initial sync for mirror: {}", distro);
-                match sync_mirror(&upstream, &dir.join(&local), &config.exclude_patterns, config.bandwidth_limit_bps, &config.hash_policy).await {
-                    Ok(bytes) => {
-                        let mut w = cfgs.write().await;
-                        if let Some(c) = w.iter_mut().find(|c| c.distro == distro) {
-                            c.sync_status = "idle".to_string();
-                            c.last_sync = Some(chrono::Utc::now().timestamp());
-                            c.total_bytes = bytes;
-                        }
-                        info!("Mirror sync complete for {}: {} bytes", distro, bytes);
+                Err(e) => {
+                    let mut w = cfgs.write().await;
+                    if let Some(c) = w.iter_mut().find(|c| c.distro == distro) {
+                        c.sync_status = format!("error: {}", e);
                     }
-                    Err(e) => {
-                        let mut w = cfgs.write().await;
-                        if let Some(c) = w.iter_mut().find(|c| c.distro == distro) {
-                            c.sync_status = format!("error: {}", e);
-                        }
-                        error!("Mirror sync failed for {}: {}", distro, e);
-                    }
+                    error!("Mirror sync failed for {}: {}", distro, e);
                 }
             }
         }
-        drop(guard);
 
         // Periodic sync loop
         loop {
@@ -349,7 +380,8 @@ impl MirrorManager {
             let due: Vec<MirrorConfig> = {
                 let guard = configs.read().await;
                 let now = chrono::Utc::now().timestamp();
-                guard.iter()
+                guard
+                    .iter()
                     .filter(|c| c.sync_enabled)
                     .filter(|c| {
                         let last = c.last_sync.unwrap_or(0);
@@ -378,7 +410,9 @@ impl MirrorManager {
                     &config.exclude_patterns,
                     config.bandwidth_limit_bps,
                     &config.hash_policy,
-                ).await {
+                )
+                .await
+                {
                     Ok(bytes) => {
                         let mut w = configs.write().await;
                         if let Some(c) = w.iter_mut().find(|c| c.distro == distro) {
@@ -407,7 +441,12 @@ impl MirrorManager {
 
     /// Get config for a specific distro
     pub async fn get_config(&self, distro: &str) -> Option<MirrorConfig> {
-        self.configs.read().await.iter().find(|c| c.distro == distro).cloned()
+        self.configs
+            .read()
+            .await
+            .iter()
+            .find(|c| c.distro == distro)
+            .cloned()
     }
 
     /// Access the database handle (for gRPC upsert/delete)
@@ -441,10 +480,7 @@ impl MirrorManager {
     /// the in-memory list and the database.
     ///
     /// Returns the number of new mirror configs created.
-    pub async fn ensure_mirrors_for_package_managers(
-        &self,
-        package_managers: &[String],
-    ) -> usize {
+    pub async fn ensure_mirrors_for_package_managers(&self, package_managers: &[String]) -> usize {
         let mut created = 0;
 
         for pm_str in package_managers {
@@ -489,7 +525,10 @@ impl MirrorManager {
         }
 
         if created > 0 {
-            info!("Auto-created {} mirror config(s) from client registration", created);
+            info!(
+                "Auto-created {} mirror config(s) from client registration",
+                created
+            );
         }
 
         created
@@ -510,7 +549,9 @@ impl MirrorManager {
     ///
     /// If no DB is available, falls back to the legacy blind directory scrape.
     pub async fn trigger_sync(&self, distro: &str) -> Result<(), String> {
-        let config = self.get_config(distro).await
+        let config = self
+            .get_config(distro)
+            .await
             .ok_or_else(|| format!("Mirror not found: {}", distro))?;
 
         // Mark as syncing
@@ -529,8 +570,14 @@ impl MirrorManager {
             self.index_and_prefetch(distro, &config, &local_path).await
         } else {
             // Legacy: blind directory scrape
-            sync_mirror(&config.upstream_url, &local_path, &config.exclude_patterns,
-                        config.bandwidth_limit_bps, &config.hash_policy).await
+            sync_mirror(
+                &config.upstream_url,
+                &local_path,
+                &config.exclude_patterns,
+                config.bandwidth_limit_bps,
+                &config.hash_policy,
+            )
+            .await
         };
 
         match result {
@@ -581,16 +628,33 @@ impl MirrorManager {
         let index_urls = crate::repo_index::repo_index_urls(distro, arch);
         if index_urls.is_empty() {
             // Unknown distro format — fall back to legacy scrape
-            info!(distro, "No known index format, falling back to directory scrape");
-            return sync_mirror(&config.upstream_url, local_path, &config.exclude_patterns,
-                               config.bandwidth_limit_bps, &config.hash_policy).await;
+            info!(
+                distro,
+                "No known index format, falling back to directory scrape"
+            );
+            return sync_mirror(
+                &config.upstream_url,
+                local_path,
+                &config.exclude_patterns,
+                config.bandwidth_limit_bps,
+                &config.hash_policy,
+            )
+            .await;
         }
 
-        info!(distro, "Phase 1: Indexing repo metadata ({} repos)", index_urls.len());
+        info!(
+            distro,
+            "Phase 1: Indexing repo metadata ({} repos)",
+            index_urls.len()
+        );
         let mut total_indexed = 0usize;
 
         for (repo, index_path) in &index_urls {
-            let url = format!("{}/{}", config.upstream_url.trim_end_matches('/'), index_path);
+            let url = format!(
+                "{}/{}",
+                config.upstream_url.trim_end_matches('/'),
+                index_path
+            );
             info!(repo, url = %url, "Downloading index");
 
             let bytes = download_file(&url).await?;
@@ -604,31 +668,46 @@ impl MirrorManager {
             };
 
             // Fill in download URLs
-            crate::repo_index::resolve_download_urls(&mut packages, distro, repo, &config.upstream_url, arch);
+            crate::repo_index::resolve_download_urls(
+                &mut packages,
+                distro,
+                repo,
+                &config.upstream_url,
+                arch,
+            );
 
             // Persist to DB
-            db.replace_upstream_packages(distro, repo, &packages).await
+            db.replace_upstream_packages(distro, repo, &packages)
+                .await
                 .map_err(|e| format!("Failed to store index: {}", e))?;
 
             total_indexed += packages.len();
         }
 
-        info!(distro, total_indexed, "Phase 1 complete: indexed upstream packages");
+        info!(
+            distro,
+            total_indexed, "Phase 1 complete: indexed upstream packages"
+        );
 
         // ── Phase 2: Prefetch packages that installed clients need ──
         info!(distro, "Phase 2: Checking inventory for needed updates");
 
         // Get all upstream versions for this distro
-        let upstream = db.latest_upstream_versions(distro).await
+        let upstream = db
+            .latest_upstream_versions(distro)
+            .await
             .map_err(|e| format!("Failed to query upstream packages: {}", e))?;
 
         // Get all package names+versions that clients have installed
-        let client_pkgs = db.get_all_client_package_versions(distro).await
+        let client_pkgs = db
+            .get_all_client_package_versions(distro)
+            .await
             .map_err(|e| format!("Failed to query client inventory: {}", e))?;
 
         // Build a set of (name) → latest installed version
         use std::collections::HashMap;
-        let installed: HashMap<String, String> = client_pkgs.iter()
+        let installed: HashMap<String, String> = client_pkgs
+            .iter()
             .map(|(name, ver)| (name.clone(), ver.clone()))
             .collect();
 
@@ -652,11 +731,16 @@ impl MirrorManager {
         // Download the packages that need updating
         let mut total_bytes = 0u64;
         if !to_download.is_empty() {
-            info!(distro, count = to_download.len(), "Phase 2: Prefetching updated packages");
+            info!(
+                distro,
+                count = to_download.len(),
+                "Phase 2: Prefetching updated packages"
+            );
 
             let client = build_https_client();
             let local_mirror = self.mirror_dir.join(&config.local_path);
-            tokio::fs::create_dir_all(&local_mirror).await
+            tokio::fs::create_dir_all(&local_mirror)
+                .await
                 .map_err(|e| format!("Failed to create {}: {}", local_mirror.display(), e))?;
 
             for pkg in &to_download {
@@ -679,20 +763,37 @@ impl MirrorManager {
                     }
                 }
 
-                match sync_single_file(&client, url, &dest, config.bandwidth_limit_bps, &config.hash_policy).await {
+                match sync_single_file(
+                    &client,
+                    url,
+                    &dest,
+                    config.bandwidth_limit_bps,
+                    &config.hash_policy,
+                )
+                .await
+                {
                     Ok(size) => total_bytes += size,
                     Err(e) => warn!("Failed to prefetch {}: {}", url, e),
                 }
             }
         } else {
-            info!(distro, "Phase 2: No updates needed — all installed packages are current");
+            info!(
+                distro,
+                "Phase 2: No updates needed — all installed packages are current"
+            );
         }
 
         // Also download index files themselves (so they're cached for clients)
         for (_repo, index_path) in &index_urls {
-            let url = format!("{}/{}", config.upstream_url.trim_end_matches('/'), index_path);
+            let url = format!(
+                "{}/{}",
+                config.upstream_url.trim_end_matches('/'),
+                index_path
+            );
             let dest = local_path.join(index_path.split('/').last().unwrap_or("index"));
-            if let Ok(size) = sync_single_file(&build_https_client(), &url, &dest, None, "fail-open").await {
+            if let Ok(size) =
+                sync_single_file(&build_https_client(), &url, &dest, None, "fail-open").await
+            {
                 total_bytes += size;
             }
         }
@@ -765,14 +866,17 @@ async fn get_peers(State(state): State<MirrorState>) -> impl IntoResponse {
     let configs = state.manager.list_configs().await;
 
     // Build peer entries from local mirror configs
-    let peers: Vec<PeerEntry> = configs.iter().map(|c| {
-        let expires = chrono::Utc::now() + chrono::Duration::hours(1);
-        PeerEntry {
-            mirror_id: format!("{}-{}", hostname(), c.distro),
-            endpoint: format!("http://{}:3129/mirror/{}", hostname(), c.distro),
-            expires_at: expires.to_rfc3339(),
-        }
-    }).collect();
+    let peers: Vec<PeerEntry> = configs
+        .iter()
+        .map(|c| {
+            let expires = chrono::Utc::now() + chrono::Duration::hours(1);
+            PeerEntry {
+                mirror_id: format!("{}-{}", hostname(), c.distro),
+                endpoint: format!("http://{}:3129/mirror/{}", hostname(), c.distro),
+                expires_at: expires.to_rfc3339(),
+            }
+        })
+        .collect();
 
     Json(PeerList {
         source: "local".to_string(),
@@ -805,14 +909,17 @@ async fn list_mirrors(State(state): State<MirrorState>) -> Json<Vec<MirrorConfig
 async fn get_manifest(State(state): State<MirrorState>) -> impl IntoResponse {
     let configs = state.manager.list_configs().await;
 
-    let mirrors: Vec<ManifestEntry> = configs.iter().map(|c| ManifestEntry {
-        distro: c.distro.clone(),
-        upstream_url: c.upstream_url.clone(),
-        public: c.public,
-        last_sync: c.last_sync,
-        sync_status: c.sync_status.clone(),
-        total_bytes: c.total_bytes,
-    }).collect();
+    let mirrors: Vec<ManifestEntry> = configs
+        .iter()
+        .map(|c| ManifestEntry {
+            distro: c.distro.clone(),
+            upstream_url: c.upstream_url.clone(),
+            public: c.public,
+            last_sync: c.last_sync,
+            sync_status: c.sync_status.clone(),
+            total_bytes: c.total_bytes,
+        })
+        .collect();
 
     let manifest = MirrorManifest {
         version: 1,
@@ -853,7 +960,11 @@ async fn trigger_sync(
 ) -> impl IntoResponse {
     match state.manager.trigger_sync(&distro).await {
         Ok(()) => (StatusCode::OK, "Sync triggered").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Sync failed: {}", e)).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Sync failed: {}", e),
+        )
+            .into_response(),
     }
 }
 
@@ -872,7 +983,9 @@ async fn serve_mirror_file(
     // Sanitize: ensure path doesn't escape mirror dir
     let canonical_mirror = match state.mirror_dir.join(&config.local_path).canonicalize() {
         Ok(p) => p,
-        Err(_) => return (StatusCode::NOT_FOUND, "Mirror directory not accessible").into_response(),
+        Err(_) => {
+            return (StatusCode::NOT_FOUND, "Mirror directory not accessible").into_response()
+        }
     };
 
     let canonical_file = match local_file.canonicalize() {
@@ -910,9 +1023,7 @@ async fn serve_mirror_file(
                 });
             response.into_response()
         }
-        Err(_) => {
-            proxy_to_upstream(&config.upstream_url, &file_path).await
-        }
+        Err(_) => proxy_to_upstream(&config.upstream_url, &file_path).await,
     }
 }
 
@@ -969,11 +1080,10 @@ async fn proxy_to_upstream(upstream_url: &str, file_path: &str) -> Response {
                     builder = builder.header(name, value);
                 }
             }
-            builder.header("X-Mirror", "miss")
+            builder
+                .header("X-Mirror", "miss")
                 .body(axum::body::Body::from(bytes))
-                .unwrap_or_else(|_| {
-                    Response::new(axum::body::Body::from("Internal error"))
-                })
+                .unwrap_or_else(|_| Response::new(axum::body::Body::from("Internal error")))
                 .into_response()
         }
         Err(e) => {
@@ -987,7 +1097,8 @@ async fn proxy_to_upstream(upstream_url: &str, file_path: &str) -> Response {
 /// Used for fetching repo index files.
 async fn download_file(url: &str) -> Result<Vec<u8>, String> {
     let client = build_https_client();
-    let uri: hyper::Uri = url.parse()
+    let uri: hyper::Uri = url
+        .parse()
         .map_err(|e| format!("Invalid URL {}: {}", url, e))?;
     let req = hyper::Request::builder()
         .uri(uri)
@@ -995,7 +1106,9 @@ async fn download_file(url: &str) -> Result<Vec<u8>, String> {
         .body(empty_body())
         .map_err(|e| format!("Failed to build request: {}", e))?;
 
-    let response = client.request(req).await
+    let response = client
+        .request(req)
+        .await
         .map_err(|e| format!("Request failed: {}", e))?;
 
     if !response.status().is_success() {
@@ -1003,7 +1116,9 @@ async fn download_file(url: &str) -> Result<Vec<u8>, String> {
     }
 
     let (_parts, body) = response.into_parts();
-    let bytes = body.collect().await
+    let bytes = body
+        .collect()
+        .await
         .map_err(|e| format!("Failed to read body: {}", e))?
         .to_bytes();
 
@@ -1018,17 +1133,25 @@ async fn sync_mirror(
     bandwidth_limit_bps: Option<u64>,
     hash_policy: &str,
 ) -> Result<u64, String> {
-    info!("Syncing mirror: {} -> {}", upstream_url, local_path.display());
+    info!(
+        "Syncing mirror: {} -> {}",
+        upstream_url,
+        local_path.display()
+    );
 
     // SSRF validation on upstream URL
-    let parsed_upstream = url::Url::parse(upstream_url)
-        .map_err(|e| format!("Invalid upstream URL: {}", e))?;
+    let parsed_upstream =
+        url::Url::parse(upstream_url).map_err(|e| format!("Invalid upstream URL: {}", e))?;
     if let Err(e) = crate::url_validation::validate_url_host(&parsed_upstream) {
-        return Err(format!("SSRF blocked: upstream URL {} — {}", upstream_url, e));
+        return Err(format!(
+            "SSRF blocked: upstream URL {} — {}",
+            upstream_url, e
+        ));
     }
 
     // Create local directory
-    tokio::fs::create_dir_all(local_path).await
+    tokio::fs::create_dir_all(local_path)
+        .await
         .map_err(|e| format!("Failed to create {}: {}", local_path.display(), e))?;
 
     let client = build_https_client();
@@ -1043,17 +1166,22 @@ async fn sync_mirror(
         .body(empty_body())
         .map_err(|e| format!("Failed to build request: {}", e))?;
 
-    let response = client.request(req).await
+    let response = client
+        .request(req)
+        .await
         .map_err(|e| format!("Upstream request failed: {}", e))?;
 
-    let content_type = response.headers()
+    let content_type = response
+        .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
 
     let (_parts, body) = response.into_parts();
-    let bytes = body.collect().await
+    let bytes = body
+        .collect()
+        .await
         .map_err(|e| format!("Failed to read response: {}", e))?
         .to_bytes();
 
@@ -1072,14 +1200,26 @@ async fn sync_mirror(
 
             let filename = link.split('/').next_back().unwrap_or(link);
             let child_local = local_path.join(filename);
-            let child_url = format!("{}/{}", upstream_url.trim_end_matches('/'), link.trim_start_matches('/'));
+            let child_url = format!(
+                "{}/{}",
+                upstream_url.trim_end_matches('/'),
+                link.trim_start_matches('/')
+            );
 
             // Skip if it looks like a directory (ends with /) or parent directory link
             if link.ends_with('/') || link.starts_with("../") || link == "./" || link == "../" {
                 continue;
             }
 
-            match sync_single_file(&client, &child_url, &child_local, bandwidth_limit_bps, hash_policy).await {
+            match sync_single_file(
+                &client,
+                &child_url,
+                &child_local,
+                bandwidth_limit_bps,
+                hash_policy,
+            )
+            .await
+            {
                 Ok(size) => total_bytes += size,
                 Err(e) => warn!("Failed to sync {}: {}", link, e),
             }
@@ -1089,7 +1229,14 @@ async fn sync_mirror(
         // Single file — save directly
         let filename = upstream_url.split('/').next_back().unwrap_or("index");
         let file_path = local_path.join(filename);
-        sync_single_file(&client, upstream_url, &file_path, bandwidth_limit_bps, hash_policy).await
+        sync_single_file(
+            &client,
+            upstream_url,
+            &file_path,
+            bandwidth_limit_bps,
+            hash_policy,
+        )
+        .await
     }
 }
 
@@ -1196,7 +1343,8 @@ async fn sync_single_file(
         }
     }
 
-    let uri: hyper::Uri = url.parse()
+    let uri: hyper::Uri = url
+        .parse()
         .map_err(|e| format!("Invalid URL {}: {}", url, e))?;
 
     let req = hyper::Request::builder()
@@ -1205,7 +1353,9 @@ async fn sync_single_file(
         .body(empty_body())
         .map_err(|e| format!("Failed to build request: {}", e))?;
 
-    let response = client.request(req).await
+    let response = client
+        .request(req)
+        .await
         .map_err(|e| format!("Request failed: {}", e))?;
 
     if !response.status().is_success() {
@@ -1216,18 +1366,24 @@ async fn sync_single_file(
 
     // Pre-flight: reject obviously huge files via content-length header
     const MAX_MIRROR_FILE_SIZE: u64 = 4 * 1024 * 1024 * 1024; // 4 GB
-    if let Some(cl) = parts.headers
+    if let Some(cl) = parts
+        .headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
     {
         if cl > MAX_MIRROR_FILE_SIZE {
-            return Err(format!("File too large ({} bytes, max {})", cl, MAX_MIRROR_FILE_SIZE));
+            return Err(format!(
+                "File too large ({} bytes, max {})",
+                cl, MAX_MIRROR_FILE_SIZE
+            ));
         }
     }
 
     // Collect body
-    let bytes = body.collect().await
+    let bytes = body
+        .collect()
+        .await
         .map_err(|e| format!("Failed to read body: {}", e))?
         .to_bytes();
 
@@ -1235,7 +1391,10 @@ async fn sync_single_file(
 
     // Double-check actual body size
     if len > MAX_MIRROR_FILE_SIZE {
-        return Err(format!("Body too large ({} bytes, max {})", len, MAX_MIRROR_FILE_SIZE));
+        return Err(format!(
+            "Body too large ({} bytes, max {})",
+            len, MAX_MIRROR_FILE_SIZE
+        ));
     }
 
     // Hash verification: try to fetch .sha256 / .sha256sum from upstream
@@ -1250,7 +1409,10 @@ async fn sync_single_file(
         if bps > 0 && len > 0 {
             let expected_time = (len as f64 / bps as f64).ceil() as u64;
             if expected_time > 0 {
-                debug!("Bandwidth limited: {} bytes will take {}s at {} bps", len, expected_time, bps);
+                debug!(
+                    "Bandwidth limited: {} bytes will take {}s at {} bps",
+                    len, expected_time, bps
+                );
                 tokio::time::sleep(Duration::from_secs(expected_time.min(60))).await;
             }
         }
@@ -1258,14 +1420,16 @@ async fn sync_single_file(
 
     // Create parent directory
     if let Some(parent) = local_path.parent() {
-        tokio::fs::create_dir_all(parent).await
+        tokio::fs::create_dir_all(parent)
+            .await
             .map_err(|e| format!("Failed to create dir: {}", e))?;
     }
 
     // Write file atomically (write to .tmp then rename)
     let tmp_path = {
         let mut p = local_path.to_path_buf();
-        let stem = p.file_stem()
+        let stem = p
+            .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("file")
             .to_string();
@@ -1273,17 +1437,21 @@ async fn sync_single_file(
         p
     };
 
-    let mut file = tokio::fs::File::create(&tmp_path).await
+    let mut file = tokio::fs::File::create(&tmp_path)
+        .await
         .map_err(|e| format!("Failed to create file: {}", e))?;
 
-    file.write_all(&bytes).await
+    file.write_all(&bytes)
+        .await
         .map_err(|e| format!("Failed to write file: {}", e))?;
-    file.flush().await
+    file.flush()
+        .await
         .map_err(|e| format!("Failed to flush file: {}", e))?;
     drop(file);
 
     // Atomic rename
-    tokio::fs::rename(&tmp_path, local_path).await
+    tokio::fs::rename(&tmp_path, local_path)
+        .await
         .map_err(|e| format!("Failed to rename: {}", e))?;
 
     debug!("Synced: {} ({} bytes)", local_path.display(), len);
@@ -1384,7 +1552,11 @@ struct TokenBucket {
 impl TokenBucket {
     fn new(rps: u32) -> Self {
         let max = rps.max(1) as f64;
-        Self { tokens: max, max_tokens: max, last_refill: Instant::now() }
+        Self {
+            tokens: max,
+            max_tokens: max,
+            last_refill: Instant::now(),
+        }
     }
 
     /// Try to consume one token. Returns true if allowed.
@@ -1413,13 +1585,20 @@ struct RateLimiter {
 
 impl RateLimiter {
     fn new(rps: u32) -> Self {
-        Self { buckets: Arc::new(tokio::sync::Mutex::new(HashMap::new())), rps }
+        Self {
+            buckets: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            rps,
+        }
     }
 
     async fn check(&self, ip: IpAddr) -> bool {
-        if self.rps == 0 { return true; }
+        if self.rps == 0 {
+            return true;
+        }
         let mut buckets = self.buckets.lock().await;
-        let bucket = buckets.entry(ip).or_insert_with(|| TokenBucket::new(self.rps));
+        let bucket = buckets
+            .entry(ip)
+            .or_insert_with(|| TokenBucket::new(self.rps));
         bucket.try_consume(self.rps)
     }
 }
@@ -1428,9 +1607,9 @@ impl RateLimiter {
 use axum::body::Body as AxumBody;
 use axum::extract::ConnectInfo;
 
+use futures::future::BoxFuture;
 use std::net::SocketAddr;
 use tower::{Layer, Service};
-use futures::future::BoxFuture;
 
 #[derive(Clone)]
 struct MirrorAuthLayer {
@@ -1441,14 +1620,23 @@ struct MirrorAuthLayer {
 
 impl MirrorAuthLayer {
     fn new(limiter: RateLimiter, require_auth: bool, db: Option<Arc<Database>>) -> Self {
-        Self { limiter, require_auth, db }
+        Self {
+            limiter,
+            require_auth,
+            db,
+        }
     }
 }
 
 impl<S> Layer<S> for MirrorAuthLayer {
     type Service = MirrorAuthMiddleware<S>;
     fn layer(&self, inner: S) -> Self::Service {
-        MirrorAuthMiddleware { inner, limiter: self.limiter.clone(), require_auth: self.require_auth, db: self.db.clone() }
+        MirrorAuthMiddleware {
+            inner,
+            limiter: self.limiter.clone(),
+            require_auth: self.require_auth,
+            db: self.db.clone(),
+        }
     }
 }
 
@@ -1462,14 +1650,20 @@ struct MirrorAuthMiddleware<S> {
 
 impl<S> Service<axum::http::Request<AxumBody>> for MirrorAuthMiddleware<S>
 where
-    S: Service<axum::http::Request<AxumBody>, Response = axum::response::Response> + Clone + Send + 'static,
+    S: Service<axum::http::Request<AxumBody>, Response = axum::response::Response>
+        + Clone
+        + Send
+        + 'static,
     S::Future: Send + 'static,
 {
     type Response = axum::response::Response;
     type Error = S::Error;
     type Future = BoxFuture<'static, Result<Self::Response, Self::Error>>;
 
-    fn poll_ready(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
     }
 
@@ -1481,7 +1675,8 @@ where
 
         Box::pin(async move {
             // Extract client IP from ConnectInfo or X-Forwarded-For
-            let ip = req.extensions()
+            let ip = req
+                .extensions()
                 .get::<ConnectInfo<SocketAddr>>()
                 .map(|ci| ci.0.ip())
                 .unwrap_or_else(|| "127.0.0.1".parse().unwrap());
@@ -1499,7 +1694,8 @@ where
 
             // Auth check: if not public, require X-Monopsony-Key
             if require_auth {
-                let key = req.headers()
+                let key = req
+                    .headers()
                     .get("X-Monopsony-Key")
                     .and_then(|v| v.to_str().ok());
                 let key = match key {
@@ -1515,7 +1711,7 @@ where
 
                 // Validate API key: SHA-256 hash of key, check against DB
                 let key_hash = {
-                    use sha2::{Sha256, Digest};
+                    use sha2::{Digest, Sha256};
                     let mut hasher = Sha256::new();
                     hasher.update(key.as_bytes());
                     hex::encode(hasher.finalize())
@@ -1558,8 +1754,14 @@ pub fn create_mirror_router(state: MirrorState, max_rps: u32, any_private: bool)
 
     axum::Router::new()
         .route("/", axum::routing::get(list_mirrors))
-        .route("/.well-known/monopsony/manifest.json", axum::routing::get(get_manifest))
-        .route("/.well-known/monopsony/peers", axum::routing::get(get_peers))
+        .route(
+            "/.well-known/monopsony/manifest.json",
+            axum::routing::get(get_manifest),
+        )
+        .route(
+            "/.well-known/monopsony/peers",
+            axum::routing::get(get_peers),
+        )
         .route("/:distro/status", axum::routing::get(mirror_status))
         .route("/:distro/sync", axum::routing::post(trigger_sync))
         .route("/:distro/*path", axum::routing::get(serve_mirror_file))
@@ -1671,6 +1873,8 @@ sync_enabled = false
         assert!(links.contains(&"linux-6.8.pkg.tar.zst".to_string()));
         assert!(links.contains(&"linux-6.8.pkg.tar.zst.sig".to_string()));
         // Should NOT contain parent dir, absolute paths, or query strings
-        assert!(!links.iter().any(|l| l.starts_with('/') || l.starts_with('?') || l.starts_with("..")));
+        assert!(!links
+            .iter()
+            .any(|l| l.starts_with('/') || l.starts_with('?') || l.starts_with("..")));
     }
 }

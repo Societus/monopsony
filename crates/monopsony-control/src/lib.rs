@@ -8,5 +8,5 @@ pub mod tls;
 pub mod tracker;
 
 pub use discovery::DiscoveryService;
-pub use grpc::{MonopsonyGrpc, start as start_grpc};
+pub use grpc::{start as start_grpc, MonopsonyGrpc};
 pub use tls::TlsManager;

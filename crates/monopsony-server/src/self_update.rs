@@ -3,18 +3,18 @@
 //! Reuses the same infrastructure as the client binary.
 
 use anyhow::Context;
-use monopsony_client::self_update::{check_for_update, apply_update};
+use monopsony_client::self_update::{apply_update, check_for_update};
 
 /// Run self-update check or apply for the server binary
 pub async fn run_self_update(cmd: crate::SelfUpdateMode) -> anyhow::Result<()> {
     let current_version = env!("CARGO_PKG_VERSION").to_string();
-    
+
     match cmd {
         crate::SelfUpdateMode::Check => {
             println!("Current server: {}", current_version);
-            
+
             let result = check_for_update(&current_version).await;
-            
+
             match result {
                 Ok(result) => {
                     if let Some(latest) = &result.latest_version {
@@ -33,42 +33,47 @@ pub async fn run_self_update(cmd: crate::SelfUpdateMode) -> anyhow::Result<()> {
                 }
             }
         }
-        
+
         crate::SelfUpdateMode::Apply => {
             let result = check_for_update(&current_version).await;
-            
+
             match result {
                 Ok(result) => {
                     if result.latest_version.is_none() {
                         println!("Already at latest version. Nothing to do.");
                         return Ok(());
                     }
-                    
+
                     // Check if we have an asset URL for this platform
                     let asset_url = match result.asset_url {
                         Some(url) => url,
                         None => {
                             eprintln!("No compatible release asset found for this platform.");
-                            eprintln!("Available at: {}", result.changelog_url.as_deref().unwrap_or("GitHub releases"));
+                            eprintln!(
+                                "Available at: {}",
+                                result.changelog_url.as_deref().unwrap_or("GitHub releases")
+                            );
                             std::process::exit(3);
                         }
                     };
-                    
+
                     // Determine current binary path
-                    let current_exe = std::env::current_exe()
-                        .context("Failed to get current executable path")?;
-                    
-                    let target_dir = current_exe.parent()
+                    let current_exe =
+                        std::env::current_exe().context("Failed to get current executable path")?;
+
+                    let target_dir = current_exe
+                        .parent()
                         .context("Failed to get parent directory of binary")?
                         .to_path_buf();
-                    
+
                     println!("Downloading update from: {}", asset_url);
                     println!("Installing to: {}", current_exe.display());
 
                     // Try parsing the default recipe for the managed pipeline
                     let recipe = toml::from_str::<monopsony_common::shadow_types::ShadowRecipe>(
                         monopsony_common::shadow_types::DEFAULT_MONOPSONY_RECIPE,
-                    ).ok();
+                    )
+                    .ok();
 
                     if recipe.is_some() {
                         let mut ctx = monopsony_client::self_update::UpdateContext::new(
@@ -76,7 +81,11 @@ pub async fn run_self_update(cmd: crate::SelfUpdateMode) -> anyhow::Result<()> {
                             current_exe,
                             target_dir,
                             current_version,
-                            result.latest_version.as_deref().unwrap_or("unknown").to_string(),
+                            result
+                                .latest_version
+                                .as_deref()
+                                .unwrap_or("unknown")
+                                .to_string(),
                             asset_url,
                         );
 
@@ -84,7 +93,9 @@ pub async fn run_self_update(cmd: crate::SelfUpdateMode) -> anyhow::Result<()> {
                             Ok(monopsony_client::self_update::UpdateOutcome::Success) => {
                                 println!("Update applied successfully! Restart monopsony-server to use the new version.");
                             }
-                            Ok(monopsony_client::self_update::UpdateOutcome::RolledBack(reason)) => {
+                            Ok(monopsony_client::self_update::UpdateOutcome::RolledBack(
+                                reason,
+                            )) => {
                                 eprintln!("Update rolled back: {}", reason);
                                 eprintln!("Your system has been restored to the previous version.");
                                 std::process::exit(5);
@@ -100,7 +111,9 @@ pub async fn run_self_update(cmd: crate::SelfUpdateMode) -> anyhow::Result<()> {
                             &target_dir,
                             &asset_url,
                             result.latest_version.as_deref().unwrap_or("unknown"),
-                        ).await {
+                        )
+                        .await
+                        {
                             Ok(()) => {
                                 println!("Update applied successfully! Restart monopsony-server to use the new version.");
                             }
@@ -118,6 +131,6 @@ pub async fn run_self_update(cmd: crate::SelfUpdateMode) -> anyhow::Result<()> {
             }
         }
     }
-    
+
     Ok(())
 }

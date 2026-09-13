@@ -1,9 +1,9 @@
 use anyhow::Result;
 use chrono::Utc;
+use monopsony_common::package_manager::PackageManagerKind;
 use monopsony_common::{
     ApiKey, ApiKeyId, Client, ClientId, ClientPackage, Package, PackageId, PackageRef,
 };
-use monopsony_common::package_manager::PackageManagerKind;
 use tracing::{debug, info, warn};
 
 use sqlx::{PgPool, Row};
@@ -12,7 +12,6 @@ use uuid::Uuid;
 pub struct Database {
     pool: PgPool,
 }
-
 
 /// Cache entry metadata for recording cache misses
 #[derive(Debug, Clone)]
@@ -25,7 +24,6 @@ pub struct CacheMissConfig {
     pub last_modified: Option<String>,
     pub cached_at: i64,
 }
-
 
 /// Mirror configuration for upsert operations
 #[derive(Debug, Clone)]
@@ -241,9 +239,11 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
-        sqlx::query("CREATE INDEX IF NOT EXISTS idx_shadow_packages_client ON shadow_packages(client_id)")
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_shadow_packages_client ON shadow_packages(client_id)",
+        )
+        .execute(&self.pool)
+        .await?;
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_shadow_packages_name ON shadow_packages(name)")
             .execute(&self.pool)
             .await?;
@@ -386,15 +386,14 @@ impl Database {
         let now = Utc::now();
 
         // Get current package IDs for this client
-        let existing: Vec<Uuid> = sqlx::query(
-            "SELECT package_id FROM client_packages WHERE client_id = $1",
-        )
-        .bind(client_id.0)
-        .fetch_all(&mut *tx)
-        .await?
-        .iter()
-        .map(|r| r.get::<Uuid, _>("package_id"))
-        .collect();
+        let existing: Vec<Uuid> =
+            sqlx::query("SELECT package_id FROM client_packages WHERE client_id = $1")
+                .bind(client_id.0)
+                .fetch_all(&mut *tx)
+                .await?
+                .iter()
+                .map(|r| r.get::<Uuid, _>("package_id"))
+                .collect();
 
         let mut current_ids = std::collections::HashSet::new();
 
@@ -770,11 +769,12 @@ impl Database {
 
     #[allow(dead_code)] // Will be used when API key auth is wired to mirror middleware
     pub async fn validate_api_key(&self, key_hash: &str) -> Result<Option<ApiKeyId>> {
-        let row = sqlx::query("UPDATE api_keys SET last_used = $1 WHERE key_hash = $2 RETURNING id")
-            .bind(Utc::now())
-            .bind(key_hash)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row =
+            sqlx::query("UPDATE api_keys SET last_used = $1 WHERE key_hash = $2 RETURNING id")
+                .bind(Utc::now())
+                .bind(key_hash)
+                .fetch_optional(&self.pool)
+                .await?;
 
         match row {
             Some(r) => {
@@ -825,13 +825,11 @@ impl Database {
         client_id: &ClientId,
         paired_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
-        let result = sqlx::query(
-            "UPDATE clients SET paired_at = $1, last_seen = $1 WHERE id = $2",
-        )
-        .bind(paired_at)
-        .bind(client_id.0)
-        .execute(&self.pool)
-        .await?;
+        let result = sqlx::query("UPDATE clients SET paired_at = $1, last_seen = $1 WHERE id = $2")
+            .bind(paired_at)
+            .bind(client_id.0)
+            .execute(&self.pool)
+            .await?;
 
         if result.rows_affected() == 0 {
             warn!(
@@ -925,7 +923,7 @@ impl Database {
 }
 
 /// Convert DB row to Package
-    #[allow(dead_code)] // Helper for DB query methods above
+#[allow(dead_code)] // Helper for DB query methods above
 fn row_to_package(row: &sqlx::postgres::PgRow) -> Package {
     Package {
         id: PackageId(row.get("id")),
@@ -1034,22 +1032,20 @@ impl Database {
 
     #[allow(dead_code)] // Will be used by mirror gRPC handlers
     pub async fn get_mirror_config(&self, distro: &str) -> Result<Option<MirrorConfigRow>> {
-        let row = sqlx::query_as::<_, MirrorConfigRow>(
-            "SELECT * FROM mirror_configs WHERE distro = $1",
-        )
-        .bind(distro)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query_as::<_, MirrorConfigRow>("SELECT * FROM mirror_configs WHERE distro = $1")
+                .bind(distro)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row)
     }
 
     #[allow(dead_code)] // Will be used by mirror gRPC handlers
     pub async fn list_mirror_configs(&self) -> Result<Vec<MirrorConfigRow>> {
-        let rows = sqlx::query_as::<_, MirrorConfigRow>(
-            "SELECT * FROM mirror_configs ORDER BY distro",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query_as::<_, MirrorConfigRow>("SELECT * FROM mirror_configs ORDER BY distro")
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows)
     }
 
@@ -1137,10 +1133,7 @@ impl Database {
 
     /// Get the latest upstream version for packages matching a distro and
     /// optional name filter. Returns the highest version per name+arch.
-    pub async fn latest_upstream_versions(
-        &self,
-        distro: &str,
-    ) -> Result<Vec<UpstreamPackageRow>> {
+    pub async fn latest_upstream_versions(&self, distro: &str) -> Result<Vec<UpstreamPackageRow>> {
         let rows = sqlx::query_as::<_, UpstreamPackageRow>(
             "SELECT DISTINCT ON (name, architecture)
                     id, distro, repo, name, version, architecture, filename,
@@ -1157,10 +1150,11 @@ impl Database {
 
     /// Count upstream packages for a distro.
     pub async fn count_upstream_packages(&self, distro: &str) -> Result<i64> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM upstream_packages WHERE distro = $1")
-            .bind(distro)
-            .fetch_one(&self.pool)
-            .await?;
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM upstream_packages WHERE distro = $1")
+                .bind(distro)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(count)
     }
 
@@ -1235,9 +1229,12 @@ impl Database {
         Ok(id)
     }
 
-    pub async fn get_shadow_package(&self, id: &uuid::Uuid) -> Result<Option<sqlx::types::Json<serde_json::Value>>> {
+    pub async fn get_shadow_package(
+        &self,
+        id: &uuid::Uuid,
+    ) -> Result<Option<sqlx::types::Json<serde_json::Value>>> {
         let row = sqlx::query_as::<_, (sqlx::types::Json<serde_json::Value>,)>(
-            "SELECT row_to_json(shadow_packages.*) FROM shadow_packages WHERE id = $1"
+            "SELECT row_to_json(shadow_packages.*) FROM shadow_packages WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -1258,9 +1255,13 @@ impl Database {
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
-    pub async fn update_shadow_package_version(&self, id: &uuid::Uuid, version: &str) -> Result<()> {
+    pub async fn update_shadow_package_version(
+        &self,
+        id: &uuid::Uuid,
+        version: &str,
+    ) -> Result<()> {
         sqlx::query(
-            "UPDATE shadow_packages SET version = $1, last_updated_at = now() WHERE id = $2"
+            "UPDATE shadow_packages SET version = $1, last_updated_at = now() WHERE id = $2",
         )
         .bind(version)
         .bind(id)
@@ -1339,8 +1340,16 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> Result<()> {
-        let applied = if status == "applied" { ", applied_at = now()" } else { "" };
-        let rolled = if status == "rolled_back" { ", rolled_back_at = now()" } else { "" };
+        let applied = if status == "applied" {
+            ", applied_at = now()"
+        } else {
+            ""
+        };
+        let rolled = if status == "rolled_back" {
+            ", rolled_back_at = now()"
+        } else {
+            ""
+        };
         sqlx::query(&format!(
             "UPDATE shadow_update_history SET status = $1, error_message = $2{applied}{rolled} WHERE id = $3"
         ))
@@ -1366,7 +1375,7 @@ impl Database {
                 (cache_path, package_name, package_version, scan_version,
                  clamav_result, yara_matches, max_entropy, cve_matches,
                  scan_status, blocked_reason, scanned_at)
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb, $9, $10, $11)"
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::jsonb, $9, $10, $11)",
         )
         .bind(&record.cache_path)
         .bind(&record.package_name)
@@ -1392,7 +1401,7 @@ impl Database {
                     scan_status, blocked_reason, scanned_at
              FROM cache_scan_results
              WHERE cache_path = $1
-             ORDER BY scan_version DESC LIMIT 1"
+             ORDER BY scan_version DESC LIMIT 1",
         )
         .bind(cache_path)
         .fetch_optional(&self.pool)
@@ -1400,10 +1409,8 @@ impl Database {
 
         match row {
             Some(r) => {
-                let yara: Option<serde_json::Value> = r.try_get("yara_matches")
-                    .unwrap_or(None);
-                let cve: Option<serde_json::Value> = r.try_get("cve_matches")
-                    .unwrap_or(None);
+                let yara: Option<serde_json::Value> = r.try_get("yara_matches").unwrap_or(None);
+                let cve: Option<serde_json::Value> = r.try_get("cve_matches").unwrap_or(None);
                 Ok(Some(ScanResultRow {
                     cache_path: r.get("cache_path"),
                     package_name: r.try_get("package_name").unwrap_or(None),
@@ -1454,4 +1461,3 @@ impl Database {
         Ok(())
     }
 }
-

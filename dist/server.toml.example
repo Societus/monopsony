@@ -17,7 +17,6 @@ bind = "0.0.0.0:3128"
 # If not set, the system hostname is used.
 # Type: string (optional)
 # hostname = "my-monopsony-server"
-
 # ============================================================================
 # gRPC Control Plane
 # ============================================================================
@@ -27,6 +26,14 @@ bind = "0.0.0.0:3128"
 # certificate signed by the Monopsony CA.
 # Type: string (host:port)
 bind = "0.0.0.0:50051"
+
+# WebSocket tunnel URL for clients behind Cloudflare Tunnels or reverse
+# proxies. When set, the server includes this URL in PairResponse so
+# paired clients know to connect via WSS instead of direct TCP.
+# Leave unset for LAN-only deployments where clients reach the gRPC port
+# directly.
+# Type: string (wss:// or ws:// URL, optional)
+# ws_url = "wss://monopsony.example.com/ws/tunnel"
 
 # ============================================================================
 # PostgreSQL Database
@@ -63,6 +70,27 @@ max_size_gb = 50
 # eviction. Default: 30
 # Type: u32
 # purge_after_days = 30
+
+# Streaming proxy limits for large packages (kernel/firmware images).
+# Bodies are streamed to disk with O(1) memory; these guard against
+# malicious upstreams and orphaned partial uploads.
+[cache.proxy_limits]
+# Maximum single response body in bytes, enforced via Content-Length when
+# present and a streamed-bytes counter otherwise. Default: 4 GiB — sized
+# for linux-firmware (~1 GB) with headroom.
+# max_response_bytes = 4294967296
+
+# Seconds an in-flight upstream fetch may stall (no bytes received) before
+# the server gives up and returns an error to the client.
+# upstream_stall_secs = 120
+
+# How often (seconds) the janitor sweeps orphaned partial-upload staging
+# files left behind by crashed fetches. Minimum 60.
+# stale_part_sweep_secs = 3600
+
+# Staging files older than this many seconds are considered orphaned and
+# deleted by the janitor.
+# stale_part_ttl_secs = 7200
 
 # ============================================================================
 # TLS / mTLS

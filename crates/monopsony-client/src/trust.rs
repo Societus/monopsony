@@ -8,9 +8,9 @@ use anyhow::{bail, Context, Result};
 use tracing::{debug, warn};
 
 use monopsony_common::config::ShadowPackageTrustConfig;
-use monopsony_common::shadow_types::SignedRecipe;
 #[cfg(test)]
 use monopsony_common::shadow_types::RecipeSignature;
+use monopsony_common::shadow_types::SignedRecipe;
 
 /// Verify a signed recipe against the client's trust policy.
 ///
@@ -36,9 +36,8 @@ pub fn verify_recipe_trust(
         }
         "paranoid" => {
             // Require both operator and author signatures
-            let vk = operator_verifying_key.context(
-                "trust policy 'paranoid' requires an operator verifying key",
-            )?;
+            let vk = operator_verifying_key
+                .context("trust policy 'paranoid' requires an operator verifying key")?;
             verify_operator_signature(signed, vk)?;
             verify_author_signature_present(signed, &trust_config.trusted_author_keys)?;
             debug!("trust check passed: paranoid (both signatures verified)");
@@ -47,9 +46,7 @@ pub fn verify_recipe_trust(
         p if p.starts_with("trusted_authors") => {
             // Verify author signature against trusted keys list
             verify_author_signature_present(signed, &trust_config.trusted_author_keys)?;
-            debug!(
-                "trust check passed: trusted_authors (author key verified)"
-            );
+            debug!("trust check passed: trusted_authors (author key verified)");
             Ok(())
         }
         other => {
@@ -64,8 +61,8 @@ fn verify_operator_signature(
     signed: &SignedRecipe,
     verifying_key: &ed25519_dalek::VerifyingKey,
 ) -> Result<()> {
-    use ed25519_dalek::{Signature, Verifier};
     use base64::Engine;
+    use ed25519_dalek::{Signature, Verifier};
 
     let sig_bytes: Vec<u8> = base64::engine::general_purpose::STANDARD
         .decode(&signed.operator_signature.signature)
@@ -178,7 +175,10 @@ mod tests {
 
         let result = verify_recipe_trust(&signed, &default_trust(), Some(&wrong_vk));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("verification failed"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("verification failed"));
     }
 
     #[test]
@@ -188,7 +188,10 @@ mod tests {
 
         let result = verify_recipe_trust(&signed, &default_trust(), None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("operator verifying key"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("operator verifying key"));
     }
 
     #[test]
@@ -201,7 +204,8 @@ mod tests {
 
         let author_sig = RecipeSignature {
             key_id: author_kid.clone(),
-            signature: base64_engine().encode(author_key.sign(b"[package]\nname = \"test\"").to_bytes()),
+            signature: base64_engine()
+                .encode(author_key.sign(b"[package]\nname = \"test\"").to_bytes()),
             signed_at: chrono::Utc::now(),
         };
         let signed = make_signed_recipe(&key, Some(author_sig));
@@ -230,7 +234,10 @@ mod tests {
 
         let result = verify_recipe_trust(&signed, &trust, Some(&vk));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("author signature required"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("author signature required"));
     }
 
     #[test]
@@ -279,7 +286,10 @@ mod tests {
 
         let result = verify_recipe_trust(&signed, &trust, None);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not in the trusted keys list"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("not in the trusted keys list"));
     }
 
     #[test]
@@ -296,6 +306,9 @@ mod tests {
 
         let result = verify_recipe_trust(&signed, &trust, Some(&vk));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unknown trust policy"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unknown trust policy"));
     }
 }

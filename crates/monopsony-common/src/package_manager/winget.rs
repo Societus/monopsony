@@ -1,6 +1,6 @@
 //! Winget package manager backend implementation
 
-use crate::{PackageRef, PackageManagerBackend, PackageManagerKind, ProxyConfigAction, UrlPattern};
+use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 
 pub struct WingetBackend;
@@ -71,9 +71,20 @@ impl PackageManagerBackend for WingetBackend {
 
     fn upstream_url_patterns(&self) -> Vec<UrlPattern> {
         vec![
-            UrlPattern::new(r"https?://[^/]*githubusercontent\.com/.*", 100, "GitHub CDN (winget)").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*aka\.ms/.*", 90, "Microsoft redirect (winget)").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*winget\.cdn\..*", 90, "Winget CDN").expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*githubusercontent\.com/.*",
+                100,
+                "GitHub CDN (winget)",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*aka\.ms/.*",
+                90,
+                "Microsoft redirect (winget)",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(r"https?://[^/]*winget\.cdn\..*", 90, "Winget CDN")
+                .expect("valid regex"),
         ]
     }
 

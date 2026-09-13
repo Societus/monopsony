@@ -103,13 +103,9 @@ pub enum PackageCommand {
 #[derive(Subcommand, Debug)]
 pub enum RecipeCommand {
     /// Open recipe in $EDITOR
-    Edit {
-        name: String,
-    },
+    Edit { name: String },
     /// Validate a recipe file
-    Validate {
-        path: String,
-    },
+    Validate { path: String },
 }
 
 /// Summary card for a recipe variant, used during interactive selection.
@@ -150,7 +146,11 @@ pub fn select_recipe_variant(
         // Select highest-scored variant
         return valid
             .into_iter()
-            .max_by(|a, b| a.1.score.partial_cmp(&b.1.score).unwrap_or(std::cmp::Ordering::Equal))
+            .max_by(|a, b| {
+                a.1.score
+                    .partial_cmp(&b.1.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .map(|(i, _)| i);
     }
 
@@ -197,16 +197,12 @@ mod tests {
     #[test]
     fn package_command_clap_parse() {
         // Verify the command structure is valid clap
-        let _ = PackageCommand::augment_subcommands(
-            clap::Command::new("test"),
-        );
+        let _ = PackageCommand::augment_subcommands(clap::Command::new("test"));
     }
 
     #[test]
     fn recipe_command_clap_parse() {
-        let _ = RecipeCommand::augment_subcommands(
-            clap::Command::new("test"),
-        );
+        let _ = RecipeCommand::augment_subcommands(clap::Command::new("test"));
     }
 
     #[test]
@@ -246,130 +242,129 @@ mod tests {
     }
 }
 
-    #[test]
-    fn select_variant_interactive() {
-        let variants = vec![
-            RecipeVariant {
-                id: "h1".into(),
-                name: "sonarr".into(),
-                author_key_id: "auth1".into(),
-                operator_key_id: Some("op1".into()),
-                source_type: "github_release".into(),
-                version: Some("4.0.7".into()),
-                score: 47.0,
-                install_count: 89,
-                report_count: 0,
-                quarantined: false,
-            },
-            RecipeVariant {
-                id: "h2".into(),
-                name: "sonarr-alpine".into(),
-                author_key_id: "auth2".into(),
-                operator_key_id: None,
-                source_type: "github_release".into(),
-                version: Some("4.0.7".into()),
-                score: 12.0,
-                install_count: 5,
-                report_count: 0,
-                quarantined: false,
-            },
-        ];
-        // Select variant 2
-        assert_eq!(select_recipe_variant(&variants, false, Some("2")), Some(1));
-        // Select variant 1
-        assert_eq!(select_recipe_variant(&variants, false, Some("1")), Some(0));
-        // Quit
-        assert_eq!(select_recipe_variant(&variants, false, Some("q")), None);
-        // Invalid
-        assert_eq!(select_recipe_variant(&variants, false, Some("99")), None);
-    }
-
-    #[test]
-    fn select_variant_non_interactive() {
-        let variants = vec![
-            RecipeVariant {
-                id: "h1".into(),
-                name: "sonarr".into(),
-                author_key_id: "auth1".into(),
-                operator_key_id: Some("op1".into()),
-                source_type: "github_release".into(),
-                version: Some("4.0.7".into()),
-                score: 12.0,
-                install_count: 5,
-                report_count: 0,
-                quarantined: false,
-            },
-            RecipeVariant {
-                id: "h2".into(),
-                name: "sonarr-high".into(),
-                author_key_id: "auth2".into(),
-                operator_key_id: None,
-                source_type: "github_release".into(),
-                version: Some("4.0.7".into()),
-                score: 47.0,
-                install_count: 89,
-                report_count: 0,
-                quarantined: false,
-            },
-        ];
-        // Should select index 1 (score 47 > 12)
-        assert_eq!(select_recipe_variant(&variants, true, None), Some(1));
-    }
-
-    #[test]
-    fn select_variant_skips_quarantined() {
-        let variants = vec![
-            RecipeVariant {
-                id: "h1".into(),
-                name: "bad-sonarr".into(),
-                author_key_id: "evil".into(),
-                operator_key_id: None,
-                source_type: "github_release".into(),
-                version: Some("4.0.7".into()),
-                score: 100.0,
-                install_count: 0,
-                report_count: 5,
-                quarantined: true,
-            },
-            RecipeVariant {
-                id: "h2".into(),
-                name: "good-sonarr".into(),
-                author_key_id: "auth1".into(),
-                operator_key_id: Some("op1".into()),
-                source_type: "github_release".into(),
-                version: Some("4.0.7".into()),
-                score: 30.0,
-                install_count: 50,
-                report_count: 0,
-                quarantined: false,
-            },
-        ];
-        // Non-interactive should skip quarantined
-        assert_eq!(select_recipe_variant(&variants, true, None), Some(1));
-        // Interactive selecting quarantined returns None
-        assert_eq!(select_recipe_variant(&variants, false, Some("1")), None);
-        // Interactive selecting non-quarantined works
-        assert_eq!(select_recipe_variant(&variants, false, Some("2")), Some(1));
-    }
-
-    #[test]
-    fn format_variant_display() {
-        let v = RecipeVariant {
+#[test]
+fn select_variant_interactive() {
+    let variants = vec![
+        RecipeVariant {
             id: "h1".into(),
             name: "sonarr".into(),
-            author_key_id: "keypad".into(),
-            operator_key_id: Some("societus".into()),
+            author_key_id: "auth1".into(),
+            operator_key_id: Some("op1".into()),
             source_type: "github_release".into(),
             version: Some("4.0.7".into()),
             score: 47.0,
             install_count: 89,
-            report_count: 3,
+            report_count: 0,
             quarantined: false,
-        };
-        let out = format_variant(1, &v);
-        assert!(out.contains("[1]"));
-        assert!(out.contains("sonarr"));
-        assert!(out.contains("keypad"));
-        assert!(out.contains("47.0"));
-    
+        },
+        RecipeVariant {
+            id: "h2".into(),
+            name: "sonarr-alpine".into(),
+            author_key_id: "auth2".into(),
+            operator_key_id: None,
+            source_type: "github_release".into(),
+            version: Some("4.0.7".into()),
+            score: 12.0,
+            install_count: 5,
+            report_count: 0,
+            quarantined: false,
+        },
+    ];
+    // Select variant 2
+    assert_eq!(select_recipe_variant(&variants, false, Some("2")), Some(1));
+    // Select variant 1
+    assert_eq!(select_recipe_variant(&variants, false, Some("1")), Some(0));
+    // Quit
+    assert_eq!(select_recipe_variant(&variants, false, Some("q")), None);
+    // Invalid
+    assert_eq!(select_recipe_variant(&variants, false, Some("99")), None);
+}
+
+#[test]
+fn select_variant_non_interactive() {
+    let variants = vec![
+        RecipeVariant {
+            id: "h1".into(),
+            name: "sonarr".into(),
+            author_key_id: "auth1".into(),
+            operator_key_id: Some("op1".into()),
+            source_type: "github_release".into(),
+            version: Some("4.0.7".into()),
+            score: 12.0,
+            install_count: 5,
+            report_count: 0,
+            quarantined: false,
+        },
+        RecipeVariant {
+            id: "h2".into(),
+            name: "sonarr-high".into(),
+            author_key_id: "auth2".into(),
+            operator_key_id: None,
+            source_type: "github_release".into(),
+            version: Some("4.0.7".into()),
+            score: 47.0,
+            install_count: 89,
+            report_count: 0,
+            quarantined: false,
+        },
+    ];
+    // Should select index 1 (score 47 > 12)
+    assert_eq!(select_recipe_variant(&variants, true, None), Some(1));
+}
+
+#[test]
+fn select_variant_skips_quarantined() {
+    let variants = vec![
+        RecipeVariant {
+            id: "h1".into(),
+            name: "bad-sonarr".into(),
+            author_key_id: "evil".into(),
+            operator_key_id: None,
+            source_type: "github_release".into(),
+            version: Some("4.0.7".into()),
+            score: 100.0,
+            install_count: 0,
+            report_count: 5,
+            quarantined: true,
+        },
+        RecipeVariant {
+            id: "h2".into(),
+            name: "good-sonarr".into(),
+            author_key_id: "auth1".into(),
+            operator_key_id: Some("op1".into()),
+            source_type: "github_release".into(),
+            version: Some("4.0.7".into()),
+            score: 30.0,
+            install_count: 50,
+            report_count: 0,
+            quarantined: false,
+        },
+    ];
+    // Non-interactive should skip quarantined
+    assert_eq!(select_recipe_variant(&variants, true, None), Some(1));
+    // Interactive selecting quarantined returns None
+    assert_eq!(select_recipe_variant(&variants, false, Some("1")), None);
+    // Interactive selecting non-quarantined works
+    assert_eq!(select_recipe_variant(&variants, false, Some("2")), Some(1));
+}
+
+#[test]
+fn format_variant_display() {
+    let v = RecipeVariant {
+        id: "h1".into(),
+        name: "sonarr".into(),
+        author_key_id: "keypad".into(),
+        operator_key_id: Some("societus".into()),
+        source_type: "github_release".into(),
+        version: Some("4.0.7".into()),
+        score: 47.0,
+        install_count: 89,
+        report_count: 3,
+        quarantined: false,
+    };
+    let out = format_variant(1, &v);
+    assert!(out.contains("[1]"));
+    assert!(out.contains("sonarr"));
+    assert!(out.contains("keypad"));
+    assert!(out.contains("47.0"));
 }

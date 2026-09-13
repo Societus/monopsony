@@ -6,12 +6,7 @@
 
 use std::sync::Arc;
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
@@ -138,10 +133,7 @@ pub async fn handle_report(
 
     match result {
         Ok(_) => {
-            info!(
-                "Report: mirror={} type={}",
-                req.mirror_id, report_type_str
-            );
+            info!("Report: mirror={} type={}", req.mirror_id, report_type_str);
             (StatusCode::OK, "reported").into_response()
         }
         Err(e) => {
@@ -163,7 +155,7 @@ pub async fn handle_list_reports(
             "SELECT id, mirror_id, report_type, package_name, expected_hash,
                     actual_hash, client_ip, details, timestamp, created_at
              FROM reports WHERE mirror_id = ?1
-             ORDER BY created_at DESC LIMIT 100"
+             ORDER BY created_at DESC LIMIT 100",
         ) {
             Ok(s) => s,
             Err(e) => {
@@ -192,7 +184,7 @@ pub async fn handle_list_reports(
             "SELECT id, mirror_id, report_type, package_name, expected_hash,
                     actual_hash, client_ip, details, timestamp, created_at
              FROM reports
-             ORDER BY created_at DESC LIMIT 100"
+             ORDER BY created_at DESC LIMIT 100",
         ) {
             Ok(s) => s,
             Err(e) => {

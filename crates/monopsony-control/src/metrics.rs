@@ -74,7 +74,12 @@ async fn get_stats(State(state): State<MetricsState>) -> Json<ServerStats> {
     if state.cache_dir.exists() {
         if let Ok(mut entries) = tokio::fs::read_dir(&state.cache_dir).await {
             while let Ok(Some(entry)) = entries.next_entry().await {
-                if entry.file_type().await.map(|t| t.is_file()).unwrap_or(false) {
+                if entry
+                    .file_type()
+                    .await
+                    .map(|t| t.is_file())
+                    .unwrap_or(false)
+                {
                     if let Ok(metadata) = entry.metadata().await {
                         cache_size_bytes += metadata.len();
                         cache_file_count += 1;
@@ -113,7 +118,10 @@ pub fn install_prometheus_exporter() -> PrometheusHandle {
 pub type PrometheusHandle = metrics_exporter_prometheus::PrometheusHandle;
 
 /// Prometheus metrics endpoint — serves the real metrics-exporter-prometheus output
-async fn get_metrics(State(_state): State<MetricsState>, handle: axum::extract::Extension<PrometheusHandle>) -> String {
+async fn get_metrics(
+    State(_state): State<MetricsState>,
+    handle: axum::extract::Extension<PrometheusHandle>,
+) -> String {
     handle.render()
 }
 
@@ -136,11 +144,7 @@ pub async fn run_metrics_server(
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("Metrics server listening on {}", addr);
 
-    axum::serve(
-        listener,
-        app.into_make_service(),
-    )
-    .await?;
+    axum::serve(listener, app.into_make_service()).await?;
 
     Ok(())
 }

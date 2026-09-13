@@ -34,7 +34,10 @@ pub fn run_setup(config_path: &str) -> anyhow::Result<SetupResult> {
     // Check if config already exists
     let config_exists = Path::new(config_path).exists();
     if config_exists {
-        println!("Found existing config at {}. We'll add missing sections.", config_path);
+        println!(
+            "Found existing config at {}. We'll add missing sections.",
+            config_path
+        );
         let existing = fs::read_to_string(config_path)?;
         toml_sections.push(existing);
     }
@@ -69,21 +72,31 @@ pub fn run_setup(config_path: &str) -> anyhow::Result<SetupResult> {
     let enable_scan = prompt_bool("Enable post-cache malware scanning?", false)?;
     let scan_section = if enable_scan {
         sections.push("scan.enabled=true".to_string());
-        let clamav_socket = prompt_string_default("ClamAV socket path (empty to skip)", "/var/run/clamav/clamd.ctl")?;
+        let clamav_socket = prompt_string_default(
+            "ClamAV socket path (empty to skip)",
+            "/var/run/clamav/clamd.ctl",
+        )?;
         let yara_dir = prompt_string_default("YARA rules directory", "/etc/monopsony/yara-rules")?;
         let block_on_malware = prompt_bool("Block serving if malware detected?", true)?;
         let warn_on_cve = prompt_bool("Warn on known CVEs (OSV lookup)?", true)?;
-        let entropy_threshold: f64 = prompt_f64_default("Entropy threshold (0.0-8.0, higher=more suspicious)", 7.5)?;
+        let entropy_threshold: f64 =
+            prompt_f64_default("Entropy threshold (0.0-8.0, higher=more suspicious)", 7.5)?;
 
         // Check ClamAV socket
         if !clamav_socket.is_empty() && !Path::new(&clamav_socket).exists() {
-            warnings.push(format!("ClamAV socket not found at {} — install ClamAV first", clamav_socket));
+            warnings.push(format!(
+                "ClamAV socket not found at {} — install ClamAV first",
+                clamav_socket
+            ));
         }
 
         // Create YARA rules dir
         if !Path::new(&yara_dir).exists() {
             if let Err(e) = fs::create_dir_all(&yara_dir) {
-                warnings.push(format!("Could not create YARA rules dir {}: {}", yara_dir, e));
+                warnings.push(format!(
+                    "Could not create YARA rules dir {}: {}",
+                    yara_dir, e
+                ));
             }
         }
 
@@ -120,7 +133,9 @@ pub fn run_setup(config_path: &str) -> anyhow::Result<SetupResult> {
     let node_section = format!(
         "\n\n[node]\ntier = \"{}\"{}",
         tier_str,
-        node_name.map(|n| format!("\nname = \"{}\"", n)).unwrap_or_default()
+        node_name
+            .map(|n| format!("\nname = \"{}\"", n))
+            .unwrap_or_default()
     );
 
     // 4. Encryption key (only for S3)
@@ -128,7 +143,8 @@ pub fn run_setup(config_path: &str) -> anyhow::Result<SetupResult> {
         println!("\n--- S3 Encryption ---");
         let gen_key = prompt_bool("Generate a 256-bit SSE-C encryption key?", true)?;
         if gen_key {
-            let key_path = prompt_string_default("Encryption key path", "/etc/monopsony/s3-encryption.key")?;
+            let key_path =
+                prompt_string_default("Encryption key path", "/etc/monopsony/s3-encryption.key")?;
             let key = generate_encryption_key()?;
             // Write with restrictive permissions
             if let Some(parent) = Path::new(&key_path).parent() {
@@ -218,13 +234,19 @@ pub fn run_check(config_path: &str) -> anyhow::Result<Vec<String>> {
         // Scan enabled — check for clamav socket
         if let Some(socket) = extract_toml_value(&content, "clamav_socket") {
             if !socket.is_empty() && !Path::new(&socket).exists() {
-                issues.push(format!("ClamAV socket not found: {} (scanning enabled)", socket));
+                issues.push(format!(
+                    "ClamAV socket not found: {} (scanning enabled)",
+                    socket
+                ));
             }
         }
         // Check for YARA rules dir
         if let Some(yara_dir) = extract_toml_value(&content, "yara_rules_dir") {
             if !Path::new(&yara_dir).exists() {
-                issues.push(format!("YARA rules directory not found: {} (scanning enabled)", yara_dir));
+                issues.push(format!(
+                    "YARA rules directory not found: {} (scanning enabled)",
+                    yara_dir
+                ));
             }
         }
     }
@@ -300,7 +322,8 @@ bind = "0.0.0.0:9090"
 [logging]
 level = "info"
 format = "json"
-"#.to_string()
+"#
+    .to_string()
 }
 
 fn generate_encryption_key() -> anyhow::Result<Vec<u8>> {
@@ -317,7 +340,9 @@ fn generate_encryption_key() -> anyhow::Result<Vec<u8>> {
 fn extract_toml_value(content: &str, key: &str) -> Option<String> {
     for line in content.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with('#') { continue; }
+        if trimmed.starts_with('#') {
+            continue;
+        }
         if let Some(eq_pos) = trimmed.find('=') {
             let k = trimmed[..eq_pos].trim();
             if k == key {
@@ -370,7 +395,10 @@ fn prompt_bool(prompt: &str, default: bool) -> io::Result<bool> {
     if val.is_empty() {
         return Ok(default);
     }
-    Ok(matches!(val.to_lowercase().as_str(), "y" | "yes" | "true" | "1"))
+    Ok(matches!(
+        val.to_lowercase().as_str(),
+        "y" | "yes" | "true" | "1"
+    ))
 }
 
 fn prompt_u32_default(prompt: &str, default: u32) -> io::Result<u32> {
@@ -414,8 +442,14 @@ mod tests {
     #[test]
     fn test_extract_toml_value_found() {
         let content = "bind = \"0.0.0.0:3128\"\nenabled = true\n";
-        assert_eq!(extract_toml_value(content, "bind"), Some("\"0.0.0.0:3128\"".to_string()));
-        assert_eq!(extract_toml_value(content, "enabled"), Some("true".to_string()));
+        assert_eq!(
+            extract_toml_value(content, "bind"),
+            Some("\"0.0.0.0:3128\"".to_string())
+        );
+        assert_eq!(
+            extract_toml_value(content, "enabled"),
+            Some("true".to_string())
+        );
     }
 
     #[test]
@@ -427,7 +461,10 @@ mod tests {
     #[test]
     fn test_extract_toml_value_skips_comments() {
         let content = "# enabled = false\nenabled = true\n";
-        assert_eq!(extract_toml_value(content, "enabled"), Some("true".to_string()));
+        assert_eq!(
+            extract_toml_value(content, "enabled"),
+            Some("true".to_string())
+        );
     }
 
     #[test]
@@ -441,7 +478,9 @@ mod tests {
         let dir = std::env::temp_dir().join("monopsony-setup-test-valid");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("server.toml");
-        fs::write(&path, r#"
+        fs::write(
+            &path,
+            r#"
 [server]
 bind = "0.0.0.0:3128"
 
@@ -467,7 +506,9 @@ enabled = false
 
 [node]
 tier = "private"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let issues = run_check(path.to_str().unwrap()).unwrap();
         assert!(issues.is_empty(), "Expected no issues, got: {:?}", issues);
         let _ = fs::remove_dir_all(&dir);
@@ -490,7 +531,9 @@ tier = "private"
         let dir = std::env::temp_dir().join("monopsony-setup-test-public");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("server.toml");
-        fs::write(&path, r#"
+        fs::write(
+            &path,
+            r#"
 [server]
 bind = "0.0.0.0:3128"
 [grpc]
@@ -508,7 +551,9 @@ server_key_path = "/var/lib/monopsony/server.key"
 enabled = true
 [node]
 tier = "public"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let issues = run_check(path.to_str().unwrap()).unwrap();
         assert!(issues.iter().any(|i| i.contains("S3 storage")));
         let _ = fs::remove_dir_all(&dir);
@@ -519,7 +564,9 @@ tier = "public"
         let dir = std::env::temp_dir().join("monopsony-setup-test-fed");
         let _ = fs::create_dir_all(&dir);
         let path = dir.join("server.toml");
-        fs::write(&path, r#"
+        fs::write(
+            &path,
+            r#"
 [server]
 bind = "0.0.0.0:3128"
 [grpc]
@@ -537,7 +584,9 @@ server_key_path = "/var/lib/monopsony/server.key"
 enabled = false
 [node]
 tier = "federated"
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let issues = run_check(path.to_str().unwrap()).unwrap();
         assert!(issues.iter().any(|i| i.contains("scanning")));
         let _ = fs::remove_dir_all(&dir);
@@ -559,9 +608,21 @@ tier = "federated"
     #[test]
     fn test_prompt_bool_parsing() {
         // Test via the parsing logic directly
-        assert!(matches!("y".to_lowercase().as_str(), "y" | "yes" | "true" | "1"));
-        assert!(matches!("yes".to_lowercase().as_str(), "y" | "yes" | "true" | "1"));
-        assert!(matches!("TRUE".to_lowercase().as_str(), "y" | "yes" | "true" | "1"));
-        assert!(!matches!("n".to_lowercase().as_str(), "y" | "yes" | "true" | "1"));
+        assert!(matches!(
+            "y".to_lowercase().as_str(),
+            "y" | "yes" | "true" | "1"
+        ));
+        assert!(matches!(
+            "yes".to_lowercase().as_str(),
+            "y" | "yes" | "true" | "1"
+        ));
+        assert!(matches!(
+            "TRUE".to_lowercase().as_str(),
+            "y" | "yes" | "true" | "1"
+        ));
+        assert!(!matches!(
+            "n".to_lowercase().as_str(),
+            "y" | "yes" | "true" | "1"
+        ));
     }
 }

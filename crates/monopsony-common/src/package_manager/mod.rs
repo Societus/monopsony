@@ -6,6 +6,7 @@
 mod apk;
 mod apt;
 mod bsd_privilege;
+mod choco;
 mod dnf;
 mod emerge;
 mod mport;
@@ -18,10 +19,10 @@ mod scoop;
 mod winget;
 mod xbps;
 mod zypper;
-mod choco;
 
 pub use apk::ApkBackend;
 pub use apt::AptBackend;
+pub use choco::ChocoBackend;
 pub use dnf::DnfBackend;
 pub use emerge::EmergeBackend;
 pub use mport::MportBackend;
@@ -34,7 +35,6 @@ pub use scoop::ScoopBackend;
 pub use winget::WingetBackend;
 pub use xbps::XbpsBackend;
 pub use zypper::ZypperBackend;
-pub use choco::ChocoBackend;
 
 use async_trait::async_trait;
 use regex::Regex;
@@ -157,28 +157,15 @@ impl UrlPattern {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProxyConfigAction {
     /// Write a configuration file
-    WriteFile {
-        path: PathBuf,
-        content: String,
-    },
+    WriteFile { path: PathBuf, content: String },
     /// Remove a configuration file
-    RemoveFile {
-        path: PathBuf,
-    },
+    RemoveFile { path: PathBuf },
     /// Set an environment variable
-    SetEnv {
-        key: String,
-        value: String,
-    },
+    SetEnv { key: String, value: String },
     /// Unset an environment variable
-    UnsetEnv {
-        key: String,
-    },
+    UnsetEnv { key: String },
     /// Run a command
-    RunCommand {
-        program: String,
-        args: Vec<String>,
-    },
+    RunCommand { program: String, args: Vec<String> },
     /// Multiple actions needed
     Multiple(Vec<ProxyConfigAction>),
     /// No configuration needed (package manager uses system proxy)
@@ -222,15 +209,18 @@ impl ProxyConfigAction {
             }
             ProxyConfigAction::RunCommand { program, args } => {
                 let result = (|| -> anyhow::Result<String> {
-                    let output = std::process::Command::new(program)
-                        .args(args)
-                        .output()?;
+                    let output = std::process::Command::new(program).args(args).output()?;
                     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
                     if output.status.success() {
                         Ok(format!("ran {} -> {}", program, stdout))
                     } else {
                         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-                        anyhow::bail!("{} failed (exit {:?}): {}", program, output.status.code(), stderr)
+                        anyhow::bail!(
+                            "{} failed (exit {:?}): {}",
+                            program,
+                            output.status.code(),
+                            stderr
+                        )
                     }
                 })();
                 vec![result]
@@ -348,7 +338,10 @@ pub fn get_backend(kind: PackageManagerKind) -> Option<Box<dyn PackageManagerBac
 /// Uses `get_all_backends()` so it matches URLs for all client OSes,
 /// not just PMs installed on this machine.
 pub fn matches_package_url(url: &str) -> bool {
-    get_all_backends()
-        .iter()
-        .any(|backend| backend.upstream_url_patterns().iter().any(|p| p.matches(url)))
+    get_all_backends().iter().any(|backend| {
+        backend
+            .upstream_url_patterns()
+            .iter()
+            .any(|p| p.matches(url))
+    })
 }

@@ -134,7 +134,12 @@ pub async fn lookup_cve(
                         }
                     })
                     .collect();
-                debug!("OSV returned {} vulns for {}@{}", matches.len(), package_name, package_version);
+                debug!(
+                    "OSV returned {} vulns for {}@{}",
+                    matches.len(),
+                    package_name,
+                    package_version
+                );
                 OsvResult {
                     matches,
                     error: None,
@@ -246,22 +251,34 @@ mod tests {
 
     #[test]
     fn test_infer_ecosystem_npm() {
-        assert_eq!(infer_ecosystem(std::path::Path::new("/cache/npm/lodash-4.17.20.tgz")), "npm");
+        assert_eq!(
+            infer_ecosystem(std::path::Path::new("/cache/npm/lodash-4.17.20.tgz")),
+            "npm"
+        );
     }
 
     #[test]
     fn test_infer_ecosystem_pypi() {
-        assert_eq!(infer_ecosystem(std::path::Path::new("/cache/pypi/requests-2.28.0.whl")), "PyPI");
+        assert_eq!(
+            infer_ecosystem(std::path::Path::new("/cache/pypi/requests-2.28.0.whl")),
+            "PyPI"
+        );
     }
 
     #[test]
     fn test_infer_ecosystem_crates() {
-        assert_eq!(infer_ecosystem(std::path::Path::new("/cache/crates.io/serde-1.0.crate")), "crates.io");
+        assert_eq!(
+            infer_ecosystem(std::path::Path::new("/cache/crates.io/serde-1.0.crate")),
+            "crates.io"
+        );
     }
 
     #[test]
     fn test_infer_ecosystem_unknown() {
-        assert_eq!(infer_ecosystem(std::path::Path::new("/cache/random/file.bin")), "");
+        assert_eq!(
+            infer_ecosystem(std::path::Path::new("/cache/random/file.bin")),
+            ""
+        );
     }
 
     #[tokio::test]

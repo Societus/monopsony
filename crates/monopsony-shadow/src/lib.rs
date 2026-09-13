@@ -1,3 +1,4 @@
+pub mod preloaded;
 pub mod shadow;
 pub mod shadow_cache;
 pub mod shadow_conflict;

@@ -205,7 +205,10 @@ mod tests {
     fn test_scan_entropy_tar_high_entropy_member() {
         let tar_data = make_test_tar(&[
             ("low.txt", &[0u8; 100]),
-            ("high.bin", &(0..=255u8).cycle().take(512).collect::<Vec<_>>()),
+            (
+                "high.bin",
+                &(0..=255u8).cycle().take(512).collect::<Vec<_>>(),
+            ),
         ]);
         let result = scan_entropy(&tar_data, 7.5);
         assert!(result.flagged, "should flag high-entropy member");

@@ -41,10 +41,7 @@ impl ServerProcess {
 
         let binary = env!("CARGO_BIN_EXE_monopsony-server");
 
-        let temp_dir = std::env::temp_dir().join(format!(
-            "monopsony-smoke-{}",
-            std::process::id()
-        ));
+        let temp_dir = std::env::temp_dir().join(format!("monopsony-smoke-{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).expect("failed to create temp dir");
 
         let child = Command::new(binary)
@@ -113,12 +110,18 @@ fn test_server_starts_and_binds_ports() {
     if wait_for_port(server.mirror_port, Duration::from_secs(2)) {
         eprintln!("  Mirror port {} is up", server.mirror_port);
     } else {
-        eprintln!("  Mirror port {} not bound (requires database)", server.mirror_port);
+        eprintln!(
+            "  Mirror port {} not bound (requires database)",
+            server.mirror_port
+        );
     }
     if wait_for_port(server.grpc_port, Duration::from_secs(2)) {
         eprintln!("  gRPC port {} is up", server.grpc_port);
     } else {
-        eprintln!("  gRPC port {} not bound (requires database)", server.grpc_port);
+        eprintln!(
+            "  gRPC port {} not bound (requires database)",
+            server.grpc_port
+        );
     }
 
     server.stop();
@@ -152,7 +155,10 @@ async fn test_server_health_endpoint() {
         resp.status()
     );
     let body: serde_json::Value = resp.json().await.expect("health response should be JSON");
-    assert_eq!(body["status"], "healthy", "Health status should be 'healthy'");
+    assert_eq!(
+        body["status"], "healthy",
+        "Health status should be 'healthy'"
+    );
 
     server.stop();
 }

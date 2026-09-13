@@ -44,9 +44,8 @@ impl TrackerAnnouncer {
 
     /// Run the announce loop (blocks forever)
     pub async fn run(&self) {
-        let mut interval = tokio::time::interval(
-            tokio::time::Duration::from_secs(self.interval_secs)
-        );
+        let mut interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(self.interval_secs));
 
         // Announce immediately on start
         self.announce_all().await;
@@ -65,9 +64,7 @@ impl TrackerAnnouncer {
         let configs = self.manager.list_configs().await;
 
         // Only announce public mirrors
-        let public_configs: Vec<_> = configs.iter()
-            .filter(|c| c.public)
-            .collect();
+        let public_configs: Vec<_> = configs.iter().filter(|c| c.public).collect();
 
         if public_configs.is_empty() {
             debug!("No public mirrors to announce");
@@ -103,10 +100,7 @@ impl TrackerAnnouncer {
 
             for tracker_url in &self.tracker_urls {
                 let announce_url = format!("{}/announce", tracker_url.trim_end_matches('/'));
-                let result = client.post(&announce_url)
-                    .json(&payload)
-                    .send()
-                    .await;
+                let result = client.post(&announce_url).json(&payload).send().await;
 
                 match result {
                     Ok(resp) => {
@@ -114,19 +108,26 @@ impl TrackerAnnouncer {
                         if status.is_success() {
                             debug!("Announced {} to {}", config.distro, tracker_url);
                         } else {
-                            warn!("Tracker {} returned {} for {}", 
-                                tracker_url, status, config.distro);
+                            warn!(
+                                "Tracker {} returned {} for {}",
+                                tracker_url, status, config.distro
+                            );
                         }
                     }
                     Err(e) => {
-                        warn!("Failed to announce {} to {}: {}", 
-                            config.distro, tracker_url, e);
+                        warn!(
+                            "Failed to announce {} to {}: {}",
+                            config.distro, tracker_url, e
+                        );
                     }
                 }
             }
         }
 
-        info!("Announced {} public mirrors to {} tracker(s)", 
-            public_count, self.tracker_urls.len());
+        info!(
+            "Announced {} public mirrors to {} tracker(s)",
+            public_count,
+            self.tracker_urls.len()
+        );
     }
 }

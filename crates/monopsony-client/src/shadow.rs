@@ -46,7 +46,10 @@ pub struct UpdateResult {
 }
 
 /// Verify installed version by running detect_command and matching detect_pattern
-pub async fn verify_version(detect_command: &str, detect_pattern: &str) -> Result<String, ShadowClientError> {
+pub async fn verify_version(
+    detect_command: &str,
+    detect_pattern: &str,
+) -> Result<String, ShadowClientError> {
     let output = Command::new("sh")
         .arg("-c")
         .arg(detect_command)
@@ -57,9 +60,10 @@ pub async fn verify_version(detect_command: &str, detect_pattern: &str) -> Resul
         .map_err(|e| ShadowClientError::VerificationFailed(e.to_string()))?;
 
     if !output.status.success() {
-        return Err(ShadowClientError::VerificationFailed(
-            format!("command exited with {}", output.status),
-        ));
+        return Err(ShadowClientError::VerificationFailed(format!(
+            "command exited with {}",
+            output.status
+        )));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -73,36 +77,48 @@ pub async fn detect_version(
     use monopsony_common::shadow_types::VersionDetectMethod;
 
     match config.method {
-        VersionDetectMethod::Command => {
-            verify_version(&config.source, &config.pattern).await
-        }
+        VersionDetectMethod::Command => verify_version(&config.source, &config.pattern).await,
         VersionDetectMethod::File => {
             let content = tokio::fs::read_to_string(&config.source)
                 .await
-                .map_err(|e| ShadowClientError::VerificationFailed(
-                    format!("failed to read file '{}': {}", config.source, e)
-                ))?;
+                .map_err(|e| {
+                    ShadowClientError::VerificationFailed(format!(
+                        "failed to read file '{}': {}",
+                        config.source, e
+                    ))
+                })?;
             extract_version(&content, &config.pattern)
         }
         VersionDetectMethod::Header => {
             let header_name = config.header_name.as_deref().unwrap_or("etag");
             let client = reqwest::Client::new();
-            let resp = client.head(&config.source)
+            let resp = client
+                .head(&config.source)
                 .timeout(Duration::from_secs(10))
                 .send()
                 .await
-                .map_err(|e| ShadowClientError::VerificationFailed(
-                    format!("HTTP HEAD to '{}' failed: {}", config.source, e)
-                ))?;
-            let value = resp.headers()
+                .map_err(|e| {
+                    ShadowClientError::VerificationFailed(format!(
+                        "HTTP HEAD to '{}' failed: {}",
+                        config.source, e
+                    ))
+                })?;
+            let value = resp
+                .headers()
                 .get(header_name)
-                .ok_or_else(|| ShadowClientError::VerificationFailed(
-                    format!("header '{}' not found in response", header_name)
-                ))?
+                .ok_or_else(|| {
+                    ShadowClientError::VerificationFailed(format!(
+                        "header '{}' not found in response",
+                        header_name
+                    ))
+                })?
                 .to_str()
-                .map_err(|e| ShadowClientError::VerificationFailed(
-                    format!("header value not valid UTF-8: {}", e)
-                ))?;
+                .map_err(|e| {
+                    ShadowClientError::VerificationFailed(format!(
+                        "header value not valid UTF-8: {}",
+                        e
+                    ))
+                })?;
             extract_version(value, &config.pattern)
         }
     }
@@ -110,8 +126,8 @@ pub async fn detect_version(
 
 /// Extract a version string from text using a regex with one capture group.
 fn extract_version(text: &str, pattern: &str) -> Result<String, ShadowClientError> {
-    let pat = Regex::new(pattern)
-        .map_err(|e| ShadowClientError::VerificationFailed(e.to_string()))?;
+    let pat =
+        Regex::new(pattern).map_err(|e| ShadowClientError::VerificationFailed(e.to_string()))?;
     let caps = pat
         .captures(text)
         .ok_or_else(|| ShadowClientError::VersionMismatch {
@@ -169,10 +185,10 @@ pub struct RollbackEntry {
 ///
 /// Scans for directories matching `{target_dir}.bak.*` and returns them
 /// sorted newest-first.
-pub async fn list_rollback_versions(target_dir: &str) -> Result<Vec<RollbackEntry>, ShadowClientError> {
-    let parent = Path::new(target_dir)
-        .parent()
-        .unwrap_or(Path::new("."));
+pub async fn list_rollback_versions(
+    target_dir: &str,
+) -> Result<Vec<RollbackEntry>, ShadowClientError> {
+    let parent = Path::new(target_dir).parent().unwrap_or(Path::new("."));
     let dir_name = Path::new(target_dir)
         .file_name()
         .map(|f| f.to_string_lossy().to_string())
@@ -209,11 +225,17 @@ pub async fn rollback_to_version(
     let entry = versions
         .iter()
         .find(|v| v.version == target_version)
-        .ok_or_else(|| ShadowClientError::RollbackFailed(format!(
-            "version '{}' not found in rollback history (available: {})",
-            target_version,
-            versions.iter().map(|v| v.version.as_str()).collect::<Vec<_>>().join(", ")
-        )))?;
+        .ok_or_else(|| {
+            ShadowClientError::RollbackFailed(format!(
+                "version '{}' not found in rollback history (available: {})",
+                target_version,
+                versions
+                    .iter()
+                    .map(|v| v.version.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
 
     // Detect current version from the live directory name for logging
     info!("Rolling back {} to version {}", target_dir, target_version);
@@ -221,23 +243,28 @@ pub async fn rollback_to_version(
     // Backup current state before rollback
     let current = Path::new(target_dir);
     if current.exists() {
-        let current_backup = PathBuf::from(format!(
-            "{target_dir}.bak.prerollback.{target_version}"
-        ));
+        let current_backup =
+            PathBuf::from(format!("{target_dir}.bak.prerollback.{target_version}"));
         copy_dir_recursive(current, &current_backup).await?;
     }
 
     // Restore the target backup
     restore_backup(target_dir, &entry.backup_path).await?;
 
-    info!("Successfully rolled back {} to {}", target_dir, target_version);
+    info!(
+        "Successfully rolled back {} to {}",
+        target_dir, target_version
+    );
     Ok(())
 }
 
 /// Prune old backups exceeding max_backups.
 ///
 /// Keeps the `max_backups` most recent backups, deletes the rest.
-pub async fn prune_backups(target_dir: &str, max_backups: usize) -> Result<usize, ShadowClientError> {
+pub async fn prune_backups(
+    target_dir: &str,
+    max_backups: usize,
+) -> Result<usize, ShadowClientError> {
     let max = max_backups.max(1);
     let versions = list_rollback_versions(target_dir).await?;
 
@@ -263,7 +290,10 @@ pub async fn prune_backups(target_dir: &str, max_backups: usize) -> Result<usize
 
 /// Extract a tar.gz archive to a temp directory
 pub async fn extract_to_temp(archive_path: &Path) -> Result<PathBuf, ShadowClientError> {
-    let temp_dir = archive_path.parent().unwrap_or(Path::new("/tmp")).join("extracted");
+    let temp_dir = archive_path
+        .parent()
+        .unwrap_or(Path::new("/tmp"))
+        .join("extracted");
     if temp_dir.exists() {
         fs::remove_dir_all(&temp_dir).await?;
     }
@@ -319,49 +349,73 @@ pub async fn install_binaries(
         // Ensure parent directory exists
         if let Some(parent) = target.parent() {
             if !parent.exists() {
-                fs::create_dir_all(parent).await
-                    .map_err(|e| ShadowClientError::InstallFailed(
-                        format!("failed to create parent dir {}: {}", parent.display(), e)
-                    ))?;
+                fs::create_dir_all(parent).await.map_err(|e| {
+                    ShadowClientError::InstallFailed(format!(
+                        "failed to create parent dir {}: {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
             }
         }
 
         // Back up existing target if present
         if target.exists() {
-            let backup_name = format!("{}.bak.{}", 
+            let backup_name = format!(
+                "{}.bak.{}",
                 target.file_name().unwrap_or_default().to_string_lossy(),
                 chrono::Utc::now().timestamp()
             );
             let backup_path = backup_dir.join(&backup_name);
-            fs::copy(&target, &backup_path).await
-                .map_err(|e| ShadowClientError::InstallFailed(
-                    format!("failed to back up {}: {}", target.display(), e)
-                ))?;
-            debug!("Backed up {} -> {}", target.display(), backup_path.display());
+            fs::copy(&target, &backup_path).await.map_err(|e| {
+                ShadowClientError::InstallFailed(format!(
+                    "failed to back up {}: {}",
+                    target.display(),
+                    e
+                ))
+            })?;
+            debug!(
+                "Backed up {} -> {}",
+                target.display(),
+                backup_path.display()
+            );
         }
 
         // Copy source to target
-        fs::copy(&source, &target).await
-            .map_err(|e| ShadowClientError::InstallFailed(
-                format!("failed to copy {} -> {}: {}", source.display(), target.display(), e)
-            ))?;
+        fs::copy(&source, &target).await.map_err(|e| {
+            ShadowClientError::InstallFailed(format!(
+                "failed to copy {} -> {}: {}",
+                source.display(),
+                target.display(),
+                e
+            ))
+        })?;
 
         // Apply chmod (default 0755)
         let mode_str = entry.mode.as_deref().unwrap_or("0755");
-        let mode = u32::from_str_radix(mode_str, 8)
-            .map_err(|e| ShadowClientError::InstallFailed(
-                format!("invalid chmod mode '{}': {}", mode_str, e)
-            ))?;
+        let mode = u32::from_str_radix(mode_str, 8).map_err(|e| {
+            ShadowClientError::InstallFailed(format!("invalid chmod mode '{}': {}", mode_str, e))
+        })?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).await
-                .map_err(|e| ShadowClientError::InstallFailed(
-                    format!("failed to chmod {}: {}", target.display(), e)
-                ))?;
+            fs::set_permissions(&target, std::fs::Permissions::from_mode(mode))
+                .await
+                .map_err(|e| {
+                    ShadowClientError::InstallFailed(format!(
+                        "failed to chmod {}: {}",
+                        target.display(),
+                        e
+                    ))
+                })?;
         }
 
-        info!("Installed {} -> {} ({:o})", source.display(), target.display(), mode);
+        info!(
+            "Installed {} -> {} ({:o})",
+            source.display(),
+            target.display(),
+            mode
+        );
         installed.push(target);
     }
 
@@ -378,18 +432,22 @@ fn find_in_extracted(temp_dir: &Path, filename: &str) -> Result<PathBuf, ShadowC
     }
 
     // Try just the filename component (strip any prefix dirs)
-    let basename = Path::new(filename).file_name()
-        .unwrap_or_default().to_string_lossy();
-    
+    let basename = Path::new(filename)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+
     // Walk temp_dir looking for the file
-    for entry in std::fs::read_dir(temp_dir)
-        .map_err(|e| ShadowClientError::InstallFailed(
-            format!("failed to read temp dir {}: {}", temp_dir.display(), e)
-        ))?
-    {
-        let entry = entry.map_err(|e| ShadowClientError::InstallFailed(
-            format!("failed to read dir entry: {}", e)
-        ))?;
+    for entry in std::fs::read_dir(temp_dir).map_err(|e| {
+        ShadowClientError::InstallFailed(format!(
+            "failed to read temp dir {}: {}",
+            temp_dir.display(),
+            e
+        ))
+    })? {
+        let entry = entry.map_err(|e| {
+            ShadowClientError::InstallFailed(format!("failed to read dir entry: {}", e))
+        })?;
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             let candidate = entry.path().join(basename.as_ref());
             if candidate.exists() {
@@ -398,9 +456,11 @@ fn find_in_extracted(temp_dir: &Path, filename: &str) -> Result<PathBuf, ShadowC
         }
     }
 
-    Err(ShadowClientError::InstallFailed(
-        format!("binary '{}' not found in extracted archive at {}", filename, temp_dir.display())
-    ))
+    Err(ShadowClientError::InstallFailed(format!(
+        "binary '{}' not found in extracted archive at {}",
+        filename,
+        temp_dir.display()
+    )))
 }
 
 /// Run a health check after update
@@ -474,9 +534,10 @@ pub fn verify_extraction(temp_dir: &Path, recipe: &ShadowRecipe) -> Result<(), S
         for bin in chmod_list {
             let bin_path = temp_dir.join(bin);
             if !bin_path.exists() {
-                return Err(ShadowClientError::VerificationFailed(
-                    format!("expected file not found: {}", bin_path.display()),
-                ));
+                return Err(ShadowClientError::VerificationFailed(format!(
+                    "expected file not found: {}",
+                    bin_path.display()
+                )));
             }
         }
     }
@@ -499,7 +560,10 @@ pub async fn atomic_swap(source_dir: &Path, target_dir: &Path) -> Result<(), Sha
 }
 
 /// Recursively copy a directory
-fn copy_dir_recursive<'a>(src: &'a Path, dst: &'a Path) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ShadowClientError>> + 'a>> {
+fn copy_dir_recursive<'a>(
+    src: &'a Path,
+    dst: &'a Path,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ShadowClientError>> + 'a>> {
     Box::pin(async move {
         fs::create_dir_all(dst).await?;
         let mut entries = fs::read_dir(src).await?;
@@ -661,15 +725,11 @@ mod tests {
         fs::write(&script, "#!/bin/sh\necho '4.0.7.1863'\n")
             .await
             .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let result = verify_version(
-            &format!("{}", script.display()),
-            r"(\d+\.\d+\.\d+\.\d+)",
-        )
-        .await
-        .unwrap();
+        let result = verify_version(&format!("{}", script.display()), r"(\d+\.\d+\.\d+\.\d+)")
+            .await
+            .unwrap();
         assert_eq!(result, "4.0.7.1863");
     }
 
@@ -702,9 +762,7 @@ mod tests {
             .await
             .unwrap();
 
-        let content = fs::read_to_string(target.join("config.txt"))
-            .await
-            .unwrap();
+        let content = fs::read_to_string(target.join("config.txt")).await.unwrap();
         assert_eq!(content, "old config");
     }
 
@@ -897,7 +955,9 @@ mod tests {
         let target = dir.path().join("mypkg");
         fs::create_dir_all(&target).await.unwrap();
 
-        let versions = list_rollback_versions(&target.to_string_lossy()).await.unwrap();
+        let versions = list_rollback_versions(&target.to_string_lossy())
+            .await
+            .unwrap();
         assert!(versions.is_empty());
     }
 
@@ -908,13 +968,23 @@ mod tests {
         fs::create_dir_all(&target).await.unwrap();
 
         // Create backup dirs
-        fs::create_dir_all(dir.path().join("mypkg.bak.1.0.0")).await.unwrap();
-        fs::create_dir_all(dir.path().join("mypkg.bak.1.1.0")).await.unwrap();
-        fs::create_dir_all(dir.path().join("mypkg.bak.2.0.0")).await.unwrap();
+        fs::create_dir_all(dir.path().join("mypkg.bak.1.0.0"))
+            .await
+            .unwrap();
+        fs::create_dir_all(dir.path().join("mypkg.bak.1.1.0"))
+            .await
+            .unwrap();
+        fs::create_dir_all(dir.path().join("mypkg.bak.2.0.0"))
+            .await
+            .unwrap();
         // Non-matching dir
-        fs::create_dir_all(dir.path().join("other.bak.1.0")).await.unwrap();
+        fs::create_dir_all(dir.path().join("other.bak.1.0"))
+            .await
+            .unwrap();
 
-        let versions = list_rollback_versions(&target.to_string_lossy()).await.unwrap();
+        let versions = list_rollback_versions(&target.to_string_lossy())
+            .await
+            .unwrap();
         assert_eq!(versions.len(), 3);
         // Should be sorted newest-first (all created in same second, so order
         // may vary — just check all versions are present)
@@ -941,7 +1011,9 @@ mod tests {
         let removed = prune_backups(&target.to_string_lossy(), 3).await.unwrap();
         assert_eq!(removed, 2);
 
-        let remaining = list_rollback_versions(&target.to_string_lossy()).await.unwrap();
+        let remaining = list_rollback_versions(&target.to_string_lossy())
+            .await
+            .unwrap();
         assert_eq!(remaining.len(), 3);
     }
 
@@ -952,13 +1024,17 @@ mod tests {
         fs::create_dir_all(&target).await.unwrap();
 
         for v in ["1.0.0", "2.0.0"] {
-            fs::create_dir_all(dir.path().join(format!("mypkg.bak.{v}"))).await.unwrap();
+            fs::create_dir_all(dir.path().join(format!("mypkg.bak.{v}")))
+                .await
+                .unwrap();
         }
 
         let removed = prune_backups(&target.to_string_lossy(), 1).await.unwrap();
         assert_eq!(removed, 1);
 
-        let remaining = list_rollback_versions(&target.to_string_lossy()).await.unwrap();
+        let remaining = list_rollback_versions(&target.to_string_lossy())
+            .await
+            .unwrap();
         assert_eq!(remaining.len(), 1);
     }
 
@@ -967,20 +1043,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("mypkg");
         fs::create_dir_all(&target).await.unwrap();
-        fs::write(target.join("current.txt"), "latest").await.unwrap();
+        fs::write(target.join("current.txt"), "latest")
+            .await
+            .unwrap();
 
         // Create backup of version 1.0.0
         let bak1 = dir.path().join("mypkg.bak.1.0.0");
         fs::create_dir_all(&bak1).await.unwrap();
-        fs::write(bak1.join("data.txt"), "version-1.0.0").await.unwrap();
+        fs::write(bak1.join("data.txt"), "version-1.0.0")
+            .await
+            .unwrap();
 
         // Create backup of version 2.0.0
         let bak2 = dir.path().join("mypkg.bak.2.0.0");
         fs::create_dir_all(&bak2).await.unwrap();
-        fs::write(bak2.join("data.txt"), "version-2.0.0").await.unwrap();
+        fs::write(bak2.join("data.txt"), "version-2.0.0")
+            .await
+            .unwrap();
 
         // Rollback to 1.0.0
-        rollback_to_version(&target.to_string_lossy(), "1.0.0").await.unwrap();
+        rollback_to_version(&target.to_string_lossy(), "1.0.0")
+            .await
+            .unwrap();
 
         // Current directory should now have version-1.0.0 content
         let content = fs::read_to_string(target.join("data.txt")).await.unwrap();
@@ -1007,8 +1091,12 @@ mod tests {
         fs::create_dir_all(&extracted).await.unwrap();
 
         // Create fake binaries in extracted dir
-        fs::write(extracted.join("myapp"), "#!/bin/sh\necho myapp").await.unwrap();
-        fs::write(extracted.join("helper"), "#!/bin/sh\necho helper").await.unwrap();
+        fs::write(extracted.join("myapp"), "#!/bin/sh\necho myapp")
+            .await
+            .unwrap();
+        fs::write(extracted.join("helper"), "#!/bin/sh\necho helper")
+            .await
+            .unwrap();
 
         let install_dir = tmp.path().join("install");
         fs::create_dir_all(&install_dir).await.unwrap();
@@ -1027,7 +1115,9 @@ mod tests {
             },
         ];
 
-        let installed = install_binaries(&extracted, &entries, &backup_dir).await.unwrap();
+        let installed = install_binaries(&extracted, &entries, &backup_dir)
+            .await
+            .unwrap();
         assert_eq!(installed.len(), 2);
 
         // Verify files exist
@@ -1035,7 +1125,9 @@ mod tests {
         assert!(install_dir.join("bin/helper").exists());
 
         // Verify content
-        let content = fs::read_to_string(install_dir.join("bin/myapp")).await.unwrap();
+        let content = fs::read_to_string(install_dir.join("bin/myapp"))
+            .await
+            .unwrap();
         assert!(content.contains("myapp"));
     }
 
@@ -1046,23 +1138,27 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let extracted = tmp.path().join("extracted");
         fs::create_dir_all(&extracted).await.unwrap();
-        fs::write(extracted.join("app"), "new-binary").await.unwrap();
+        fs::write(extracted.join("app"), "new-binary")
+            .await
+            .unwrap();
 
         let install_dir = tmp.path().join("install/bin");
         fs::create_dir_all(&install_dir).await.unwrap();
-        fs::write(install_dir.join("app"), "old-binary").await.unwrap();
+        fs::write(install_dir.join("app"), "old-binary")
+            .await
+            .unwrap();
 
         let backup_dir = tmp.path().join("backups");
 
-        let entries = vec![
-            BinaryEntry {
-                source: "app".to_string(),
-                target: install_dir.join("app").to_string_lossy().to_string(),
-                mode: None,
-            },
-        ];
+        let entries = vec![BinaryEntry {
+            source: "app".to_string(),
+            target: install_dir.join("app").to_string_lossy().to_string(),
+            mode: None,
+        }];
 
-        let installed = install_binaries(&extracted, &entries, &backup_dir).await.unwrap();
+        let installed = install_binaries(&extracted, &entries, &backup_dir)
+            .await
+            .unwrap();
         assert_eq!(installed.len(), 1);
 
         // New binary should be in place
@@ -1070,7 +1166,8 @@ mod tests {
         assert_eq!(content, "new-binary");
 
         // Old binary should be backed up
-        let backup_files: Vec<_> = std::fs::read_dir(&backup_dir).unwrap()
+        let backup_files: Vec<_> = std::fs::read_dir(&backup_dir)
+            .unwrap()
             .filter_map(|e| e.ok())
             .collect();
         assert_eq!(backup_files.len(), 1);
@@ -1089,13 +1186,11 @@ mod tests {
 
         let backup_dir = tmp.path().join("backups");
 
-        let entries = vec![
-            BinaryEntry {
-                source: "nonexistent".to_string(),
-                target: "/tmp/should-not-exist".to_string(),
-                mode: None,
-            },
-        ];
+        let entries = vec![BinaryEntry {
+            source: "nonexistent".to_string(),
+            target: "/tmp/should-not-exist".to_string(),
+            mode: None,
+        }];
 
         let result = install_binaries(&extracted, &entries, &backup_dir).await;
         assert!(result.is_err());
@@ -1198,7 +1293,10 @@ mod tests {
             pattern = "([0-9]+)"
         "#;
         let vd: monopsony_common::shadow_types::VersionDetect = toml::from_str(toml).unwrap();
-        assert_eq!(vd.method, monopsony_common::shadow_types::VersionDetectMethod::Command);
+        assert_eq!(
+            vd.method,
+            monopsony_common::shadow_types::VersionDetectMethod::Command
+        );
     }
 
     #[test]
@@ -1209,7 +1307,10 @@ mod tests {
             pattern = "([0-9]+\\.[0-9]+)"
         "#;
         let vd: monopsony_common::shadow_types::VersionDetect = toml::from_str(toml).unwrap();
-        assert_eq!(vd.method, monopsony_common::shadow_types::VersionDetectMethod::File);
+        assert_eq!(
+            vd.method,
+            monopsony_common::shadow_types::VersionDetectMethod::File
+        );
         assert_eq!(vd.source, "/etc/myapp/version");
         assert!(vd.header_name.is_none());
     }
@@ -1223,7 +1324,10 @@ mod tests {
             header_name = "X-Version"
         "#;
         let vd: monopsony_common::shadow_types::VersionDetect = toml::from_str(toml).unwrap();
-        assert_eq!(vd.method, monopsony_common::shadow_types::VersionDetectMethod::Header);
+        assert_eq!(
+            vd.method,
+            monopsony_common::shadow_types::VersionDetectMethod::Header
+        );
         assert_eq!(vd.header_name.as_deref(), Some("X-Version"));
     }
 }

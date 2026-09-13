@@ -38,7 +38,10 @@ pub enum PolicyDecision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyWarning {
     /// CVEs found in the requested version.
-    CveInRequested { count: usize, worst_severity: String },
+    CveInRequested {
+        count: usize,
+        worst_severity: String,
+    },
     /// CVEs found in both requested and installed versions.
     CveAlreadyExposed { count: usize },
     /// High entropy detected (suspicious but not confirmed malware).
@@ -469,10 +472,7 @@ mod tests {
             ..flagged_cve_info()
         };
         let result = evaluate_policy(&info, &no_force(), &default_config());
-        if let PolicyDecision::Warn(PolicyWarning::CveInRequested {
-            worst_severity, ..
-        }) = result
-        {
+        if let PolicyDecision::Warn(PolicyWarning::CveInRequested { worst_severity, .. }) = result {
             assert_eq!(worst_severity, "critical");
         } else {
             panic!("Expected CveInRequested warning, got {:?}", result);
@@ -482,9 +482,7 @@ mod tests {
     #[test]
     fn test_block_reason_clamav_signature() {
         let result = evaluate_policy(&infected_clamav_info(), &no_force(), &default_config());
-        if let PolicyDecision::Block(PolicyBlockReason::MalwareDetected {
-            signature, ..
-        }) = result
+        if let PolicyDecision::Block(PolicyBlockReason::MalwareDetected { signature, .. }) = result
         {
             assert_eq!(signature, "Win.Test.EICAR_HDB-1");
         } else {

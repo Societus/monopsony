@@ -1,6 +1,6 @@
 //! NetBSD pkgin package manager backend implementation
 
-use crate::{PackageRef, PackageManagerBackend, PackageManagerKind, ProxyConfigAction, UrlPattern};
+use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 
 use super::bsd_privilege;
@@ -31,9 +31,7 @@ impl PackageManagerBackend for PkginBackend {
     }
 
     async fn list_installed(&self) -> crate::Result<Vec<PackageRef>> {
-        let output = bsd_privilege::escalate("pkgin", &["list"])
-            .output()
-            .await?;
+        let output = bsd_privilege::escalate("pkgin", &["list"]).output().await?;
 
         if !output.status.success() {
             return Err(crate::Error::CommandFailed {
@@ -57,7 +55,7 @@ impl PackageManagerBackend for PkginBackend {
                         version: Some(version.to_string()),
                         architecture: None,
                         manager: PackageManagerKind::Pkgin,
-                    installed_at: 0,
+                        installed_at: 0,
                     });
                 }
             }
@@ -68,24 +66,16 @@ impl PackageManagerBackend for PkginBackend {
 
     fn upstream_url_patterns(&self) -> Vec<UrlPattern> {
         vec![
-            UrlPattern::new(
-                r"https?://[^/]*netbsd\.org/.*",
-                100,
-                "NetBSD official",
-            )
-            .expect("valid regex"),
+            UrlPattern::new(r"https?://[^/]*netbsd\.org/.*", 100, "NetBSD official")
+                .expect("valid regex"),
             UrlPattern::new(
                 r"https?://cdn\.netbsd\.org/pub/pkgsrc/.*",
                 95,
                 "NetBSD pkgsrc CDN",
             )
             .expect("valid regex"),
-            UrlPattern::new(
-                r"https?://[^/]*pkgsrc\.org/.*",
-                80,
-                "pkgsrc repository",
-            )
-            .expect("valid regex"),
+            UrlPattern::new(r"https?://[^/]*pkgsrc\.org/.*", 80, "pkgsrc repository")
+                .expect("valid regex"),
         ]
     }
 

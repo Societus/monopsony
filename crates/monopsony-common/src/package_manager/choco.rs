@@ -1,6 +1,6 @@
 //! Chocolatey package manager backend implementation
 
-use crate::{PackageRef, PackageManagerBackend, PackageManagerKind, ProxyConfigAction, UrlPattern};
+use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 use std::path::PathBuf;
 
@@ -66,8 +66,18 @@ impl PackageManagerBackend for ChocoBackend {
 
     fn upstream_url_patterns(&self) -> Vec<UrlPattern> {
         vec![
-            UrlPattern::new(r"https?://[^/]*chocolatey\.org/.*", 100, "Chocolatey packages").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*community\.chocolatey\.org/.*", 100, "Chocolatey community").expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*chocolatey\.org/.*",
+                100,
+                "Chocolatey packages",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*community\.chocolatey\.org/.*",
+                100,
+                "Chocolatey community",
+            )
+            .expect("valid regex"),
         ]
     }
 
@@ -79,11 +89,14 @@ impl PackageManagerBackend for ChocoBackend {
     fn proxy_config(&self, proxy_addr: &str) -> ProxyConfigAction {
         ProxyConfigAction::WriteFile {
             path: PathBuf::from("C:/ProgramData/chocolatey/config/monopsony-proxy.config"),
-            content: format!(r#"<?xml version="1.0"?>
+            content: format!(
+                r#"<?xml version="1.0"?>
 <configuration>
   <proxy proxyUrl="{}" />
 </configuration>
-"#, proxy_addr),
+"#,
+                proxy_addr
+            ),
         }
     }
 

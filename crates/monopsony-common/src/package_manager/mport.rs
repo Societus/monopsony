@@ -1,6 +1,6 @@
 //! MidnightBSD mport package manager backend implementation
 
-use crate::{PackageRef, PackageManagerBackend, PackageManagerKind, ProxyConfigAction, UrlPattern};
+use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 
 use super::bsd_privilege;
@@ -57,7 +57,7 @@ impl PackageManagerBackend for MportBackend {
                         version: Some(version.to_string()),
                         architecture: None,
                         manager: PackageManagerKind::Mport,
-                    installed_at: 0,
+                        installed_at: 0,
                     });
                 }
             } else {

@@ -1,6 +1,6 @@
 //! Apt package manager backend implementation
 
-use crate::{PackageRef, PackageManagerBackend, PackageManagerKind, ProxyConfigAction, UrlPattern};
+use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 use std::path::PathBuf;
 
@@ -55,7 +55,7 @@ impl PackageManagerBackend for AptBackend {
                 let name = parts[1].to_string();
                 let version = parts[2].to_string();
                 let arch = parts.get(3).map(|s| s.to_string());
-                
+
                 packages.push(PackageRef {
                     name,
                     version: Some(version),
@@ -72,9 +72,20 @@ impl PackageManagerBackend for AptBackend {
     fn upstream_url_patterns(&self) -> Vec<UrlPattern> {
         vec![
             // Debian/Ubuntu mirrors
-            UrlPattern::new(r"https?://[^/]*(?:debian|ubuntu)\.org/.*\.deb", 100, "Debian/Ubuntu official").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*(?:archive|security)\.(?:debian|ubuntu)\.org/.*", 90, "Debian/Ubuntu archives").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*/ubuntu/.*\.deb", 80, "Ubuntu mirrors").expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*(?:debian|ubuntu)\.org/.*\.deb",
+                100,
+                "Debian/Ubuntu official",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*(?:archive|security)\.(?:debian|ubuntu)\.org/.*",
+                90,
+                "Debian/Ubuntu archives",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(r"https?://[^/]*/ubuntu/.*\.deb", 80, "Ubuntu mirrors")
+                .expect("valid regex"),
         ]
     }
 

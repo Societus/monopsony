@@ -1,6 +1,6 @@
 //! Scoop package manager backend implementation
 
-use crate::{PackageRef, PackageManagerBackend, PackageManagerKind, ProxyConfigAction, UrlPattern};
+use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 
 pub struct ScoopBackend;
@@ -65,8 +65,18 @@ impl PackageManagerBackend for ScoopBackend {
 
     fn upstream_url_patterns(&self) -> Vec<UrlPattern> {
         vec![
-            UrlPattern::new(r"https?://[^/]*github\.com/ScoopInstaller/.*", 100, "Scoop packages").expect("valid regex"),
-            UrlPattern::new(r"https?://[^/]*raw\.githubusercontent\.com/.*", 90, "GitHub raw (scoop)").expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*github\.com/ScoopInstaller/.*",
+                100,
+                "Scoop packages",
+            )
+            .expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*raw\.githubusercontent\.com/.*",
+                90,
+                "GitHub raw (scoop)",
+            )
+            .expect("valid regex"),
         ]
     }
 

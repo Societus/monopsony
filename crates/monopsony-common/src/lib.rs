@@ -5,12 +5,14 @@
 pub mod config;
 pub mod error;
 pub mod metrics;
-pub mod shadow_types;
 pub mod models;
 pub mod package_manager;
 pub mod proto;
+pub mod shadow_types;
 
 pub use config::*;
 pub use error::{Error, Result};
 pub use models::*;
-pub use package_manager::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
+pub use package_manager::{
+    PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern,
+};

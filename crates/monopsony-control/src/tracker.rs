@@ -124,10 +124,7 @@ impl TrackerClient {
             Ok(r) => {
                 let status = r.status();
                 let body = r.text().await.unwrap_or_default();
-                warn!(
-                    "Failed to publish recipe {}: {} {}",
-                    req.name, status, body
-                );
+                warn!("Failed to publish recipe {}: {} {}", req.name, status, body);
                 Err(anyhow::anyhow!(
                     "tracker publish failed: {} {}",
                     status,
@@ -173,10 +170,7 @@ impl TrackerClient {
 
         match resp {
             Ok(r) if r.status().is_success() => Ok(r.json().await?),
-            Ok(r) => Err(anyhow::anyhow!(
-                "get recipe failed: {}",
-                r.status()
-            )),
+            Ok(r) => Err(anyhow::anyhow!("get recipe failed: {}", r.status())),
             Err(e) => Err(anyhow::anyhow!("tracker unreachable: {}", e)),
         }
     }
@@ -243,10 +237,7 @@ impl TrackerClient {
         _from: &str,
         _to: &str,
     ) -> Result<Vec<UpdateAnnotation>> {
-        let url = format!(
-            "{}/annotations/fetch?package={}",
-            self.base_url, package
-        );
+        let url = format!("{}/annotations/fetch?package={}", self.base_url, package);
 
         let resp = self.client.get(&url).send().await;
 
@@ -255,10 +246,7 @@ impl TrackerClient {
                 let annotations: Vec<UpdateAnnotation> = r.json().await?;
                 Ok(annotations)
             }
-            Ok(r) => Err(anyhow::anyhow!(
-                "fetch annotations failed: {}",
-                r.status()
-            )),
+            Ok(r) => Err(anyhow::anyhow!("fetch annotations failed: {}", r.status())),
             Err(e) => Err(anyhow::anyhow!("tracker unreachable: {}", e)),
         }
     }

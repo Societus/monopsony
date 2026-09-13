@@ -4,7 +4,7 @@
 //! binary packages — instead it caches source tarballs (distfiles) fetched
 //! from Gentoo mirrors. URL patterns match the distfile host URLs.
 
-use crate::{PackageRef, PackageManagerBackend, PackageManagerKind, ProxyConfigAction, UrlPattern};
+use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 use std::path::PathBuf;
 
@@ -48,11 +48,7 @@ impl PackageManagerBackend for EmergeBackend {
         let cat_entries = std::fs::read_dir(pkg_db)?;
         for cat_entry in cat_entries {
             let cat_entry = cat_entry?;
-            if !cat_entry
-                .file_type()
-                .map(|t| t.is_dir())
-                .unwrap_or(false)
-            {
+            if !cat_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }
             let category = match cat_entry.file_name().to_str() {
@@ -63,11 +59,7 @@ impl PackageManagerBackend for EmergeBackend {
             let pkg_entries = std::fs::read_dir(cat_entry.path())?;
             for pkg_entry in pkg_entries {
                 let pkg_entry = pkg_entry?;
-                if !pkg_entry
-                    .file_type()
-                    .map(|t| t.is_dir())
-                    .unwrap_or(false)
-                {
+                if !pkg_entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                     continue;
                 }
                 let dirname = match pkg_entry.file_name().to_str() {
@@ -207,21 +199,21 @@ mod tests {
         let patterns = backend.upstream_url_patterns();
 
         // Distfile
-        assert!(patterns.iter().any(|p| p.matches(
-            "https://distfiles.gentoo.org/distfiles/bash-5.2.tar.gz"
-        )));
+        assert!(patterns
+            .iter()
+            .any(|p| p.matches("https://distfiles.gentoo.org/distfiles/bash-5.2.tar.gz")));
         // OSUOSL mirror
-        assert!(patterns.iter().any(|p| p.matches(
-            "https://gentoo.osuosl.org/distfiles/bash-5.2.tar.gz"
-        )));
+        assert!(patterns
+            .iter()
+            .any(|p| p.matches("https://gentoo.osuosl.org/distfiles/bash-5.2.tar.gz")));
         // Portage snapshot
-        assert!(patterns.iter().any(|p| p.matches(
-            "https://gentoo.org/snapshots/portage-latest.tar.xz"
-        )));
+        assert!(patterns
+            .iter()
+            .any(|p| p.matches("https://gentoo.org/snapshots/portage-latest.tar.xz")));
         // Non-matching
-        assert!(!patterns.iter().any(|p| p.matches(
-            "https://archlinux.org/packages/x86_64/bash.tar.zst"
-        )));
+        assert!(!patterns
+            .iter()
+            .any(|p| p.matches("https://archlinux.org/packages/x86_64/bash.tar.zst")));
     }
 
     #[test]
@@ -229,10 +221,7 @@ mod tests {
         let backend = EmergeBackend::new();
         let path =
             backend.url_to_cache_path("https://distfiles.gentoo.org/distfiles/bash-5.2.tar.gz");
-        assert_eq!(
-            path.as_deref(),
-            Some("emerge/distfiles/bash-5.2.tar.gz")
-        );
+        assert_eq!(path.as_deref(), Some("emerge/distfiles/bash-5.2.tar.gz"));
     }
 
     #[test]

@@ -192,7 +192,9 @@ pub struct RecipeInstall {
     pub binaries: Vec<BinaryEntry>,
 }
 
-fn default_max_backups() -> usize { 3 }
+fn default_max_backups() -> usize {
+    3
+}
 
 /// Describes a single binary to extract from a release archive.
 /// When `binaries` is set on `RecipeInstall`, each binary is installed
@@ -505,7 +507,10 @@ mod tests {
             "Sonarr.main.linux-musl-arm64.tar.gz".into(),
         ];
         let matched = sel.match_asset("linux", "aarch64", Some("musl"), &assets);
-        assert_eq!(matched, Some("Sonarr.main.linux-musl-arm64.tar.gz".to_string()));
+        assert_eq!(
+            matched,
+            Some("Sonarr.main.linux-musl-arm64.tar.gz".to_string())
+        );
     }
 
     #[test]
@@ -642,7 +647,8 @@ mod tests {
             "[version]",
             "detect_command = \"myapp --version\"",
             r#"detect_pattern = "([0-9]+\\.[0-9]+\\.[0-9]+)""#,
-        ].join("\n");
+        ]
+        .join("\n");
         let recipe: ShadowRecipe = toml::from_str(&toml).unwrap();
         assert_eq!(recipe.install.binaries.len(), 2);
         assert_eq!(recipe.install.binaries[0].source, "myapp");
@@ -666,7 +672,8 @@ mod tests {
             "[version]",
             "detect_command = \"simple --version\"",
             "detect_pattern = \"([0-9]+)\"",
-        ].join("\n");
+        ]
+        .join("\n");
         let recipe: ShadowRecipe = toml::from_str(&toml).unwrap();
         assert!(recipe.install.binaries.is_empty());
     }

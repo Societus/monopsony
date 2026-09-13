@@ -37,11 +37,7 @@ pub struct YaraMatch {
 ///
 /// If `yara` is not found on PATH, returns `YaraResult { available: false, .. }`.
 /// If the rules directory doesn't exist or is empty, returns no matches (not an error).
-pub async fn scan_file(
-    target_path: &Path,
-    rules_dir: &Path,
-    scan_timeout: Duration,
-) -> YaraResult {
+pub async fn scan_file(target_path: &Path, rules_dir: &Path, scan_timeout: Duration) -> YaraResult {
     // Check if yara binary exists
     let yara_bin = match which_yara().await {
         Some(bin) => bin,
@@ -136,7 +132,11 @@ pub async fn scan_file(
 /// RuleName TargetFilePath
 /// ```
 /// With `-s` it would also print matching strings, but we don't use that here.
-pub fn parse_yara_output(stdout: &[u8], stderr: &[u8], exit_status: std::process::ExitStatus) -> YaraResult {
+pub fn parse_yara_output(
+    stdout: &[u8],
+    stderr: &[u8],
+    exit_status: std::process::ExitStatus,
+) -> YaraResult {
     let stderr_text = String::from_utf8_lossy(stderr);
     if !stderr_text.is_empty() {
         debug!("YARA stderr: {}", stderr_text.trim());
@@ -237,7 +237,8 @@ mod tests {
     #[test]
     fn parse_yara_output_with_matches() {
         // Simulate YARA output with matches
-        let stdout = b"SuspiciousInstallScript /cache/pkg-1.0.tgz\nCryptoMiner /cache/pkg-1.0.tgz\n";
+        let stdout =
+            b"SuspiciousInstallScript /cache/pkg-1.0.tgz\nCryptoMiner /cache/pkg-1.0.tgz\n";
         let output = std::process::Command::new("true")
             .output()
             .expect("true should exist");
@@ -257,7 +258,11 @@ mod tests {
         let result = parse_yara_output(b"", b"error: cannot open rules\n", output.status);
         assert!(result.available);
         assert!(result.error.is_some());
-        assert!(result.error.as_ref().unwrap().contains("error: cannot open rules"));
+        assert!(result
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("error: cannot open rules"));
     }
 
     #[test]

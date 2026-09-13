@@ -54,16 +54,14 @@ fn default_auto_blacklist_threshold() -> i64 {
 /// GET /api/v1/features — get current feature flags.
 pub async fn handle_get_features(State(state): State<AdminState>) -> impl IntoResponse {
     let flags = match &state.db {
-        Some(db) => {
-            match db.get_setting(FEATURE_FLAGS_KEY).await {
-                Ok(Some(val)) => serde_json::from_value::<FeatureFlags>(val).unwrap_or_default(),
-                Ok(None) => FeatureFlags::default(),
-                Err(e) => {
-                    warn!("Failed to load feature flags: {e}");
-                    FeatureFlags::default()
-                }
+        Some(db) => match db.get_setting(FEATURE_FLAGS_KEY).await {
+            Ok(Some(val)) => serde_json::from_value::<FeatureFlags>(val).unwrap_or_default(),
+            Ok(None) => FeatureFlags::default(),
+            Err(e) => {
+                warn!("Failed to load feature flags: {e}");
+                FeatureFlags::default()
             }
-        }
+        },
         None => FeatureFlags::default(),
     };
     Json(flags)
@@ -132,16 +130,14 @@ pub struct MonetizationConfig {
 /// GET /api/v1/features/monetization — get monetization config.
 pub async fn handle_get_monetization(State(state): State<AdminState>) -> impl IntoResponse {
     let config = match &state.db {
-        Some(db) => {
-            match db.get_setting(MONETIZATION_KEY).await {
-                Ok(Some(val)) => serde_json::from_value::<MonetizationConfig>(val).unwrap_or_default(),
-                Ok(None) => MonetizationConfig::default(),
-                Err(e) => {
-                    warn!("Failed to load monetization config: {e}");
-                    MonetizationConfig::default()
-                }
+        Some(db) => match db.get_setting(MONETIZATION_KEY).await {
+            Ok(Some(val)) => serde_json::from_value::<MonetizationConfig>(val).unwrap_or_default(),
+            Ok(None) => MonetizationConfig::default(),
+            Err(e) => {
+                warn!("Failed to load monetization config: {e}");
+                MonetizationConfig::default()
             }
-        }
+        },
         None => MonetizationConfig::default(),
     };
     Json(config)

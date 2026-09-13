@@ -74,9 +74,7 @@ impl ShadowCache {
 
         // Create parent dir
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(CacheError::Io)?;
+            fs::create_dir_all(parent).await.map_err(CacheError::Io)?;
         }
 
         fs::write(&path, data).await.map_err(CacheError::Io)?;
@@ -116,9 +114,7 @@ impl ShadowCache {
     ) -> Result<(), CacheError> {
         let path = self.index_path(package, version, platform);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(CacheError::Io)?;
+            fs::create_dir_all(parent).await.map_err(CacheError::Io)?;
         }
         let entry = AssetIndexEntry {
             blob_hash: blob_hash.to_string(),
@@ -163,15 +159,14 @@ impl ShadowCache {
         // Find and remove orphaned blobs
         let mut freed: u64 = 0;
         if blobs_dir.exists() {
-            let mut prefix_dirs = fs::read_dir(&blobs_dir)
-                .await
-                .map_err(CacheError::Io)?;
+            let mut prefix_dirs = fs::read_dir(&blobs_dir).await.map_err(CacheError::Io)?;
             while let Some(entry) = prefix_dirs.next_entry().await.map_err(CacheError::Io)? {
                 if entry.file_type().await.map_err(CacheError::Io)?.is_dir() {
-                    let mut blob_files = fs::read_dir(entry.path())
-                        .await
-                        .map_err(CacheError::Io)?;
-                    while let Some(blob_entry) = blob_files.next_entry().await.map_err(CacheError::Io)? {
+                    let mut blob_files =
+                        fs::read_dir(entry.path()).await.map_err(CacheError::Io)?;
+                    while let Some(blob_entry) =
+                        blob_files.next_entry().await.map_err(CacheError::Io)?
+                    {
                         let name = blob_entry.file_name();
                         let name_str = name.to_string_lossy().into_owned();
                         let prefix_name = entry.file_name();
@@ -258,7 +253,14 @@ mod tests {
         let (_dir, cache) = setup_cache().await;
         let hash = cache.store_blob(b"asset-data").await.unwrap();
         cache
-            .index_asset("sonarr", "4.0.7", "linux-x86_64-glibc", &hash, "sonarr.tar.gz", 1024)
+            .index_asset(
+                "sonarr",
+                "4.0.7",
+                "linux-x86_64-glibc",
+                &hash,
+                "sonarr.tar.gz",
+                1024,
+            )
             .await
             .unwrap();
         let entry = cache

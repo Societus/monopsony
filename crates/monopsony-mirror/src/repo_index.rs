@@ -176,18 +176,20 @@ pub fn repo_index_urls(distro: &str, arch: &str) -> Vec<(&'static str, String)> 
             ("core", format!("core/os/{}/core.db", arch)),
             ("extra", format!("extra/os/{}/extra.db", arch)),
         ],
-        "debian" => vec![
-            ("main", format!("dists/stable/main/binary-{}/Packages.gz", arch)),
-        ],
-        "ubuntu" => vec![
-            ("main", format!("dists/stable/main/binary-{}/Packages.gz", arch)),
-        ],
+        "debian" => vec![(
+            "main",
+            format!("dists/stable/main/binary-{}/Packages.gz", arch),
+        )],
+        "ubuntu" => vec![(
+            "main",
+            format!("dists/stable/main/binary-{}/Packages.gz", arch),
+        )],
         _ => vec![],
     }
 }
 
 /// Fill in the download_url and filename fields for each package based on upstream base URL.
-/// 
+///
 /// For pacman:
 /// - `download_url` uses the original filename (e.g., https://mirror/core/os/x86_64/bash-5.3.15-1-x86_64.pkg.tar.zst)
 /// - `filename` is set to the repo-relative path for local storage (e.g., core/os/x86_64/bash-5.3.15-1-x86_64.pkg.tar.zst)

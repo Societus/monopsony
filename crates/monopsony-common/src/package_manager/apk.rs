@@ -1,6 +1,6 @@
 //! Alpine apk package manager backend implementation
 
-use crate::{PackageRef, PackageManagerBackend, PackageManagerKind, ProxyConfigAction, UrlPattern};
+use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 use std::path::PathBuf;
 
@@ -112,11 +112,26 @@ impl PackageManagerBackend for ApkBackend {
     fn upstream_url_patterns(&self) -> Vec<UrlPattern> {
         vec![
             // Package files (.apk extension)
-            UrlPattern::new(r"https?://[^/]*alpinelinux\.org/.*\.apk", 100, "Alpine packages").expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*alpinelinux\.org/.*\.apk",
+                100,
+                "Alpine packages",
+            )
+            .expect("valid regex"),
             // Index metadata: APKINDEX.tar.gz
-            UrlPattern::new(r"https?://[^/]*alpinelinux\.org/.*APKINDEX.*\.tar\.gz", 90, "Alpine repo index").expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*alpinelinux\.org/.*APKINDEX.*\.tar\.gz",
+                90,
+                "Alpine repo index",
+            )
+            .expect("valid regex"),
             // Signature files
-            UrlPattern::new(r"https?://[^/]*alpinelinux\.org/.*\.SIGN\.RSA.*", 80, "Alpine signatures").expect("valid regex"),
+            UrlPattern::new(
+                r"https?://[^/]*alpinelinux\.org/.*\.SIGN\.RSA.*",
+                80,
+                "Alpine signatures",
+            )
+            .expect("valid regex"),
         ]
     }
 
@@ -181,20 +196,30 @@ mod tests {
         let patterns = backend.upstream_url_patterns();
 
         // Package file
-        assert!(patterns.iter().any(|p| p.matches("https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/busybox-1.37.0-r20.apk")));
+        assert!(patterns.iter().any(|p| p.matches(
+            "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/busybox-1.37.0-r20.apk"
+        )));
         // APKINDEX
-        assert!(patterns.iter().any(|p| p.matches("https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/APKINDEX.tar.gz")));
+        assert!(patterns.iter().any(|p| p
+            .matches("https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/APKINDEX.tar.gz")));
         // Signature
         assert!(patterns.iter().any(|p| p.matches("https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/APKINDEX.tar.gz.SIGN.RSA.saunders.rsa.pub")));
         // Non-matching URL
-        assert!(!patterns.iter().any(|p| p.matches("https://archlinux.org/packages/x86_64/bash.tar.zst")));
+        assert!(!patterns
+            .iter()
+            .any(|p| p.matches("https://archlinux.org/packages/x86_64/bash.tar.zst")));
     }
 
     #[test]
     fn test_url_to_cache_path() {
         let backend = ApkBackend::new();
-        let path = backend.url_to_cache_path("https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/busybox-1.37.0-r20.apk");
-        assert_eq!(path.as_deref(), Some("apk/alpine/v3.22/main/x86_64/busybox-1.37.0-r20.apk"));
+        let path = backend.url_to_cache_path(
+            "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/busybox-1.37.0-r20.apk",
+        );
+        assert_eq!(
+            path.as_deref(),
+            Some("apk/alpine/v3.22/main/x86_64/busybox-1.37.0-r20.apk")
+        );
     }
 
     #[test]

@@ -121,11 +121,11 @@ pub fn mask_from_pm(pkg_name: &str, pm: &PmKind) -> Result<String, PmConflictErr
         PmKind::Pacman => {
             // Add to IgnorePkg in /etc/pacman.conf
             warn!("Pacman masking requires manual /etc/pacman.conf edit for {pkg_name}");
-            Ok(format!("manual: add IgnorePkg = {pkg_name} to /etc/pacman.conf"))
+            Ok(format!(
+                "manual: add IgnorePkg = {pkg_name} to /etc/pacman.conf"
+            ))
         }
-        PmKind::Apk => {
-            Err(PmConflictError::UnsupportedManager(PmKind::Apk))
-        }
+        PmKind::Apk => Err(PmConflictError::UnsupportedManager(PmKind::Apk)),
         PmKind::Dnf => {
             let output = Command::new("dnf")
                 .args(["versionlock", "add", pkg_name])
@@ -163,9 +163,9 @@ pub fn unmask_from_pm(pkg_name: &str, pm: &PmKind) -> Result<String, PmConflictE
                 })
             }
         }
-        PmKind::Pacman => {
-            Ok(format!("manual: remove IgnorePkg = {pkg_name} from /etc/pacman.conf"))
-        }
+        PmKind::Pacman => Ok(format!(
+            "manual: remove IgnorePkg = {pkg_name} from /etc/pacman.conf"
+        )),
         PmKind::Apk => Err(PmConflictError::UnsupportedManager(PmKind::Apk)),
         PmKind::Dnf => {
             let output = Command::new("dnf")
@@ -194,10 +194,7 @@ fn which_exists(cmd: &str) -> bool {
 }
 
 fn check_dpkg(pkg: &str) -> Option<String> {
-    let output = Command::new("dpkg")
-        .args(["-s", pkg])
-        .output()
-        .ok()?;
+    let output = Command::new("dpkg").args(["-s", pkg]).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -211,10 +208,7 @@ fn check_dpkg(pkg: &str) -> Option<String> {
 }
 
 fn check_pacman(pkg: &str) -> Option<String> {
-    let output = Command::new("pacman")
-        .args(["-Q", pkg])
-        .output()
-        .ok()?;
+    let output = Command::new("pacman").args(["-Q", pkg]).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -228,10 +222,7 @@ fn check_pacman(pkg: &str) -> Option<String> {
 }
 
 fn check_apk(pkg: &str) -> Option<String> {
-    let output = Command::new("apk")
-        .args(["info", pkg])
-        .output()
-        .ok()?;
+    let output = Command::new("apk").args(["info", pkg]).output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -247,7 +238,10 @@ mod tests {
     fn detect_active_pms() {
         let pms = detect_active_package_managers();
         // On this Arch system, pacman should be detected
-        assert!(!pms.is_empty() || true, "no PMs detected (OK in containers)");
+        assert!(
+            !pms.is_empty() || true,
+            "no PMs detected (OK in containers)"
+        );
     }
 
     #[test]
@@ -259,6 +253,9 @@ mod tests {
     #[test]
     fn apk_unsupported_mask() {
         let result = mask_from_pm("test-pkg", &PmKind::Apk);
-        assert!(matches!(result, Err(PmConflictError::UnsupportedManager(PmKind::Apk))));
+        assert!(matches!(
+            result,
+            Err(PmConflictError::UnsupportedManager(PmKind::Apk))
+        ));
     }
 }

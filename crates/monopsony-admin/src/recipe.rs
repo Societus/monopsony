@@ -26,32 +26,52 @@ pub struct ValidationError {
 
 /// POST /api/v1/shadow/recipe/validate — validate recipe TOML.
 pub async fn handle_validate(Json(req): Json<ValidateRequest>) -> impl IntoResponse {
-    let recipe: monopsony_common::shadow_types::ShadowRecipe = match toml::from_str(&req.recipe_toml) {
-        Ok(r) => r,
-        Err(e) => {
-            return Json(ValidateResponse {
-                valid: false,
-                errors: vec![ValidationError {
-                    field: "toml".into(),
-                    message: e.to_string(),
-                }],
-            });
-        }
-    };
+    let recipe: monopsony_common::shadow_types::ShadowRecipe =
+        match toml::from_str(&req.recipe_toml) {
+            Ok(r) => r,
+            Err(e) => {
+                return Json(ValidateResponse {
+                    valid: false,
+                    errors: vec![ValidationError {
+                        field: "toml".into(),
+                        message: e.to_string(),
+                    }],
+                });
+            }
+        };
 
     match monopsony_shadow::shadow_recipe::validate_recipe_quick(&recipe) {
-        Ok(()) => Json(ValidateResponse { valid: true, errors: vec![] }),
+        Ok(()) => Json(ValidateResponse {
+            valid: true,
+            errors: vec![],
+        }),
         Err(errors) => {
-            let errs: Vec<_> = errors.into_iter().map(|e| {
-                let field = match &e {
-                    monopsony_shadow::shadow_recipe::RecipeError::InvalidRegex { field, .. } => field.clone(),
-                    monopsony_shadow::shadow_recipe::RecipeError::PathNotAbsolute { .. } => "install.target_dir".into(),
-                    monopsony_shadow::shadow_recipe::RecipeError::MissingField { field } => field.clone(),
-                    _ => "unknown".into(),
-                };
-                ValidationError { field, message: e.to_string() }
-            }).collect();
-            Json(ValidateResponse { valid: false, errors: errs })
+            let errs: Vec<_> = errors
+                .into_iter()
+                .map(|e| {
+                    let field = match &e {
+                        monopsony_shadow::shadow_recipe::RecipeError::InvalidRegex {
+                            field,
+                            ..
+                        } => field.clone(),
+                        monopsony_shadow::shadow_recipe::RecipeError::PathNotAbsolute {
+                            ..
+                        } => "install.target_dir".into(),
+                        monopsony_shadow::shadow_recipe::RecipeError::MissingField { field } => {
+                            field.clone()
+                        }
+                        _ => "unknown".into(),
+                    };
+                    ValidationError {
+                        field,
+                        message: e.to_string(),
+                    }
+                })
+                .collect();
+            Json(ValidateResponse {
+                valid: false,
+                errors: errs,
+            })
         }
     }
 }
@@ -119,21 +139,36 @@ pub async fn handle_estimate(
                     if let Ok(release_assets) = source.release_assets("latest").await {
                         assets = release_assets.iter().map(|a| a.name.clone()).collect();
                     }
-                    (monopsony_common::shadow_types::ShadowSource::GithubRelease, assets)
+                    (
+                        monopsony_common::shadow_types::ShadowSource::GithubRelease,
+                        assets,
+                    )
                 }
                 Err(e) => {
                     warnings.push(format!("GitHub parse failed: {}", e));
-                    (monopsony_common::shadow_types::ShadowSource::DirectUrl, vec![])
+                    (
+                        monopsony_common::shadow_types::ShadowSource::DirectUrl,
+                        vec![],
+                    )
                 }
             }
         } else if url.starts_with("git://") || url.ends_with(".git") {
-            (monopsony_common::shadow_types::ShadowSource::GitBuild, vec![])
+            (
+                monopsony_common::shadow_types::ShadowSource::GitBuild,
+                vec![],
+            )
         } else {
-            (monopsony_common::shadow_types::ShadowSource::DirectUrl, vec![])
+            (
+                monopsony_common::shadow_types::ShadowSource::DirectUrl,
+                vec![],
+            )
         }
     } else {
         warnings.push("No source URL provided, defaulting to direct_url".into());
-        (monopsony_common::shadow_types::ShadowSource::DirectUrl, vec![])
+        (
+            monopsony_common::shadow_types::ShadowSource::DirectUrl,
+            vec![],
+        )
     };
 
     let source_type_str = match source_type {
@@ -144,13 +179,22 @@ pub async fn handle_estimate(
 
     let source_url = req.source_url.unwrap_or_default();
     let recipe_toml = monopsony_shadow::shadow_recipe::generate_registration_template(
-        &name, &source_url, source_type, &arch, version.as_deref(), &available_assets,
+        &name,
+        &source_url,
+        source_type,
+        &arch,
+        version.as_deref(),
+        &available_assets,
     );
 
     Json(EstimateResponse {
         recipe_toml,
         detected: DetectedInfo {
-            name, version, arch, source_type: source_type_str.into(), available_assets,
+            name,
+            version,
+            arch,
+            source_type: source_type_str.into(),
+            available_assets,
         },
         warnings,
     })
@@ -177,5 +221,8 @@ async fn detect_version(binary_path: &str) -> Result<String, String> {
 }
 
 fn extract_semver(text: &str) -> Option<String> {
-    regex::Regex::new(r"\d+\.\d+\.\d+").ok()?.find(text).map(|m| m.as_str().to_string())
+    regex::Regex::new(r"\d+\.\d+\.\d+")
+        .ok()?
+        .find(text)
+        .map(|m| m.as_str().to_string())
 }

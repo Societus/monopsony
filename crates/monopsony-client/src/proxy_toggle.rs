@@ -57,9 +57,7 @@ fn is_root() -> bool {
         Ok(out) => String::from_utf8_lossy(&out.stdout).trim() == "0",
         Err(_) => {
             // Fallback: check $USER
-            std::env::var("USER")
-                .map(|u| u == "root")
-                .unwrap_or(false)
+            std::env::var("USER").map(|u| u == "root").unwrap_or(false)
         }
     }
 }
@@ -173,7 +171,11 @@ fn docker_proxy_on(server_addr: &str) -> ProxyToggleResult {
     let path = docker_daemon_json_path();
     match write_file_with_dirs(&path, &pretty) {
         Ok(_) => {
-            info!("Docker: wrote registry-mirror {} to {}", mirror, path.display());
+            info!(
+                "Docker: wrote registry-mirror {} to {}",
+                mirror,
+                path.display()
+            );
             ProxyToggleResult {
                 subsystem: "docker".to_string(),
                 success: true,
@@ -212,13 +214,14 @@ fn docker_proxy_off() -> ProxyToggleResult {
     }
     let obj = daemon.as_object_mut().unwrap();
 
-    let changed = if let Some(arr) = obj.get_mut("registry-mirrors").and_then(|v| v.as_array_mut()) {
+    let changed = if let Some(arr) = obj
+        .get_mut("registry-mirrors")
+        .and_then(|v| v.as_array_mut())
+    {
         let before = arr.len();
-        arr.retain(|v| {
-            match v.as_str() {
-                Some(s) => !s.contains("monopsony") && !s.contains(":3128"),
-                None => true,
-            }
+        arr.retain(|v| match v.as_str() {
+            Some(s) => !s.contains("monopsony") && !s.contains(":3128"),
+            None => true,
         });
         arr.len() != before
     } else {
@@ -264,56 +267,51 @@ fn docker_proxy_off() -> ProxyToggleResult {
 fn docker_status() -> ProxyToggleResult {
     let path = docker_daemon_json_path();
     match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            match serde_json::from_str::<serde_json::Value>(&content) {
-                Ok(daemon) => {
-                    let mirrors: Vec<String> = daemon
-                        .get("registry-mirrors")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
+            Ok(daemon) => {
+                let mirrors: Vec<String> = daemon
+                    .get("registry-mirrors")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
 
-                    let monopsony_mirrors: Vec<&String> = mirrors
-                        .iter()
-                        .filter(|m| m.contains("monopsony") || m.contains(":3128"))
-                        .collect();
+                let monopsony_mirrors: Vec<&String> = mirrors
+                    .iter()
+                    .filter(|m| m.contains("monopsony") || m.contains(":3128"))
+                    .collect();
 
-                    if monopsony_mirrors.is_empty() {
-                        ProxyToggleResult {
-                            subsystem: "docker".to_string(),
-                            success: true,
-                            message: "Docker daemon.json exists, no Monopsony mirror configured"
-                                .to_string(),
-                        }
-                    } else {
-                        ProxyToggleResult {
-                            subsystem: "docker".to_string(),
-                            success: true,
-                            message: format!(
-                                "Docker proxy active (mirrors: {})",
-                                monopsony_mirrors
-                                    .iter()
-                                    .map(|s| s.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            ),
-                        }
+                if monopsony_mirrors.is_empty() {
+                    ProxyToggleResult {
+                        subsystem: "docker".to_string(),
+                        success: true,
+                        message: "Docker daemon.json exists, no Monopsony mirror configured"
+                            .to_string(),
+                    }
+                } else {
+                    ProxyToggleResult {
+                        subsystem: "docker".to_string(),
+                        success: true,
+                        message: format!(
+                            "Docker proxy active (mirrors: {})",
+                            monopsony_mirrors
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
                     }
                 }
-                Err(e) => ProxyToggleResult {
-                    subsystem: "docker".to_string(),
-                    success: true,
-                    message: format!(
-                        "Docker daemon.json exists but unparseable: {}",
-                        e
-                    ),
-                },
             }
-        }
+            Err(e) => ProxyToggleResult {
+                subsystem: "docker".to_string(),
+                success: true,
+                message: format!("Docker daemon.json exists but unparseable: {}", e),
+            },
+        },
         Err(_) => ProxyToggleResult {
             subsystem: "docker".to_string(),
             success: true,
@@ -580,10 +578,7 @@ fn shadow_proxy_on() -> ProxyToggleResult {
     }
     let shadow_table = shadow_entry.as_table_mut().unwrap();
 
-    shadow_table.insert(
-        "enabled".to_string(),
-        toml::Value::Boolean(true),
-    );
+    shadow_table.insert("enabled".to_string(), toml::Value::Boolean(true));
 
     let new_toml = toml::to_string_pretty(&doc).unwrap_or_else(|e| {
         warn!("Failed to serialize TOML: {}", e);
@@ -628,7 +623,10 @@ fn shadow_proxy_off() -> ProxyToggleResult {
             return ProxyToggleResult {
                 subsystem: "shadow".to_string(),
                 success: true,
-                message: format!("Config {} not found — shadow trust already off", path.display()),
+                message: format!(
+                    "Config {} not found — shadow trust already off",
+                    path.display()
+                ),
             };
         }
     };
@@ -805,7 +803,10 @@ pub async fn proxy_on(target: ToggleTarget, server_addr: &str) -> Vec<ProxyToggl
                 results.push(ProxyToggleResult {
                     subsystem: pm_name.clone(),
                     success: false,
-                    message: format!("Package manager '{}' is not installed on this system", pm_name),
+                    message: format!(
+                        "Package manager '{}' is not installed on this system",
+                        pm_name
+                    ),
                 });
                 return results;
             }
@@ -899,7 +900,10 @@ pub async fn proxy_off(target: ToggleTarget) -> Vec<ProxyToggleResult> {
                 results.push(ProxyToggleResult {
                     subsystem: pm_name.clone(),
                     success: false,
-                    message: format!("Package manager '{}' is not installed on this system", pm_name),
+                    message: format!(
+                        "Package manager '{}' is not installed on this system",
+                        pm_name
+                    ),
                 });
                 return results;
             }
@@ -939,14 +943,8 @@ mod tests {
     fn test_mirror_url_formats() {
         assert_eq!(mirror_url("192.168.1.1:50051"), "http://192.168.1.1:3128");
         assert_eq!(mirror_url("192.168.1.1"), "http://192.168.1.1:3128");
-        assert_eq!(
-            mirror_url("http://server:3128"),
-            "http://server:3128"
-        );
-        assert_eq!(
-            mirror_url("https://secure:443"),
-            "https://secure:443"
-        );
+        assert_eq!(mirror_url("http://server:3128"), "http://server:3128");
+        assert_eq!(mirror_url("https://secure:443"), "https://secure:443");
     }
 
     #[test]

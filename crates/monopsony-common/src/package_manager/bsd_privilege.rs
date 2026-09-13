@@ -61,9 +61,17 @@ pub fn proxy_env_actions(proxy_addr: &str) -> Vec<crate::ProxyConfigAction> {
 /// Unset HTTP/HTTPS proxy environment variables.
 pub fn remove_proxy_env_actions() -> Vec<crate::ProxyConfigAction> {
     vec![
-        crate::ProxyConfigAction::UnsetEnv { key: "HTTP_PROXY".to_string() },
-        crate::ProxyConfigAction::UnsetEnv { key: "HTTPS_PROXY".to_string() },
-        crate::ProxyConfigAction::UnsetEnv { key: "http_proxy".to_string() },
-        crate::ProxyConfigAction::UnsetEnv { key: "https_proxy".to_string() },
+        crate::ProxyConfigAction::UnsetEnv {
+            key: "HTTP_PROXY".to_string(),
+        },
+        crate::ProxyConfigAction::UnsetEnv {
+            key: "HTTPS_PROXY".to_string(),
+        },
+        crate::ProxyConfigAction::UnsetEnv {
+            key: "http_proxy".to_string(),
+        },
+        crate::ProxyConfigAction::UnsetEnv {
+            key: "https_proxy".to_string(),
+        },
     ]
 }

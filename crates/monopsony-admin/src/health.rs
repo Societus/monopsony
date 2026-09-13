@@ -33,41 +33,69 @@ pub async fn handle_health(State(state): State<AdminState>) -> impl IntoResponse
     } else {
         false
     };
-    services.insert("database".to_string(), ServiceHealth {
-        healthy: db_healthy || state.db.is_none(),
-        status: if state.db.is_some() {
-            if db_healthy { "connected".to_string() } else { "unreachable".to_string() }
-        } else {
-            "disabled".to_string()
+    services.insert(
+        "database".to_string(),
+        ServiceHealth {
+            healthy: db_healthy || state.db.is_none(),
+            status: if state.db.is_some() {
+                if db_healthy {
+                    "connected".to_string()
+                } else {
+                    "unreachable".to_string()
+                }
+            } else {
+                "disabled".to_string()
+            },
+            message: None,
         },
-        message: None,
-    });
+    );
 
     // Shadow manager
-    services.insert("shadow".to_string(), ServiceHealth {
-        healthy: true,
-        status: if state.shadow_manager.is_some() { "active".into() } else { "disabled".into() },
-        message: None,
-    });
+    services.insert(
+        "shadow".to_string(),
+        ServiceHealth {
+            healthy: true,
+            status: if state.shadow_manager.is_some() {
+                "active".into()
+            } else {
+                "disabled".into()
+            },
+            message: None,
+        },
+    );
 
     // Mirror manager
-    services.insert("mirror".to_string(), ServiceHealth {
-        healthy: true,
-        status: if state.mirror_manager.is_some() { "active".into() } else { "disabled".into() },
-        message: None,
-    });
+    services.insert(
+        "mirror".to_string(),
+        ServiceHealth {
+            healthy: true,
+            status: if state.mirror_manager.is_some() {
+                "active".into()
+            } else {
+                "disabled".into()
+            },
+            message: None,
+        },
+    );
 
     // TLS
-    services.insert("tls".to_string(), ServiceHealth {
-        healthy: true,
-        status: "active".into(),
-        message: Some(state.tls_manager.ca_fingerprint()),
-    });
+    services.insert(
+        "tls".to_string(),
+        ServiceHealth {
+            healthy: true,
+            status: "active".into(),
+            message: Some(state.tls_manager.ca_fingerprint()),
+        },
+    );
 
     let all_healthy = services.values().all(|s| s.healthy);
 
     Json(HealthResponse {
-        status: if all_healthy { "healthy".into() } else { "degraded".into() },
+        status: if all_healthy {
+            "healthy".into()
+        } else {
+            "degraded".into()
+        },
         services,
         uptime_seconds: 0,
     })
@@ -93,7 +121,10 @@ pub async fn handle_stats(State(state): State<AdminState>) -> impl IntoResponse 
     };
 
     let total_packages = if let Some(ref db) = state.db {
-        db.list_packages().await.map(|p| p.len() as i64).unwrap_or(0)
+        db.list_packages()
+            .await
+            .map(|p| p.len() as i64)
+            .unwrap_or(0)
     } else {
         0
     };

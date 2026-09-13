@@ -6,9 +6,9 @@
 //! WebSocket as an inner TLS layer. Cloudflare or any reverse proxy only
 //! sees opaque binary frames.
 
+use futures_util::{SinkExt, StreamExt};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, warn};
 
@@ -17,8 +17,17 @@ use tracing::{debug, warn};
 /// Implements hyper::rt::Read + hyper::rt::Write so it can be used directly
 /// as a tonic connector target.
 pub struct WsTransport {
-    rx: futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
-    tx: futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, WsMessage>,
+    rx: futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
+    tx: futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        WsMessage,
+    >,
     read_buf: Vec<u8>,
     closed: bool,
 }
@@ -47,7 +56,11 @@ impl WsTransport {
 
 /// Helper to read from the internal buffer + WebSocket into a generic byte slice.
 fn fill_from_ws(
-    rx: &mut futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>>,
+    rx: &mut futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    >,
     read_buf: &mut Vec<u8>,
     out: &mut [u8],
     cx: &mut Context<'_>,
@@ -87,12 +100,10 @@ fn fill_from_ws(
                 }
             }
         }
-        Poll::Ready(Some(Err(e))) => {
-            Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                format!("WebSocket error: {}", e),
-            )))
-        }
+        Poll::Ready(Some(Err(e))) => Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            format!("WebSocket error: {}", e),
+        ))),
         Poll::Ready(None) => {
             debug!("WS transport: stream ended");
             Poll::Ready(Ok(0))
@@ -173,10 +184,7 @@ impl hyper::rt::Write for WsTransport {
         }
     }
 
-    fn poll_flush(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.tx.poll_flush_unpin(cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
             Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
@@ -187,10 +195,7 @@ impl hyper::rt::Write for WsTransport {
         }
     }
 
-    fn poll_shutdown(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.tx.poll_close_unpin(cx) {
             Poll::Ready(Ok(())) => {
                 self.closed = true;

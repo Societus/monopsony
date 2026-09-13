@@ -15,7 +15,7 @@ use hyper_util::{
     rt::TokioExecutor,
 };
 use sqlx::Row;
-use tracing::{debug, error, info, warn, trace};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::cache_storage::CacheStorage;
 use monopsony_db::Database;
@@ -69,7 +69,8 @@ struct PrefetchCandidate {
 /// Result of a single prefetch fetch
 #[allow(dead_code)] // For logging/debugging prefetch results
 struct PrefetchResult {
-    #[allow(dead_code)] url: String,
+    #[allow(dead_code)]
+    url: String,
     size: u64,
 }
 
@@ -132,7 +133,11 @@ async fn run_prefetch_cycle(db: &Database, config: &PrefetchConfig) -> anyhow::R
     };
 
     let bandwidth_remaining = Arc::new(tokio::sync::Semaphore::new(
-        if config.bandwidth_limit_bps > 0 { 1 } else { config.max_concurrent }
+        if config.bandwidth_limit_bps > 0 {
+            1
+        } else {
+            config.max_concurrent
+        },
     ));
 
     // Fetch with bounded concurrency
@@ -167,18 +172,22 @@ async fn run_prefetch_cycle(db: &Database, config: &PrefetchConfig) -> anyhow::R
                         // Record in DB
                         let now = chrono::Utc::now().timestamp();
                         let cache_key = url_to_cache_key(&candidate.url);
-                        let cache_path = storage.base_dir()
+                        let cache_path = storage
+                            .base_dir()
                             .map(|base| base.join(&cache_key).to_string_lossy().to_string())
                             .unwrap_or_else(|| cache_key.clone());
-                        if let Err(e) = db.record_cache_miss(&monopsony_db::db::CacheMissConfig {
-                            url: candidate.url.clone(),
-                            cache_path,
-                            content_type: None,
-                            content_length: size as i64,
-                            etag: None,
-                            last_modified: None,
-                            cached_at: now,
-                        }).await {
+                        if let Err(e) = db
+                            .record_cache_miss(&monopsony_db::db::CacheMissConfig {
+                                url: candidate.url.clone(),
+                                cache_path,
+                                content_type: None,
+                                content_length: size as i64,
+                                etag: None,
+                                last_modified: None,
+                                cached_at: now,
+                            })
+                            .await
+                        {
                             trace!("Failed to record pre-fetch in DB: {}", e);
                         }
 
@@ -187,12 +196,16 @@ async fn run_prefetch_cycle(db: &Database, config: &PrefetchConfig) -> anyhow::R
                             let expected_time = (size as f64 / bw_limit as f64).ceil() as u64;
                             if expected_time > 0 {
                                 tokio::time::sleep(Duration::from_millis(
-                                    expected_time.min(60) * 1000
-                                )).await;
+                                    expected_time.min(60) * 1000,
+                                ))
+                                .await;
                             }
                         }
 
-                        Some(PrefetchResult { url: candidate.url, size })
+                        Some(PrefetchResult {
+                            url: candidate.url,
+                            size,
+                        })
                     }
                     Err(e) => {
                         warn!("Pre-fetch failed for {}: {}", candidate.url, e);
@@ -283,13 +296,10 @@ async fn prefetch_url(
         .map_err(|e| format!("Failed to build request: {}", e))?;
 
     // Fetch with timeout
-    let response = tokio::time::timeout(
-        Duration::from_secs(timeout_secs),
-        client.request(req),
-    )
-    .await
-    .map_err(|_| format!("Request timed out after {}s", timeout_secs))?
-    .map_err(|e| format!("Request failed: {}", e))?;
+    let response = tokio::time::timeout(Duration::from_secs(timeout_secs), client.request(req))
+        .await
+        .map_err(|_| format!("Request timed out after {}s", timeout_secs))?
+        .map_err(|e| format!("Request failed: {}", e))?;
 
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
@@ -297,7 +307,8 @@ async fn prefetch_url(
 
     // Enforce max response body size
     let (parts, body) = response.into_parts();
-    let content_length: u64 = parts.headers
+    let content_length: u64 = parts
+        .headers
         .get("content-length")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
@@ -319,21 +330,20 @@ async fn prefetch_url(
         .to_bytes();
 
     if bytes.len() as u64 > crate::security::MAX_RESPONSE_BODY_SIZE {
-        return Err(format!(
-            "Response body exceeds max: {} bytes",
-            bytes.len()
-        ));
+        return Err(format!("Response body exceeds max: {} bytes", bytes.len()));
     }
 
     // Write to cache via storage backend
-    storage.write(&cache_key, &bytes)
+    storage
+        .write(&cache_key, &bytes)
         .await
         .map_err(|e| format!("Failed to write cache: {}", e))?;
 
     // Write metadata sidecar — must match the CacheEntry struct so that
     // ProxyState::load_meta() can deserialize it for X-Cache headers.
     let now = chrono::Utc::now().timestamp();
-    let cache_path = storage.base_dir()
+    let cache_path = storage
+        .base_dir()
         .map(|base| base.join(&cache_key).to_string_lossy().to_string())
         .unwrap_or_else(|| cache_key.clone());
     let meta = serde_json::json!({
@@ -377,7 +387,8 @@ fn url_to_cache_key(url: &str) -> String {
     }
 
     // Generic fallback (same logic as ProxyState::url_to_cache_key)
-    let parsed = url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://invalid").unwrap());
+    let parsed =
+        url::Url::parse(url).unwrap_or_else(|_| url::Url::parse("http://invalid").unwrap());
     let host = parsed.host_str().unwrap_or("unknown");
     let path = parsed.path().trim_start_matches('/');
     format!("other/{}/{}", host, path)
@@ -399,9 +410,7 @@ mod tests {
     #[test]
     fn test_url_to_cache_key() {
         // pacman backend matches archlinux.org → key starts with "pacman/"
-        let key = url_to_cache_key(
-            "https://repo.archlinux.org/os/x86_64/linux-6.1.pkg.tar.zst",
-        );
+        let key = url_to_cache_key("https://repo.archlinux.org/os/x86_64/linux-6.1.pkg.tar.zst");
         assert!(key.starts_with("pacman/"));
         assert!(key.contains("linux-6.1.pkg.tar.zst"));
     }

@@ -1,8 +1,8 @@
 pub mod cache_storage;
 pub mod docker;
 pub mod object_store_backend;
-pub mod proxy;
 pub mod prefetch;
+pub mod proxy;
 pub mod purge;
 pub mod scan;
 pub mod scan_clamav;

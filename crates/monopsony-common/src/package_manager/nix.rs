@@ -5,7 +5,7 @@
 //! metadata files and `.nar.xz` / `.nar` data files. Both are highly
 //! cacheable because they are content-addressed (immutable by hash).
 
-use crate::{PackageRef, PackageManagerBackend, PackageManagerKind, ProxyConfigAction, UrlPattern};
+use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 use std::path::PathBuf;
 
@@ -220,10 +220,9 @@ mod tests {
 
     #[test]
     fn test_parse_nix_store_path_simple() {
-        let (name, ver) = parse_nix_store_path(
-            "/nix/store/0a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d-bash-5.2-p15",
-        )
-        .unwrap();
+        let (name, ver) =
+            parse_nix_store_path("/nix/store/0a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d-bash-5.2-p15")
+                .unwrap();
         assert_eq!(name, "bash");
         assert_eq!(ver, "5.2-p15");
     }
@@ -250,29 +249,33 @@ mod tests {
         let patterns = backend.upstream_url_patterns();
 
         // narinfo
-        assert!(patterns.iter().any(|p| p.matches(
-            "https://cache.nixos.org/0a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d.narinfo"
-        )));
+        assert!(
+            patterns
+                .iter()
+                .any(|p| p
+                    .matches("https://cache.nixos.org/0a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d.narinfo"))
+        );
         // NAR file
-        assert!(patterns.iter().any(|p| p.matches(
-            "https://cache.nixos.org/nar/0a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d.nar.xz"
-        )));
+        assert!(patterns
+            .iter()
+            .any(|p| p
+                .matches("https://cache.nixos.org/nar/0a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d.nar.xz")));
         // Cachix
-        assert!(patterns.iter().any(|p| p.matches(
-            "https://mycache.cachix.org/0a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d.narinfo"
-        )));
+        assert!(patterns
+            .iter()
+            .any(|p| p
+                .matches("https://mycache.cachix.org/0a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d.narinfo")));
         // Non-matching
-        assert!(!patterns.iter().any(|p| p.matches(
-            "https://archlinux.org/packages/x86_64/bash.tar.zst"
-        )));
+        assert!(!patterns
+            .iter()
+            .any(|p| p.matches("https://archlinux.org/packages/x86_64/bash.tar.zst")));
     }
 
     #[test]
     fn test_url_to_cache_path() {
         let backend = NixBackend::new();
-        let path = backend.url_to_cache_path(
-            "https://cache.nixos.org/0a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d.narinfo",
-        );
+        let path = backend
+            .url_to_cache_path("https://cache.nixos.org/0a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d.narinfo");
         assert_eq!(
             path.as_deref(),
             Some("nix/0a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d.narinfo")
@@ -293,9 +296,7 @@ mod tests {
             ProxyConfigAction::WriteFile { path, content } => {
                 assert_eq!(
                     path,
-                    PathBuf::from(
-                        "/etc/systemd/system/nix-daemon.service.d/monopsony-proxy.conf"
-                    )
+                    PathBuf::from("/etc/systemd/system/nix-daemon.service.d/monopsony-proxy.conf")
                 );
                 assert!(content.contains("http_proxy=http://10.10.20.58:3128"));
                 assert!(content.contains("https_proxy=http://10.10.20.58:3128"));

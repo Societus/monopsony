@@ -95,19 +95,17 @@ impl DiscoveryService {
 
         if let Some(daemon) = state.daemon.take() {
             match daemon.shutdown() {
-                Ok(receiver) => {
-                    match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
-                        Ok(mdns_sd::DaemonStatus::Shutdown) => {
-                            info!("mDNS daemon shut down");
-                        }
-                        Ok(status) => {
-                            warn!(?status, "unexpected mDNS daemon status on shutdown");
-                        }
-                        Err(e) => {
-                            warn!(error = %e, "timeout waiting for mDNS daemon shutdown");
-                        }
+                Ok(receiver) => match receiver.recv_timeout(std::time::Duration::from_secs(2)) {
+                    Ok(mdns_sd::DaemonStatus::Shutdown) => {
+                        info!("mDNS daemon shut down");
                     }
-                }
+                    Ok(status) => {
+                        warn!(?status, "unexpected mDNS daemon status on shutdown");
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "timeout waiting for mDNS daemon shutdown");
+                    }
+                },
                 Err(e) => {
                     warn!(error = %e, "failed to shutdown mDNS daemon");
                 }

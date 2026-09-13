@@ -1,17 +1,17 @@
 //! Monopsony Client - Local proxy and package manager integration
 
+mod proxy_toggle;
 mod shadow;
 mod shadow_cli;
-mod proxy_toggle;
 mod ws_transport;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
-use anyhow::Context;
 
 // Platform-conditional default paths for config and certificate directories.
 fn default_config_path() -> String {
@@ -34,12 +34,12 @@ fn default_cert_dir() -> String {
     }
 }
 
-mod proxy;
-mod grpc_client;
-mod discovery;
-mod trust;
 mod auto_update;
+mod discovery;
+mod grpc_client;
+mod proxy;
 mod self_update;
+mod trust;
 
 #[derive(Parser, Debug)]
 #[command(name = "monopsony-client", version)]
@@ -74,9 +74,21 @@ enum Commands {
         #[arg(long)]
         server: Option<String>,
 
-        /// Timeout in ms before returning 503 to package manager
-        #[arg(long, default_value = "5000")]
+        /// Per-attempt timeout in ms (connect + headers). The retry loop's
+        /// total budget is --retry-deadline-ms.
+        #[arg(long, default_value = "30000")]
         timeout_ms: u64,
+
+        /// Total retry budget in ms before returning 503 to the package
+        /// manager. Sized for multi-minute upstream fetches of large
+        /// packages (rust, linux-firmware) through a cold cache.
+        #[arg(long, default_value = "300000")]
+        retry_deadline_ms: u64,
+
+        /// First backoff step between retries (ms); doubles per attempt,
+        /// capped at 30 s, ±20% jitter.
+        #[arg(long, default_value = "2000")]
+        retry_backoff_initial_ms: u64,
     },
     /// Discover Monopsony servers on the network
     Discover {
@@ -177,17 +189,17 @@ fn detect_binary_type() -> &'static str {
 
 async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
     let binary_type = detect_binary_type();
-    
+
     match cmd {
         SelfUpdateMode::Check => {
             info!("Checking for {} updates...", binary_type);
-            
+
             // Get current version from env var set by cargo at build time
             let current_version = env!("CARGO_PKG_VERSION").to_string();
             println!("Current {}: {}", binary_type, current_version);
-            
+
             let result = self_update::check_for_update(&current_version).await;
-            
+
             match result {
                 Ok(result) => {
                     if let Some(latest) = &result.latest_version {
@@ -197,7 +209,10 @@ async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
                         }
                         std::process::exit(1); // Exit code 1 indicates update available
                     } else {
-                        println!("You are running the latest version of monopsony {}.", binary_type);
+                        println!(
+                            "You are running the latest version of monopsony {}.",
+                            binary_type
+                        );
                     }
                 }
                 Err(e) => {
@@ -206,46 +221,51 @@ async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
                 }
             }
         }
-        
+
         SelfUpdateMode::Apply => {
             info!("Applying {} update...", binary_type);
-            
+
             let current_version = env!("CARGO_PKG_VERSION").to_string();
-            
+
             let result = self_update::check_for_update(&current_version).await;
-            
+
             match result {
                 Ok(result) => {
                     if result.latest_version.is_none() {
                         println!("Already at latest version. Nothing to do.");
                         return Ok(());
                     }
-                    
+
                     // Check if we have an asset URL for this platform
                     let asset_url = match result.asset_url {
                         Some(url) => url,
                         None => {
                             eprintln!("No compatible release asset found for this platform.");
-                            eprintln!("Available at: {}", result.changelog_url.as_deref().unwrap_or("GitHub releases"));
+                            eprintln!(
+                                "Available at: {}",
+                                result.changelog_url.as_deref().unwrap_or("GitHub releases")
+                            );
                             std::process::exit(3);
                         }
                     };
-                    
+
                     // Determine current binary path
-                    let current_exe = std::env::current_exe()
-                        .context("Failed to get current executable path")?;
-                    
-                    let target_dir = current_exe.parent()
+                    let current_exe =
+                        std::env::current_exe().context("Failed to get current executable path")?;
+
+                    let target_dir = current_exe
+                        .parent()
                         .context("Failed to get parent directory of binary")?
                         .to_path_buf();
-                    
+
                     println!("Downloading update from: {}", asset_url);
                     println!("Installing to: {}", current_exe.display());
 
                     // Try parsing the default recipe for the managed pipeline
                     let recipe = toml::from_str::<monopsony_common::shadow_types::ShadowRecipe>(
                         monopsony_common::shadow_types::DEFAULT_MONOPSONY_RECIPE,
-                    ).ok();
+                    )
+                    .ok();
 
                     if recipe.is_some() {
                         // Managed update with full safety pipeline
@@ -254,7 +274,11 @@ async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
                             current_exe,
                             target_dir,
                             current_version,
-                            result.latest_version.as_deref().unwrap_or("unknown").to_string(),
+                            result
+                                .latest_version
+                                .as_deref()
+                                .unwrap_or("unknown")
+                                .to_string(),
                             asset_url,
                         );
 
@@ -279,7 +303,9 @@ async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
                             &target_dir,
                             &asset_url,
                             result.latest_version.as_deref().unwrap_or("unknown"),
-                        ).await {
+                        )
+                        .await
+                        {
                             Ok(()) => {
                                 println!("Update applied successfully! Restart monopsony to use the new version.");
                             }
@@ -297,7 +323,7 @@ async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -349,22 +375,22 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let log_level = if args.debug { Level::DEBUG } else { Level::INFO };
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(log_level)
-        .finish();
+    let log_level = if args.debug {
+        Level::DEBUG
+    } else {
+        Level::INFO
+    };
+    let subscriber = FmtSubscriber::builder().with_max_level(log_level).finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
     // Resolve cert_dir — platform-aware defaults. Windows uses APPDATA; Linux uses ~/.config/monopsony.
-    let cert_dir_raw = args
-        .cert_dir
-        .clone()
-        .unwrap_or_else(default_cert_dir);
+    let cert_dir_raw = args.cert_dir.clone().unwrap_or_else(default_cert_dir);
 
     let cert_dir = if cfg!(windows) {
         PathBuf::from(cert_dir_raw) // Windows: APPDATA paths don't need tilde expansion
     } else {
-        shellexpand::tilde(&cert_dir_raw).to_string()
+        shellexpand::tilde(&cert_dir_raw)
+            .to_string()
             .parse::<PathBuf>()
             .unwrap_or_else(|_| PathBuf::from(cert_dir_raw))
     };
@@ -372,10 +398,30 @@ async fn main() -> anyhow::Result<()> {
     let config_path = args.config.clone().unwrap_or_else(default_config_path);
 
     match args.command {
-        Some(Commands::Daemon { proxy_addr, server, timeout_ms }) => {
-            run_daemon(proxy_addr, server, timeout_ms, cert_dir, &config_path).await?;
+        Some(Commands::Daemon {
+            proxy_addr,
+            server,
+            timeout_ms,
+            retry_deadline_ms,
+            retry_backoff_initial_ms,
+        }) => {
+            run_daemon(
+                proxy_addr,
+                server,
+                timeout_ms,
+                retry_deadline_ms,
+                retry_backoff_initial_ms,
+                cert_dir,
+                &config_path,
+            )
+            .await?;
         }
-        Some(Commands::Discover { timeout_secs, tracker_url, peer_url, distro }) => {
+        Some(Commands::Discover {
+            timeout_secs,
+            tracker_url,
+            peer_url,
+            distro,
+        }) => {
             run_discover(timeout_secs, tracker_url, peer_url, &distro).await?;
         }
         Some(Commands::Status) => {
@@ -387,7 +433,11 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Pair { server, code }) => {
             run_pair(&server, &code, &cert_dir).await?;
         }
-        Some(Commands::Mirror { server, distro, mirror_url }) => {
+        Some(Commands::Mirror {
+            server,
+            distro,
+            mirror_url,
+        }) => {
             run_mirror(&server, &distro, mirror_url.as_deref()).await?;
         }
         Some(Commands::CacheStats { server }) => {
@@ -411,9 +461,10 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Resolve server address using the fallback chain:
-/// 1. cert_dir/server.json (from pairing)
-/// 2. mDNS discovery
-/// 3. Error if all fail
+/// 1. cert_dir/server.json — ws_url field (from pairing, for CF tunnel deployments)
+/// 2. cert_dir/server.json — grpc_addr field (from pairing, for direct TCP)
+/// 3. mDNS discovery
+/// 4. Error if all fail
 async fn resolve_server_addr(cert_dir: &Path) -> anyhow::Result<String> {
     // Try server.json from pairing
     let server_json_path = cert_dir.join("server.json");
@@ -421,6 +472,15 @@ async fn resolve_server_addr(cert_dir: &Path) -> anyhow::Result<String> {
         match std::fs::read_to_string(&server_json_path) {
             Ok(content) => {
                 if let Ok(info) = serde_json::from_str::<serde_json::Value>(&content) {
+                    // Prefer ws_url (WebSocket tunnel) if present — this is set
+                    // when the server is behind Cloudflare Tunnels or a reverse proxy.
+                    if let Some(ws_url) = info.get("ws_url").and_then(|v| v.as_str()) {
+                        if !ws_url.is_empty() {
+                            info!("Using WebSocket tunnel from pairing: {}", ws_url);
+                            return Ok(ws_url.to_string());
+                        }
+                    }
+                    // Fall back to direct TCP gRPC address
                     if let Some(grpc_addr) = info.get("grpc_addr").and_then(|v| v.as_str()) {
                         if !grpc_addr.is_empty() {
                             info!("Using server from pairing: {}", grpc_addr);
@@ -438,11 +498,15 @@ async fn resolve_server_addr(cert_dir: &Path) -> anyhow::Result<String> {
     // Fall back to mDNS
     info!("Discovering server via mDNS...");
     let disc = discovery::ClientDiscovery::new("monopsony");
-    let found = disc.discover_one(Duration::from_secs(10)).await
-        .map_err(|e| anyhow::anyhow!(
+    let found =
+        disc.discover_one(Duration::from_secs(10))
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
             "Server discovery failed (no --server provided, no server.json, and mDNS failed). \
              Is the server running and on the same network? Error: {}", e
-        ))?;
+        )
+            })?;
     let addr = format!("{}:{}", found.address, found.grpc_port);
     info!("Discovered server at {}", addr);
     Ok(addr)
@@ -452,30 +516,34 @@ async fn run_daemon(
     proxy_addr: String,
     server: Option<String>,
     timeout_ms: u64,
+    retry_deadline_ms: u64,
+    retry_backoff_initial_ms: u64,
     cert_dir: PathBuf,
     config_path: &str,
 ) -> anyhow::Result<()> {
     info!("Starting Monopsony Client v{}", env!("CARGO_PKG_VERSION"));
 
     // Log system info for diagnostics
-    debug!("Platform: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+    debug!(
+        "Platform: {} {}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
     debug!("Config path: {}", config_path);
     debug!("Cert dir: {}", cert_dir.display());
 
     // Load client config (optional — daemon works without one using CLI args)
     let client_config = match std::fs::read_to_string(config_path) {
-        Ok(toml_str) => {
-            match toml::from_str::<monopsony_common::config::ClientConfig>(&toml_str) {
-                Ok(cfg) => {
-                    info!("Loaded config from {}", config_path);
-                    Some(cfg)
-                }
-                Err(e) => {
-                    warn!("Failed to parse config at {}: {}", config_path, e);
-                    None
-                }
+        Ok(toml_str) => match toml::from_str::<monopsony_common::config::ClientConfig>(&toml_str) {
+            Ok(cfg) => {
+                info!("Loaded config from {}", config_path);
+                Some(cfg)
             }
-        }
+            Err(e) => {
+                warn!("Failed to parse config at {}: {}", config_path, e);
+                None
+            }
+        },
         Err(_) => {
             info!("No config file at {} (using CLI args)", config_path);
             None
@@ -533,8 +601,7 @@ async fn run_daemon(
         }
     };
 
-    let listen_addr: SocketAddr = proxy_addr.parse()
-        .expect("invalid proxy listen address");
+    let listen_addr: SocketAddr = proxy_addr.parse().expect("invalid proxy listen address");
 
     // Build TLS config for the initial connection
     let tls = tonic::transport::ClientTlsConfig::new()
@@ -562,18 +629,21 @@ async fn run_daemon(
             Ok(id) => id.trim().to_string(),
             Err(_) => {
                 // Register with server to get client ID
-                let hostname = hostname::get()?
-                    .to_string_lossy()
-                    .to_string();
+                let hostname = hostname::get()?.to_string_lossy().to_string();
                 let backends = monopsony_common::package_manager::get_available_backends();
-                let managers: Vec<String> = backends.iter().map(|b| b.kind().as_str().to_string()).collect();
+                let managers: Vec<String> = backends
+                    .iter()
+                    .map(|b| b.kind().as_str().to_string())
+                    .collect();
 
-                let (id, _) = grpc_client.register(
-                    &hostname,
-                    std::env::consts::OS,
-                    std::env::consts::ARCH,
-                    &managers,
-                ).await?;
+                let (id, _) = grpc_client
+                    .register(
+                        &hostname,
+                        std::env::consts::OS,
+                        std::env::consts::ARCH,
+                        &managers,
+                    )
+                    .await?;
                 std::fs::write(&id_file, &id)?;
                 info!("Registered with server, client ID: {}", id);
                 id
@@ -612,8 +682,12 @@ async fn run_daemon(
                 ))
                 .domain_name("monopsony-server");
 
-            let mut client = if server_addr_for_task.starts_with("wss://") || server_addr_for_task.starts_with("ws://") {
-                match grpc_client::MonopsonyGrpcClient::connect_ws(&server_addr_for_task, Some(tls)).await {
+            let mut client = if server_addr_for_task.starts_with("wss://")
+                || server_addr_for_task.starts_with("ws://")
+            {
+                match grpc_client::MonopsonyGrpcClient::connect_ws(&server_addr_for_task, Some(tls))
+                    .await
+                {
                     Ok(c) => {
                         info!("Connected to server via WebSocket tunnel");
                         backoff = Duration::from_secs(1);
@@ -627,7 +701,9 @@ async fn run_daemon(
                     }
                 }
             } else {
-                match grpc_client::MonopsonyGrpcClient::connect(&server_addr_for_task, Some(tls)).await {
+                match grpc_client::MonopsonyGrpcClient::connect(&server_addr_for_task, Some(tls))
+                    .await
+                {
                     Ok(c) => {
                         info!("Connected to server");
                         backoff = Duration::from_secs(1); // reset on success
@@ -666,11 +742,21 @@ async fn run_daemon(
                     for backend in &backends {
                         match backend.list_installed().await {
                             Ok(pkgs) => all_packages.extend(pkgs),
-                            Err(e) => warn!("Failed to list packages from {:?}: {}", backend.kind(), e),
+                            Err(e) => {
+                                warn!("Failed to list packages from {:?}: {}", backend.kind(), e)
+                            }
                         }
                     }
 
-                    match client.report_inventory(&client_id_for_task, &all_packages, true, report_telemetry).await {
+                    match client
+                        .report_inventory(
+                            &client_id_for_task,
+                            &all_packages,
+                            true,
+                            report_telemetry,
+                        )
+                        .await
+                    {
                         Ok(_) => info!("Inventory reported ({} packages)", all_packages.len()),
                         Err(e) => {
                             warn!("Inventory report failed, reconnecting: {}", e);
@@ -721,15 +807,15 @@ async fn run_daemon(
     // The --server flag gives us the gRPC port (50051), but the HTTP forward proxy
     // is on port 3128. We derive the proxy address from the server host.
     let proxy_server_addr = {
-        let server_host = server_addr.split(':')
-            .next()
-            .unwrap_or("127.0.0.1");
+        let server_host = server_addr.split(':').next().unwrap_or("127.0.0.1");
         format!("{}:3128", server_host)
     };
 
     let proxy_config = proxy::ProxyConfig {
         server_addr: proxy_server_addr,
         timeout_ms,
+        retry_deadline_ms,
+        retry_backoff_initial_ms,
     };
 
     info!("Local proxy listening on {}", listen_addr);
@@ -749,15 +835,28 @@ async fn run_discover(
     peer_url: Option<String>,
     distro: &str,
 ) -> anyhow::Result<()> {
-    info!("Discovering Monopsony servers (timeout: {}s)...", timeout_secs);
+    info!(
+        "Discovering Monopsony servers (timeout: {}s)...",
+        timeout_secs
+    );
     let disc = discovery::ClientDiscovery::new("monopsony");
 
     let tracker_urls: Vec<String> = tracker_url
-        .map(|s| s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
 
     let peer_urls: Vec<String> = peer_url
-        .map(|s| s.split(',').map(|u| u.trim().to_string()).filter(|u| !u.is_empty()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|u| u.trim().to_string())
+                .filter(|u| !u.is_empty())
+                .collect()
+        })
         .unwrap_or_default();
 
     if tracker_urls.is_empty() && peer_urls.is_empty() {
@@ -775,12 +874,14 @@ async fn run_discover(
         }
     } else {
         // Multi-source discovery
-        let result = disc.discover_v2(
-            Duration::from_secs(timeout_secs),
-            &tracker_urls,
-            &peer_urls,
-            Some(distro),
-        ).await?;
+        let result = disc
+            .discover_v2(
+                Duration::from_secs(timeout_secs),
+                &tracker_urls,
+                &peer_urls,
+                Some(distro),
+            )
+            .await?;
 
         if result.total_results() == 0 {
             info!("No servers found from any source.");
@@ -788,22 +889,28 @@ async fn run_discover(
             if !result.tracker_mirrors.is_empty() {
                 info!("Tracker mirrors ({}):", result.tracker_mirrors.len());
                 for m in &result.tracker_mirrors {
-                    info!("  {} {} (score={:.1}, transport={})",
-                        m.mirror_id, m.endpoint, m.score, m.transport);
+                    info!(
+                        "  {} {} (score={:.1}, transport={})",
+                        m.mirror_id, m.endpoint, m.score, m.transport
+                    );
                 }
             }
             if !result.peer_mirrors.is_empty() {
                 info!("Peer mirrors ({}):", result.peer_mirrors.len());
                 for m in &result.peer_mirrors {
-                    info!("  {} {} (score={:.1}, transport={})",
-                        m.mirror_id, m.endpoint, m.score, m.transport);
+                    info!(
+                        "  {} {} (score={:.1}, transport={})",
+                        m.mirror_id, m.endpoint, m.score, m.transport
+                    );
                 }
             }
             if !result.mdns_services.is_empty() {
                 info!("mDNS services ({}):", result.mdns_services.len());
                 for srv in &result.mdns_services {
-                    info!("  {} (HTTP port: {}, gRPC port: {:?})",
-                        srv.address, srv.http_port, srv.grpc_port);
+                    info!(
+                        "  {} (HTTP port: {}, gRPC port: {:?})",
+                        srv.address, srv.http_port, srv.grpc_port
+                    );
                 }
             }
         }
@@ -866,21 +973,23 @@ async fn run_configure(server: &str) -> anyhow::Result<()> {
         }
     }
 
-    println!("Configuration complete: {} actions succeeded, {} failed", configured, failed);
+    println!(
+        "Configuration complete: {} actions succeeded, {} failed",
+        configured, failed
+    );
     if failed > 0 {
         anyhow::bail!("{} configuration actions failed", failed);
     }
     Ok(())
 }
 
-async fn run_pair(
-    server: &str,
-    code: &str,
-    cert_dir: &Path,
-) -> anyhow::Result<()> {
+async fn run_pair(server: &str, code: &str, cert_dir: &Path) -> anyhow::Result<()> {
     // Check if already paired
     if grpc_client::ClientCerts::load(cert_dir).is_some() {
-        warn!("Client already has certificates. Delete {} to re-pair.", cert_dir.display());
+        warn!(
+            "Client already has certificates. Delete {} to re-pair.",
+            cert_dir.display()
+        );
         return Ok(());
     }
 
@@ -890,27 +999,53 @@ async fn run_pair(
         .to_string();
 
     let backends = monopsony_common::package_manager::get_available_backends();
-    let managers: Vec<String> = backends.iter().map(|b| b.kind().as_str().to_string()).collect();
+    let managers: Vec<String> = backends
+        .iter()
+        .map(|b| b.kind().as_str().to_string())
+        .collect();
 
     info!("Pairing with server: {}", server);
-    let (client_id, certs, grpc_addr) = grpc_client::MonopsonyGrpcClient::pair(
-        server,
-        code,
-        &hostname,
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-        &managers,
-    ).await.map_err(|e| anyhow::anyhow!(
-        "Pairing with server {} failed: {}. Is the server running and the pairing code correct?",
-        server, e
-    ))?;
+
+    // Route to WebSocket pairing when the server address is a ws:// or wss:// URL.
+    // This is used when the server is behind Cloudflare Tunnels or a reverse proxy.
+    let (client_id, certs, grpc_addr, ws_url) = if server.starts_with("wss://")
+        || server.starts_with("ws://")
+    {
+        info!("Using WebSocket tunnel for pairing");
+        grpc_client::MonopsonyGrpcClient::pair_ws(
+            server,
+            code,
+            &hostname,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            &managers,
+        ).await.map_err(|e| anyhow::anyhow!(
+            "Pairing with server {} failed: {}. Is the server running and the pairing code correct?",
+            server, e
+        ))?
+    } else {
+        grpc_client::MonopsonyGrpcClient::pair(
+            server,
+            code,
+            &hostname,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            &managers,
+        ).await.map_err(|e| anyhow::anyhow!(
+            "Pairing with server {} failed: {}. Is the server running and the pairing code correct?",
+            server, e
+        ))?
+    };
 
     certs.save(cert_dir)?;
     std::fs::write(cert_dir.join("client_id"), &client_id)?;
 
     // Persist server connection info for future daemon connections.
+    // Include ws_url when the server provided one — clients will prefer it
+    // over grpc_addr for daemon connections (WS tunnel through CF/proxy).
     let server_info = serde_json::json!({
         "grpc_addr": grpc_addr,
+        "ws_url": ws_url,
         "paired_addr": server,
         "paired_at": chrono::Utc::now().to_rfc3339(),
     });
@@ -922,18 +1057,17 @@ async fn run_pair(
     info!("Pairing complete!");
     info!("  Client ID: {}", client_id);
     info!("  Certificates saved to: {}", cert_dir.display());
-    info!("  Server address saved to: {}/server.json", cert_dir.display());
+    info!(
+        "  Server address saved to: {}/server.json",
+        cert_dir.display()
+    );
     println!("Pairing complete! Client ID: {}", client_id);
 
     Ok(())
 }
 
 #[cfg(unix)]
-async fn run_mirror(
-    server: &str,
-    distro: &str,
-    mirror_url: Option<&str>,
-) -> anyhow::Result<()> {
+async fn run_mirror(server: &str, distro: &str, mirror_url: Option<&str>) -> anyhow::Result<()> {
     {
         use monopsony_common::package_manager::{get_available_backends, PackageManagerKind};
 
@@ -941,107 +1075,121 @@ async fn run_mirror(
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("http://{}/mirror/{}/", server, distro));
 
-    let kind = match distro.to_lowercase().as_str() {
-        "archlinux" | "arch" => PackageManagerKind::Pacman,
-        "debian" => PackageManagerKind::Apt,
-        "ubuntu" => PackageManagerKind::Apt,
-        "alpine" => PackageManagerKind::Apt, // Alpine uses apk, but closest match
-        "fedora" => PackageManagerKind::Dnf,
-        "nixos" => {
-            info!("NixOS mirror configuration requires manual channel override.");
-            println!("NixOS: set NIX_CONFIG=\"substituters = {} https://cache.nixos.org\"", mirror_base);
-            return Ok(());
-        }
-        _ => {
-            anyhow::bail!("Unsupported distro: {}. Supported: archlinux, debian, ubuntu, alpine, fedora, nixos", distro);
-        }
-    };
+        let kind = match distro.to_lowercase().as_str() {
+            "archlinux" | "arch" => PackageManagerKind::Pacman,
+            "debian" => PackageManagerKind::Apt,
+            "ubuntu" => PackageManagerKind::Apt,
+            "alpine" => PackageManagerKind::Apt, // Alpine uses apk, but closest match
+            "fedora" => PackageManagerKind::Dnf,
+            "nixos" => {
+                info!("NixOS mirror configuration requires manual channel override.");
+                println!(
+                    "NixOS: set NIX_CONFIG=\"substituters = {} https://cache.nixos.org\"",
+                    mirror_base
+                );
+                return Ok(());
+            }
+            _ => {
+                anyhow::bail!("Unsupported distro: {}. Supported: archlinux, debian, ubuntu, alpine, fedora, nixos", distro);
+            }
+        };
 
-    let backends = get_available_backends();
-    let backend = backends.iter().find(|b| b.kind() == kind);
+        let backends = get_available_backends();
+        let backend = backends.iter().find(|b| b.kind() == kind);
 
-    match backend {
-        Some(_b) => {
-            info!("Configuring {} mirror: {}", distro, mirror_base);
-            println!("Configuring {} to use mirror: {}", distro, mirror_base);
+        match backend {
+            Some(_b) => {
+                info!("Configuring {} mirror: {}", distro, mirror_base);
+                println!("Configuring {} to use mirror: {}", distro, mirror_base);
 
-            match kind {
-                PackageManagerKind::Pacman => {
-                    // Write mirrorlist
-                    let content = format!("# Monopsony mirror for Arch Linux\nServer = {}$repo/os/$arch\n", mirror_base);
-                    let path = "/etc/pacman.d/mirrorlist";
-                    println!("  Writing {}", path);
-                    std::fs::write(path, content)?;
-                    info!("Wrote {}", path);
-                }
-                PackageManagerKind::Apt => {
-                    let codename = if distro.to_lowercase() == "ubuntu" {
-                        // Try to detect Ubuntu codename
-                        let output = std::process::Command::new("lsb_release")
-                            .args(["-c", "-s"])
-                            .output();
-                        match output {
-                            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-                            _ => "noble".to_string(),
-                        }
-                    } else {
-                        // Debian
-                        let output = std::process::Command::new("lsb_release")
-                            .args(["-c", "-s"])
-                            .output();
-                        match output {
-                            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-                            _ => "bookworm".to_string(),
-                        }
-                    };
-                    let suite = &codename;
-                    let content = format!(
-                        "deb {} {} main restricted universe multiverse\n\
+                match kind {
+                    PackageManagerKind::Pacman => {
+                        // Write mirrorlist
+                        let content = format!(
+                            "# Monopsony mirror for Arch Linux\nServer = {}$repo/os/$arch\n",
+                            mirror_base
+                        );
+                        let path = "/etc/pacman.d/mirrorlist";
+                        println!("  Writing {}", path);
+                        std::fs::write(path, content)?;
+                        info!("Wrote {}", path);
+                    }
+                    PackageManagerKind::Apt => {
+                        let codename = if distro.to_lowercase() == "ubuntu" {
+                            // Try to detect Ubuntu codename
+                            let output = std::process::Command::new("lsb_release")
+                                .args(["-c", "-s"])
+                                .output();
+                            match output {
+                                Ok(o) if o.status.success() => {
+                                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                                }
+                                _ => "noble".to_string(),
+                            }
+                        } else {
+                            // Debian
+                            let output = std::process::Command::new("lsb_release")
+                                .args(["-c", "-s"])
+                                .output();
+                            match output {
+                                Ok(o) if o.status.success() => {
+                                    String::from_utf8_lossy(&o.stdout).trim().to_string()
+                                }
+                                _ => "bookworm".to_string(),
+                            }
+                        };
+                        let suite = &codename;
+                        let content = format!(
+                            "deb {} {} main restricted universe multiverse\n\
                          deb {} {}-updates main restricted universe multiverse\n\
                          deb {} {}-security main restricted universe multiverse\n",
-                        mirror_base, suite, mirror_base, suite, mirror_base, suite,
-                    );
-                    let path = "/etc/apt/sources.list.d/monopsony-mirror.list";
-                    println!("  Writing {}", path);
-                    std::fs::write(path, content)?;
-                    info!("Wrote {}", path);
-                }
-                PackageManagerKind::Dnf => {
-                    let content = format!(
+                            mirror_base, suite, mirror_base, suite, mirror_base, suite,
+                        );
+                        let path = "/etc/apt/sources.list.d/monopsony-mirror.list";
+                        println!("  Writing {}", path);
+                        std::fs::write(path, content)?;
+                        info!("Wrote {}", path);
+                    }
+                    PackageManagerKind::Dnf => {
+                        let content = format!(
                         "[monopsony-mirror]\nname=Monopsony Mirror - Fedora\nbaseurl={}\nenabled=1\ngpgcheck=1\nmetadata_expire=6h\n",
                         mirror_base,
                     );
-                    let path = "/etc/yum.repos.d/monopsony-mirror.repo";
-                    println!("  Writing {}", path);
-                    std::fs::write(path, content)?;
-                    info!("Wrote {}", path);
-                }
-                _ => {
-                    anyhow::bail!("Mirror configuration not yet implemented for {:?}", kind);
-                }
-            } // end match kind (#[cfg(unix)])
+                        let path = "/etc/yum.repos.d/monopsony-mirror.repo";
+                        println!("  Writing {}", path);
+                        std::fs::write(path, content)?;
+                        info!("Wrote {}", path);
+                    }
+                    _ => {
+                        anyhow::bail!("Mirror configuration not yet implemented for {:?}", kind);
+                    }
+                } // end match kind (#[cfg(unix)])
 
-            println!("Mirror configuration complete for {}.", distro);
-            println!("Note: You may need to run the package manager update command (e.g., apt update, pacman -Sy).");
-        }
-        None => {
-            info!("No package manager backend found for {} (kind: {:?})", distro, kind);
-            println!("No compatible package manager detected for {} on this system.", distro);
-            println!("Manual configuration: point your package manager at {}", mirror_base);
-        }
-    } // end match backend
-
+                println!("Mirror configuration complete for {}.", distro);
+                println!("Note: You may need to run the package manager update command (e.g., apt update, pacman -Sy).");
+            }
+            None => {
+                info!(
+                    "No package manager backend found for {} (kind: {:?})",
+                    distro, kind
+                );
+                println!(
+                    "No compatible package manager detected for {} on this system.",
+                    distro
+                );
+                println!(
+                    "Manual configuration: point your package manager at {}",
+                    mirror_base
+                );
+            }
+        } // end match backend
     } // end #[cfg(unix)] block
 
     Ok(())
 }
 
 #[cfg(windows)]
-async fn run_mirror(
-    server: &str,
-    distro: &str,
-    mirror_url: Option<&str>,
-) -> anyhow::Result<()> {
+async fn run_mirror(server: &str, distro: &str, mirror_url: Option<&str>) -> anyhow::Result<()> {
     let mirror_base = mirror_url
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("http://{}/mirror/{}/", server, distro));
@@ -1059,7 +1207,7 @@ async fn run_mirror(
 
 async fn run_cache_stats(server: &str) -> anyhow::Result<()> {
     info!("Connecting to server {} for cache stats...", server);
-    
+
     // For now, print a helpful message pointing to the server-side command.
     // Full implementation will query the server via gRPC once the CacheStats
     // RPC is added to the proto definition.
@@ -1067,9 +1215,12 @@ async fn run_cache_stats(server: &str) -> anyhow::Result<()> {
     println!("Run on the server:");
     println!("  monopsony-server cache-stats [--cache-dir /var/cache/monopsony]");
     println!();
-    println!("Or connect to the server at {} and query the metrics endpoint:", server);
+    println!(
+        "Or connect to the server at {} and query the metrics endpoint:",
+        server
+    );
     println!("  curl http://{}/metrics | grep monopsony_cache", server);
-    
+
     Ok(())
 }
 
@@ -1077,7 +1228,15 @@ fn run_shadow_package(cmd: shadow_cli::PackageCommand) -> anyhow::Result<()> {
     use shadow_cli::PackageCommand::*;
 
     match cmd {
-        Register { path, source, name, recipe, method, branch, requires } => {
+        Register {
+            path,
+            source,
+            name,
+            recipe,
+            method,
+            branch,
+            requires,
+        } => {
             let pkg_name = name.unwrap_or_else(|| {
                 std::path::Path::new(&path)
                     .file_name()
@@ -1099,7 +1258,11 @@ fn run_shadow_package(cmd: shadow_cli::PackageCommand) -> anyhow::Result<()> {
             println!("Note: Full registration requires a running server connection.");
             println!("Use 'monopsony-client daemon' to connect, then register via gRPC.");
         }
-        Add { name, tracker, non_interactive } => {
+        Add {
+            name,
+            tracker,
+            non_interactive,
+        } => {
             let tracker_url = tracker.unwrap_or_else(|| "http://localhost:8080".to_string());
             println!("Searching tracker at {} for '{}'...", tracker_url, name);
             if non_interactive {
@@ -1131,7 +1294,11 @@ fn run_shadow_package(cmd: shadow_cli::PackageCommand) -> anyhow::Result<()> {
             }
             println!("Note: Requires server connection.");
         }
-        Update { name, dry_run, no_restart: _ } => {
+        Update {
+            name,
+            dry_run,
+            no_restart: _,
+        } => {
             if dry_run {
                 println!("Dry-run: checking updates for '{}'...", name);
             } else {
@@ -1162,7 +1329,10 @@ fn run_shadow_package(cmd: shadow_cli::PackageCommand) -> anyhow::Result<()> {
                             // When a signed recipe arrives from the server, trust
                             // verification happens before execute_build/execute_script.
                             // See: trust::verify_recipe_trust()
-                            println!("Trust enforcement: enabled (policy: {})", trust_config.policy);
+                            println!(
+                                "Trust enforcement: enabled (policy: {})",
+                                trust_config.policy
+                            );
                         }
                         Err(e) => eprintln!("Warning: could not parse client config: {}", e),
                     }
@@ -1179,25 +1349,24 @@ fn run_shadow_package(cmd: shadow_cli::PackageCommand) -> anyhow::Result<()> {
             println!("Note: Requires server connection for full rollback.");
             println!("Available rollback versions can be listed once connected.");
         }
-        Recipe { command: sub } => {
-            match sub {
-                shadow_cli::RecipeCommand::Edit { name } => {
-                    println!("Edit recipe for: {}", name);
-                    println!("Recipe files are stored in /etc/monopsony/recipes/<name>.toml");
-                }
-                shadow_cli::RecipeCommand::Validate { path } => {
-                    match std::fs::read_to_string(&path) {
-                        Ok(content) => {
-                            match toml::from_str::<monopsony_common::shadow_types::ShadowRecipe>(&content) {
-                                Ok(recipe) => println!("Recipe {} is valid (package: {}).", path, recipe.package.name),
-                                Err(e) => eprintln!("Recipe validation failed: {}", e),
-                            }
-                        }
-                        Err(e) => eprintln!("Cannot read {}: {}", path, e),
+        Recipe { command: sub } => match sub {
+            shadow_cli::RecipeCommand::Edit { name } => {
+                println!("Edit recipe for: {}", name);
+                println!("Recipe files are stored in /etc/monopsony/recipes/<name>.toml");
+            }
+            shadow_cli::RecipeCommand::Validate { path } => match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    match toml::from_str::<monopsony_common::shadow_types::ShadowRecipe>(&content) {
+                        Ok(recipe) => println!(
+                            "Recipe {} is valid (package: {}).",
+                            path, recipe.package.name
+                        ),
+                        Err(e) => eprintln!("Recipe validation failed: {}", e),
                     }
                 }
-            }
-        }
+                Err(e) => eprintln!("Cannot read {}: {}", path, e),
+            },
+        },
     }
     Ok(())
 }
@@ -1213,8 +1382,14 @@ async fn run_proxy_command(cmd: ProxyCommand, cert_dir: &Path) -> anyhow::Result
             if server_json_path.exists() {
                 if let Ok(content) = std::fs::read_to_string(&server_json_path) {
                     if let Ok(info) = serde_json::from_str::<serde_json::Value>(&content) {
-                        let grpc_addr = info.get("grpc_addr").and_then(|v| v.as_str()).unwrap_or("unknown");
-                        let paired_at = info.get("paired_at").and_then(|v| v.as_str()).unwrap_or("unknown");
+                        let grpc_addr = info
+                            .get("grpc_addr")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let paired_at = info
+                            .get("paired_at")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
                         println!("Server:           {}", grpc_addr);
                         println!("Paired at:        {}", paired_at);
                     }
@@ -1235,7 +1410,13 @@ async fn run_proxy_command(cmd: ProxyCommand, cert_dir: &Path) -> anyhow::Result
                 }
             }
         }
-        ProxyCommand::On { pm, docker, shadow, all, server } => {
+        ProxyCommand::On {
+            pm,
+            docker,
+            shadow,
+            all,
+            server,
+        } => {
             let target = if all {
                 proxy_toggle::ToggleTarget::All
             } else if let Some(name) = pm {
@@ -1252,7 +1433,9 @@ async fn run_proxy_command(cmd: ProxyCommand, cert_dir: &Path) -> anyhow::Result
             let server_addr = if let Some(s) = server {
                 s
             } else {
-                resolve_server_addr(cert_dir).await.unwrap_or_else(|_| "127.0.0.1:3128".to_string())
+                resolve_server_addr(cert_dir)
+                    .await
+                    .unwrap_or_else(|_| "127.0.0.1:3128".to_string())
             };
 
             let results = proxy_toggle::proxy_on(target, &server_addr).await;
@@ -1272,7 +1455,12 @@ async fn run_proxy_command(cmd: ProxyCommand, cert_dir: &Path) -> anyhow::Result
                 anyhow::bail!("{} actions failed", failed);
             }
         }
-        ProxyCommand::Off { pm, docker, shadow, all } => {
+        ProxyCommand::Off {
+            pm,
+            docker,
+            shadow,
+            all,
+        } => {
             let target = if all {
                 proxy_toggle::ToggleTarget::All
             } else if let Some(name) = pm {
