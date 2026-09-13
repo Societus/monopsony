@@ -71,6 +71,51 @@
 - **prefetch.rs still buffers whole bodies** (pre-existing). Uses the old `write()` API. Follow-up candidate: switch to `spool()` for the same O(1) memory. Not blocking — prefetch is for small repo metadata + scheduled warmups.
 - Plan item §2 (Retry-After on first-byte-late server responses): skipped per plan's own "low priority" note — streaming removed the pain.
 - `docker.rs` `fetch_upstream` still collects (docker blobs via different path — unchanged this pass).
+- **HTTPS CONNECT tunneling NOT implemented** (client or server proxy) — pre-existing, live-hit this round: .20's https mirrorlist 404s through the chain; http:// works. **USER ACTION ITEM (Sep 13 2026): make https proxying work before public servers exist** — PMs that hard-require https (winget/choco CDNs) hit the same wall.
+
+## Live verification findings (Sep 13 round)
+
+1. **REGRESSION FOUND + FIXED (uncommitted):** DB write boundary scheme mismatch.
+   The streaming rewrite moved `normalize_url_scheme` to the DB *lookup* only;
+   `record_cache_miss`/`update_cache_sha256` still wrote the RAW fetch URL
+   (http:// after mirror switch) while lookups canonicalize to https://.
+   Result: every post-switch object MISSed forever and re-committed each request
+   (3 identical "Cached" lines for realtek; DB census 11 http / 296 https rows).
+   Fix: normalize at all DB boundaries in proxy.rs (record_cache_miss,
+   update_cache_sha256, record_cache_hit). `record_cache_hit` had the mirror bug —
+   HITs counted against the un-normalized URL, UPDATE matched 0 rows.
+2. .20 mirrorlist was still https:// — client proxy has no CONNECT tunneling
+   (known limitation, user action item above). Switched to http:// (backup:
+   mirrorlist.pre-streaming-test).
+3. Single-pass `pacman -Syu` on .20 through the full chain: rc=0, zero 503s ✓
+4. RSS flat during streamed fetches (server 9228 KB, client ~9.8 MB — 7.5 MB
+   realtek + ~155 MB linux kernel pkg) ✓
+5. **Item 3 PASSED (kill mid-fetch):** server pkilled mid-clang-fetch with a live
+   15 MiB staged part (`clang…#1`) — 0 DB rows committed (atomicity held), client
+   saw truncated body at EOF (fail-closed for PM checksum), daemon survived and
+   reconnected post-restart, server clean on all 5 ports. Orphaned staged part
+   left on disk for the janitor; live janitor collection still pending (needs
+   temporary `stale_part_sweep_secs=20`/`ttl=20` in server.toml + restart + revert;
+   unit test `test_sweep_staged_parts_removes_orphans` passing).
+6. **Item 4 PASSED (concurrent):** 5 hosts fetched lvm2 simultaneously —
+   1 MISS + 4 HIT, exactly 1 server-side upstream commit (sha256 logged once).
+7. Fixed server binary (scheme-normalization at all DB boundaries) deployed to
+   .58 18:34; MISS→HIT verified live on realtek; DB now records https:// rows.
+8. Full fleet re-deployed on current clients + current CA: .20 (glibc),
+   .62 (glibc, re-paired), .235/.242/.159 (musl, paired). All 5 connected +
+   heartbeating. .62/.242/.159 had stale pre-rotation certs (BadSignature →
+   re-pair); .159 had a stray monopsony-server holding 3129 (killed by PID).
+9. Pairing ceremony proven 4× live: admin login cookie → pair/init → client pair
+   on :50052 → daemon restart → heartbeat. NOTE: `pair --admin-user/--admin-pass`
+   CLI flags 401 (basic auth not accepted by session-cookie middleware) — use
+   curl login + cookie for pair/init until fixed.
+
+## Uncommitted at round end (awaiting GPG signing)
+
+- ca_guard (context/2026-09-13-ca-guard-status.md) — message draft in
+  .git-commit-message.tmp (may need updating to cover both changesets).
+- DB-boundary scheme fix: crates/monopsony-proxy/src/proxy.rs
+  (record_cache_miss / update_cache_sha256 / record_cache_hit normalized).
 
 ## Live verification checklist (on 10.10.20.58, next session)
 

@@ -162,7 +162,12 @@ impl ProxyState {
             let _ = self.save_meta(cache_key, &meta).await;
 
             if let Some(db) = &self.db {
-                if let Err(e) = db.record_cache_hit(url, now as i64).await {
+                // The row was recorded under the scheme-normalized lookup URL;
+                // count the hit against the same canonical form.
+                if let Err(e) = db
+                    .record_cache_hit(&normalize_url_scheme(url), now as i64)
+                    .await
+                {
                     trace!("Failed to record cache hit in DB for {}: {}", url, e);
                 }
             }
@@ -964,9 +969,12 @@ async fn run_tee(
     }
 
     if let Some(db) = &ctx.state.db {
+        // Canonicalize the DB key to match the HIT-path lookup, which
+        // scheme-normalizes before querying. Writing the raw fetch URL here
+        // (http://) makes freshly committed objects invisible to lookups.
         if let Err(e) = db
             .record_cache_miss(&monopsony_db::db::CacheMissConfig {
-                url: ctx.url.clone(),
+                url: normalize_url_scheme(&ctx.url),
                 cache_path: entry.cache_path.clone(),
                 content_type: entry.content_type.clone(),
                 content_length: entry.content_length as i64,
@@ -978,9 +986,10 @@ async fn run_tee(
         {
             trace!("Failed to record cache miss in DB for {}: {}", ctx.url, e);
         }
-        // Store the spool-computed hash for tamper detection on HITs.
+        // Store the spool-computed hash for tamper detection on HITs
+        // (canonical scheme, matching how the row was recorded).
         if let Err(e) = db
-            .update_cache_sha256(&ctx.url, &meta.checksum_sha256)
+            .update_cache_sha256(&normalize_url_scheme(&ctx.url), &meta.checksum_sha256)
             .await
         {
             trace!("Failed to store SHA256 for {}: {}", ctx.url, e);

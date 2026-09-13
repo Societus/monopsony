@@ -10,12 +10,13 @@ use tracing_subscriber::FmtSubscriber;
 
 // Crate imports
 use monopsony_admin::{AdminState, DashboardConfig};
-use monopsony_control::{announce, discovery, grpc, metrics, tls};
+use monopsony_control::{announce, discovery, grpc, metrics};
 use monopsony_db::Database;
 use monopsony_mirror::mirror;
 use monopsony_proxy::{cache_storage, object_store_backend, prefetch, proxy, purge};
 use monopsony_shadow::ShadowPackageManager;
 
+mod ca_guard;
 mod self_update;
 mod setup;
 
@@ -74,6 +75,16 @@ struct Args {
     /// Directory for TLS CA and certificates
     #[arg(long)]
     tls_cert_dir: Option<String>,
+
+    /// Directory for the CA backup (kept OUTSIDE the cache dir so a cache wipe
+    /// cannot destroy both copies). Default: /var/lib/monopsony/ca-backup
+    #[arg(long, default_value = "/var/lib/monopsony/ca-backup")]
+    ca_backup_dir: String,
+
+    /// Regenerate the CA even when paired clients exist (deliberate rotation;
+    /// every client must re-pair afterwards)
+    #[arg(long)]
+    regenerate_ca: bool,
 
     /// Tracker URL(s) for mirror announce (comma-separated)
     #[arg(long, env = "MONOPSONY_TRACKER_URL")]
@@ -293,31 +304,45 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|| cache_dir.join("tls"));
 
-    let tls_manager =
-        tls::TlsManager::load_or_create(&tls_dir.join("ca.crt"), &tls_dir.join("ca.key"))?;
-    info!("CA fingerprint: {}", tls_manager.ca_fingerprint());
-
-    let tls_manager = Arc::new(tls_manager);
-
-    let db = if args.no_db {
+    // Connect to the DB BEFORE initializing the CA: the CA guard must know how
+    // many paired clients exist before it may generate a fresh CA.
+    let db: Option<Arc<Database>>;
+    let mut db_unreachable = false;
+    if args.no_db {
         info!("Database disabled, using file-only caching");
-        None
+        db = None;
     } else {
         match Database::connect(&args.database_url).await {
             Ok(database) => {
                 database.run_migrations().await?;
                 info!("Database connected and migrations applied");
-                Some(Arc::new(database))
+                db = Some(Arc::new(database));
             }
             Err(e) => {
                 warn!(
                     "Failed to connect to database: {}. Continuing with file-only caching.",
                     e
                 );
-                None
+                db = None;
+                db_unreachable = true;
             }
         }
-    };
+    }
+
+    // CA lifecycle guard: auto-restore from backup (plan B) or fail closed when
+    // paired clients exist. Only generates a fresh CA when that is provably safe.
+    let backup_dir = PathBuf::from(&args.ca_backup_dir);
+    let tls_manager = ca_guard::init_ca(
+        &tls_dir,
+        &backup_dir,
+        db.as_deref(),
+        db_unreachable,
+        args.regenerate_ca,
+    )
+    .await?;
+    info!("CA fingerprint: {}", tls_manager.ca_fingerprint());
+
+    let tls_manager = Arc::new(tls_manager);
 
     let storage: Arc<dyn cache_storage::CacheStorage> = match args.cache_backend.as_str() {
         "s3" => {
