@@ -159,69 +159,42 @@ async fn try_cache(state: &DockerState, key: &str) -> Option<Response<Body>> {
 }
 
 /// Write response data to cache and return a response to the client.
+///
+/// Success bodies are streamed through a `SpoolHandle` (O(chunk) memory even
+/// for multi-GB image layers): upstream chunks are spooled, the spool is
+/// committed atomically, then the response is served via `read_stream` — the
+/// same serving path cache hits use. Registry error bodies (non-success) are
+/// small JSON and pass through buffered, as before.
 async fn cache_and_respond(
     state: &DockerState,
     key: &str,
     upstream: reqwest::Response,
 ) -> Response<Body> {
+    use futures::StreamExt;
+
     let status = upstream.status();
     let headers = upstream.headers().clone();
 
-    let bytes = match upstream.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            error!("Docker upstream body read failed: {}", e);
-            return Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from("Failed to read upstream body"))
-                .unwrap_or_else(|_| Response::new(Body::empty()));
-        }
-    };
-
-    // Only cache successful responses
-    if status.is_success() {
-        let content_type = headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-
-        // Cache the body
-        if let Err(e) = state.storage.write(key, &bytes).await {
-            warn!("Docker cache write failed for {}: {}", key, e);
-        } else {
-            info!("Docker cached: {} ({} bytes)", key, bytes.len());
-
-            // Save content-type metadata sidecar
-            if let Some(ref ct) = content_type {
-                let meta = DockerCacheMeta {
-                    content_type: Some(ct.clone()),
-                };
-                if let Ok(raw) = serde_json::to_vec(&meta) {
-                    let _ = state.storage.save_meta_json(key, &raw).await;
-                }
+    if !status.is_success() {
+        // Non-success: pass through without caching. Registry error bodies
+        // are small JSON documents, so buffering here is fine.
+        let bytes = match upstream.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                error!("Docker upstream body read failed: {}", e);
+                return Response::builder()
+                    .status(StatusCode::BAD_GATEWAY)
+                    .body(Body::from("Failed to read upstream body"))
+                    .unwrap_or_else(|_| Response::new(Body::empty()));
             }
-        }
+        };
 
-        // Build response with MISS header
         let mut builder = Response::builder()
             .status(status)
-            .header("X-Cache", "MISS")
             .header("Docker-Distribution-Api-Version", "registry/2.0");
 
-        if let Some(ct) = content_type {
+        if let Some(ct) = headers.get(header::CONTENT_TYPE) {
             builder = builder.header(header::CONTENT_TYPE, ct);
-        }
-        builder = builder.header(header::CONTENT_LENGTH, bytes.len());
-
-        // Forward digest-related headers
-        for h in &[
-            "docker-content-digest",
-            "etag",
-            header::LAST_MODIFIED.as_str(),
-        ] {
-            if let Some(v) = headers.get(*h) {
-                builder = builder.header(*h, v);
-            }
         }
 
         return builder
@@ -229,17 +202,104 @@ async fn cache_and_respond(
             .unwrap_or_else(|_| Response::new(Body::empty()));
     }
 
-    // Non-success: pass through without caching
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    // Stream the upstream body into a spool — never buffer a whole layer.
+    let mut spool = match state.storage.spool(key).await {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Docker cache spool open failed for {}: {}", key, e);
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from("Failed to open cache spool"))
+                .unwrap_or_else(|_| Response::new(Body::empty()));
+        }
+    };
+
+    let mut stream = upstream.bytes_stream();
+    let mut fetch_err: Option<reqwest::Error> = None;
+    loop {
+        match stream.next().await {
+            None => break, // clean EOF
+            Some(Err(e)) => {
+                fetch_err = Some(e);
+                break;
+            }
+            Some(Ok(chunk)) => spool.write(&chunk),
+        }
+    }
+
+    if let Some(e) = fetch_err {
+        error!("Docker upstream body read failed for {}: {}", key, e);
+        spool.abort().await;
+        return Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::from("Failed to read upstream body"))
+            .unwrap_or_else(|_| Response::new(Body::empty()));
+    }
+
+    // Clean EOF — publish atomically.
+    let meta = match spool.commit().await {
+        Ok(m) => m,
+        Err(e) => {
+            error!("Docker cache spool commit failed for {}: {}", key, e);
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from("Failed to commit cached body"))
+                .unwrap_or_else(|_| Response::new(Body::empty()));
+        }
+    };
+    info!("Docker cached: {} ({} bytes)", key, meta.size_bytes);
+
+    // Save content-type metadata sidecar
+    if let Some(ref ct) = content_type {
+        let sidecar = DockerCacheMeta {
+            content_type: Some(ct.clone()),
+        };
+        if let Ok(raw) = serde_json::to_vec(&sidecar) {
+            let _ = state.storage.save_meta_json(key, &raw).await;
+        }
+    }
+
+    // Serve the freshly cached object via read_stream — identical serving
+    // path to cache hits, so misses stream to the client chunk-by-chunk too.
+    let (body_stream, total) = match state.storage.read_stream(key, 0..u64::MAX).await {
+        Ok(v) => v,
+        Err(e) => {
+            error!("Docker cache read-back failed for {}: {}", key, e);
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from("Failed to read cached body"))
+                .unwrap_or_else(|_| Response::new(Body::empty()));
+        }
+    };
+
     let mut builder = Response::builder()
         .status(status)
-        .header("Docker-Distribution-Api-Version", "registry/2.0");
+        .header("X-Cache", "MISS")
+        .header("Docker-Distribution-Api-Version", "registry/2.0")
+        .header(header::CONTENT_LENGTH, total);
 
-    if let Some(ct) = headers.get(header::CONTENT_TYPE) {
+    if let Some(ct) = content_type {
         builder = builder.header(header::CONTENT_TYPE, ct);
     }
 
+    // Forward digest-related headers
+    for h in &[
+        "docker-content-digest",
+        "etag",
+        header::LAST_MODIFIED.as_str(),
+    ] {
+        if let Some(v) = headers.get(*h) {
+            builder = builder.header(*h, v);
+        }
+    }
+
     builder
-        .body(Body::from(bytes))
+        .body(Body::from_stream(body_stream))
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 

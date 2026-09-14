@@ -1762,6 +1762,12 @@ pub fn create_mirror_router(state: MirrorState, max_rps: u32, any_private: bool)
             "/.well-known/monopsony/peers",
             axum::routing::get(get_peers),
         )
+        // Windows PM shims: static prefixes win over the /:distro/*path
+        // catch-all in matchit, so /scoop/... never collides with distro
+        // serving. Each shim is self-contained (own state clone, own routes).
+        .nest("/scoop", crate::scoop_shim::router(state.clone()).with_state(()))
+        .nest("/choco", crate::choco_shim::router(state.clone()).with_state(()))
+        .nest("/winget", crate::winget_shim::router(state.clone()).with_state(()))
         .route("/:distro/status", axum::routing::get(mirror_status))
         .route("/:distro/sync", axum::routing::post(trigger_sync))
         .route("/:distro/*path", axum::routing::get(serve_mirror_file))

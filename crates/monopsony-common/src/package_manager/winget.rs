@@ -93,16 +93,53 @@ impl PackageManagerBackend for WingetBackend {
         Some(format!("winget{}", url.path()))
     }
 
-    fn proxy_config(&self, _proxy_addr: &str) -> ProxyConfigAction {
-        ProxyConfigAction::SetEnv {
-            key: "HTTP_PROXY".to_string(),
-            value: _proxy_addr.to_string(),
-        }
+    fn proxy_config(&self, proxy_addr: &str) -> ProxyConfigAction {
+        // Derive the mirror (shim) base from the proxy address: the mirror
+        // router listens on :3129 while the caching proxy is on :3128
+        // (same derivation as scoop.rs).
+        let mirror_addr = if let Some(stripped) = proxy_addr.strip_suffix(":3128") {
+            format!("{}:3129", stripped)
+        } else {
+            proxy_addr.to_string()
+        };
+        let source_url = format!("http://{}/winget/", mirror_addr);
+        // winget warns on plain-http sources; --trust accepts it. Remove any
+        // existing monopsony source first (2>$null makes removal-of-absent a
+        // no-op) so re-configure is idempotent.
+        let add_script = format!(
+            "winget source remove monopsony 2>$null; winget source add -n monopsony -a {} -t Microsoft.Rest --trust",
+            source_url
+        );
+        ProxyConfigAction::Multiple(vec![
+            ProxyConfigAction::SetEnv {
+                key: "HTTP_PROXY".to_string(),
+                value: proxy_addr.to_string(),
+            },
+            ProxyConfigAction::RunCommand {
+                program: "powershell".to_string(),
+                args: vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    add_script,
+                ],
+            },
+        ])
     }
 
     fn remove_proxy_config(&self) -> ProxyConfigAction {
-        ProxyConfigAction::UnsetEnv {
-            key: "HTTP_PROXY".to_string(),
-        }
+        // Best-effort source removal: `; exit 0` makes failure a no-op.
+        ProxyConfigAction::Multiple(vec![
+            ProxyConfigAction::UnsetEnv {
+                key: "HTTP_PROXY".to_string(),
+            },
+            ProxyConfigAction::RunCommand {
+                program: "powershell".to_string(),
+                args: vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    "winget source remove monopsony; exit 0".to_string(),
+                ],
+            },
+        ])
     }
 }

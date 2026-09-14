@@ -305,8 +305,8 @@ async fn prefetch_url(
         return Err(format!("HTTP {}", response.status()));
     }
 
-    // Enforce max response body size
-    let (parts, body) = response.into_parts();
+    // Enforce max response body size (declared size, checked up front)
+    let (parts, mut body) = response.into_parts();
     let content_length: u64 = parts
         .headers
         .get("content-length")
@@ -322,22 +322,45 @@ async fn prefetch_url(
         ));
     }
 
-    // Collect body
-    let bytes = body
-        .collect()
+    // Stream the body into a spool instead of buffering it whole.
+    // Memory is O(chunk); nothing is visible to readers until commit
+    // (atomic publish). A multi-GB package no longer risks OOM.
+    let mut spool = storage
+        .spool(&cache_key)
         .await
-        .map_err(|e| format!("Failed to read body: {}", e))?
-        .to_bytes();
+        .map_err(|e| format!("Failed to open spool for {}: {}", cache_key, e))?;
 
-    if bytes.len() as u64 > crate::security::MAX_RESPONSE_BODY_SIZE {
-        return Err(format!("Response body exceeds max: {} bytes", bytes.len()));
+    let mut bytes_seen: u64 = 0;
+    loop {
+        match body.frame().await {
+            None => break, // clean EOF
+            Some(Err(e)) => {
+                spool.abort().await;
+                return Err(format!("Failed to read body: {}", e));
+            }
+            Some(Ok(frame)) => {
+                let chunk = match frame.data_ref() {
+                    Some(c) => c,
+                    None => continue, // trailers — not body data
+                };
+                bytes_seen += chunk.len() as u64;
+                if bytes_seen > crate::security::MAX_RESPONSE_BODY_SIZE {
+                    spool.abort().await;
+                    return Err(format!(
+                        "Response body exceeds max: {} bytes",
+                        bytes_seen
+                    ));
+                }
+                spool.write(chunk);
+            }
+        }
     }
 
-    // Write to cache via storage backend
-    storage
-        .write(&cache_key, &bytes)
+    // Atomic commit — publishes the object and returns final size/checksum.
+    let meta = spool
+        .commit()
         .await
-        .map_err(|e| format!("Failed to write cache: {}", e))?;
+        .map_err(|e| format!("Failed to commit spool for {}: {}", cache_key, e))?;
 
     // Write metadata sidecar — must match the CacheEntry struct so that
     // ProxyState::load_meta() can deserialize it for X-Cache headers.
@@ -350,7 +373,7 @@ async fn prefetch_url(
         "url": url,
         "cache_path": cache_path,
         "content_type": parts.headers.get("content-type").and_then(|v| v.to_str().ok()),
-        "content_length": bytes.len(),
+        "content_length": meta.size_bytes,
         "etag": parts.headers.get("etag").and_then(|v| v.to_str().ok()),
         "last_modified": parts.headers.get("last-modified").and_then(|v| v.to_str().ok()),
         "cached_at": now,
@@ -362,7 +385,7 @@ async fn prefetch_url(
         .map_err(|e| format!("Failed to serialize metadata: {}", e))?;
     storage.save_meta_json(&cache_key, &meta_bytes).await.ok();
 
-    Ok(bytes.len() as u64)
+    Ok(bytes_seen)
 }
 
 /// Convert a URL to a storage key, matching the proxy's key derivation.
