@@ -121,6 +121,7 @@ fn test_config(server_addr: String) -> ProxyConfig {
         timeout_ms: 2_000,
         retry_deadline_ms: 10_000,
         retry_backoff_initial_ms: 50,
+        ..Default::default()
     }
 }
 

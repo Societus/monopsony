@@ -80,6 +80,9 @@ pub struct ProxyState {
     /// Permit upstreams on private/loopback IPs (SSRF guard bypass). Needed
     /// when Monopsony caches from LAN-internal mirrors. Default: false.
     pub allow_private_upstreams: bool,
+    /// HTTP CONNECT pass-through settings (enabled flag, deny-list, private
+    /// upstreams). Default: disabled.
+    pub connect_config: monopsony_common::config::ProxyServerConfig,
 }
 
 impl ProxyState {
@@ -99,6 +102,7 @@ impl ProxyState {
             inflight: Arc::new(Mutex::new(HashMap::new())),
             limits: monopsony_common::config::ProxyLimitsConfig::default(),
             allow_private_upstreams: false,
+            connect_config: monopsony_common::config::ProxyServerConfig::default(),
         }
     }
 
@@ -185,6 +189,15 @@ pub fn create_proxy_router(
         .route("/health", axum::routing::get(health_check))
         .route("/*path", axum::routing::any(handle_proxy_request))
         .route("/", axum::routing::any(handle_proxy_request))
+        // No `.fallback` here: CONNECT is intercepted in the hyper Service
+        // (ProxyHyperService) before the Router, and `/*path` + `/` already
+        // matched every routable request pre-CONNECT. A fallback only widened
+        // matching — malformed paths matchit rejects reached the handler
+        // instead of 404ing.
+        //
+        // Auth gates every Router-dispatched request (GET/HEAD cache path).
+        // CONNECT never reaches the Router — it is auth'd separately in
+        // `handle_connect_request` before the tunnel is established.
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
             monopsony_control::auth::auth_middleware,
@@ -1242,6 +1255,419 @@ async fn fetch_upstream(
     Ok(Response::from_parts(parts, Body::new(incoming)))
 }
 
+/// Releases an acquired rate-limiter concurrent slot exactly once when
+/// dropped. The CONNECT path holds its slot for the tunnel's lifetime (not
+/// per byte) across every exit path: early rejects drop it locally, and a
+/// spawned tunnel task drops it when the relay finishes.
+struct ConnectSlotGuard {
+    limiter: Option<Arc<crate::security::RateLimiter>>,
+    ip: std::net::IpAddr,
+    armed: bool,
+}
+
+impl Drop for ConnectSlotGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(l) = &self.limiter {
+                l.release_concurrent(&self.ip);
+            }
+        }
+    }
+}
+
+/// Rate-limited, authenticated entry point for CONNECT requests that bypasses
+/// the axum Router (the serve loop calls this directly — see
+/// `serve_proxy_router`).
+///
+/// The per-IP rate-limit slot is acquired INSIDE the auth-wrapped passthrough
+/// service, i.e. only after auth passes: an auth-rejected CONNECT (401/501)
+/// never acquires a slot, and the `ConnectSlotGuard` created in the same scope
+/// as the acquire is passed into `handle_connect`, which moves it into the
+/// tunnel task. Every early return drops the guard → releases the slot, so the
+/// slot cannot leak.
+///
+/// Auth mirrors `monopsony_control::auth::auth_middleware` exactly: it is
+/// invoked via a `Next` whose inner service runs the CONNECT handler, so the
+/// real middleware (not a copy) gates this path.
+async fn handle_connect_request(
+    state: Arc<ProxyState>,
+    rate_limiter: Option<Arc<crate::security::RateLimiter>>,
+    auth_state: Arc<monopsony_control::auth::AuthState>,
+    addr: SocketAddr,
+    req: Request<Body>,
+) -> Response<Body> {
+    // Same auth the Router would have run: the real auth_middleware is
+    // invoked through its FromFnLayer, wrapped around a passthrough service
+    // that runs the CONNECT handler (axum 0.7 exposes no Next constructor,
+    // so middleware-from-a-fn must be called via its layer).
+    let authority = req.uri().authority().map(|a| a.to_string());
+    let connect_cfg = state.connect_config.clone();
+    let connect_limiter = rate_limiter.clone();
+    let connect_addr = addr;
+    let svc = tower::util::BoxCloneService::new(tower::service_fn(
+        move |req: Request<Body>| {
+            let authority = authority.clone();
+            let connect_cfg = connect_cfg.clone();
+            let limiter = connect_limiter.clone();
+            async move {
+                // Auth passed. NOW acquire the concurrent slot (F1): before
+                // this, an auth reject leaked the slot because the guard only
+                // existed inside handle_connect.
+                let ip = connect_addr.ip();
+                if let Some(limiter) = &limiter {
+                    if !limiter.check_rate(&ip) {
+                        warn!("Rate limit exceeded for {}", ip);
+                        return Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(StatusCode::TOO_MANY_REQUESTS)
+                                .body(Body::from("Rate limit exceeded"))
+                                .unwrap_or_else(|_| {
+                                    Response::new(Body::from("Rate limit exceeded"))
+                                })
+                                .into_response(),
+                        );
+                    }
+                    if !limiter.acquire_concurrent(&ip, crate::security::DEFAULT_MAX_CONCURRENT_PER_IP)
+                    {
+                        warn!("Concurrent connection limit exceeded for {}", ip);
+                        return Ok(
+                            Response::builder()
+                                .status(StatusCode::TOO_MANY_REQUESTS)
+                                .body(Body::from("Too many concurrent connections"))
+                                .unwrap_or_else(|_| {
+                                    Response::new(Body::from(
+                                        "Too many concurrent connections",
+                                    ))
+                                })
+                                .into_response(),
+                        );
+                    }
+                }
+                // Guard created in the same scope as the acquire: every early
+                // return from here on releases the slot via Drop.
+                let slot = ConnectSlotGuard {
+                    limiter,
+                    ip,
+                    armed: true,
+                };
+                Ok(handle_connect(slot, ip, authority, connect_cfg, req)
+                    .await
+                    .into_response())
+            }
+        },
+    ));
+    let middleware = axum::middleware::from_fn_with_state(
+        auth_state,
+        monopsony_control::auth::auth_middleware,
+    );
+    let mut authed = tower::Layer::layer(&middleware, svc);
+    use tower::Service as _;
+    // Error type is Infallible, so this unwrap_or_else is total.
+    authed.call(req).await.unwrap_or_else(|e| match e {})
+}
+
+/// Handle an HTTP CONNECT request: open an opaque TCP tunnel to the
+/// authority's host:port and relay raw bytes in both directions.
+///
+/// The tunnel is deliberately opaque: no caching, no tee/spool, no body
+/// inspection, no X-Cache header. The concurrent slot was acquired by the
+/// caller (after auth) and arrives as `slot`; the guard moves into the tunnel
+/// task, releasing the slot exactly once when the relay ends.
+async fn handle_connect(
+    slot: ConnectSlotGuard,
+    ip: std::net::IpAddr,
+    authority: Option<String>,
+    connect_cfg: monopsony_common::config::ProxyServerConfig,
+    request: Request<Body>,
+) -> Response<Body> {
+    if !connect_cfg.connect_enabled {
+        warn!("CONNECT rejected: connect_enabled=false in [proxy] config");
+        return Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .body(Body::from("CONNECT pass-through is disabled on this proxy"))
+            .unwrap_or_else(|_| Response::new(Body::from("CONNECT disabled")));
+    }
+
+    let authority = match authority {
+        Some(a) => a,
+        None => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from("CONNECT requires an authority (host:port)"))
+                .unwrap_or_else(|_| Response::new(Body::from("CONNECT requires an authority")));
+        }
+    };
+
+    // Parse "host:port" — the url crate handles bare hosts and [IPv6]:port.
+    let parsed = match url::Url::parse(&format!("http://{}", authority)) {
+        Ok(u) => u,
+        Err(e) => {
+            warn!("CONNECT invalid authority '{}': {}", authority, e);
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from("CONNECT invalid authority"))
+                .unwrap_or_else(|_| Response::new(Body::from("CONNECT invalid authority")));
+        }
+    };
+    let host = parsed.host_str().unwrap_or_default().to_string();
+    if host.is_empty() {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from("CONNECT authority has no host"))
+            .unwrap_or_else(|_| Response::new(Body::from("CONNECT authority has no host")));
+    }
+    let port = parsed.port().unwrap_or(443);
+
+    // Host reject-list: normalized case-insensitive match at a label
+    // boundary (F8). `evil.com` denies `evil.com`, `EVIL.COM.`, and
+    // `api.evil.com` — plain exact-match missed both.
+    if let Some(deny) = &connect_cfg.connect_deny {
+        let h = host.trim_end_matches('.').to_ascii_lowercase();
+        if deny.iter().any(|d| {
+            let d = d.trim_end_matches('.').to_ascii_lowercase();
+            h == d || h.ends_with(&format!(".{d}"))
+        }) {
+            warn!("CONNECT to denied host '{}' rejected", host);
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .body(Body::from("CONNECT destination is denied"))
+                .unwrap_or_else(|_| Response::new(Body::from("CONNECT destination is denied")));
+        }
+    }
+
+    // SSRF guard WITHOUT a DNS-rebinding TOCTOU (F2): resolve the hostname
+    // ONCE, validate every resolved address against the private-IP check,
+    // and dial ONLY validated addresses, in order. The hostname is never
+    // dialed again, so rebinding between check and dial is impossible.
+    // Resolution failure is a reject (not "let the fetch fail naturally"),
+    // so a resolver blackhole cannot bypass the guard either.
+    let resolved: Vec<SocketAddr> = match tokio::net::lookup_host((host.as_str(), port)).await {
+        Ok(addrs) => addrs.collect(),
+        Err(e) => {
+            warn!("CONNECT DNS resolve for '{}' failed: {}", host, e);
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(format!("CONNECT to {} failed to resolve: {}", host, e)))
+                .unwrap_or_else(|_| Response::new(Body::from("CONNECT upstream unreachable")));
+        }
+    };
+    let candidates: Vec<SocketAddr> = if connect_cfg.allow_private_upstreams {
+        resolved
+    } else {
+        resolved
+            .into_iter()
+            .filter(|a| {
+                let private = crate::security::is_private_ip(&a.ip());
+                if private {
+                    warn!("SSRF blocked CONNECT to '{}': resolves to private IP {}", host, a);
+                }
+                !private
+            })
+            .collect()
+    };
+    if candidates.is_empty() {
+        return Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from(
+                "CONNECT destination resolves to a private network",
+            ))
+            .unwrap_or_else(|_| {
+                Response::new(Body::from(
+                    "CONNECT destination resolves to a private network",
+                ))
+            });
+    }
+
+    // Dial upstream BEFORE acknowledging: on dial failure the client sees a
+    // clean 502 and no interim 200 was ever sent. The dial is bounded by
+    // connect_timeout_secs (F3) — previously a blackholed upstream hung on
+    // the OS's ~2min connect timeout.
+    let dial_timeout = Duration::from_secs(connect_cfg.connect_timeout_secs);
+    let mut upstream = None;
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in &candidates {
+        match tokio::time::timeout(dial_timeout, tokio::net::TcpStream::connect(addr)).await {
+            Ok(Ok(s)) => {
+                upstream = Some(s);
+                break;
+            }
+            Ok(Err(e)) => last_err = Some(e),
+            Err(_) => {
+                last_err = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("dial to {} timed out after {}s", addr, connect_cfg.connect_timeout_secs),
+                ));
+            }
+        }
+    }
+    let mut upstream = match upstream {
+        Some(s) => s,
+        None => {
+            let e = last_err.unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::Other, "no validated addresses to dial")
+            });
+            warn!("CONNECT upstream dial {}:{} failed: {}", host, port, e);
+            return Response::builder()
+                .status(StatusCode::BAD_GATEWAY)
+                .body(Body::from(format!(
+                    "CONNECT to {}:{} failed: {}",
+                    host, port, e
+                )))
+                .unwrap_or_else(|_| Response::new(Body::from("CONNECT upstream unreachable")));
+        }
+    };
+    // Disable Nagle on the tunnel legs (F4): the manual serve loop replaced
+    // axum::serve, which set nodelay by default. Without it, tunnels suffer
+    // Nagle/delayed-ACK (~40ms per direction switch).
+    let _ = upstream.set_nodelay(true);
+
+    // Tunnel lifecycle: return 200, then relay raw bytes until either side
+    // closes (or the F3 total-lifetime cap expires). The slot guard MOVES
+    // INTO the task so the concurrent slot is held for the tunnel's lifetime
+    // (not per byte) and released exactly once when the relay ends.
+    let lifetime = Duration::from_secs(connect_cfg.tunnel_max_lifetime_secs);
+    let max_lifetime_secs = connect_cfg.tunnel_max_lifetime_secs;
+    debug!("CONNECT tunnel open {}:{} for client {}", host, port, ip);
+    tokio::spawn(async move {
+        let _slot = slot; // moved: dropped at task end → releases the slot
+        match hyper::upgrade::on(request).await {
+            Ok(upgraded) => {
+                // hyper 1.x `Upgraded` implements hyper::rt::Read/Write, not
+                // tokio's traits. TokioIo bridges the trait families both
+                // ways, giving copy_bidirectional a tokio AsyncRead+Write.
+                let mut client_io = hyper_util::rt::TokioIo::new(upgraded);
+                match tokio::time::timeout(
+                    lifetime,
+                    tokio::io::copy_bidirectional(&mut client_io, &mut upstream),
+                )
+                .await
+                {
+                    Ok(Ok((to_upstream, to_client))) => {
+                        monopsony_common::metrics::proxy_connect_bytes(to_upstream + to_client);
+                        debug!(
+                            "CONNECT tunnel {}:{} closed ({}B up, {}B down)",
+                            host, port, to_upstream, to_client
+                        );
+                    }
+                    Ok(Err(e)) => warn!("CONNECT tunnel {}:{} relay error: {}", host, port, e),
+                    Err(_) => warn!(
+                        "CONNECT tunnel {}:{} exceeded max lifetime {}s — closing",
+                        host, port, max_lifetime_secs
+                    ),
+                }
+            }
+            Err(e) => {
+                warn!("CONNECT upgrade for {}:{} failed: {}", host, port, e)
+            }
+        }
+        // `slot` drops here — releases the concurrent slot exactly once.
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(Body::empty())
+        .unwrap_or_else(|_| Response::new(Body::empty()))
+}
+
+/// Thin hyper service: intercepts CONNECT before the axum Router, forwards
+/// everything else into the Router unchanged.
+///
+/// Why this exists: axum 0.7's `RouteFuture` injects `Content-Length` into
+/// every top-level route/fallback response, and hyper's h1 encoder FORBIDS
+/// Content-Length/Transfer-Encoding on a 2xx response to CONNECT (RFC 7231)
+/// — the encode error closes the connection and cancels the upgrade, killing
+/// every tunnel. The injection happens outside any Router-level middleware,
+/// so it cannot be stripped with `.layer(...)`; bypassing the Router for
+/// CONNECT is the only correct fix.
+struct ProxyHyperService {
+    router: axum::Router,
+    state: Arc<ProxyState>,
+    rate_limiter: Option<Arc<crate::security::RateLimiter>>,
+    auth_state: Arc<monopsony_control::auth::AuthState>,
+    /// The peer address of the connection this service instance serves; used
+    /// for rate limiting and logging on the CONNECT path (CONNECT never goes
+    /// through axum's ConnectInfo extractor because it bypasses the Router).
+    peer_addr: SocketAddr,
+}
+
+impl hyper::service::Service<Request<hyper::body::Incoming>> for ProxyHyperService {
+    type Response = axum::response::Response;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<Self::Response, Self::Error>>
+                + Send,
+        >,
+    >;
+
+    fn call(&self, req: Request<hyper::body::Incoming>) -> Self::Future {
+        if req.method() == Method::CONNECT {
+            // Tunnel path: bypass the Router entirely (its RouteFuture would
+            // inject Content-Length and kill the tunnel). Convert Incoming ->
+            // axum Body and run the CONNECT handler on the raw request.
+            let (parts, incoming) = req.into_parts();
+            let req = Request::from_parts(parts, Body::new(incoming));
+            let fut = handle_connect_request(
+                self.state.clone(),
+                self.rate_limiter.clone(),
+                self.auth_state.clone(),
+                self.peer_addr,
+                req,
+            );
+            Box::pin(async move { Ok(fut.await) })
+        } else {
+            // Normal path: through the axum Router (routes + middleware +
+            // cache logic untouched). The Router's handler extracts
+            // ConnectInfo<SocketAddr>; axum::serve normally inserts that
+            // extension via into_make_service_with_connect_info, which this
+            // manual loop replaces — so insert it here.
+            let (mut parts, incoming) = req.into_parts();
+            parts
+                .extensions
+                .insert(axum::extract::ConnectInfo(self.peer_addr));
+            let req = Request::from_parts(parts, Body::new(incoming));
+            let mut router = self.router.clone();
+            Box::pin(async move {
+                use tower::Service as _; // Router<()>: tower Service, Error = Infallible
+                let res = router.call(req).await.unwrap_or_else(|e| match e {});
+                Ok(res)
+            })
+        }
+    }
+}
+
+/// Manual hyper-util serve loop for the proxy Router. Replaces `axum::serve`:
+/// CONNECT is intercepted by [`ProxyHyperService`] before the Router, and
+/// `serve_connection_with_upgrades` delivers h1 upgrades for the tunnel.
+pub async fn serve_proxy_router(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    state: Arc<ProxyState>,
+    rate_limiter: Option<Arc<crate::security::RateLimiter>>,
+    auth_state: Arc<monopsony_control::auth::AuthState>,
+) -> anyhow::Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        // axum::serve set TCP_NODELAY by default; this manual loop replaces
+        // it, so set it explicitly or tunnels suffer Nagle/delayed-ACK (F4).
+        let _ = stream.set_nodelay(true);
+        let svc = ProxyHyperService {
+            router: app.clone(),
+            state: state.clone(),
+            rate_limiter: rate_limiter.clone(),
+            auth_state: auth_state.clone(),
+            peer_addr: peer,
+        };
+        tokio::spawn(async move {
+            let _ = hyper_util::server::conn::auto::Builder::new(
+                hyper_util::rt::TokioExecutor::new(),
+            )
+            .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), svc)
+            .await;
+        });
+    }
+}
+
 /// Start the HTTP proxy server
 pub async fn run_proxy(
     addr: SocketAddr,
@@ -1251,6 +1677,7 @@ pub async fn run_proxy(
     scan_config: Option<monopsony_common::config::ScanConfig>,
     node_config: Option<monopsony_common::config::ServerConfig>,
     limits: Option<monopsony_common::config::ProxyLimitsConfig>,
+    connect_config: monopsony_common::config::ProxyServerConfig,
 ) -> anyhow::Result<()> {
     storage.init_dirs().await?;
 
@@ -1261,11 +1688,20 @@ pub async fn run_proxy(
             .expect("state should be uniquely owned at this point")
             .scan_config = Some(cfg.clone());
     }
-    // Wire node config (for Object Lock retention)
+    // Wire node config (for Object Lock retention).
     if let Some(ref cfg) = node_config {
         Arc::get_mut(&mut state)
             .expect("state should be uniquely owned at this point")
             .node_config = Some(cfg.clone());
+    }
+    // Wire CONNECT ([proxy] section) config. Passed explicitly by the caller:
+    // monopsony-server's main reads TOML per-section and historically never
+    // constructed a full ServerConfig, so piggybacking on node_config left
+    // connect_enabled stuck at its default (false).
+    {
+        Arc::get_mut(&mut state)
+            .expect("state should be uniquely owned at this point")
+            .connect_config = connect_config;
     }
     // Wire streaming limits (max body size, stall timeout, janitor cadence)
     if let Some(ref cfg) = limits {
@@ -1301,16 +1737,12 @@ pub async fn run_proxy(
     // Create auth middleware state
     let auth_state = Arc::new(monopsony_control::auth::AuthState { auth_mode, db });
 
-    let app = create_proxy_router(state, Some(limiter), auth_state);
+    let app = create_proxy_router(state.clone(), Some(limiter.clone()), auth_state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("HTTP proxy listening on {}", addr);
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    serve_proxy_router(listener, app, state, Some(limiter), auth_state).await?;
 
     Ok(())
 }

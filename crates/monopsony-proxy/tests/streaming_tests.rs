@@ -114,16 +114,15 @@ async fn spawn_proxy_router(state: Arc<ProxyState>) -> SocketAddr {
         auth_mode: AuthMode::Open,
         db: None,
     });
-    let app = create_proxy_router(state, None, auth_state);
+    let app = create_proxy_router(state.clone(), None, auth_state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .await
-        .unwrap();
+        // Exercise the REAL serve path (manual hyper-util loop with CONNECT
+        // interception), not axum::serve — tunnels only work through it.
+        monopsony_proxy::proxy::serve_proxy_router(listener, app, state, None, auth_state)
+            .await
+            .unwrap();
     });
     addr
 }
@@ -290,4 +289,373 @@ async fn test_head_request_does_not_poison_cache() {
     let (status, body, _) = proxy_get(proxy_addr, &url, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body.len(), size);
+}
+
+// ---------------------------------------------------------------------------
+// CONNECT pass-through integration tests (Sprint 19 Phase 1, slice 3).
+//
+// Loopback-only and hermetic: the "upstream" is a local tokio echo listener.
+// Raw CONNECT requests are written by hand over a tokio TcpStream — do NOT
+// use reqwest/Client::request, it dials the target host directly and
+// bypasses the proxy.
+// ---------------------------------------------------------------------------
+
+/// Read one HTTP/1.x response head (terminated by \r\n\r\n) plus any body
+/// bytes already received with it.
+async fn read_response_head(stream: &mut tokio::net::TcpStream) -> (String, Vec<u8>) {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = tokio::io::AsyncReadExt::read(stream, &mut chunk)
+            .await
+            .expect("read response head");
+        assert!(n > 0, "connection closed before a response head arrived");
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(pos) = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            let head = String::from_utf8_lossy(&buf[..pos]).to_string();
+            let rest = buf[pos + 4..].to_vec();
+            return (head, rest);
+        }
+    }
+}
+
+/// Dial the proxy and send a raw CONNECT request for `authority`
+/// (e.g. "127.0.0.1:12345"), returning the parsed response head.
+async fn send_connect(proxy: SocketAddr, authority: &str) -> (tokio::net::TcpStream, String) {
+    use tokio::io::AsyncWriteExt;
+    let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    let req = format!(
+        "CONNECT {a} HTTP/1.1\r\nHost: {a}\r\n\r\n",
+        a = authority
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    stream.flush().await.unwrap();
+    let (head, _rest) = read_response_head(&mut stream).await;
+    (stream, head)
+}
+
+/// Tiny tokio echo server: reads whatever it gets and writes it straight
+/// back until the client closes. Returns its bound address.
+async fn spawn_echo_upstream() -> SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((mut sock, _)) => {
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match sock.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    if sock.write_all(&buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    addr
+}
+
+/// ProxyState with the given CONNECT configuration.
+fn make_connect_state(cache_dir: &std::path::Path, cfg: monopsony_common::config::ProxyServerConfig) -> Arc<ProxyState> {
+    // ProxyState::new() builds an HTTPS client which needs the ring
+    // CryptoProvider installed process-wide (same as make_state above;
+    // install_default is a no-op once another test has installed it).
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let storage: Arc<dyn CacheStorage> =
+        Arc::new(ObjectStoreBackend::local(cache_dir.to_path_buf(), 0).unwrap());
+    let mut state = ProxyState::new(storage, None);
+    state.backends = vec![Box::new(TestBackend)];
+    state.allow_private_upstreams = true;
+    state.connect_config = cfg;
+    Arc::new(state)
+}
+
+#[tokio::test]
+async fn test_connect_disabled_returns_405() {
+    let dir = tempfile::tempdir().unwrap();
+    // Default ProxyServerConfig: connect_enabled = false.
+    let state = make_connect_state(dir.path(), Default::default());
+    let proxy_addr = spawn_proxy_router(state).await;
+
+    let (_stream, head) = send_connect(proxy_addr, "127.0.0.1:443").await;
+    assert!(
+        head.starts_with("HTTP/1.1 405"),
+        "expected 405 for disabled CONNECT, got: {}",
+        head
+    );
+}
+
+#[tokio::test]
+async fn test_connect_private_target_blocked() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = make_connect_state(
+        dir.path(),
+        monopsony_common::config::ProxyServerConfig {
+            connect_enabled: true,
+            allow_private_upstreams: false, // SSRF guard active
+            connect_deny: None,
+            ..Default::default()
+        },
+    );
+    let proxy_addr = spawn_proxy_router(state).await;
+
+    // Loopback = private → SSRF block.
+    let (mut stream, head) = send_connect(proxy_addr, "127.0.0.1:9").await;
+    assert!(
+        head.starts_with("HTTP/1.1 403"),
+        "expected 403 for private CONNECT target, got: {}",
+        head
+    );
+    // No 200 was ever sent: exactly one response head, nothing after it.
+    let mut leftover = Vec::new();
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        tokio::io::AsyncReadExt::read(&mut stream, &mut [0u8; 128]),
+    )
+    .await
+    {
+        Ok(Ok(0)) | Err(_) => {}                       // closed / quiet: correct
+        Ok(Ok(n)) => leftover.extend_from_slice(&[0u8; 128][..n]),
+        Ok(Err(e)) => {}                               // reset also fine
+    }
+    assert!(
+        leftover.is_empty(),
+        "expected no bytes after the 403 head, got: {:?}",
+        leftover
+    );
+}
+
+#[tokio::test]
+async fn test_connect_end_to_end_loopback() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = make_connect_state(
+        dir.path(),
+        monopsony_common::config::ProxyServerConfig {
+            connect_enabled: true,
+            allow_private_upstreams: true, // loopback test upstream allowed
+            connect_deny: None,
+            ..Default::default()
+        },
+    );
+    let proxy_addr = spawn_proxy_router(state).await;
+
+    let upstream = spawn_echo_upstream().await;
+    let authority = format!("127.0.0.1:{}", upstream.port());
+
+    let (mut stream, head) = send_connect(proxy_addr, &authority).await;
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "expected 200 Connection established, got: {}",
+        head
+    );
+
+    // Tunnel established: bytes must flow both ways through the proxy.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let payload = b"hello through the monopsony tunnel";
+    stream.write_all(payload).await.unwrap();
+    stream.flush().await.unwrap();
+
+    let mut echoed = vec![0u8; payload.len()];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_exact(&mut echoed),
+    )
+    .await
+    .expect("timed out waiting for echo")
+    .expect("read echo failed");
+    assert_eq!(echoed, payload, "echo must round-trip through the tunnel");
+
+    // Client half-close → clean bidirectional shutdown.
+    let _ = stream.shutdown().await;
+}
+
+#[tokio::test]
+async fn test_connect_refused_upstream_502() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = make_connect_state(
+        dir.path(),
+        monopsony_common::config::ProxyServerConfig {
+            connect_enabled: true,
+            allow_private_upstreams: true,
+            connect_deny: None,
+            ..Default::default()
+        },
+    );
+    let proxy_addr = spawn_proxy_router(state).await;
+
+    // Bind then drop a listener to obtain a guaranteed-closed loopback port.
+    let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+
+    let (_stream, head) =
+        send_connect(proxy_addr, &format!("127.0.0.1:{}", closed_port)).await;
+    assert!(
+        head.starts_with("HTTP/1.1 502"),
+        "expected 502 for dead upstream, got: {}",
+        head
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 19 Phase 1 review — S3 verification tests (F8/F9).
+// ---------------------------------------------------------------------------
+
+/// Full client→server CONNECT chain (F9): a raw socket dials the CLIENT
+/// proxy (`monopsony_client::proxy::run_proxy`), which must tunnel the
+/// CONNECT through the SERVER proxy (monopsony-proxy router) to a local
+/// echo upstream. Bytes must round-trip through BOTH proxies.
+///
+/// `run_proxy` binds its listener internally, so we pre-bind a port, note
+/// it, drop the listener, and pass the port to `run_proxy` in a spawned
+/// task, then poll-connect until it accepts (small bind race, accepted).
+#[tokio::test]
+async fn test_connect_chain_client_to_server() {
+    use monopsony_client::proxy::{run_proxy, ProxyConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // --- Server side: monopsony-proxy router with CONNECT enabled.
+    let dir = tempfile::tempdir().unwrap();
+    let state = make_connect_state(
+        dir.path(),
+        monopsony_common::config::ProxyServerConfig {
+            connect_enabled: true,
+            allow_private_upstreams: true, // loopback echo upstream
+            connect_deny: None,
+            ..Default::default()
+        },
+    );
+    let server_addr = spawn_proxy_router(state).await;
+
+    // --- Client side: real client proxy forwarding to the server proxy.
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let client_port = probe.local_addr().unwrap().port();
+    drop(probe);
+
+    let client_config = ProxyConfig {
+        server_addr: format!("127.0.0.1:{}", server_addr.port()),
+        timeout_ms: 2_000,
+        retry_deadline_ms: 5_000,
+        retry_backoff_initial_ms: 100,
+        tunnel_max_lifetime_ms: 60_000,
+    };
+    tokio::spawn(async move {
+        let addr: SocketAddr = format!("127.0.0.1:{}", client_port).parse().unwrap();
+        if let Err(e) = run_proxy(addr, client_config).await {
+            tracing::warn!("client proxy exited: {}", e);
+        }
+    });
+
+    // Wait for the client proxy to come up (poll-connect, bounded).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(_) = tokio::net::TcpStream::connect(("127.0.0.1", client_port)).await {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "client proxy did not start listening within 5s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let client_addr: SocketAddr = format!("127.0.0.1:{}", client_port).parse().unwrap();
+
+    // --- Raw CONNECT through the CLIENT proxy to the echo upstream.
+    let upstream = spawn_echo_upstream().await;
+    let authority = format!("127.0.0.1:{}", upstream.port());
+
+    let (mut stream, head) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        send_connect(client_addr, &authority),
+    )
+    .await
+    .expect("timed out sending CONNECT through client proxy");
+    assert!(
+        head.starts_with("HTTP/1.1 200"),
+        "expected 200 through the client→server chain, got: {}",
+        head
+    );
+
+    // Echo round-trip through BOTH proxies.
+    let payload = b"chain: client proxy -> server proxy -> echo upstream";
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        stream.write_all(payload).await.unwrap();
+        stream.flush().await.unwrap();
+    })
+    .await
+    .expect("timed out writing into tunnel");
+
+    let mut echoed = vec![0u8; payload.len()];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.read_exact(&mut echoed),
+    )
+    .await
+    .expect("timed out waiting for chained echo")
+    .expect("read chained echo failed");
+    assert_eq!(
+        echoed, payload,
+        "echo must round-trip through client AND server proxy tunnels"
+    );
+
+    let _ = stream.shutdown().await;
+}
+
+/// F8 contract: `connect_deny` entries must block the exact host AND any
+/// subdomain of it (suffix match at a label boundary), case-insensitively.
+/// The deny check runs before any dial, so fake hostnames are safe — no
+/// public dials happen (a not-yet-landed F8 fix fails the subdomain case;
+/// this test encodes the contract).
+#[tokio::test]
+async fn test_connect_denied_suffix_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = make_connect_state(
+        dir.path(),
+        monopsony_common::config::ProxyServerConfig {
+            connect_enabled: true,
+            allow_private_upstreams: true,
+            connect_deny: Some(vec!["evil.example".to_string()]),
+            ..Default::default()
+        },
+    );
+    let proxy_addr = spawn_proxy_router(state).await;
+
+    // Exact match must be denied.
+    let (_s1, head_exact) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        send_connect(proxy_addr, "evil.example:443"),
+    )
+    .await
+    .expect("timed out on exact-deny CONNECT");
+    assert!(
+        head_exact.starts_with("HTTP/1.1 403"),
+        "exact deny-list match must return 403, got: {}",
+        head_exact
+    );
+
+    // Subdomain must ALSO be denied (F8 suffix semantics).
+    let (_s2, head_sub) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        send_connect(proxy_addr, "api.evil.example:443"),
+    )
+    .await
+    .expect("timed out on subdomain-deny CONNECT");
+    assert!(
+        head_sub.starts_with("HTTP/1.1 403"),
+        "subdomain of a deny-list entry must return 403 (F8 suffix semantics), got: {}",
+        head_sub
+    );
 }

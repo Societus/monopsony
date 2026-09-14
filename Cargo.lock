@@ -2029,6 +2029,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "mime_guess",
+ "monopsony-client",
  "monopsony-common",
  "monopsony-control",
  "monopsony-db",

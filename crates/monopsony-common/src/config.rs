@@ -63,6 +63,54 @@ pub struct ServerConfig {
     pub telemetry: TelemetryConfig,
     #[serde(default)]
     pub access_control: AccessControlConfig,
+    /// HTTP CONNECT pass-through settings ([proxy] section). All fields
+    /// default so existing TOMLs without the section still parse.
+    #[serde(default)]
+    pub proxy: ProxyServerConfig,
+}
+
+/// Server-side HTTP CONNECT pass-through configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyServerConfig {
+    /// Enable HTTP CONNECT tunneling through the server proxy. Default: false.
+    #[serde(default)]
+    pub connect_enabled: bool,
+    /// Permit CONNECT to hosts resolving to private/loopback IPs (SSRF guard
+    /// bypass, e.g. LAN-internal mirrors). Default: false.
+    #[serde(default)]
+    pub allow_private_upstreams: bool,
+    /// Optional host reject-list for CONNECT destinations. Entries match
+    /// case-insensitively after trimming a trailing dot, at a label boundary
+    /// (`evil.com` denies `evil.com`, `evil.com.`, and `api.evil.com`).
+    #[serde(default)]
+    pub connect_deny: Option<Vec<String>>,
+    /// Timeout in seconds for dialing the CONNECT upstream. Default: 10.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// Maximum total lifetime in seconds for a CONNECT tunnel before the
+    /// relay is torn down. Default: 3600 (1 hour).
+    #[serde(default = "default_tunnel_max_lifetime_secs")]
+    pub tunnel_max_lifetime_secs: u64,
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    10
+}
+
+fn default_tunnel_max_lifetime_secs() -> u64 {
+    3600
+}
+
+impl Default for ProxyServerConfig {
+    fn default() -> Self {
+        Self {
+            connect_enabled: false,
+            allow_private_upstreams: false,
+            connect_deny: None,
+            connect_timeout_secs: default_connect_timeout_secs(),
+            tunnel_max_lifetime_secs: default_tunnel_max_lifetime_secs(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1059,6 +1107,7 @@ mod tests {
             node: NodeConfig::default(),
             telemetry: TelemetryConfig::default(),
             access_control: AccessControlConfig::default(),
+            proxy: ProxyServerConfig::default(),
         }
     }
 

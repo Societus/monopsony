@@ -7,6 +7,8 @@ pub mod server {
     pub const CACHE_REQUESTS_TOTAL: &str = "monopsony_cache_requests_total";
     pub const CACHE_BYTES_SERVED: &str = "monopsony_cache_bytes_served_total";
     pub const CACHE_BYTES_CACHED: &str = "monopsony_cache_bytes_cached_total";
+    /// Total bytes relayed through HTTP CONNECT tunnels (client + upstream)
+    pub const PROXY_CONNECT_BYTES: &str = "monopsony_proxy_connect_bytes_total";
     pub const CACHE_ENTRIES: &str = "monopsony_cache_entries_current";
     pub const CLIENTS_CONNECTED: &str = "monopsony_clients_connected_current";
     pub const CLIENTS_REGISTERED: &str = "monopsony_clients_registered_total";
@@ -58,6 +60,11 @@ pub fn cache_bytes_served(bytes: u64) {
 /// Record bytes cached
 pub fn cache_bytes_cached(bytes: u64) {
     counter!(server::CACHE_BYTES_CACHED).increment(bytes);
+}
+
+/// Record bytes relayed through HTTP CONNECT tunnels
+pub fn proxy_connect_bytes(bytes: u64) {
+    counter!(server::PROXY_CONNECT_BYTES).increment(bytes);
 }
 
 /// Set current cache entry count

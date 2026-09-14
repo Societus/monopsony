@@ -432,6 +432,31 @@ async fn main() -> anyhow::Result<()> {
             Err(_) => None,
         }
     };
+
+    // Read CONNECT pass-through config ([proxy] section). Falls back to
+    // defaults (connect_enabled=false) when absent — same behavior as
+    // configs that predate the section.
+    let connect_config = match std::fs::read_to_string(&args.config) {
+        Ok(content) => {
+            #[derive(serde::Deserialize, Default)]
+            struct ProxySectionWrapper {
+                #[serde(default)]
+                proxy: monopsony_common::config::ProxyServerConfig,
+            }
+            toml::from_str::<ProxySectionWrapper>(&content)
+                .map(|w| w.proxy)
+                .unwrap_or_default()
+        }
+        Err(_) => monopsony_common::config::ProxyServerConfig::default(),
+    };
+    info!(
+        "CONNECT pass-through: {}",
+        if connect_config.connect_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     info!(
         "Proxy limits: max_body={} MiB, upstream_stall={}s",
         proxy_limits
@@ -453,6 +478,7 @@ async fn main() -> anyhow::Result<()> {
             scan_config_for_proxy,
             None,
             proxy_limits,
+            connect_config,
         )
         .await
         {

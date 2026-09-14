@@ -816,6 +816,8 @@ async fn run_daemon(
         timeout_ms,
         retry_deadline_ms,
         retry_backoff_initial_ms,
+        // tunnel_max_lifetime_ms keeps its Default (1 h).
+        ..Default::default()
     };
 
     info!("Local proxy listening on {}", listen_addr);

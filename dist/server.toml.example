@@ -17,6 +17,45 @@ bind = "0.0.0.0:3128"
 # If not set, the system hostname is used.
 # Type: string (optional)
 # hostname = "my-monopsony-server"
+
+# ============================================================================
+# HTTP CONNECT Pass-Through (https tunnels)
+# ============================================================================
+# CONNECT tunnels are opaque and uncached by design: the server relays
+# encrypted bytes between client and upstream and never inspects or stores
+# them. Caching only applies to plain-http package URLs.
+[proxy]
+
+# Enable HTTP CONNECT tunneling through the server proxy. When false (the
+# default), CONNECT requests are refused and only plain-http URLs are
+# proxied. Enable so https package URLs work through the chain.
+# Default: false
+# Type: bool
+# connect_enabled = true
+
+# Permit CONNECT to hosts resolving to private/loopback IPs. This bypasses
+# the SSRF guard and should stay false unless you deliberately mirror from
+# LAN-internal hosts. Default: false
+# Type: bool
+# allow_private_upstreams = false
+
+# Optional host reject-list for CONNECT destinations. Entries match
+# case-insensitively after trimming a trailing dot, at a label boundary:
+# "evil.com" denies evil.com, evil.com., and api.evil.com — but not
+# notevil.com. Default: none
+# Type: array of strings
+# connect_deny = ["internal.corp"]
+
+# Timeout in seconds for dialing the CONNECT upstream before the tunnel
+# fails with 503. Default: 10
+# Type: u64
+# connect_timeout_secs = 10
+
+# Maximum total lifetime in seconds for a CONNECT tunnel before the relay
+# is torn down. Guards against pinned-open tunnels. Default: 3600 (1 hour)
+# Type: u64
+# tunnel_max_lifetime_secs = 3600
+
 # ============================================================================
 # gRPC Control Plane
 # ============================================================================

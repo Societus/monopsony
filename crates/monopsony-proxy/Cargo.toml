@@ -39,3 +39,4 @@ clamav-client = { version = "2.2", features = ["tokio"] }
 [dev-dependencies]
 tempfile = "3"
 rustls = { version = "0.23", features = ["ring"] }
+monopsony-client = { path = "../monopsony-client" }
