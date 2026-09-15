@@ -75,11 +75,27 @@ const TRANSIENT_503_MARKERS: [&str; 4] = [
 
 pub struct ClientProxyState {
     config: ProxyConfig,
+    /// Pin verification (Sprint 20 Phase 3). Inert until the daemon
+    /// provisions the server's mirror verify key; shared via Arc so the
+    /// daemon can rotate the key without rebuilding the proxy.
+    pub pin: std::sync::Arc<crate::pin_verify::PinState>,
 }
 
 impl ClientProxyState {
     pub fn new(config: ProxyConfig) -> Self {
-        Self { config }
+        let events_path = dirs_events_path();
+        Self {
+            config,
+            pin: std::sync::Arc::new(crate::pin_verify::PinState::new(None, events_path)),
+        }
+    }
+
+    pub fn with_pin(
+        mut self,
+        pin: std::sync::Arc<crate::pin_verify::PinState>,
+    ) -> Self {
+        self.pin = pin;
+        self
     }
 
     /// Read-only access to the effective proxy configuration.
@@ -381,6 +397,13 @@ async fn proxy_handler(
                     response
                         .headers_mut()
                         .insert("X-Monopsony", "forwarded".parse().unwrap());
+                    // Pin verification (Sprint 20 Phase 3): wrap 200 payload
+                    // bodies that carry a signed pin. HEAD (no body) and
+                    // 206 partial responses are skipped — a partial body's
+                    // hash cannot match the whole-object pin.
+                    if method != Method::HEAD && response.status() == StatusCode::OK {
+                        return wrap_with_pin_check(state, &uri, response);
+                    }
                     return response;
                 }
                 debug!(
@@ -431,6 +454,81 @@ fn build_503(msg: &'static str) -> Response<Body> {
         .status(StatusCode::SERVICE_UNAVAILABLE)
         .body(Body::from(msg))
         .unwrap_or_else(|_| Response::new(Body::from("Service unavailable")))
+}
+
+/// Canonical URL scheme for pin comparison — MUST match the server's
+/// `normalize_url_scheme` applied when the pin was recorded.
+fn pin_url(uri: &hyper::Uri) -> String {
+    match uri.scheme_str() {
+        Some("http") => format!("https://{}", uri.authority().map(|a| a.as_str()).unwrap_or("")),
+        _ => uri.to_string(),
+    }
+}
+
+/// Wrap a 200 response body in the hash-checking stream when a signed pin
+/// header is present, provisioned, and verifies. Outcomes:
+/// - no/invalid pin header → pass through untouched (server-side decision;
+///   `X-Monopsony-Pin-Status: invalid` is logged as a tamper event)
+/// - pin verifies → stream-hash the body; mismatch truncates + spools event
+/// - pinning unprovisioned → pass through untouched (inert)
+fn wrap_with_pin_check(
+    state: Arc<ClientProxyState>,
+    uri: &hyper::Uri,
+    response: Response<Body>,
+) -> Response<Body> {
+    let (mut parts, body) = response.into_parts();
+    let url = pin_url(uri);
+
+    let Some(pin_json) = parts
+        .headers
+        .get("x-monopsony-pin")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+    else {
+        // No pin on this object (origin had no integrity source, or server
+        // pinning disabled) — nothing to enforce.
+        return Response::from_parts(parts, body);
+    };
+
+    let att = match state.pin.verify_attestation_json(&pin_json, &url) {
+        Ok(att) => att,
+        Err(reason) => {
+            // Invalid/unprovisioned pin. Unprovisioned is normal (feature
+            // not yet paired); invalid is worth an event + warn.
+            if state.pin.provisioned() {
+                warn!("Invalid pin for {}: {}", url, reason);
+                state.pin.record_event(&crate::pin_verify::TamperEvent {
+                    url: url.clone(),
+                    expected_sha256: String::new(),
+                    actual_sha256: String::new(),
+                    detail: format!("invalid pin attestation: {}", reason),
+                    observed_at: chrono::Utc::now().timestamp(),
+                });
+            }
+            return Response::from_parts(parts, body);
+        }
+    };
+
+    let expected = att.expected_sha256.clone();
+    let data_stream = body.into_data_stream();
+    let checked = crate::pin_verify::pin_check_stream(
+        data_stream,
+        state.pin.clone(),
+        url,
+        expected,
+    );
+    parts
+        .headers
+        .insert("X-Monopsony-Verified", "pending".parse().expect("static"));
+    Response::from_parts(parts, Body::from_stream(checked))
+}
+
+/// Default JSONL spool path for tamper events under the client state dir.
+fn dirs_events_path() -> std::path::PathBuf {
+    let base = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join(".local/state/monopsony"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/monopsony"));
+    base.join("tamper-events.jsonl")
 }
 
 /// Handle a CONNECT request by relaying a tunnel through the server proxy.
@@ -526,8 +624,12 @@ async fn handle_connect(state: Arc<ClientProxyState>, request: Request<Body>) ->
     }
 }
 
-pub async fn run_proxy(listen_addr: SocketAddr, config: ProxyConfig) -> anyhow::Result<()> {
-    let state = Arc::new(ClientProxyState::new(config));
+pub async fn run_proxy(
+    listen_addr: SocketAddr,
+    config: ProxyConfig,
+    pin: std::sync::Arc<crate::pin_verify::PinState>,
+) -> anyhow::Result<()> {
+    let state = Arc::new(ClientProxyState::new(config).with_pin(pin));
 
     let app = axum::Router::new()
         .route("/*path", axum::routing::any(proxy_handler))

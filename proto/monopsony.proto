@@ -30,6 +30,7 @@ message ClientMessage {
         HeartbeatRequest heartbeat = 2;
         InventoryReport inventory = 3;
         InventoryDelta delta = 4;
+        TamperAlert tamper_alert = 5;
     }
 }
 
@@ -55,6 +56,16 @@ message RegisterResponse {
     bytes client_cert_pem = 3;  // Issued client certificate
     bytes client_key_pem = 4;   // Issued client private key
     string ca_cert_pem = 5;     // CA certificate for verification
+    bytes mirror_verify_key = 6; // Ed25519 verifying key for pin attestations — re-delivered on every register so already-paired clients rotate without re-pairing
+}
+
+// Client → server: served object hash did not match its signed pin (Sprint 20 Phase 3).
+message TamperAlert {
+    string url = 1;                 // canonical cache URL
+    string expected_sha256 = 2;     // hex, from the pin
+    string actual_sha256 = 3;       // hex, computed by the client while streaming
+    string detail = 4;              // human-readable context (source URL class, policy)
+    int64 observed_at = 5;          // unix seconds
 }
 
 message HeartbeatRequest {
@@ -122,6 +133,7 @@ message PairResponse {
     bytes ca_cert_pem = 4;
     string grpc_addr = 5;               // Server gRPC address for future mTLS connections
     string ws_url = 6;                  // WebSocket tunnel URL (wss://host/ws/tunnel) for clients behind CF/proxy
+    bytes mirror_verify_key = 7;        // Ed25519 verifying key (32 bytes) for pin attestations (Sprint 20 Phase 3)
 }
 
 // Mirror management RPCs

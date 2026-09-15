@@ -57,6 +57,29 @@ bind = "0.0.0.0:3128"
 # tunnel_max_lifetime_secs = 3600
 
 # ============================================================================
+# Package Integrity Pinning (Sprint 20 Phase 3)
+# ============================================================================
+[integrity]
+# Enable origin-integrity capture at spool commit: the proxy records the
+# checksum the ORIGIN declares for each fetched object (x-checksum headers,
+# sibling .sha256 sidecar files, or shim-declared hashes), signs the record
+# with the server's pin key (shadow_dir/pin-signing.key), and exposes it to
+# clients as an X-Monopsony-Pin header on cache hits. Clients verify served
+# bytes against the pin before handing them to the package manager.
+# Default: false
+# Type: bool
+# pinning_enabled = true
+
+# Policy for objects fetched with no origin-declared checksum (bare fetches):
+#   "flag"         — pin records the commit-time hash as origin_unverified;
+#                    clients warn but serve (default)
+#   "double_fetch" — re-fetch from origin at commit and compare (2x upstream
+#                    bandwidth on unverified objects)
+# Default: "flag"
+# Type: string
+# unverified_policy = "flag"
+
+# ============================================================================
 # gRPC Control Plane
 # ============================================================================
 [grpc]

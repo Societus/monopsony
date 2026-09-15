@@ -545,6 +545,12 @@ async fn test_connect_chain_client_to_server() {
     let client_port = probe.local_addr().unwrap().port();
     drop(probe);
 
+    // Pinning not provisioned for the client harness (None key = inert).
+    let pin_state = Arc::new(monopsony_client::pin_verify::PinState::new(
+        None,
+        dir.path().join("pin-events.jsonl"),
+    ));
+
     let client_config = ProxyConfig {
         server_addr: format!("127.0.0.1:{}", server_addr.port()),
         timeout_ms: 2_000,
@@ -554,7 +560,7 @@ async fn test_connect_chain_client_to_server() {
     };
     tokio::spawn(async move {
         let addr: SocketAddr = format!("127.0.0.1:{}", client_port).parse().unwrap();
-        if let Err(e) = run_proxy(addr, client_config).await {
+        if let Err(e) = run_proxy(addr, client_config, pin_state).await {
             tracing::warn!("client proxy exited: {}", e);
         }
     });
@@ -658,4 +664,236 @@ async fn test_connect_denied_suffix_matches() {
         "subdomain of a deny-list entry must return 403 (F8 suffix semantics), got: {}",
         head_sub
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 20 Phase 3 slice 7: tamper-injection end-to-end tests.
+//
+// Loopback-only: a local upstream serves fixed-pattern bytes and the REAL
+// proxy router commits the object + pin through the tee. Deterministic
+// Ed25519 keys (no rand), no sleeps beyond bounded commit polling.
+// ---------------------------------------------------------------------------
+
+/// Deterministic pin signing key (same construction as proxy.rs `pin_test_key`).
+fn pin_e2e_key(seed: u8) -> ed25519_dalek::SigningKey {
+    let mut bytes = [0u8; 32];
+    bytes[0] = seed;
+    bytes[31] = seed.wrapping_mul(7);
+    ed25519_dalek::SigningKey::from_bytes(&bytes)
+}
+
+/// ProxyState with pin capture provisioned: real signing key, pinning on,
+/// private loopback upstreams allowed (test upstreams live on 127.0.0.1).
+fn make_pin_state(
+    cache_dir: &std::path::Path,
+    key: ed25519_dalek::SigningKey,
+) -> Arc<ProxyState> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let storage: Arc<dyn CacheStorage> =
+        Arc::new(ObjectStoreBackend::local(cache_dir.to_path_buf(), 0).unwrap());
+    let mut state = ProxyState::new(storage, None);
+    state.backends = vec![Box::new(TestBackend)];
+    state.allow_private_upstreams = true;
+    state.pin_key = Some(key);
+    state.integrity.pinning_enabled = true;
+    Arc::new(state)
+}
+
+/// Upstream serving `size` bytes of 0xAB in 256 KiB chunks. When
+/// `with_checksum` is true it declares `x-checksum-sha256`; otherwise no
+/// integrity header at all (origin becomes Unverified at commit). Returns
+/// the bound address plus the sha256 of the served bytes. The `/file.pkg.sha256`
+/// sidecar path is NOT routed, so the sidecar probe 404s and the header
+/// origin (or Unverified) wins cleanly.
+async fn spawn_checksum_upstream(
+    size: usize,
+    with_checksum: bool,
+    fetches: Arc<AtomicUsize>,
+) -> (SocketAddr, String) {
+    use axum::routing::get;
+    use sha2::{Digest, Sha256};
+    use std::io;
+
+    // Hash of the deterministic 0xAB pattern, computed once up front.
+    let chunk = vec![0xABu8; 256 * 1024];
+    let mut hasher = Sha256::new();
+    let mut sent = 0usize;
+    while sent < size {
+        let take = chunk.len().min(size - sent);
+        hasher.update(&chunk[..take]);
+        sent += take;
+    }
+    let hash_hex = hex::encode(hasher.finalize());
+    let route_hash = hash_hex.clone();
+
+    let app = axum::Router::new().route(
+        "/file.pkg",
+        get(move || {
+            let fetches = fetches.clone();
+            let value = route_hash.clone();
+            async move {
+                let hash_hex = value.clone();
+                fetches.fetch_add(1, Ordering::SeqCst);
+                let chunk = vec![0xABu8; 256 * 1024];
+                let mut chunks: Vec<Result<bytes::Bytes, io::Error>> = Vec::new();
+                let mut sent = 0usize;
+                while sent < size {
+                    let take = chunk.len().min(size - sent);
+                    chunks.push(Ok(bytes::Bytes::copy_from_slice(&chunk[..take])));
+                    sent += take;
+                }
+                let mut builder = axum::response::Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-length", size)
+                    .header("content-type", "application/octet-stream");
+                if with_checksum {
+                    builder = builder.header("x-checksum-sha256", hash_hex);
+                }
+                builder
+                    .body(Body::from_stream(futures::stream::iter(chunks)))
+                    .unwrap()
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, hash_hex)
+}
+
+/// The tee task commits (meta + pin) shortly after the last body byte is
+/// forwarded; poll for the pin file so the follow-up HIT is deterministic.
+async fn wait_for_pin_file(pin_path: &std::path::Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !pin_path.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pin file never appeared at {}",
+            pin_path.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn miss_then_hit_carries_signed_pin() {
+    let dir = tempfile::tempdir().unwrap();
+    let key = pin_e2e_key(21);
+    let state = make_pin_state(dir.path(), key.clone());
+    let proxy_addr = spawn_proxy_router(state.clone()).await;
+
+    let size = 64 * 1024;
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let (upstream, hash_hex) = spawn_checksum_upstream(size, true, fetches.clone()).await;
+    let url = format!("http://127.0.0.1:{}/file.pkg", upstream.port());
+
+    // First request: streaming MISS through the tee.
+    let (status, body, headers) = proxy_get(proxy_addr, &url, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("x-cache").and_then(|v| v.to_str().ok()),
+        Some("MISS"),
+        "first request must be a streaming miss"
+    );
+    assert_eq!(body.len(), size);
+
+    // Tee commit must have produced the pin sidecar at
+    // <cache_dir>/pins/<cache_key>.pin (cache_key from url_to_cache_path).
+    let cache_key = "test/file.pkg";
+    let pin_path = dir.path().join("pins").join(format!("{}.pin", cache_key));
+    wait_for_pin_file(&pin_path).await;
+
+    // Second request: HIT carrying the signed pin.
+    let (status, body, headers) = proxy_get(proxy_addr, &url, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("x-cache").and_then(|v| v.to_str().ok()),
+        Some("HIT")
+    );
+    assert_eq!(body.len(), size);
+    assert_eq!(
+        fetches.load(Ordering::SeqCst),
+        1,
+        "HIT must not refetch upstream"
+    );
+
+    let pin_header = headers
+        .get("x-monopsony-pin")
+        .expect("HIT must carry X-Monopsony-Pin");
+    let att = monopsony_common::pin_store::from_json(pin_header.to_str().unwrap())
+        .expect("X-Monopsony-Pin parses as a PinAttestation");
+    assert!(
+        att.verify(&key.verifying_key()),
+        "pin attestation must verify under the proxy's pin key"
+    );
+    assert_eq!(att.origin.as_str(), "header", "header origin wins");
+    assert_eq!(
+        att.expected_sha256, hash_hex,
+        "pinned hash must equal the upstream bytes' sha256"
+    );
+    assert!(
+        pin_path.exists(),
+        "pin file must exist at <cache_dir>/pins/<cache_key>.pin"
+    );
+}
+
+#[tokio::test]
+async fn hit_with_forged_pin_reports_invalid() {
+    let dir = tempfile::tempdir().unwrap();
+    let real_key = pin_e2e_key(31);
+    let state = make_pin_state(dir.path(), real_key);
+    let proxy_addr = spawn_proxy_router(state.clone()).await;
+
+    let size = 64 * 1024;
+    let fetches = Arc::new(AtomicUsize::new(0));
+    // No checksum header → commit-time Unverified pin; then we forge over it.
+    let (upstream, _hash) = spawn_checksum_upstream(size, false, fetches.clone()).await;
+    let url = format!("http://127.0.0.1:{}/file.pkg", upstream.port());
+
+    // Plain MISS with pinning enabled (no origin source → Unverified pin).
+    let (status, body, headers) = proxy_get(proxy_addr, &url, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers.get("x-cache").and_then(|v| v.to_str().ok()),
+        Some("MISS")
+    );
+    assert_eq!(body.len(), size);
+
+    let cache_key = "test/file.pkg";
+    let pin_path = dir.path().join("pins").join(format!("{}.pin", cache_key));
+    wait_for_pin_file(&pin_path).await;
+
+    // Forge: re-sign the committed pin with a DIFFERENT key and write it back.
+    let forger = pin_e2e_key(32);
+    let original = monopsony_common::pin_store::from_json(
+        &std::fs::read_to_string(&pin_path).expect("read committed pin"),
+    )
+    .expect("committed pin parses");
+    let mut forged = original.clone();
+    forged.sign(&forger);
+    std::fs::write(&pin_path, monopsony_common::pin_store::to_json(&forged))
+        .expect("overwrite pin file with forged attestation");
+
+    // HIT: invalid pin must be flagged, not served, and must not block the object.
+    let (status, body, headers) = proxy_get(proxy_addr, &url, None).await;
+    assert_eq!(status, StatusCode::OK, "server-side pin check is advisory");
+    assert_eq!(
+        headers.get("x-cache").and_then(|v| v.to_str().ok()),
+        Some("HIT")
+    );
+    assert!(
+        headers.get("x-monopsony-pin").is_none(),
+        "forged pin must NOT ride out as X-Monopsony-Pin"
+    );
+    assert_eq!(
+        headers
+            .get("x-monopsony-pin-status")
+            .and_then(|v| v.to_str().ok()),
+        Some("invalid"),
+        "forged pin must surface X-Monopsony-Pin-Status: invalid"
+    );
+    assert_eq!(body.len(), size);
 }

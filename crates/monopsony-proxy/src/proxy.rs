@@ -83,6 +83,12 @@ pub struct ProxyState {
     /// HTTP CONNECT pass-through settings (enabled flag, deny-list, private
     /// upstreams). Default: disabled.
     pub connect_config: monopsony_common::config::ProxyServerConfig,
+    /// Pin-store signing key (Sprint 20 Phase 3). When set together with
+    /// `integrity.pinning_enabled`, spool commits sign pin attestations and
+    /// HIT responses carry X-Monopsony-Pin. NEVER the mTLS CA key.
+    pub pin_key: Option<ed25519_dalek::SigningKey>,
+    /// [integrity] config section (pinning_enabled, unverified_policy).
+    pub integrity: monopsony_common::config::IntegrityConfig,
 }
 
 impl ProxyState {
@@ -103,6 +109,8 @@ impl ProxyState {
             limits: monopsony_common::config::ProxyLimitsConfig::default(),
             allow_private_upstreams: false,
             connect_config: monopsony_common::config::ProxyServerConfig::default(),
+            pin_key: None,
+            integrity: monopsony_common::config::IntegrityConfig::default(),
         }
     }
 
@@ -426,6 +434,26 @@ async fn handle_cached_request(
     }
 }
 
+/// Quarantine check for cache hits (Sprint 20 Phase 3 slice 5).
+///
+/// Returns true when the DB has a tamper_alert row for the (scheme-normalized)
+/// URL — the object is then un-servable. Fail-open: when db is None or the
+/// DB query errors, we log and return false so proxy availability never
+/// hinges on the alerts table. The cached object itself is NOT deleted
+/// (forensic evidence).
+async fn quarantined(state: &ProxyState, url: &str) -> bool {
+    let Some(db) = &state.db else {
+        return false;
+    };
+    match db.has_tamper_alert(&normalize_url_scheme(url)).await {
+        Ok(quarantined) => quarantined,
+        Err(e) => {
+            warn!("Tamper-alert lookup failed for {}: {} (fail-open)", url, e);
+            false
+        }
+    }
+}
+
 /// Serve a validated cache hit as a streaming response. Returns None when the
 /// storage read fails or a security policy blocks serving — the caller then
 /// treats the request as a miss.
@@ -440,6 +468,22 @@ async fn serve_cache_hit(
 ) -> Option<Response<Body>> {
     debug!("Cache hit for: {}", url);
     monopsony_common::metrics::cache_request_hit();
+
+    // Sprint 20 Phase 3 slice 5: quarantine enforcement. A tamper_alerts row
+    // makes the URL un-servable: 403 with no body stream, BEFORE any pin
+    // headers are attached (quarantined objects get 403, not headers).
+    if quarantined(state, url).await {
+        warn!("Serving quarantined URL {} is refused", url);
+        return Some(
+            Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("X-Monopsony-Quarantine", "1")
+                .body(Body::from("Package quarantined by tamper alert"))
+                .unwrap_or_else(|_| {
+                    Response::new(Body::from("Package quarantined by tamper alert"))
+                }),
+        );
+    }
 
     state.update_access(cache_key, url).await;
 
@@ -494,6 +538,7 @@ async fn serve_cache_hit(
                 }
             }
             builder = builder.header("X-Cache", "HIT");
+            builder = attach_pin_header(builder, state, cache_key).await;
 
             // Scan policy enforcement: query DB for scan status on HIT
             if let Some(db) = &state.db {
@@ -711,6 +756,14 @@ async fn fetch_and_stream_get(
 
     let (parts, upstream_body) = upstream_response.into_parts();
 
+    // Capture the upstream response headers for the tee task (pin capture).
+    let upstream_headers: Option<HashMap<String, String>> = Some(
+        headers
+            .iter()
+            .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.as_str().to_string(), vs.to_string())))
+            .collect(),
+    );
+
     // Tee task: reads the upstream body frame by frame, appending each chunk
     // to the spool while forwarding it to the client. On clean EOF it commits
     // the spool (atomic publish) and records metadata + DB + scan dispatch.
@@ -726,6 +779,7 @@ async fn fetch_and_stream_get(
         upstream_content_length,
         etag,
         last_modified,
+        upstream_headers,
     };
     tokio::spawn(run_tee(upstream_body, spool, tx, tee_ctx));
 
@@ -833,6 +887,9 @@ struct TeeContext {
     upstream_content_length: Option<u64>,
     etag: Option<String>,
     last_modified: Option<String>,
+    /// Upstream response headers (name, value), captured at the construction
+    /// site so the tee task can extract origin-declared checksums for pinning.
+    upstream_headers: Option<HashMap<String, String>>,
 }
 
 /// Tee task body: pump upstream chunks to the spool and the client channel.
@@ -979,6 +1036,60 @@ async fn run_tee(
     };
     if let Err(e) = ctx.state.save_meta(&ctx.cache_key, &entry).await {
         warn!("Failed to save cache metadata: {}", e);
+    }
+
+    // Pin capture (Sprint 20 Phase 3): record the origin-declared hash as a
+    // signed attestation when pinning is provisioned and enabled.
+    if ctx.state.integrity.pinning_enabled && ctx.state.pin_key.is_some() {
+        // Origin precedence: response headers first, then `<url>.sha256`
+        // sidecar, then the commit-time hash as an Unverified observation.
+        let origin = ctx
+            .upstream_headers
+            .as_ref()
+            .and_then(|h| origin_hash_from_header_map(h));
+        let origin = if origin.is_some() {
+            origin
+        } else {
+            origin_hash_from_sidecar(&ctx.state, &ctx.url).await
+        };
+        let (expected_sha256, pin_origin) = origin.unwrap_or_else(|| {
+            (meta.checksum_sha256.clone(), monopsony_common::pin_store::PinOrigin::Unverified)
+        });
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let mut att = monopsony_common::pin_store::PinAttestation {
+            url: normalize_url_scheme(&ctx.url),
+            expected_sha256,
+            origin: pin_origin,
+            key_id: String::new(),
+            observed_at: now_secs,
+            signature: String::new(),
+        };
+        att.sign(ctx.state.pin_key.as_ref().unwrap());
+
+        // Sidecar pin file next to the cache metadata. Cache keys carry
+        // slashes (host/path), so create the FULL parent chain of the pin
+        // path, not just the pins/ root.
+        let pin_path = ctx
+            .state
+            .cache_dir
+            .join("pins")
+            .join(format!("{}.pin", ctx.cache_key));
+        if let Some(parent) = pin_path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                warn!("Failed to create pins dir {}: {}", parent.display(), e);
+            }
+        }
+        let pin_json = monopsony_common::pin_store::to_json(&att);
+        if let Err(e) = tokio::fs::write(&pin_path, pin_json).await {
+            warn!("Failed to write pin file {}: {}", pin_path.display(), e);
+        } else {
+            debug!("Pinned {} (origin {})", ctx.url, pin_origin.as_str());
+        }
+        // DB upsert: slice-2 wires db.record_pin()
     }
 
     if let Some(db) = &ctx.state.db {
@@ -1188,6 +1299,139 @@ async fn sweep_dir(
         }
     }
     Ok(())
+}
+
+/// Extract an origin-declared sha256 (hex-64) from upstream response headers.
+///
+/// Checked (case-insensitive): `x-checksum-sha256` (bare hex),
+/// `x-goog-hash` (only `sha256=<hex>` entries — crc32c/md5 are skipped),
+/// `x-amz-meta-sha256`, and `digest` (RFC 3230, only `sha256=<hex>`).
+/// First matching header wins; `PinOrigin::Header` on hit.
+fn origin_hash_from_header_map(headers: &HashMap<String, String>) -> Option<(String, monopsony_common::pin_store::PinOrigin)> {
+    fn valid_sha256(value: &str) -> Option<String> {
+        let v = value.trim();
+        if v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some(v.to_lowercase())
+        } else {
+            None
+        }
+    }
+
+    for name in [
+        "x-checksum-sha256",
+        "x-goog-hash",
+        "x-amz-meta-sha256",
+        "digest",
+    ] {
+        let Some(value) = headers.get(name) else {
+            continue;
+        };
+        // x-goog-hash and digest can carry multiple entries; take only the
+        // sha256= form. Others are a bare hex digest.
+        if name == "x-goog-hash" || name == "digest" {
+            for entry in value.split(',') {
+                let entry = entry.trim();
+                if let Some(hex_part) = entry.strip_prefix("sha256=") {
+                    if let Some(hex) = valid_sha256(hex_part) {
+                        return Some((hex, monopsony_common::pin_store::PinOrigin::Header));
+                    }
+                }
+            }
+        } else if let Some(hex) = valid_sha256(value) {
+            return Some((hex, monopsony_common::pin_store::PinOrigin::Header));
+        }
+    }
+    None
+}
+
+/// Try to fetch `<url>.sha256` from the same origin; return
+/// `(hex-64 sha256, PinOrigin::Sidecar)` when the sibling checksum file
+/// exists and parses. Bounded to 5s and 4 KiB so commit latency stays small.
+/// Accepts a bare hex line or `<hex>  <filename>` (sha256sum format —
+/// first token only). A 128-hex sidecar is a sha512 of the object, NOT
+/// comparable to our sha256 pin.
+// Phase 4: sha512 sidecars
+async fn origin_hash_from_sidecar(
+    _state: &ProxyState,
+    url: &str,
+) -> Option<(String, monopsony_common::pin_store::PinOrigin)> {
+    let sidecar_url = format!("{}.sha256", url);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?;
+    let fut = async {
+        let resp = client.get(&sidecar_url).send().await.ok()?;
+        if resp.status() != reqwest::StatusCode::OK {
+            return None;
+        }
+        let body = resp.bytes().await.ok()?;
+        if body.len() > 4096 {
+            return None;
+        }
+        let text = std::str::from_utf8(&body).ok()?;
+        let hex = text.split_whitespace().next()?.trim().to_lowercase();
+        if hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            Some((hex, monopsony_common::pin_store::PinOrigin::Sidecar))
+        } else {
+            None
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), fut).await.ok()?
+}
+
+/// Attach pin headers to a cache-HIT response builder.
+///
+/// Reads `<cache_dir>/pins/<cache_key>.pin`. When the attestation verifies
+/// under the state's pin key (and its declared hash matches the
+/// storage-recorded checksum, when one is available) the signed pin rides
+/// out as `X-Monopsony-Pin`. An existing-but-invalid pin yields
+/// `X-Monopsony-Pin-Status: invalid` plus a warn — serving is never blocked
+/// at the server (enforcement is the client's job).
+async fn attach_pin_header(
+    builder: axum::http::response::Builder,
+    state: &ProxyState,
+    cache_key: &str,
+) -> axum::http::response::Builder {
+    // Pinning not provisioned — stay inert (also covers the zeroed key
+    // case: without a real signing key there is nothing to verify with).
+    let Some(pin_key) = state.pin_key.as_ref() else {
+        return builder;
+    };
+    if !state.integrity.pinning_enabled {
+        return builder;
+    }
+
+    let pin_path = state.cache_dir.join("pins").join(format!("{}.pin", cache_key));
+    let Some(json) = tokio::fs::read_to_string(&pin_path).await.ok() else {
+        return builder;
+    };
+    let Some(att) = monopsony_common::pin_store::from_json(&json) else {
+        warn!("Unparseable pin file for cache key {}", cache_key);
+        return builder.header("X-Monopsony-Pin-Status", "invalid");
+    };
+    if !att.verify(&pin_key.verifying_key()) {
+        warn!("Pin attestation FAILED verification for cache key {}", cache_key);
+        return builder.header("X-Monopsony-Pin-Status", "invalid");
+    }
+    // Cross-check against the storage-side recorded checksum when one
+    // is present; skip the comparison otherwise (per slice spec).
+    let stored = state
+        .storage
+        .get_checksum(cache_key)
+        .await
+        .ok()
+        .flatten();
+    if let Some(stored) = stored {
+        if !stored.eq_ignore_ascii_case(&att.expected_sha256) {
+            warn!(
+                "Pin hash mismatch for cache key {}: pin {} vs stored {}",
+                cache_key, att.expected_sha256, stored
+            );
+            return builder.header("X-Monopsony-Pin-Status", "invalid");
+        }
+    }
+    builder.header("X-Monopsony-Pin", monopsony_common::pin_store::to_json(&att))
 }
 
 /// Pass through request to upstream without caching
@@ -1678,6 +1922,8 @@ pub async fn run_proxy(
     node_config: Option<monopsony_common::config::ServerConfig>,
     limits: Option<monopsony_common::config::ProxyLimitsConfig>,
     connect_config: monopsony_common::config::ProxyServerConfig,
+    pin_key: Option<ed25519_dalek::SigningKey>,
+    integrity: monopsony_common::config::IntegrityConfig,
 ) -> anyhow::Result<()> {
     storage.init_dirs().await?;
 
@@ -1708,6 +1954,14 @@ pub async fn run_proxy(
         Arc::get_mut(&mut state)
             .expect("state should be uniquely owned at this point")
             .limits = cfg.clone();
+    }
+    // Wire integrity pinning (Sprint 20 Phase 3): signing key + [integrity]
+    // section. Pin attestations are only produced when both are present.
+    {
+        let mut st = Arc::get_mut(&mut state)
+            .expect("state should be uniquely owned at this point");
+        st.pin_key = pin_key;
+        st.integrity = integrity;
     }
 
     // Spawn the staged-part janitor: sweeps orphaned `#N` multipart staging
@@ -1770,6 +2024,137 @@ mod tests {
 
         // Should produce a cache path
         assert!(path.is_some());
+    }
+
+    // ---- Sprint 20 Phase 3 slice 1: pin capture / pin header ----
+
+    fn pin_test_key(seed: u8) -> ed25519_dalek::SigningKey {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        bytes[31] = seed.wrapping_mul(7);
+        ed25519_dalek::SigningKey::from_bytes(&bytes)
+    }
+
+    // ---- Sprint 20 Phase 3 slice 5: quarantine gate ----
+
+    #[tokio::test]
+    async fn test_quarantined_db_none_returns_false() {
+        // db=None path: quarantine must fail-open (serve) — no DB, no gate.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp_dir = std::env::temp_dir().join("monopsony-test-quarantine-none");
+        std::fs::create_dir_all(&temp_dir).expect("create test cache dir");
+        let storage = Arc::new(
+            ObjectStoreBackend::local(temp_dir, 0).expect("local backend should construct"),
+        );
+        let state = ProxyState::new(storage, None);
+        assert!(!quarantined(&state, "http://archive.ubuntu.com/ubuntu/pool/main/x/x.deb").await);
+    }
+
+    #[test]
+    fn test_origin_hash_from_headers_prefers_x_checksum() {
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert(
+            "x-checksum-sha256".to_string(),
+            "AABBCCDD".repeat(8).to_lowercase(),
+        );
+        // Later-precedence headers must be ignored when x-checksum-sha256 wins.
+        headers.insert(
+            "digest".to_string(),
+            format!("sha256={}", "ee".repeat(32)),
+        );
+
+        let (hex, origin) = origin_hash_from_header_map(&headers).expect("should find a hash");
+        assert_eq!(hex, "aabbccdd".repeat(8));
+        assert_eq!(origin, monopsony_common::pin_store::PinOrigin::Header);
+    }
+
+    #[test]
+    fn test_origin_hash_from_headers_ignores_non_sha256_goog_hash() {
+        let mut headers: HashMap<String, String> = HashMap::new();
+        headers.insert("x-goog-hash".to_string(), "crc32c=AAAAAA==".to_string());
+        assert!(origin_hash_from_header_map(&headers).is_none());
+
+        // md5-only form is likewise skipped.
+        headers.insert("x-goog-hash".to_string(), "md5=AAAAAA==".to_string());
+        assert!(origin_hash_from_header_map(&headers).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pin_sidecar_write_and_header_roundtrip() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(
+            ObjectStoreBackend::local(temp_dir.path().to_path_buf(), 0)
+                .expect("local backend should construct"),
+        );
+        let mut state = ProxyState::new(storage, None);
+        let key = pin_test_key(9);
+        state.pin_key = Some(key.clone());
+        state.integrity.pinning_enabled = true;
+
+        let cache_key = "other/example.com/pkg-1.0.bin";
+        let pin_path = state
+            .cache_dir
+            .join("pins")
+            .join(format!("{}.pin", cache_key));
+        std::fs::create_dir_all(pin_path.parent().expect("pin path has parent"))
+            .expect("create pins parent dir");
+
+        let mut att = monopsony_common::pin_store::PinAttestation {
+            url: "https://example.com/pkg-1.0.bin".to_string(),
+            expected_sha256: "ab".repeat(32),
+            origin: monopsony_common::pin_store::PinOrigin::Sidecar,
+            key_id: String::new(),
+            observed_at: 1_700_000_000,
+            signature: String::new(),
+        };
+        att.sign(&key);
+        std::fs::write(&pin_path, monopsony_common::pin_store::to_json(&att))
+            .expect("write pin file");
+
+        // Roundtrip: verifying pin attaches X-Monopsony-Pin with the JSON body.
+        let builder = Response::builder().header("X-Cache", "HIT");
+        let builder = attach_pin_header(builder, &state, cache_key).await;
+        let resp = builder.body(()).expect("build");
+        let pin_header = resp.headers().get("X-Monopsony-Pin").expect("pin header");
+        let parsed = monopsony_common::pin_store::from_json(
+            std::str::from_utf8(pin_header.as_bytes()).expect("utf8"),
+        )
+        .expect("parse attestation from header");
+        assert_eq!(parsed.url, att.url);
+        assert_eq!(parsed.expected_sha256, att.expected_sha256);
+        assert!(parsed.verify(&key.verifying_key()));
+        assert!(resp.headers().get("X-Monopsony-Pin-Status").is_none());
+
+        // Tampered pin (wrong key signed it): status=invalid, no pin header.
+        let other_key = pin_test_key(10);
+        let mut bad = att.clone();
+        bad.sign(&other_key);
+        std::fs::write(&pin_path, monopsony_common::pin_store::to_json(&bad))
+            .expect("write bad pin file");
+        let builder = attach_pin_header(Response::builder(), &state, cache_key).await;
+        let resp = builder.body(()).expect("build");
+        assert!(resp.headers().get("X-Monopsony-Pin").is_none());
+        assert_eq!(
+            resp.headers().get("X-Monopsony-Pin-Status").expect("status header"),
+            "invalid"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_attach_pin_header_inert_without_pinning() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let storage = Arc::new(
+            ObjectStoreBackend::local(temp_dir.path().to_path_buf(), 0)
+                .expect("local backend should construct"),
+        );
+        // Default ProxyState: no pin key, pinning disabled.
+        let state = ProxyState::new(storage, None);
+        let builder = attach_pin_header(Response::builder(), &state, "some/key").await;
+        let resp = builder.body(()).expect("build");
+        assert!(resp.headers().get("X-Monopsony-Pin").is_none());
+        assert!(resp.headers().get("X-Monopsony-Pin-Status").is_none());
     }
 }
 

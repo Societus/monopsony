@@ -149,6 +149,7 @@ pub async fn handle_pair_init(
     let grpc_addr_config = state.grpc_addr.clone();
     let grpc_addr_override = req.grpc_addr_override.clone();
     let ws_url = state.ws_url.clone();
+    let mirror_verify_key = state.mirror_verify_key;
     let code_for_task = pairing_code.clone();
 
     *session_lock = Some(session.clone());
@@ -166,6 +167,7 @@ pub async fn handle_pair_init(
             grpc_addr_config,
             grpc_addr_override,
             ws_url,
+            mirror_verify_key,
             pairing_manager,
         )
         .await
@@ -279,6 +281,7 @@ async fn run_pairing_listener(
     grpc_addr_config: String,
     grpc_addr_override: Option<String>,
     ws_url: Option<String>,
+    mirror_verify_key: [u8; 32],
     pairing_manager: std::sync::Arc<tokio::sync::Mutex<Option<PairingSession>>>,
 ) -> anyhow::Result<()> {
     use prost::Message;
@@ -417,6 +420,7 @@ async fn run_pairing_listener(
                 ca_cert_pem,
                 grpc_addr,
                 ws_url: ws_url.clone().unwrap_or_default(),
+                mirror_verify_key: mirror_verify_key.to_vec(),
             };
             let resp_bytes = resp.encode_to_vec();
             let resp_len = resp_bytes.len() as u32;

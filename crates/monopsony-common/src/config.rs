@@ -67,6 +67,9 @@ pub struct ServerConfig {
     /// default so existing TOMLs without the section still parse.
     #[serde(default)]
     pub proxy: ProxyServerConfig,
+    /// Package integrity pinning ([integrity] section). All fields default.
+    #[serde(default)]
+    pub integrity: IntegrityConfig,
 }
 
 /// Server-side HTTP CONNECT pass-through configuration.
@@ -109,6 +112,35 @@ impl Default for ProxyServerConfig {
             connect_deny: None,
             connect_timeout_secs: default_connect_timeout_secs(),
             tunnel_max_lifetime_secs: default_tunnel_max_lifetime_secs(),
+        }
+    }
+}
+
+/// Package integrity pinning ([integrity] section, Sprint 20 Phase 3).
+/// All fields default so existing TOMLs without the section still parse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrityConfig {
+    /// Enable origin-integrity capture + signed pin attestations at spool
+    /// commit, and X-Monopsony-Pin headers on cache hits. Default: false.
+    #[serde(default)]
+    pub pinning_enabled: bool,
+    /// Policy for objects fetched with no origin-declared checksum (bare
+    /// fetches): "flag" marks the pin origin_unverified (client warns but
+    /// serves), "double_fetch" re-fetches and compares at commit time.
+    /// Default: "flag".
+    #[serde(default = "default_unverified_policy")]
+    pub unverified_policy: String,
+}
+
+fn default_unverified_policy() -> String {
+    "flag".to_string()
+}
+
+impl Default for IntegrityConfig {
+    fn default() -> Self {
+        Self {
+            pinning_enabled: false,
+            unverified_policy: default_unverified_policy(),
         }
     }
 }
@@ -1108,6 +1140,7 @@ mod tests {
             telemetry: TelemetryConfig::default(),
             access_control: AccessControlConfig::default(),
             proxy: ProxyServerConfig::default(),
+            integrity: IntegrityConfig::default(),
         }
     }
 

@@ -1,7 +1,8 @@
 use monopsony_common::package_manager::PackageRef;
 use monopsony_common::proto::monopsony::monopsony_control_client::MonopsonyControlClient;
 use monopsony_common::proto::monopsony::{
-    HeartbeatRequest, InventoryReport, PackageEntry, PairRequest, PairResponse, RegisterRequest,
+    client_message, HeartbeatRequest, InventoryReport, PackageEntry, PairRequest, PairResponse,
+    RegisterRequest, TamperAlert,
 };
 use std::path::Path;
 use tonic::transport::Channel;
@@ -165,7 +166,7 @@ impl MonopsonyGrpcClient {
         os: &str,
         os_version: &str,
         package_managers: &[String],
-    ) -> anyhow::Result<(String, Option<ClientCerts>)> {
+    ) -> anyhow::Result<(String, Option<ClientCerts>, Vec<u8>)> {
         let req = RegisterRequest {
             hostname: hostname.to_string(),
             os: os.to_string(),
@@ -204,7 +205,7 @@ impl MonopsonyGrpcClient {
             None
         };
 
-        Ok((resp.client_id, certs))
+        Ok((resp.client_id, certs, resp.mirror_verify_key))
     }
 
     pub async fn heartbeat(&mut self, client_id: &str) -> anyhow::Result<i64> {
@@ -220,6 +221,51 @@ impl MonopsonyGrpcClient {
         debug!(server_time = server_time, "Heartbeat acknowledged");
 
         Ok(server_time)
+    }
+
+    /// One-shot ControlStream carrying client TamperAlerts (Sprint 20
+    /// Phase 3). The daemon drains its tamper-event spool into this; each
+    /// alert rides the ClientMessage oneof (TamperAlert has no unary RPC).
+    /// The server acks each message with a SyncRequest; replies are drained
+    /// with a bounded timeout so a wedged server cannot hang the heartbeat.
+    pub async fn report_tamper_alerts(
+        &mut self,
+        alerts: &[monopsony_common::proto::monopsony::TamperAlert],
+    ) -> anyhow::Result<()> {
+        use futures_util::StreamExt;
+
+        if alerts.is_empty() {
+            return Ok(());
+        }
+
+        // Owned copy: tonic streaming requests are 'static, so the stream
+        // cannot borrow the caller's slice.
+        let messages: Vec<monopsony_common::proto::monopsony::ClientMessage> = alerts
+            .iter()
+            .map(|alert| monopsony_common::proto::monopsony::ClientMessage {
+                msg: Some(client_message::Msg::TamperAlert(alert.clone())),
+            })
+            .collect();
+        let outbound = futures_util::stream::iter(messages);
+
+        let mut inbound = self
+            .client
+            .control_stream(tonic::Request::new(outbound))
+            .await?
+            .into_inner();
+
+        let drain = async {
+            while let Some(msg) = inbound.next().await {
+                if msg.is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), drain)
+            .await
+            .map_err(|_| anyhow::anyhow!("timed out draining tamper-alert acks"))?;
+
+        Ok(())
     }
 
     pub async fn report_inventory(
@@ -276,8 +322,10 @@ impl MonopsonyGrpcClient {
     }
 
     /// Perform pairing exchange over plaintext TCP on port 50052.
-    /// Returns (client_id, ClientCerts, grpc_addr, ws_url) on success.
+    /// Returns (client_id, ClientCerts, grpc_addr, ws_url, mirror_verify_key) on success.
     /// `ws_url` is `Some` when the server is configured for WebSocket tunneling.
+    /// `mirror_verify_key` is the server's 32-byte Ed25519 pin-attestation key
+    /// (empty/zeroed when pinning is not provisioned).
     pub async fn pair(
         server_addr: &str,
         code: &str,
@@ -285,7 +333,7 @@ impl MonopsonyGrpcClient {
         os: &str,
         os_version: &str,
         package_managers: &[String],
-    ) -> anyhow::Result<(String, ClientCerts, String, Option<String>)> {
+    ) -> anyhow::Result<(String, ClientCerts, String, Option<String>, Vec<u8>)> {
         use prost::Message;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -343,7 +391,13 @@ impl MonopsonyGrpcClient {
         } else {
             Some(resp.ws_url)
         };
-        Ok((resp.client_id, certs, grpc_addr, ws_url))
+        Ok((
+            resp.client_id,
+            certs,
+            grpc_addr,
+            ws_url,
+            resp.mirror_verify_key,
+        ))
     }
 
     /// Perform pairing exchange over a WebSocket tunnel.
@@ -357,7 +411,7 @@ impl MonopsonyGrpcClient {
     /// `ws_pair_url` is the full WebSocket URL, e.g.
     /// `wss://monopsony.example.com/ws/pair`.
     ///
-    /// Returns (client_id, ClientCerts, grpc_addr) on success.
+    /// Returns (client_id, ClientCerts, grpc_addr, ws_url, mirror_verify_key) on success.
     pub async fn pair_ws(
         ws_pair_url: &str,
         code: &str,
@@ -365,7 +419,7 @@ impl MonopsonyGrpcClient {
         os: &str,
         os_version: &str,
         package_managers: &[String],
-    ) -> anyhow::Result<(String, ClientCerts, String, Option<String>)> {
+    ) -> anyhow::Result<(String, ClientCerts, String, Option<String>, Vec<u8>)> {
         use futures_util::{SinkExt, StreamExt};
         use prost::Message;
         use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -485,7 +539,13 @@ impl MonopsonyGrpcClient {
         } else {
             Some(resp.ws_url)
         };
-        Ok((resp.client_id, certs, grpc_addr, ws_url))
+        Ok((
+            resp.client_id,
+            certs,
+            grpc_addr,
+            ws_url,
+            resp.mirror_verify_key,
+        ))
     }
 
     #[allow(dead_code)] // Will be used by Status subcommand

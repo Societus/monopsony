@@ -25,6 +25,7 @@ use monopsony_common::proto::monopsony::{
 };
 
 use crate::tls::TlsManager;
+use monopsony_db::db::TamperAlertInsert;
 use monopsony_db::Database;
 use monopsony_mirror::MirrorManager;
 use monopsony_shadow::ShadowPackageManager;
@@ -35,6 +36,9 @@ pub struct MonopsonyGrpc {
     shadow_manager: Option<Arc<ShadowPackageManager>>,
     mirror_manager: Option<Arc<MirrorManager>>,
     telemetry_enabled: bool,
+    /// Ed25519 verifying key for pin attestations, delivered to clients on
+    /// register. Zeroed ([0u8; 32]) = pinning not provisioned (inert).
+    mirror_verify_key: [u8; 32],
 }
 
 impl MonopsonyGrpc {
@@ -49,7 +53,14 @@ impl MonopsonyGrpc {
             shadow_manager,
             mirror_manager: None,
             telemetry_enabled: true,
+            mirror_verify_key: [0u8; 32],
         }
+    }
+
+    /// Set the pin-attestation verifying key handed to clients at register.
+    pub fn with_mirror_verify_key(mut self, mirror_verify_key: [u8; 32]) -> Self {
+        self.mirror_verify_key = mirror_verify_key;
+        self
     }
 
     /// Set the mirror manager (called from start() where the manager is already available).
@@ -108,6 +119,7 @@ impl MonopsonyGrpc {
             client_cert_pem: cert_pem,
             client_key_pem: key_pem,
             ca_cert_pem: self.tls_manager.ca_cert_pem().to_string(),
+            mirror_verify_key: self.mirror_verify_key.to_vec(),
         })
         .inspect(|_resp| {
             monopsony_common::metrics::grpc_request_duration(
@@ -341,6 +353,37 @@ impl MonopsonyGrpc {
                     msg: Some(server_message::Msg::SyncRequest(SyncRequest {})),
                 })
             }
+            client_message::Msg::TamperAlert(alert) => {
+                // Alarm surface: a client verified served bytes against the
+                // signed pin and they did not match.
+                error!(
+                    url = %alert.url,
+                    expected_sha256 = %alert.expected_sha256,
+                    actual_sha256 = %alert.actual_sha256,
+                    detail = %alert.detail,
+                    observed_at = alert.observed_at,
+                    "TAMPER ALERT: client-reported cache integrity mismatch"
+                );
+                let insert = TamperAlertInsert {
+                    url: alert.url.clone(),
+                    expected_sha256: alert.expected_sha256.clone(),
+                    actual_sha256: alert.actual_sha256.clone(),
+                    detail: if alert.detail.is_empty() {
+                        None
+                    } else {
+                        Some(alert.detail.clone())
+                    },
+                    // client identity: future (stream does not carry authenticated identity into dispatch)
+                    client_id: None,
+                    observed_at: alert.observed_at,
+                };
+                if let Err(e) = self.db.record_tamper_alert(&insert).await {
+                    error!(error = %e, "Failed to record tamper alert in database");
+                }
+                Ok(ServerMessage {
+                    msg: Some(server_message::Msg::SyncRequest(SyncRequest {})),
+                })
+            }
         }
     }
 }
@@ -390,6 +433,7 @@ impl MonopsonyControl for MonopsonyGrpc {
         let tls_manager = self.tls_manager.clone();
         let shadow_manager = self.shadow_manager.clone();
         let mirror_manager = self.mirror_manager.clone();
+        let mirror_verify_key = self.mirror_verify_key;
         let mut stream = request.into_inner();
 
         let output = async_stream::stream! {
@@ -397,7 +441,8 @@ impl MonopsonyControl for MonopsonyGrpc {
                 match msg {
                     Ok(client_msg) => {
                         let grpc = MonopsonyGrpc::new(db.clone(), tls_manager.clone(), shadow_manager.clone())
-                            .with_mirror_manager(mirror_manager.clone());
+                            .with_mirror_manager(mirror_manager.clone())
+                            .with_mirror_verify_key(mirror_verify_key);
                         yield grpc.dispatch_client_message(client_msg).await;
                     }
                     Err(status) => {
@@ -887,6 +932,7 @@ pub async fn start(
     mirror_manager: Option<Arc<MirrorManager>>,
     shadow_manager: Option<Arc<ShadowPackageManager>>,
     telemetry_enabled: bool,
+    mirror_verify_key: [u8; 32],
     additional_tls_sans: &[String],
     access_control: Option<monopsony_common::config::AccessControlConfig>,
 ) -> Result<()> {
@@ -894,7 +940,8 @@ pub async fn start(
 
     let grpc = MonopsonyGrpc::new(db.clone(), tls_manager.clone(), shadow_manager)
         .with_mirror_manager(mirror_manager.clone())
-        .with_telemetry(telemetry_enabled);
+        .with_telemetry(telemetry_enabled)
+        .with_mirror_verify_key(mirror_verify_key);
 
     let tls_config =
         tls_manager.tonic_server_tls_config_with_sans(Some(addr.ip()), additional_tls_sans)?;

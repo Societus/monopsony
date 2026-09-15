@@ -7,6 +7,7 @@ pub mod error;
 pub mod metrics;
 pub mod models;
 pub mod package_manager;
+pub mod pin_store;
 pub mod proto;
 pub mod shadow_types;
 

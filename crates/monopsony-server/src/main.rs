@@ -469,6 +469,60 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(120)
     );
 
+    // Read integrity pinning config ([integrity] section) the same way
+    // [proxy] is read: falls back to defaults (pinning disabled) when absent.
+    let integrity_cfg: monopsony_common::config::IntegrityConfig =
+        match std::fs::read_to_string(&args.config) {
+            Ok(content) => {
+                #[derive(serde::Deserialize, Default)]
+                struct IntegritySectionWrapper {
+                    #[serde(default)]
+                    integrity: monopsony_common::config::IntegrityConfig,
+                }
+                toml::from_str::<IntegritySectionWrapper>(&content)
+                    .map(|w| w.integrity)
+                    .unwrap_or_default()
+            }
+            Err(_) => monopsony_common::config::IntegrityConfig::default(),
+        };
+
+    // Pin key custody: the dedicated pin-signing key
+    // (<shadow_dir>/pin-signing.key) — NEVER the mTLS CA and NEVER the
+    // shadow recipe signing key (`signing.key`). Owned by main; cloned into
+    // the proxy below. When pinning is disabled we still LOAD the key if it
+    // exists (verification of previously written pins must keep working) but
+    // never generate a new one; a zeroed verify key = "not provisioned".
+    let pin_key_path = PathBuf::from(&args.shadow_dir).join("pin-signing.key");
+    let pin_key = if integrity_cfg.pinning_enabled {
+        let key = monopsony_shadow::shadow_signing::load_or_generate_signing_key(Some(&pin_key_path));
+        info!(
+            "Integrity pinning: enabled (policy={}), key: {}",
+            integrity_cfg.unverified_policy,
+            pin_key_path.display()
+        );
+        Some(key)
+    } else if pin_key_path.exists() {
+        let key = monopsony_shadow::shadow_signing::load_or_generate_signing_key(Some(&pin_key_path));
+        info!(
+            "Integrity pinning: disabled (policy={}), existing key loaded for pin verification: {}",
+            integrity_cfg.unverified_policy,
+            pin_key_path.display()
+        );
+        Some(key)
+    } else {
+        info!(
+            "Integrity pinning: disabled (policy={}), no pin key generated",
+            integrity_cfg.unverified_policy
+        );
+        None
+    };
+    // Zeroed verify key means "pinning not provisioned" (inert everywhere).
+    let mirror_verify_key: [u8; 32] = pin_key
+        .as_ref()
+        .map(|k| *k.verifying_key().as_bytes())
+        .unwrap_or([0u8; 32]);
+
+    let pin_key_for_proxy = pin_key.clone();
     let proxy_handle = tokio::spawn(async move {
         if let Err(e) = proxy::run_proxy(
             http_addr,
@@ -479,6 +533,8 @@ async fn main() -> anyhow::Result<()> {
             None,
             proxy_limits,
             connect_config,
+            pin_key_for_proxy,
+            integrity_cfg.clone(),
         )
         .await
         {
@@ -586,6 +642,7 @@ async fn main() -> anyhow::Result<()> {
                 mirror_for_grpc,
                 shadow_for_grpc,
                 telemetry_enabled,
+                mirror_verify_key,
                 &tls_sans,
                 access_control,
             )
@@ -794,6 +851,7 @@ async fn main() -> anyhow::Result<()> {
         tailscale: Arc::new(monopsony_admin::auth::TailscaleDetector::new()),
         grpc_addr: args.grpc_addr.clone(),
         ws_url,
+        mirror_verify_key,
         pairing_manager: Arc::new(tokio::sync::Mutex::new(None)),
         pairing_task: Arc::new(tokio::sync::Mutex::new(None)),
     };

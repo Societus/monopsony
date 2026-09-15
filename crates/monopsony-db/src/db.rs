@@ -71,6 +71,41 @@ pub struct ScanResultRow {
     pub scanned_at: chrono::DateTime<Utc>,
 }
 
+/// Row from cache_pins: a signed origin-integrity pin for a cached URL.
+#[derive(Debug, Clone)]
+pub struct PinRow {
+    pub url: String,
+    pub expected_sha256: String,
+    pub origin: String,
+    pub key_id: String,
+    pub observed_at: i64,
+    pub signature: String,
+}
+
+/// New tamper alert to insert into tamper_alerts.
+#[derive(Debug, Clone)]
+pub struct TamperAlertInsert {
+    pub url: String,
+    pub expected_sha256: String,
+    pub actual_sha256: String,
+    pub detail: Option<String>,
+    pub client_id: Option<String>,
+    pub observed_at: i64,
+}
+
+/// Row from tamper_alerts.
+#[derive(Debug, Clone)]
+pub struct TamperAlertRow {
+    pub id: i64,
+    pub url: String,
+    pub expected_sha256: String,
+    pub actual_sha256: String,
+    pub detail: Option<String>,
+    pub client_id: Option<String>,
+    pub observed_at: i64,
+    pub recorded_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 impl Database {
     pub fn pool(&self) -> &PgPool {
         &self.pool
@@ -320,6 +355,44 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+
+        // Pin attestations (Sprint 20 Phase 3): signed origin-integrity pins
+        // keyed by canonical cache URL — same key as cache_entries.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS cache_pins (
+                url             TEXT PRIMARY KEY,
+                expected_sha256 TEXT NOT NULL,
+                origin          TEXT NOT NULL,
+                key_id          TEXT NOT NULL,
+                observed_at     BIGINT NOT NULL,
+                signature       TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_cache_pins_key_id ON cache_pins(key_id)")
+            .execute(&self.pool)
+            .await?;
+
+        // Tamper alarms raised by clients (Sprint 20 Phase 3): one row per
+        // client-reported pin mismatch; quarantine bookkeeping links here.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS tamper_alerts (
+                id              BIGSERIAL PRIMARY KEY,
+                url             TEXT NOT NULL,
+                expected_sha256 TEXT NOT NULL,
+                actual_sha256   TEXT NOT NULL,
+                detail          TEXT NULL,
+                client_id       TEXT NULL,
+                observed_at     BIGINT NOT NULL,
+                recorded_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_tamper_alerts_url ON tamper_alerts(url)")
+            .execute(&self.pool)
+            .await?;
 
         info!("Database migrations complete");
         Ok(())
@@ -691,6 +764,120 @@ impl Database {
             hit_count: r.get("hit_count"),
             sha256: r.get("sha256"),
         }))
+    }
+
+    /// Record (or update) a signed origin-integrity pin for a cached URL.
+    pub async fn record_pin(&self, pin: &PinRow) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO cache_pins (url, expected_sha256, origin, key_id, observed_at, signature)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (url) DO UPDATE SET
+                 expected_sha256 = EXCLUDED.expected_sha256,
+                 origin = EXCLUDED.origin,
+                 key_id = EXCLUDED.key_id,
+                 observed_at = EXCLUDED.observed_at,
+                 signature = EXCLUDED.signature",
+        )
+        .bind(&pin.url)
+        .bind(&pin.expected_sha256)
+        .bind(&pin.origin)
+        .bind(&pin.key_id)
+        .bind(pin.observed_at)
+        .bind(&pin.signature)
+        .execute(&self.pool)
+        .await?;
+        debug!("Recorded pin for {}", pin.url);
+        Ok(())
+    }
+
+    /// Fetch the pin for a URL, if one exists.
+    pub async fn get_pin(&self, url: &str) -> Result<Option<PinRow>> {
+        let row = sqlx::query(
+            "SELECT url, expected_sha256, origin, key_id, observed_at, signature
+             FROM cache_pins WHERE url = $1",
+        )
+        .bind(url)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| PinRow {
+            url: r.get("url"),
+            expected_sha256: r.get("expected_sha256"),
+            origin: r.get("origin"),
+            key_id: r.get("key_id"),
+            observed_at: r.get("observed_at"),
+            signature: r.get("signature"),
+        }))
+    }
+
+    /// Delete the pin for a URL. Returns true if a row was removed.
+    pub async fn delete_pin(&self, url: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM cache_pins WHERE url = $1")
+            .bind(url)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Record a client-reported tamper alert. Returns the new row id.
+    pub async fn record_tamper_alert(&self, alert: &TamperAlertInsert) -> Result<i64> {
+        let row = sqlx::query(
+            "INSERT INTO tamper_alerts (url, expected_sha256, actual_sha256, detail, client_id, observed_at)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             RETURNING id",
+        )
+        .bind(&alert.url)
+        .bind(&alert.expected_sha256)
+        .bind(&alert.actual_sha256)
+        .bind(&alert.detail)
+        .bind(&alert.client_id)
+        .bind(alert.observed_at)
+        .fetch_one(&self.pool)
+        .await?;
+        let id: i64 = row.get("id");
+        warn!(
+            "Tamper alert recorded: id={} url={} expected={} actual={}",
+            id, alert.url, alert.expected_sha256, alert.actual_sha256
+        );
+        Ok(id)
+    }
+
+    /// True if any tamper alert has been recorded for the URL (quarantine check).
+    pub async fn has_tamper_alert(&self, url: &str) -> Result<bool> {
+        let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM tamper_alerts WHERE url = $1) as present")
+            .bind(url)
+            .fetch_one(&self.pool)
+            .await?;
+        let present: bool = row.get("present");
+        Ok(present)
+    }
+
+    /// List recent tamper alerts, newest first.
+    pub async fn list_tamper_alerts(&self, limit: i64) -> Result<Vec<TamperAlertRow>> {
+        let rows = sqlx::query(
+            "SELECT id, url, expected_sha256, actual_sha256, detail, client_id, observed_at, recorded_at
+             FROM tamper_alerts ORDER BY recorded_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let alerts: Vec<TamperAlertRow> = rows
+            .iter()
+            .map(|r| TamperAlertRow {
+                id: r.get("id"),
+                url: r.get("url"),
+                expected_sha256: r.get("expected_sha256"),
+                actual_sha256: r.get("actual_sha256"),
+                detail: r.get("detail"),
+                client_id: r.get("client_id"),
+                observed_at: r.get("observed_at"),
+                recorded_at: r.get("recorded_at"),
+            })
+            .collect();
+
+        debug!("Listed {} tamper alerts", alerts.len());
+        Ok(alerts)
     }
 
     /// Aggregate cache statistics from the database.

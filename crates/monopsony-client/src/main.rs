@@ -37,6 +37,7 @@ fn default_cert_dir() -> String {
 mod auto_update;
 mod discovery;
 mod grpc_client;
+mod pin_verify;
 mod proxy;
 mod self_update;
 mod trust;
@@ -512,6 +513,37 @@ async fn resolve_server_addr(cert_dir: &Path) -> anyhow::Result<String> {
     Ok(addr)
 }
 
+/// Load the pinned mirror verifying key saved at pair/register time.
+/// Returns None when absent, wrong-sized, or zeroed (not provisioned).
+fn load_mirror_verify_key(cert_dir: &Path) -> Option<[u8; 32]> {
+    let bytes = std::fs::read(cert_dir.join("mirror-verify.key")).ok()?;
+    if bytes.len() != 32 {
+        warn!(
+            "mirror-verify.key has {} bytes (expected 32) — ignoring",
+            bytes.len()
+        );
+        return None;
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&bytes);
+    if key == [0u8; 32] {
+        return None;
+    }
+    Some(key)
+}
+
+/// Persist the server's mirror verifying key (pair/register payload).
+/// Empty or zeroed payloads are skipped — pinning stays inert.
+fn store_mirror_verify_key(cert_dir: &Path, key: &[u8]) {
+    if key.len() != 32 || key.iter().all(|&b| b == 0) {
+        return;
+    }
+    match std::fs::write(cert_dir.join("mirror-verify.key"), key) {
+        Ok(()) => info!("Mirror verify key saved for pin verification"),
+        Err(e) => warn!("Could not persist mirror verify key: {}", e),
+    }
+}
+
 async fn run_daemon(
     proxy_addr: String,
     server: Option<String>,
@@ -603,6 +635,17 @@ async fn run_daemon(
 
     let listen_addr: SocketAddr = proxy_addr.parse().expect("invalid proxy listen address");
 
+    // Pin verification state (Sprint 20 Phase 3): provisioned from the key
+    // saved at pair/register time; inert until then. Events spool under
+    // cert_dir so they survive restarts and travel with the client identity.
+    let pin_state = std::sync::Arc::new(pin_verify::PinState::new(
+        load_mirror_verify_key(&cert_dir),
+        cert_dir.join("tamper-events.jsonl"),
+    ));
+    if pin_state.provisioned() {
+        info!("Integrity pin verification enabled (mirror key provisioned)");
+    }
+
     // Build TLS config for the initial connection
     let tls = tonic::transport::ClientTlsConfig::new()
         .ca_certificate(tonic::transport::Certificate::from_pem(&certs.ca_cert_pem))
@@ -636,7 +679,7 @@ async fn run_daemon(
                     .map(|b| b.kind().as_str().to_string())
                     .collect();
 
-                let (id, _) = grpc_client
+                let (id, _, mirror_key) = grpc_client
                     .register(
                         &hostname,
                         std::env::consts::OS,
@@ -644,6 +687,7 @@ async fn run_daemon(
                         &managers,
                     )
                     .await?;
+                store_mirror_verify_key(&cert_dir, &mirror_key);
                 std::fs::write(&id_file, &id)?;
                 info!("Registered with server, client ID: {}", id);
                 id
@@ -655,6 +699,7 @@ async fn run_daemon(
     let client_id_for_task = client_id.clone();
     let cert_dir_for_task = cert_dir.clone();
     let server_addr_for_task = server_addr.clone();
+    let pin_for_heartbeat = pin_state.clone();
     let heartbeat_handle = tokio::spawn(async move {
         let mut last_inventory = std::time::Instant::now();
         let mut backoff: std::time::Duration = Duration::from_secs(1);
@@ -720,6 +765,7 @@ async fn run_daemon(
 
             // Connected — run heartbeat loop
             let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
+            let pin_for_drain = pin_for_heartbeat.clone();
 
             loop {
                 interval.tick().await;
@@ -728,6 +774,27 @@ async fn run_daemon(
                 match client.heartbeat(&client_id_for_task).await {
                     Ok(_) => {
                         info!("Heartbeat sent");
+                        // Drain spooled tamper events (Sprint 20 Phase 3):
+                        // forward to the server as TamperAlerts; re-append on
+                        // failure so alarms are never lost.
+                        let events = pin_for_drain.drain_events();
+                        if !events.is_empty() {
+                            let alerts: Vec<_> = events
+                                .iter()
+                                .map(pin_verify::encode_tamper_alert)
+                                .collect();
+                            match client.report_tamper_alerts(&alerts).await {
+                                Ok(()) => {
+                                    info!("Reported {} tamper alert(s)", alerts.len())
+                                }
+                                Err(e) => {
+                                    warn!("Tamper alert report failed, re-spooling: {}", e);
+                                    for ev in &events {
+                                        pin_for_drain.record_event(ev);
+                                    }
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
                         warn!("Heartbeat failed, reconnecting: {}", e);
@@ -822,7 +889,7 @@ async fn run_daemon(
 
     info!("Local proxy listening on {}", listen_addr);
     info!("Heartbeat and inventory sync running in background");
-    proxy::run_proxy(listen_addr, proxy_config).await?;
+    proxy::run_proxy(listen_addr, proxy_config, pin_state.clone()).await?;
 
     heartbeat_handle.abort();
     if let Some(h) = auto_update_handle {
@@ -1010,7 +1077,7 @@ async fn run_pair(server: &str, code: &str, cert_dir: &Path) -> anyhow::Result<(
 
     // Route to WebSocket pairing when the server address is a ws:// or wss:// URL.
     // This is used when the server is behind Cloudflare Tunnels or a reverse proxy.
-    let (client_id, certs, grpc_addr, ws_url) = if server.starts_with("wss://")
+    let (client_id, certs, grpc_addr, ws_url, mirror_verify_key) = if server.starts_with("wss://")
         || server.starts_with("ws://")
     {
         info!("Using WebSocket tunnel for pairing");
@@ -1041,6 +1108,7 @@ async fn run_pair(server: &str, code: &str, cert_dir: &Path) -> anyhow::Result<(
 
     certs.save(cert_dir)?;
     std::fs::write(cert_dir.join("client_id"), &client_id)?;
+    store_mirror_verify_key(cert_dir, &mirror_verify_key);
 
     // Persist server connection info for future daemon connections.
     // Include ws_url when the server provided one — clients will prefer it

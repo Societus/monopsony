@@ -64,6 +64,9 @@ pub struct AdminState {
     pub pairing_manager: Arc<tokio::sync::Mutex<Option<pairing::PairingSession>>>,
     /// Handle to the spawned pairing listener task — aborted on cancel to free port 50052.
     pub pairing_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Pin-store verifying key (Sprint 20 Phase 3) — 32 raw Ed25519 bytes,
+    /// delivered to clients in PairResponse so they can verify pin attestations.
+    pub mirror_verify_key: [u8; 32],
 }
 
 /// Dashboard configuration from `[dashboard]` in server.toml.
