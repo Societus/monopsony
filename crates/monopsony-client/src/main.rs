@@ -164,6 +164,35 @@ enum Commands {
         #[command(subcommand)]
         cmd: SelfUpdateMode,
     },
+    /// Manage signed downgrade exceptions in the local ledger
+    Override {
+        #[command(subcommand)]
+        mode: OverrideMode,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum OverrideMode {
+    /// Authorize downgrades of a package until the TTL expires
+    Add {
+        /// Package key ("<pm>:<name>", e.g. pacman:bash)
+        #[arg(long)]
+        package: String,
+
+        /// Target (lower) version the downgrades are expected to land on
+        #[arg(long)]
+        to: String,
+
+        /// Why the downgrade is authorized
+        #[arg(long)]
+        reason: String,
+
+        /// Exception lifetime in seconds (default 1 week)
+        #[arg(long)]
+        ttl_secs: Option<i64>,
+    },
+    /// List active (unexpired) exceptions
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -455,6 +484,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Proxy { cmd }) => {
             run_proxy_command(cmd, &cert_dir).await?;
         }
+        Some(Commands::Override { mode }) => {
+            run_override(mode, &cert_dir).await?;
+        }
         None => {
             info!("No command specified. Use --help for usage.");
         }
@@ -522,6 +554,135 @@ fn dirs_ledger_parent(_cert_dir: &Path) -> PathBuf {
     std::env::var("HOME")
         .map(|h| PathBuf::from(h).join(".local/state/monopsony"))
         .unwrap_or_else(|_| PathBuf::from("/tmp/monopsony"))
+}
+
+/// `override add` / `override list` — signed downgrade exceptions in the
+/// local ledger. The signing key lives next to ledger.sqlite3
+/// (ledger-override.key, 0600, OsRng-generated on first use); records carry
+/// the signature + verifying key so the ledger can verify them on consult
+/// (see ledger.rs active_exception_on).
+async fn run_override(mode: OverrideMode, cert_dir: &Path) -> anyhow::Result<()> {
+    use ledger::SignedException;
+
+    match mode {
+        OverrideMode::Add {
+            package,
+            to,
+            reason,
+            ttl_secs,
+        } => {
+            // Validation: exactly one ':' with non-empty pm and name.
+            if package.matches(':').count() != 1 {
+                anyhow::bail!(
+                    "--package must be \"<pm>:<name>\" with exactly one ':' (e.g. pacman:bash)"
+                );
+            }
+            let (pm, name) = package.split_once(':').expect("one colon checked above");
+            if pm.is_empty() || name.is_empty() {
+                anyhow::bail!("--package pm and name must both be non-empty (e.g. pacman:bash)");
+            }
+            if reason.trim().is_empty() {
+                anyhow::bail!("--reason must not be empty");
+            }
+            if to.is_empty() {
+                anyhow::bail!("--to must not be empty");
+            }
+            let ttl = ttl_secs.unwrap_or(604_800);
+
+            let state_dir = dirs_ledger_parent(cert_dir);
+            let ledger = ledger::Ledger::open(&state_dir.join("ledger.sqlite3"))
+                .map_err(|e| anyhow::anyhow!("Failed to open ledger at {:?}: {}", state_dir, e))?;
+
+            // Load-or-generate the override signing key (hex text, 0600).
+            let key_path = state_dir.join("ledger-override.key");
+            let key_bytes: [u8; 32] = match std::fs::read_to_string(&key_path) {
+                Ok(text) => {
+                    let raw = hex::decode(text.trim())
+                        .map_err(|e| anyhow::anyhow!("Corrupt override key {:?}: {}", key_path, e))?;
+                    raw.try_into().map_err(|v: Vec<u8>| {
+                        anyhow::anyhow!(
+                            "Corrupt override key {:?}: {} bytes (expected 32)",
+                            key_path,
+                            v.len()
+                        )
+                    })?
+                }
+                Err(_) => {
+                    use rand::RngCore;
+                    let mut k = [0u8; 32];
+                    rand::rngs::OsRng.fill_bytes(&mut k);
+                    std::fs::write(&key_path, hex::encode(k))
+                        .with_context(|| format!("Writing {:?}", key_path))?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &key_path,
+                            std::fs::Permissions::from_mode(0o600),
+                        );
+                    }
+                    k
+                }
+            };
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+
+            let now = chrono::Utc::now().timestamp();
+            let mut rec = SignedException {
+                id: 0,
+                package_key: package.clone(),
+                to_version: to.clone(),
+                reason: reason.clone(),
+                created_at: now,
+                expires_at: now + ttl,
+                signature: None,
+                signing_key: None,
+            };
+            rec.sign(&signing_key);
+            ledger
+                .add_signed_exception(&rec)
+                .map_err(|e| anyhow::anyhow!("Failed to record exception: {}", e))?;
+
+            // Footgun UX: make it explicit what was just permitted.
+            let expiry_rfc3339 = chrono::DateTime::from_timestamp(rec.expires_at, 0)
+                .map(|dt| dt.to_rfc3339())
+                .unwrap_or_else(|| rec.expires_at.to_string());
+            println!("Package: {}", rec.package_key);
+            println!("Target version: {}", rec.to_version);
+            println!("Reason: {}", rec.reason);
+            println!("Expires: {}", expiry_rfc3339);
+            if let Some(held) = ledger.high_water_for(&rec.package_key) {
+                println!("Current high-water (ledger will hold downgrades below): {}", held);
+            }
+            println!(
+                "Downgrades of {} will be permitted until {}.",
+                rec.package_key, expiry_rfc3339
+            );
+        }
+        OverrideMode::List => {
+            let state_dir = dirs_ledger_parent(cert_dir);
+            let ledger = ledger::Ledger::open(&state_dir.join("ledger.sqlite3"))
+                .map_err(|e| anyhow::anyhow!("Failed to open ledger at {:?}: {}", state_dir, e))?;
+            let now = chrono::Utc::now().timestamp();
+            let rows = ledger
+                .list_active_exceptions(now)
+                .map_err(|e| anyhow::anyhow!("Failed to list exceptions: {}", e))?;
+            if rows.is_empty() {
+                println!("No active exceptions.");
+                return Ok(());
+            }
+            for r in rows {
+                let expiry = chrono::DateTime::from_timestamp(r.expires_at, 0)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(|| r.expires_at.to_string());
+                let reason: String = r.reason.chars().take(60).collect();
+                println!(
+                    "{}  {}  {}  {}  {}",
+                    r.id, r.package_key, r.to_version, expiry, reason
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Load the pinned mirror verifying key saved at pair/register time.

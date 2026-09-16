@@ -58,9 +58,26 @@ impl Ledger {
                 to_version   TEXT NOT NULL,
                 reason       TEXT NOT NULL,
                 created_at   INTEGER NOT NULL,
-                expires_at   INTEGER NOT NULL
+                expires_at   INTEGER NOT NULL,
+                signature    TEXT,
+                signing_key  TEXT
             );",
         )?;
+        // Wave-2 slice 6 migration: DBs created before the override command
+        // lack the two signature columns. ALTER them in additively; rusqlite
+        // emits "duplicate column name" when the column already exists
+        // (fresh DBs got them from the CREATE TABLE above) — swallow ONLY
+        // that, propagate anything else.
+        for ddl in [
+            "ALTER TABLE exceptions ADD COLUMN signature TEXT",
+            "ALTER TABLE exceptions ADD COLUMN signing_key TEXT",
+        ] {
+            if let Err(e) = conn.execute_batch(ddl) {
+                if !e.to_string().contains("duplicate column") {
+                    return Err(e);
+                }
+            }
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -209,6 +226,45 @@ impl Ledger {
         Ok(())
     }
 
+    /// Store a fully-signed override record (signature + verifying key hex
+    /// included). The signature MUST cover `rec`'s canonical JSON — see
+    /// [`SignedException::canonical_json`].
+    pub fn add_signed_exception(&self, rec: &SignedException) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().expect("ledger lock poisoned");
+        conn.execute(
+            "INSERT INTO exceptions
+                (package_key, to_version, reason, created_at, expires_at, signature, signing_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                rec.package_key,
+                rec.to_version,
+                rec.reason,
+                rec.created_at,
+                rec.expires_at,
+                rec.signature,
+                rec.signing_key
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// All unexpired exceptions, oldest first (id ASC) — the `override list`
+    /// view. NOT signature-checked: display-only; enforcement goes through
+    /// `active_exception_on`, which verifies.
+    pub fn list_active_exceptions(&self, now: i64) -> rusqlite::Result<Vec<SignedException>> {
+        let conn = self.conn.lock().expect("ledger lock poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT id, package_key, to_version, reason, created_at, expires_at, signature, signing_key
+             FROM exceptions WHERE expires_at > ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![now], row_to_signed_exception)?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     /// Most recent unexpired exception for `package_key` (its to_version),
     /// or None. Record-scoped: a live exception waives ANY downgrade of the
     /// package (the wave-2 override command refines per-version matching).
@@ -218,23 +274,133 @@ impl Ledger {
     }
 }
 
+/// A downgrade-exception record as stored in the `exceptions` table.
+/// `signature`/`signing_key` are `None` for legacy (pre-slice-6) rows, which
+/// stay honored as-is; new rows carry a lowercase-hex Ed25519 signature over
+/// [`SignedException::canonical_json`] plus the verifying key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignedException {
+    /// Row id (AUTOINCREMENT) — 0 on freshly built, not-yet-inserted records.
+    pub id: i64,
+    pub package_key: String,
+    pub to_version: String,
+    pub reason: String,
+    pub created_at: i64,
+    pub expires_at: i64,
+    /// Lowercase hex Ed25519 signature over the canonical JSON.
+    pub signature: Option<String>,
+    /// Lowercase hex 32-byte Ed25519 verifying key.
+    pub signing_key: Option<String>,
+}
+
+impl SignedException {
+    /// The exact byte string that gets signed. serde_json's default map is a
+    /// BTreeMap, so field order is deterministic (alphabetical) with no
+    /// feature flags. Never hand-format this with `format!` — escaping bugs
+    /// silently change the signed payload.
+    pub fn canonical_json(&self) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "package_key": self.package_key,
+            "to_version": self.to_version,
+            "reason": self.reason,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+        }))
+        .expect("exception record serializes")
+    }
+
+    /// Sign `self` in place: fills `signature` and `signing_key` (lowercase
+    /// hex) using `signing_key`.
+    pub fn sign(&mut self, signing_key: &ed25519_dalek::SigningKey) {
+        use ed25519_dalek::Signer;
+        let sig = signing_key.sign(self.canonical_json().as_bytes());
+        self.signature = Some(hex::encode(sig.to_bytes()));
+        self.signing_key = Some(hex::encode(signing_key.verifying_key().as_bytes()));
+    }
+
+    /// Verify the stored signature against the stored verifying key.
+    /// Legacy unsigned rows (both fields None) are honored → true.
+    /// Any decode failure, wrong length, or bad signature → false.
+    fn signature_valid(&self) -> bool {
+        use ed25519_dalek::Verifier;
+        let (Some(sig_hex), Some(key_hex)) = (&self.signature, &self.signing_key) else {
+            // Legacy unsigned row — documented migration path (plan §6).
+            return self.signature.is_none() && self.signing_key.is_none();
+        };
+        let (Ok(sig_bytes), Ok(key_bytes)) = (hex::decode(sig_hex), hex::decode(key_hex)) else {
+            return false;
+        };
+        let (Ok(key_arr), Ok(sig_arr)) = (
+            <[u8; 32]>::try_from(key_bytes.as_slice()),
+            <[u8; 64]>::try_from(sig_bytes.as_slice()),
+        ) else {
+            return false;
+        };
+        let Ok(verifying) = ed25519_dalek::VerifyingKey::from_bytes(&key_arr) else {
+            return false;
+        };
+        let Ok(sig) = ed25519_dalek::Signature::from_slice(&sig_arr) else {
+            return false;
+        };
+        verifying.verify(self.canonical_json().as_bytes(), &sig).is_ok()
+    }
+}
+
 /// Lock-free exception query over a borrowed connection — callable from
 /// methods that already hold the ledger mutex (see check_and_update's
 /// downgrade branch; re-locking there deadlocks, the MirrorManager
 /// RwLock bug class).
+///
+/// Walks unexpired rows newest-first and returns the FIRST row that is
+/// valid: legacy unsigned rows (both signature fields NULL) are honored
+/// as-is; signed rows must decode + verify against the row's own verifying
+/// key over the reconstructed canonical JSON — invalid or undecodable rows
+/// are SKIPPED (ignored, not fatal), and the walk continues to older rows.
+/// That is why verification lives HERE and not in the callers: both the
+/// downgrade branch of check_and_update and the public active_exception get
+/// it automatically.
 fn active_exception_on(
     conn: &rusqlite::Connection,
     package_key: &str,
     now: i64,
 ) -> Option<String> {
-    conn.query_row(
-        "SELECT to_version FROM exceptions
-         WHERE package_key = ?1 AND expires_at > ?2
-         ORDER BY id DESC LIMIT 1",
-        rusqlite::params![package_key, now],
-        |row| row.get::<_, String>(0),
-    )
-    .ok()
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, package_key, to_version, reason, created_at, expires_at, signature, signing_key
+             FROM exceptions
+             WHERE package_key = ?1 AND expires_at > ?2
+             ORDER BY id DESC",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map(rusqlite::params![package_key, now], row_to_signed_exception)
+        .ok()?;
+    for row in rows {
+        let Ok(rec) = row else {
+            continue; // unreadable column → skip, never panic
+        };
+        if !rec.signature_valid() {
+            continue; // tampered / undecodable → ignored
+        }
+        return Some(rec.to_version);
+    }
+    None
+}
+
+/// Project one exceptions row onto a [`SignedException`].
+fn row_to_signed_exception(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<SignedException> {
+    Ok(SignedException {
+        id: row.get(0)?,
+        package_key: row.get(1)?,
+        to_version: row.get(2)?,
+        reason: row.get(3)?,
+        created_at: row.get(4)?,
+        expires_at: row.get(5)?,
+        signature: row.get(6)?,
+        signing_key: row.get(7)?,
+    })
 }
 
 /// Parse a self-produced `order_key` (`epoch:version:release`, zero-padded
@@ -409,5 +575,157 @@ mod tests {
         assert_eq!(back.version, "2.3");
         assert_eq!(back.release, 4);
         assert!(parse_order_key("garbage").is_none());
+    }
+
+    // ---- slice 6: signed override records ----
+
+    use ed25519_dalek::SigningKey;
+
+    /// Deterministic test key — style reference from pin_store.rs; NEVER the
+    /// production pin key (different DB, different purpose).
+    fn test_key(seed: u8) -> SigningKey {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        bytes[31] = seed.wrapping_mul(7);
+        SigningKey::from_bytes(&bytes)
+    }
+
+    fn signed_rec(key: &SigningKey, package: &str, to: &str, now: i64, ttl: i64) -> super::SignedException {
+        let mut rec = super::SignedException {
+            id: 0,
+            package_key: package.to_string(),
+            to_version: to.to_string(),
+            reason: "kernel compat".to_string(),
+            created_at: now,
+            expires_at: now + ttl,
+            signature: None,
+            signing_key: None,
+        };
+        rec.sign(key);
+        rec
+    }
+
+    #[test]
+    fn test_legacy_migration_adds_signature_columns() {
+        // Build the OLD 5-column exceptions table with a raw connection.
+        let path = tmp_db("migrate");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE exceptions (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    package_key  TEXT NOT NULL,
+                    to_version   TEXT NOT NULL,
+                    reason       TEXT NOT NULL,
+                    created_at   INTEGER NOT NULL,
+                    expires_at   INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        }
+        // Ledger::open must migrate additively and stay usable.
+        let l = Ledger::open(&path).unwrap();
+        let k = test_key(3);
+        let rec = signed_rec(&k, "pacman:bash", "5.2.36-1", 100, 600);
+        l.add_signed_exception(&rec).unwrap();
+        assert_eq!(
+            l.active_exception("pacman:bash", 200),
+            Some("5.2.36-1".to_string())
+        );
+    }
+
+    #[test]
+    fn test_signed_roundtrip_verifies() {
+        let l = Ledger::open(&tmp_db("signed")).unwrap();
+        let k = test_key(7);
+        let rec = signed_rec(&k, "pacman:bash", "5.2.36-1", 100, 600);
+        l.add_signed_exception(&rec).unwrap();
+        assert_eq!(
+            l.active_exception("pacman:bash", 200),
+            Some("5.2.36-1".to_string())
+        );
+        // And it flows through the downgrade verdict too.
+        check(&l, "pacman:bash", "5.2.37-1", 300);
+        assert_eq!(check(&l, "pacman:bash", "5.2.30-1", 400), CheckVerdict::Ok);
+    }
+
+    #[test]
+    fn test_tampered_signature_rejected() {
+        let l = Ledger::open(&tmp_db("tamper")).unwrap();
+        let k = test_key(7);
+        let rec = signed_rec(&k, "apk:openssl", "3.3.1-r0", 100, 600);
+        l.add_signed_exception(&rec).unwrap();
+        {
+            let conn = l.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE exceptions SET signature = ?1",
+                rusqlite::params!["f".repeat(64)],
+            )
+            .unwrap();
+        }
+        assert_eq!(l.active_exception("apk:openssl", 200), None);
+    }
+
+    #[test]
+    fn test_legacy_unsigned_row_still_honored() {
+        let l = Ledger::open(&tmp_db("legacy")).unwrap();
+        {
+            let conn = l.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO exceptions (package_key, to_version, reason, created_at, expires_at, signature, signing_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL)",
+                rusqlite::params!["pacman:linux", "6.9.0", "vendor pin", 100, 900],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            l.active_exception("pacman:linux", 200),
+            Some("6.9.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_signed_expiry_enforced() {
+        let l = Ledger::open(&tmp_db("sexp")).unwrap();
+        let k = test_key(11);
+        let rec = signed_rec(&k, "pacman:linux", "6.9.0", 100, 500);
+        l.add_signed_exception(&rec).unwrap();
+        assert_eq!(
+            l.active_exception("pacman:linux", 400),
+            Some("6.9.0".to_string())
+        );
+        assert_eq!(l.active_exception("pacman:linux", 601), None);
+    }
+
+    #[test]
+    fn test_tampered_row_skipped_valid_older_row_honored() {
+        let l = Ledger::open(&tmp_db("walk")).unwrap();
+        let k = test_key(13);
+        // id 1: valid.
+        let good = signed_rec(&k, "pacman:zsh", "5.9-1", 100, 600);
+        l.add_signed_exception(&good).unwrap();
+        // id 2: valid signature column, but garbage key → undecodable.
+        {
+            let conn = l.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO exceptions (package_key, to_version, reason, created_at, expires_at, signature, signing_key)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "pacman:zsh",
+                    "5.8-1",
+                    "evil",
+                    150,
+                    700,
+                    "a".repeat(128),
+                    "b".repeat(64)
+                ],
+            )
+            .unwrap();
+        }
+        // DESC order hits the tampered id 2 first, skips it, and honors id 1.
+        assert_eq!(
+            l.active_exception("pacman:zsh", 200),
+            Some("5.9-1".to_string())
+        );
     }
 }

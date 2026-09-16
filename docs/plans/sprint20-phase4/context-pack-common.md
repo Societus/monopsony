@@ -9,16 +9,22 @@ Phase 4 adds the L3/L4 ladder rungs: a per-package high-water ledger fed by
 parsed index responses, downgrade policy enforcement, and payload-vs-index
 hash cross-checks.
 
-## Wave 1 slices (this wave)
-1. version_ord.rs (monopsony-common) — normalizer + vercmp
-2. ledger.rs (monopsony-client) — SQLite high-water store
-3. index_parse.rs (monopsony-client) — pacman .db + APKINDEX parsers
-4. proxy/main wiring — wrap_with_ledger_check + [ledger] config + policy
+## Wave 1 (LANDED — commit 4912271, tree clean)
+1. version_ord.rs (monopsony-common) — normalizer + vercmp ✅
+2. ledger.rs (monopsony-client) — SQLite high-water store ✅
+3. index_parse.rs (monopsony-client) — pacman .db + APKINDEX parsers ✅
+4. proxy/main wiring — wrap_with_ledger_check + [ledger] config + policy ✅
 
-## Wave 2 (specs are stubs; expand before dispatch)
-5. dnf primary.xml.gz + apt InRelease parsers + Valid-Until staleness
-6. override command (signed exception records with TTL)
-7. tamper/downgrade e2e tests + fleet verification
+## Wave 2 (CURRENT — specs below are EXPANDED, follow them exactly)
+5. slice5-dnf-apt-parsers.md — dnf primary.xml.gz + apt InRelease/Release +
+   Valid-Until native + pm_kind_from_url extension (owns proxy.rs this wave)
+6. slice6-override-command.md — `override add/list` CLI, signed exception
+   records, migration for signature columns (owns ledger.rs + main.rs)
+7. slice7-e2e-and-fleet-brief.md — tests/ledger_e2e.rs + fleet brief
+   (owns tests/ + this dir's brief; NOTHING in src/)
+
+File sets are DISJOINT. Parallel dispatch is safe under the foreign-failure
+rule below.
 
 ## Hard rules
 - HARD ~600s cap: work linearly, write files immediately, verify ONCE at the end.
@@ -27,6 +33,12 @@ hash cross-checks.
 - The standalone linter reports "async fn not permitted in Rust 2015" — FALSE
   POSITIVE (edition 2021). Ignore lint noise; `cargo check -p <crate>` is the verdict.
 - If time runs short, SKIP remaining items and report under not_done. Never half-edit.
+- Same-crate parallel wave: all three slices compile inside monopsony-client,
+  so YOUR verify may hit a sibling's mid-edit file (their E0277 is not your
+  bug). Filter the error's file path before diagnosing; mark out-of-scope
+  failures FOREIGN; re-run your verify ONCE after ~60s (sibling settles) and
+  if it still fails on THEIR file, report it and stop — never touch a file
+  outside your file set.
 
 ## Contracts already landed by the hub (DO NOT re-create; consume exactly)
 - crates/monopsony-common/src/pin_store.rs: PinAttestation / PinOrigin / sign-verify
@@ -43,8 +55,52 @@ hash cross-checks.
   `#[serde(default)] pub ledger: LedgerConfig`.
 - Workspace + client Cargo.toml: `zstd` dep added (pacman .db is zstd).
   flate2 + tar already in client crate (APKINDEX.tar.gz).
-- rusqlite 0.31 (bundled) is a workspace dep; add `rusqlite = { workspace = true }`
-  to monopsony-client's Cargo.toml when your slice needs it.
+- rusqlite (bundled) is a workspace dep and is ALREADY in
+  monopsony-client's Cargo.toml — do not add it again.
+
+## Landed wave-1 contracts (hub-verified 2026-09-15 against commit 4912271 — TRUST, then grep if unsure)
+- ledger.rs: tables high_water / repo_seen / exceptions (5-col, NO signature
+  columns yet — slice 6 migrates); `check_and_update(key, version,
+  &NormalizedVersion, source, now) -> CheckVerdict::{Ok, Downgrade{held}}`;
+  `high_water_for(key)` read-only; `repo_seen(key, now)` / `repo_age_secs(key)`;
+  `add_exception(...)` (5-arg, unsigned); `active_exception_on(&conn, ...)`
+  is THE lock-free exception path — extend verification THERE, never in
+  callers.
+- index_parse.rs: `parse_index` decodes by MAGIC (zstd 28B52FFD / gzip 1F8B /
+  raw) then sniffs tar contents; `IndexEntry{name, version, sha256:Option}`;
+  `ParsedIndex::{Pacman, Apk}{entries}`; caps 256MB/100k entries/1MB desc;
+  `looks_like_index(path)` (.db/.db.tar.gz/APKINDEX*); `repo_key_from_url`
+  (dir portion, https-canonical); `package_key_for(pm, name)`.
+- proxy.rs wiring: `wrap_with_ledger_check` runs BEFORE `wrap_with_pin_check`
+  in proxy_handler's 200 path. Index = buffered → spawn_blocking parse →
+  per-entry `check_and_update`; `IndexOutcome::{Clean, Oversize,
+  ParseError, Downgrades}` → `ledger_index_verdict_response` applies policy.
+  Headers: `X-Monopsony-Downgrade`, `X-Monopsony-Index-Parse-Error`,
+  `X-Monopsony-Index-Stale` (age secs). Reject bodies say "rewound"
+  (downgrade) / "failed parsing" (parse error). Tamper events share the
+  Phase 3 spool with `downgrade:` / `index-parse-error:` detail prefixes.
+  `pm_kind_from_url` (host/path sniff) → "pacman" | "apk" | None — slice 5
+  extends this.
+- main.rs daemon: ledger opens at `dirs_ledger_parent(&cert_dir).join(
+  "ledger.sqlite3")` when `cfg.ledger.enabled`; `dirs_ledger_parent` =
+  `$HOME/.local/state/monopsony` (fallback /tmp/monopsony). Open failure =
+  fail-open (daemon runs ledger-less).
+- proxy.rs (post-hub-refactor): `run_proxy(addr, ...)` binds then delegates
+  to `pub run_proxy_with_listener(listener, config, pin, ledger, policy,
+  max_age_secs)` — slice 7's port-discovery entry point.
+- ClientProxyState fields are PRIVATE (config) + pub (pin, ledger,
+  ledger_policy, ledger_max_index_age_secs); builders `.with_pin(arc)` /
+  `.with_ledger(arc, policy, max)`. Events: `PinState::new(None, events_path)`;
+  default events path = dirs_events_path() (same state dir,
+  tamper-events.jsonl).
+- HUB FIX during wave 2 (caught by slice 7's e2e): client `pin_url()` was
+  authority-only for http URIs — it now mirrors the server's
+  `normalize_url_scheme` exactly (prefix swap, path preserved). Repo keys and
+  pin URLs for http mirrors were previously mis-keyed (pin verification
+  silently disengaged). Canonical URL = `https://<host>:<port>/<full path>`.
+- Deps present in client crate: zstd, flate2, tar, rusqlite (bundled),
+  ed25519-dalek v2 (serde, rand_core), rand 0.8, base64, hex, sha2, chrono.
+  quick-xml is NOT a workspace dep and must stay out.
 
 ## Phase 4 semantics (do not deviate)
 - **Ledger home:** `<state_dir>/ledger.sqlite3`

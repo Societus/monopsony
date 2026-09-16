@@ -28,6 +28,14 @@ pub struct IndexEntry {
 pub enum ParsedIndex {
     Pacman { entries: Vec<IndexEntry> },
     Apk { entries: Vec<IndexEntry> },
+    /// dnf/rocky `primary.xml(.gz)` (slice 5).
+    Dnf { entries: Vec<IndexEntry> },
+    /// apt `InRelease` / `Release` (slice 5). `valid_until` is the UTC
+    /// epoch of the `Valid-Until:` field when parseable.
+    Apt {
+        entries: Vec<IndexEntry>,
+        valid_until: Option<i64>,
+    },
 }
 
 /// Structured parse/decode failure (garbage input, corrupt archive, or a
@@ -57,8 +65,13 @@ const MAX_APKINDEX_BYTES: usize = 16 * 1024 * 1024;
 /// then the tar contents select pacman (descriptor directories) vs apk
 /// (a single `APKINDEX` file).
 pub fn parse_index(bytes: &[u8]) -> Result<ParsedIndex, IndexError> {
-    let tar_bytes = decode_container(bytes)?;
-    parse_tar(&tar_bytes)
+    let decoded = decode_container(bytes)?;
+    match sniff_text_format(&decoded) {
+        Some("apt") => return parse_apt_text(&decoded),
+        Some("dnf") => return parse_primary_xml(&decoded),
+        _ => {}
+    }
+    parse_tar(&decoded)
 }
 
 /// Decompress per magic bytes; raw bytes pass through untouched.
@@ -85,6 +98,38 @@ fn decode_container(bytes: &[u8]) -> Result<Vec<u8>, IndexError> {
     Ok(bytes.to_vec())
 }
 
+/// Cap on a single decompressed dnf `primary.xml` body.
+const MAX_XML_BYTES: usize = 256 * 1024 * 1024;
+/// Cap on the number of dnf `<package>` records scanned.
+const MAX_XML_PACKAGES: usize = 100_000;
+/// Cap on an apt `InRelease`/`Release` body.
+const MAX_APT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Sniff the DECODED bytes (post zstd/gzip) for a text format: apt
+/// clearsigned/Release text or dnf `primary.xml`. `None` = fall through to
+/// the tar path (pacman/apk). Detection is by content, never extension.
+fn sniff_text_format(bytes: &[u8]) -> Option<&'static str> {
+    let head = &bytes[..bytes.len().min(4096)];
+    let trimmed = String::from_utf8_lossy(head).trim_start().to_string();
+    if trimmed.starts_with("-----BEGIN PGP SIGNED MESSAGE-----") {
+        return Some("apt");
+    }
+    // First 4 KB carry both a Valid-Until field and a SHA256 block header.
+    // `SHA256:` is a FIELD line — column 0, matching parse_apt_text's rule
+    // and real Debian Release files (only hash continuations are indented).
+    let head_str = String::from_utf8_lossy(head);
+    if head_str.contains("Valid-Until:") && head_str.contains("\nSHA256:") {
+        return Some("apt");
+    }
+    if trimmed.starts_with('<') {
+        let sniff = String::from_utf8_lossy(&bytes[..bytes.len().min(512)]);
+        if sniff.contains("<metadata") {
+            return Some("dnf");
+        }
+    }
+    None
+}
+
 /// Read `reader` to end, enforcing `cap` on total bytes written.
 fn read_limited(
     mut reader: impl Read,
@@ -108,6 +153,293 @@ fn read_limited(
             Err(e) => return Err(IndexError(format!("{what} decode failed: {e}"))),
         }
     }
+}
+
+/// Parse a dnf/rocky `primary.xml` body via hand-rolled tag scanning (no
+/// quick-xml). Each `<package ...>` record contributes at most one entry.
+/// Garbage XML (unterminated tags, non-UTF-8) → `IndexError`, never panic.
+fn parse_primary_xml(bytes: &[u8]) -> Result<ParsedIndex, IndexError> {
+    if bytes.len() > MAX_XML_BYTES {
+        return Err(IndexError(format!(
+            "primary.xml exceeds {} byte cap",
+            MAX_XML_BYTES
+        )));
+    }
+    let text = String::from_utf8(bytes.to_vec())
+        .map_err(|_| IndexError("primary.xml is not valid UTF-8".to_string()))?;
+
+    let mut entries = Vec::new();
+    for record in split_package_records(&text) {
+        if entries.len() >= MAX_XML_PACKAGES {
+            return Err(IndexError(format!(
+                "primary.xml exceeds {} package cap",
+                MAX_XML_PACKAGES
+            )));
+        }
+        let Some(name) = first_tag_text(record, "name") else {
+            continue;
+        };
+        let version = xml_first_tag_attrs(record, "version")
+            .map(|attrs| dnf_version_string(&attrs))
+            .unwrap_or_default();
+        let sha256 = first_checksum_sha256(record);
+        entries.push(IndexEntry {
+            name,
+            version,
+            sha256,
+        });
+    }
+    Ok(ParsedIndex::Dnf { entries })
+}
+
+/// Split the XML text on `<package ` / `<package>` open tags; each slice is
+/// one record's content (records cannot nest). `<packages>` (the container)
+/// does not match because the tag must be followed by whitespace or `>`.
+fn split_package_records(text: &str) -> Vec<&str> {
+    let find_open = |from: &str| -> Option<usize> {
+        let mut search = from;
+        let mut offset = 0usize;
+        while let Some(pos) = search.find("<package") {
+            let after = &search[pos + "<package".len()..];
+            match after.bytes().next() {
+                Some(b' ') | Some(b'>') | Some(b'\t') | Some(b'\n') | Some(b'\r') => {
+                    return Some(offset + pos);
+                }
+                _ => {
+                    offset += pos + "<package".len();
+                    search = after;
+                }
+            }
+        }
+        None
+    };
+
+    let mut records = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = find_open(rest) {
+        rest = &rest[pos + "<package".len()..];
+        match find_open(rest) {
+            Some(next) => {
+                records.push(&rest[..next]);
+                rest = &rest[next..];
+            }
+            None => {
+                records.push(rest);
+                break;
+            }
+        }
+    }
+    records
+}
+
+/// Text of the first `<tag>...</tag>` element, or None.
+fn first_tag_text(record: &str, tag: &str) -> Option<String> {
+    let open = format!("<{}>", tag);
+    let start = record.find(&open)? + open.len();
+    let rest = &record[start..];
+    let close = format!("</{}>", tag);
+    let end = rest.find(&close)?;
+    Some(xml_unescape(&rest[..end]))
+}
+
+/// Attributes of the first `<tag ...>` (self-closing or not) element as
+/// (key, value) pairs, or None when the tag never opens.
+fn xml_first_tag_attrs(record: &str, tag: &str) -> Option<Vec<(String, String)>> {
+    let open = format!("<{}", tag);
+    let start = record.find(&open)? + open.len();
+    let rest = &record[start..];
+    // End of the open tag: first '>' (self-closing `/>' included).
+    let end = rest.find('>')?;
+    Some(parse_xml_attrs(&rest[..end]))
+}
+
+/// Parse `k="v"` / `k='v'` attribute pairs from tag-attribute text.
+fn parse_xml_attrs(s: &str) -> Vec<(String, String)> {
+    let mut attrs = Vec::new();
+    let mut rest = s.trim_start();
+    while let Some(eq) = rest.find('=') {
+        let key = rest[..eq].trim().rsplit(' ').next().unwrap_or("").trim();
+        let after = rest[eq + 1..].trim_start();
+        let quote = match after.bytes().next() {
+            Some(b'"') | Some(b'\'') => after.as_bytes()[0] as char,
+            _ => break,
+        };
+        let value = match after[1..].find(quote) {
+            Some(end) => &after[1..1 + end],
+            None => break, // unterminated attribute — do not guess
+        };
+        attrs.push((key.to_string(), xml_unescape(value)));
+        rest = &after[1 + value.len() + 1..];
+    }
+    attrs
+}
+
+/// Version string from a dnf `<version epoch ver rel/>` attribute set:
+/// `"epoch:ver-rel"`, dropping the epoch prefix when absent or "0".
+fn dnf_version_string(attrs: &[(String, String)]) -> String {
+    let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
+    let ver = get("ver").unwrap_or_default();
+    let rel = get("rel").unwrap_or_default();
+    let epoch = get("epoch");
+    match epoch.as_deref() {
+        Some(e) if !e.is_empty() && e != "0" => format!("{}:{}-{}", e, ver, rel),
+        _ => format!("{}-{}", ver, rel),
+    }
+}
+
+/// Text of the first `<checksum type="sha256">HEX</checksum>` element,
+/// lowercase hex; other checksum types (sha/md5) are skipped.
+fn first_checksum_sha256(record: &str) -> Option<String> {
+    let mut rest = record;
+    loop {
+        let open_pos = rest.find("<checksum")?;
+        let after_open = &rest[open_pos + "<checksum".len()..];
+        let tag_end = after_open.find('>')?;
+        let attrs = parse_xml_attrs(&after_open[..tag_end]);
+        let body_start = tag_end + 1;
+        let body_and_tail = &after_open[body_start..];
+        let close_pos = body_and_tail.find("</checksum>")?;
+        let body = &body_and_tail[..close_pos];
+        if attrs
+            .iter()
+            .any(|(k, v)| k == "type" && v.eq_ignore_ascii_case("sha256"))
+        {
+            let hex = body.trim();
+            if hex.bytes().all(|b| b.is_ascii_hexdigit()) && !hex.is_empty() {
+                return Some(hex.to_ascii_lowercase());
+            }
+            return None;
+        }
+        rest = &body_and_tail[close_pos + "</checksum>".len()..];
+    }
+}
+
+/// Minimal XML entity unescape for text/attribute values.
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Parse an apt `InRelease` (clearsigned) or plain `Release` body. Both
+/// share the same cleartext fields and hash blocks; the PGP armor header
+/// (when present) is skipped. Entries come ONLY from `SHA256:`-block lines
+/// whose path ends `.deb`; ambiguous basenames are skipped, never guessed.
+fn parse_apt_text(bytes: &[u8]) -> Result<ParsedIndex, IndexError> {
+    if bytes.len() > MAX_APT_BYTES {
+        return Err(IndexError(format!(
+            "InRelease/Release exceeds {} byte cap",
+            MAX_APT_BYTES
+        )));
+    }
+    let text = String::from_utf8(bytes.to_vec())
+        .map_err(|_| IndexError("InRelease/Release is not valid UTF-8".to_string()))?;
+
+    // Strip PGP armor head: everything up to and including the first blank
+    // line after the signed-message header block.
+    let body = if let Some(pos) = text.find("-----BEGIN PGP SIGNED MESSAGE-----") {
+        let after = &text[pos..];
+        match after.find("\n\n") {
+            Some(blank) => &after[blank + 2..],
+            None => {
+                return Err(IndexError(
+                    "clearsigned InRelease has no blank line after armor header".to_string(),
+                ))
+            }
+        }
+    } else {
+        &text[..]
+    };
+
+    let mut entries = Vec::new();
+    let mut valid_until: Option<i64> = None;
+    let mut in_sha256_block = false;
+    for line in body.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            in_sha256_block = false;
+            continue;
+        }
+        // Field lines start at column 0.
+        if !line.starts_with(' ') {
+            in_sha256_block = false;
+            if let Some((key, value)) = line.split_once(':') {
+                if key == "Valid-Until" {
+                    valid_until = parse_apt_valid_until(value.trim());
+                } else if key == "SHA256" {
+                    in_sha256_block = true;
+                }
+            }
+            continue;
+        }
+        // Hash-block continuation line: ` <hash> <size> <path>`.
+        if !in_sha256_block {
+            continue;
+        }
+        let mut parts = line.trim_start().split(' ');
+        let (hash, _size, path) = match (parts.next(), parts.next(), parts.next()) {
+            (Some(h), Some(s), Some(p)) if !h.is_empty() && !s.is_empty() => (h, s, p),
+            _ => continue,
+        };
+        if !path.ends_with(".deb") {
+            continue;
+        }
+        if let Some((name, version)) = apt_deb_basename_info(path) {
+            entries.push(IndexEntry {
+                name,
+                version,
+                sha256: Some(hash.to_ascii_lowercase()),
+            });
+        }
+    }
+    Ok(ParsedIndex::Apt {
+        entries,
+        valid_until,
+    })
+}
+
+/// Parse `Valid-Until:` as UTC. RFC 2822 parsing accepts the named zones
+/// Debian emits (`UTC`, `GMT`) plus numeric offsets; unparseable → None,
+/// never an error. (DateTime::parse_from_str with a literal " UTC" suffix
+/// can never work — it requires a %z offset in the format.)
+fn parse_apt_valid_until(value: &str) -> Option<i64> {
+    let v = value.trim();
+    // chrono's RFC 2822 grammar accepts GMT/UT but not the "UTC" spelling
+    // Debian also emits; both denote +0000, so normalize before parsing.
+    let normalized = v
+        .strip_suffix(" UTC")
+        .map(|s| format!("{s} GMT"))
+        .unwrap_or_else(|| v.to_string());
+    chrono::DateTime::parse_from_rfc2822(&normalized)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
+/// Best-effort (name, version) from a `.deb` path's basename. Debian pool
+/// naming is `name_VERSION-REV_arch.deb` — UNDERSCORE-separated fields, the
+/// version field already being the `upstream-rev` composite (e.g.
+/// `bash_5.2-1_amd64.deb` → ("bash", "5.2-1"); names may contain dashes
+/// (`util-linux_2.38-2_amd64.deb`)). The pacman dash-split does not apply
+/// here and yields zero entries on every real file. Ambiguous → None.
+fn apt_deb_basename_info(path: &str) -> Option<(String, String)> {
+    let fname = path.rsplit('/').next()?;
+    let stem = fname.strip_suffix(".deb")?;
+    if stem.is_empty() {
+        return None;
+    }
+    let (front, arch) = stem.rsplit_once('_')?;
+    let (name, version) = front.rsplit_once('_')?;
+    if name.is_empty() || version.is_empty() || arch.is_empty() {
+        return None;
+    }
+    // A real Debian version always carries a digit (upstream ver or epoch);
+    // guards nonsense like `a_b_c.deb` from becoming a ledger key.
+    if !version.bytes().any(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((name.to_string(), version.to_string()))
 }
 
 /// Walk the tar once, collecting pacman `desc` payloads and any `APKINDEX`
@@ -316,7 +648,18 @@ pub fn looks_like_index(url_path: &str) -> bool {
         return true;
     }
     match url_path.rsplit('/').next() {
-        Some(last) => last == "APKINDEX" || last.starts_with("APKINDEX."),
+        Some(last) => {
+            if last == "APKINDEX" || last.starts_with("APKINDEX.") {
+                return true;
+            }
+            // dnf primary metadata.
+            if last == "primary.xml.gz" || last == "primary.xml" {
+                return true;
+            }
+            // apt InRelease / Release (Release.gpg deliberately excluded —
+            // it is a signature, not an index).
+            last == "InRelease" || last == "Release"
+        }
         None => false,
     }
 }
@@ -556,5 +899,215 @@ mod tests {
     fn test_package_key_for_contract() {
         assert_eq!(package_key_for("pacman", "bash"), "pacman:bash");
         assert_eq!(package_key_for("apk", "busybox"), "apk:busybox");
+    }
+
+    // ---- slice 5: dnf primary.xml ----
+
+    /// Two-package primary.xml: one epoch attr "0", one epoch "2", with
+    /// sha256 + sha checksums interleaved per record.
+    fn primary_xml() -> String {
+        let sha_a = "a".repeat(64);
+        let sha_b = "b".repeat(64);
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata xmlns="http://linux.duke.edu/metadata/common" packages="2">
+<package type="rpm">
+  <name>bash</name>
+  <arch>x86_64</arch>
+  <checksum type="sha" pkgid="YES">0123456789abcdef0123456789abcdef</checksum>
+  <checksum type="sha256" pkgid="YES">{sha_a}</checksum>
+  <version epoch="0" ver="1.2" rel="3"/>
+</package>
+<package type="rpm">
+  <name>kernel</name>
+  <arch>x86_64</arch>
+  <checksum type="sha256" pkgid="YES">{sha_b}</checksum>
+  <checksum type="md5">fedcba9876543210fedcba9876543210</checksum>
+  <version epoch="2" ver="9.15" rel="1"/>
+</package>
+</metadata>
+"#
+        )
+    }
+
+    #[test]
+    fn test_parse_index_dnf_gzip_versions_and_sha256() {
+        let parsed = parse_index(&gzip(primary_xml().as_bytes())).unwrap();
+        let ParsedIndex::Dnf { entries } = parsed else {
+            panic!("expected dnf variant");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "bash");
+        assert_eq!(entries[0].version, "1.2-3");
+        assert_eq!(
+            entries[0].sha256.as_deref(),
+            Some("a".repeat(64).as_str())
+        );
+        assert_eq!(entries[1].name, "kernel");
+        assert_eq!(entries[1].version, "2:9.15-1");
+        assert_eq!(
+            entries[1].sha256.as_deref(),
+            Some("b".repeat(64).as_str())
+        );
+    }
+
+    #[test]
+    fn test_parse_index_dnf_raw_and_zstd_also_parse() {
+        // Raw (uncompressed) primary.xml sniffs by content, not extension.
+        let parsed = parse_index(primary_xml().as_bytes()).unwrap();
+        assert!(matches!(parsed, ParsedIndex::Dnf { .. }));
+        let parsed = parse_index(&zstd_compress(primary_xml().as_bytes())).unwrap();
+        let ParsedIndex::Dnf { entries } = parsed else {
+            panic!("expected dnf variant");
+        };
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_index_dnf_unterminated_tag_is_err_no_panic() {
+        // Unterminated <name> tag: the version element never closes either.
+        let garbage = concat!(
+            "<metadata><package type=\"rpm\"><name>bash",
+            "<version epoch=\"0\" ver=\"1.2\" rel=\"3\"/>"
+        );
+        let parsed = parse_index(&gzip(garbage.as_bytes()));
+        // The record has no closeable <name> → no entry (Dnf with 0 entries)
+        // OR a structured error — either way, no panic.
+        match parsed {
+            Ok(ParsedIndex::Dnf { entries }) => assert!(entries.is_empty()),
+            Err(e) => assert!(!e.0.is_empty()),
+            Ok(other) => panic!("unexpected variant: {:?}", other),
+        }
+        // Non-UTF-8 text must be an IndexError, never a panic.
+        let mut bad = primary_xml().into_bytes();
+        bad[60] = 0xff;
+        assert!(parse_index(&bad).is_err());
+    }
+
+    // ---- slice 5: apt InRelease / Release ----
+
+    fn apt_release_body(valid_until: &str) -> String {
+        let sha1 = "1".repeat(64);
+        let sha2 = "2".repeat(64);
+        // NOTE: lines are joined explicitly — `\n\` continuations swallow
+        // the next line's leading space, and BOTH the ` SHA256:` sniff
+        // marker and the ` <hash> <size> <path>` block format require it.
+        [
+            "Origin: Debian".to_string(),
+            "Suite: bookworm".to_string(),
+            "Date: Mon, 14 Sep 2026 00:00:00 UTC".to_string(),
+            format!("Valid-Until: {valid_until}"),
+            "MD5Sum:".to_string(),
+            " aaaa 100 main/binary-amd64/Packages".to_string(),
+            "SHA256:".to_string(),
+            format!(" {sha1} 1234 pool/main/b/bash/bash_5.2-1_amd64.deb"),
+            format!(" {sha2} 4321 pool/main/u/util-linux/util-linux_2.38-2_amd64.deb"),
+            " 999999 200 main/binary-amd64/Packages.gz".to_string(),
+            "".to_string(),
+        ]
+        .join("\n")
+    }
+
+    fn apt_in_release(valid_until: &str) -> Vec<u8> {
+        format!(
+            "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\n{}-----BEGIN PGP SIGNATURE-----\n\nrandom signature bytes\n-----END PGP SIGNATURE-----\n",
+            apt_release_body(valid_until)
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn test_parse_index_apt_in_release_future_valid_until() {
+        let expected = chrono::Utc::now().timestamp() + 3600;
+        let vu = chrono::DateTime::<chrono::Utc>::from_timestamp(expected, 0)
+            .unwrap()
+            .format("%a, %d %b %Y %H:%M:%S UTC")
+            .to_string();
+        let parsed = parse_index(&apt_in_release(&vu)).unwrap();
+        let ParsedIndex::Apt {
+            entries,
+            valid_until,
+        } = parsed
+        else {
+            panic!("expected apt variant");
+        };
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].name, "bash");
+        assert_eq!(entries[0].version, "5.2-1");
+        assert_eq!(
+            entries[0].sha256.as_deref(),
+            Some("1".repeat(64).as_str())
+        );
+        assert_eq!(entries[1].name, "util-linux");
+        assert_eq!(entries[1].version, "2.38-2");
+        assert!(valid_until.is_some());
+        assert!(
+            (valid_until.unwrap() - expected).abs() <= 60,
+            "valid_until {:?} vs expected {}",
+            valid_until,
+            expected
+        );
+    }
+
+    #[test]
+    fn test_parse_index_apt_past_valid_until_still_parses() {
+        // Staleness enforcement is the proxy's call; parse stays Ok.
+        let vu = "Mon, 01 Jan 2001 00:00:00 UTC";
+        let parsed = parse_index(&apt_in_release(vu)).unwrap();
+        let ParsedIndex::Apt {
+            valid_until,
+            entries,
+        } = parsed
+        else {
+            panic!("expected apt variant");
+        };
+        assert_eq!(entries.len(), 2);
+        // Expectation via the GMT spelling — same instant, and chrono's
+        // RFC 2822 grammar rejects the " UTC" suffix (the quirk this test
+        // exercises through the parser's normalization).
+        let expected = chrono::DateTime::parse_from_rfc2822("Mon, 01 Jan 2001 00:00:00 GMT")
+            .unwrap()
+            .timestamp();
+        assert_eq!(valid_until, Some(expected));
+    }
+
+    #[test]
+    fn test_parse_index_apt_plain_release_and_gmt() {
+        // Plain Release (no armor) with a GMT Valid-Until parses the same.
+        let vu = "Tue, 15 Sep 2026 12:00:00 GMT";
+        let body = apt_release_body(vu);
+        let parsed = parse_index(body.as_bytes()).unwrap();
+        let ParsedIndex::Apt {
+            entries,
+            valid_until,
+        } = parsed
+        else {
+            panic!("expected apt variant");
+        };
+        assert_eq!(entries.len(), 2);
+        let expected = chrono::DateTime::parse_from_rfc2822(vu).unwrap().timestamp();
+        assert_eq!(valid_until, Some(expected));
+    }
+
+    #[test]
+    fn test_parse_index_apt_armor_sniff_routes_by_content_not_name() {
+        // Served under a nonsense filename, the PGP armor still routes to
+        // the apt parser — detection is content-based.
+        let vu = "Mon, 01 Jan 2001 00:00:00 UTC";
+        let parsed = parse_index(&apt_in_release(vu)).unwrap();
+        assert!(matches!(parsed, ParsedIndex::Apt { .. }));
+    }
+
+    #[test]
+    fn test_looks_like_index_dnf_and_apt() {
+        assert!(looks_like_index(
+            "/rocky/9/BaseOS/x86_64/os/repodata/primary.xml.gz"
+        ));
+        assert!(looks_like_index("/rocky/9/BaseOS/x86_64/os/repodata/primary.xml"));
+        assert!(looks_like_index("/debian/dists/bookworm/InRelease"));
+        assert!(looks_like_index("/debian/dists/bookworm/Release"));
+        // Signature and non-primary gzip stay out.
+        assert!(!looks_like_index("/repo/Release.gpg"));
+        assert!(!looks_like_index("/foo.xml.gz"));
     }
 }

@@ -485,15 +485,17 @@ fn build_503(msg: &'static str) -> Response<Body> {
         .unwrap_or_else(|_| Response::new(Body::from("Service unavailable")))
 }
 
-/// Canonical URL scheme for pin comparison — MUST match the server's
-/// `normalize_url_scheme` applied when the pin was recorded.
+/// Canonical URL for pin attestation + ledger repo keys — MUST mirror the
+/// server proxy's `normalize_url_scheme` EXACTLY (string prefix swap on
+/// the full absolute-form URL, path and query preserved) so client-side
+/// URLs are byte-identical to the server's cache-entry keys. The previous
+/// authority-only form for http URIs broke both pin verification and
+/// repo_key derivation for http mirrors (the primary proxy deployment).
 fn pin_url(uri: &hyper::Uri) -> String {
-    match uri.scheme_str() {
-        Some("http") => format!(
-            "https://{}",
-            uri.authority().map(|a| a.as_str()).unwrap_or("")
-        ),
-        _ => uri.to_string(),
+    let s = uri.to_string();
+    match s.strip_prefix("http://") {
+        Some(rest) => format!("https://{rest}"),
+        None => s,
     }
 }
 
@@ -575,6 +577,14 @@ fn pm_kind_from_url(uri: &hyper::Uri) -> Option<&'static str> {
     }
     if host.contains("alpine") || path.contains("APKINDEX") {
         return Some("apk");
+    }
+    let last = path.rsplit('/').next().unwrap_or("");
+    if last == "primary.xml.gz" || last == "primary.xml" {
+        return Some("dnf");
+    }
+    // Release.gpg deliberately falls through: it is a signature, not an index.
+    if last == "InRelease" || last == "Release" {
+        return Some("apt");
     }
     None
 }
@@ -715,14 +725,36 @@ async fn wrap_with_ledger_check(
         // Staleness v1: previous age BEFORE this response refreshes it.
         let prev_age = ledger.repo_age_secs(&repo_key);
         let parsed = crate::index_parse::parse_index(&parse_bytes);
+        let mut apt_valid_until_expired: Option<i64> = None;
         let entries = match &parsed {
             Ok(p) => match p {
                 crate::index_parse::ParsedIndex::Pacman { entries } => entries.clone(),
                 crate::index_parse::ParsedIndex::Apk { entries } => entries.clone(),
+                crate::index_parse::ParsedIndex::Dnf { entries } => entries.clone(),
+                crate::index_parse::ParsedIndex::Apt {
+                    entries,
+                    valid_until,
+                } => {
+                    // Native apt expiry: route through the SAME downgrade
+                    // machinery (policy split applies verbatim downstream).
+                    if let Some(vu) = valid_until {
+                        if now > *vu {
+                            apt_valid_until_expired = Some(*vu);
+                        }
+                    }
+                    entries.clone()
+                }
             },
             Err(_) => Vec::new(),
         };
         let mut downgrades: Vec<(String, String, String)> = Vec::new();
+        if let Some(vu) = apt_valid_until_expired {
+            downgrades.push((
+                "apt:valid-until".to_string(),
+                format!("expired-at={}", vu),
+                format!("now={}", now),
+            ));
+        }
         if parsed.is_ok() {
             let _ = ledger.repo_seen(&repo_key, now);
             for entry in &entries {
@@ -971,6 +1003,29 @@ pub async fn run_proxy(
     ledger_policy: String,
     ledger_max_index_age_secs: u64,
 ) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    run_proxy_with_listener(
+        listener,
+        config,
+        pin,
+        ledger,
+        ledger_policy,
+        ledger_max_index_age_secs,
+    )
+    .await
+}
+
+/// Test/integration entry: identical to [`run_proxy`] but the caller
+/// supplies an already-bound listener, so `bind(127.0.0.1:0)` tests can
+/// discover the port via `local_addr()` before serving begins.
+pub async fn run_proxy_with_listener(
+    listener: tokio::net::TcpListener,
+    config: ProxyConfig,
+    pin: std::sync::Arc<crate::pin_verify::PinState>,
+    ledger: Option<std::sync::Arc<crate::ledger::Ledger>>,
+    ledger_policy: String,
+    ledger_max_index_age_secs: u64,
+) -> anyhow::Result<()> {
     let mut state = ClientProxyState::new(config).with_pin(pin);
     if let Some(ledger) = ledger {
         state = state.with_ledger(ledger, ledger_policy, ledger_max_index_age_secs);
@@ -982,8 +1037,7 @@ pub async fn run_proxy(
         .route("/", axum::routing::any(proxy_handler))
         .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
-    info!("Client proxy listening on {}", listen_addr);
+    info!("Client proxy listening on {}", listener.local_addr()?);
 
     // Manual serve loop: CONNECT is intercepted before the Router (see the
     // Content-Length note in ClientHyperService); everything else goes
@@ -1116,5 +1170,58 @@ mod tests {
 
         let resp = Response::builder().status(503).body(Body::empty()).unwrap();
         assert_eq!(retry_after_secs(&resp), None);
+    }
+
+    // ---- slice 5: pm_kind_from_url dnf/apt detection ----
+
+    fn pm_kind_for_url(url: &str) -> Option<&'static str> {
+        let uri: hyper::Uri = url.parse().expect("valid test uri");
+        pm_kind_from_url(&uri)
+    }
+
+    #[test]
+    fn pm_kind_primary_xml_gz_is_dnf() {
+        assert_eq!(
+            pm_kind_for_url("https://mirrors.rockylinux.org/rocky/9/BaseOS/x86_64/os/repodata/primary.xml.gz"),
+            Some("dnf")
+        );
+        assert_eq!(
+            pm_kind_for_url("https://mirror.example.com/repodata/primary.xml"),
+            Some("dnf")
+        );
+    }
+
+    #[test]
+    fn pm_kind_inrelease_and_release_are_apt() {
+        assert_eq!(
+            pm_kind_for_url("https://deb.debian.org/debian/dists/bookworm/InRelease"),
+            Some("apt")
+        );
+        assert_eq!(
+            pm_kind_for_url("http://archive.ubuntu.com/ubuntu/dists/noble/Release"),
+            Some("apt")
+        );
+    }
+
+    #[test]
+    fn pm_kind_release_gpg_and_unknown_fall_through_to_none() {
+        // Signature, not an index.
+        assert_eq!(
+            pm_kind_for_url("https://deb.debian.org/debian/dists/bookworm/Release.gpg"),
+            None
+        );
+        assert_eq!(pm_kind_for_url("https://example.com/some/random/path"), None);
+    }
+
+    #[test]
+    fn pm_kind_pacman_and_apk_unchanged() {
+        assert_eq!(
+            pm_kind_for_url("https://mirror.example.com/repo/os/x86_64/core.db"),
+            Some("pacman")
+        );
+        assert_eq!(
+            pm_kind_for_url("https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/APKINDEX.tar.gz"),
+            Some("apk")
+        );
     }
 }
