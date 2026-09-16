@@ -52,16 +52,16 @@ B. Config: add the `[ledger]` block above on .20 and .159 (backup first).
 C. Verification matrix (below).
 
 ## Verification matrix (each item: run → compare → PASS/FAIL)
-- **M1 (.20) downgrade policy trips:**
+- M1 (.20) downgrade policy trips:
   1. Seed a high-water ABOVE current repo state (forces a downgrade on the
-     next real refresh):
+     next real refresh). NOTE: there is no `ledger seed` CLI subcommand —
+     seed via sqlite3 directly (order_key format is
+     `{:016}:{}:{:06}` of epoch/version/release from version_ord::order_key):
      ```
-     ssh root@10.10.20.20 'monopsony-client ledger seed \
-       --package pacman:bash --version 9.9.9-1 --reason "phase4 M1 bench seed"'
+     sqlite3 /root/.local/state/monopsony/ledger.sqlite3 \
+       "INSERT OR REPLACE INTO high_water (package_key, version, version_ord, source, seen_at) \
+        VALUES ('pacman:bash', '9.9.9-1', '0000000000000000:9.9.9:000001', 'bench-seed', strftime('%s','now'));"
      ```
-     (If the subcommand differs on the built binary, use
-     `monopsony-client ledger --help` and seed pacman:bash = 9.9.9-1 — the
-     exact spelling is whatever the CLI exposes; record it.)
   2. policy = "warn": `curl -v -x http://127.0.0.1:3129 \
      http://mirror.osbeck.com/repo/os/x86_64/core.db -o /tmp/core.db`
      → HTTP 200 with `X-Monopsony-Downgrade:` header present. Also
@@ -71,33 +71,43 @@ C. Verification matrix (below).
      HTTP 503, body contains "rewound", and
      `/root/.local/state/monopsony/tamper-events.jsonl` gains a line
      containing `downgrade:`.
-- **M2 (.20) policy flip changes behavior:** backup config, edit
+- M2 (.20) policy flip changes behavior: backup config, edit
   `/etc/monopsony/client.toml` `[ledger] policy` warn → reject, restart the
-  client daemon, repeat the M1 fetch → behavior must change from
+  client daemon (pkill monopsony-clien; re-run the setsid line — a broken
+  kill loop means the OLD daemon keeps :3129 and every later step silently
+  tests stale code), repeat the M1 fetch → behavior must change from
   200+header to 503. Restore policy to "warn" after M4.
-- **M3 (.62) inert control:** ledger disabled → `apt update` completes
-  normally end-to-end; `/root/.local/state/monopsony/tamper-events.jsonl`
-  does NOT exist or does not grow (`wc -l` before/after); no
-  X-Monopsony-* ledger headers on apt's fetches (`apt -o
-  Debug::Acquire::http=true update` or tcpdump on :3129). This proves the
-  feature is fully inert when disabled.
-- **M4 (.20) override exception:** with policy "reject" and M1's seed still
-  in place (fetches 503ing):
+- M3 (.62) inert control: `[ledger] enabled = false` must be EXPLICIT —
+  the section's serde default is enabled=true, so omitting [ledger]
+  ENABLES the ledger (derive-Default trap, opposite of the usual inert
+  default). With the explicit false: `apt update` fetches flow but show no
+  ledger behavior and tamper-events.jsonl does not grow. Known pre-existing
+  (out of phase-4 scope): .62's monopsony-mirror.list points
+  /mirror/ubuntu at the server's gRPC port 50051, so apt errors with
+  "not signed"/403 regardless of the ledger.
+- M4 (.20) override exception: with policy "reject" and M1's seed still
+  in place (fetches 503ing). Real flags are `--to` and `--ttl-secs`
+  (NOT --to-version/--ttl):
   ```
-  monopsony-client override add --package pacman:bash --to-version 5.2.36-1 \
-    --reason "phase4 M4 bench: vendor-verified downgrade window" --ttl 120
+  monopsony-client override add --package pacman:bash --to 5.2.36-1 \
+    --reason "phase4 M4 bench: vendor-verified downgrade window" --ttl-secs 120
   monopsony-client override list          # record shows, with expiry
-  curl -v -x http://127.0.0.1:3129 .../core.db   # → 200 now
+  curl -sS -D - -o /dev/null -x http://127.0.0.1:3129 .../core.db   # → 200 now
   sleep 121 && monopsony-client override list    # record dropped (expired)
-  curl -v -x http://127.0.0.1:3129 .../core.db   # → 503 again
+  curl -sS -D - -o /dev/null -x http://127.0.0.1:3129 .../core.db   # → 503 again
   ```
-  Then `override remove`/expire cleanup, restore policy "warn", restart daemon.
-- **M5 (.159) apk smoke (musl):** fetch an APKINDEX through .159's proxy
-  (`curl -v -x http://127.0.0.1:3129 \
-  https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/APKINDEX.tar.gz`)
-  → 200; on a second fetch after seeding `apk:busybox` above current state →
-  `X-Monopsony-Downgrade` header (warn). Confirms the APKINDEX parser path
-  on musl.
+  Then restore policy "warn", restart daemon.
+- M5 (.159) apk smoke (musl): fetch an APKINDEX through .159's proxy —
+  use the HTTP form of the URL (https goes through the CONNECT tunnel,
+  which is opaque by design and never parsed):
+  ```
+  curl -sS -D - -o /tmp/APKINDEX.tar.gz -x http://127.0.0.1:3129 \
+    http://dl-cdn.alpinelinux.org/alpine/v3.22/main/x86_64/APKINDEX.tar.gz
+  ```
+  → 200; on a second fetch after seeding `apk:busybox` above current state
+  (same sqlite3 INSERT pattern as M1, order_key
+  `0000000000000000:9.9.9:000001`) → `X-Monopsony-Downgrade` header (warn).
+  Confirms the APKINDEX parser path on musl.
 
 ## Failure table (symptom → bounded action)
 - Client daemon won't start after config edit → TOML typo; `tomlcheck`

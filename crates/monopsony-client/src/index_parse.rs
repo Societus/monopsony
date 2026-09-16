@@ -85,7 +85,11 @@ fn decode_container(bytes: &[u8]) -> Result<Vec<u8>, IndexError> {
     }
     if bytes.len() >= 2 && bytes[..2] == [0x1F, 0x8B] {
         let mut out = Vec::new();
-        let decoder = flate2::read::GzDecoder::new(bytes);
+        // Multi-member gzip: apk-tools concatenates gzip streams in
+        // APKINDEX.tar.gz (signature entries in the first member, the index
+        // in later ones). Plain GzDecoder stops after member 1 — seen live
+        // on the bench as a truncated-tar parse error on real archives.
+        let mut decoder = flate2::read::MultiGzDecoder::new(bytes);
         read_limited(decoder, &mut out, MAX_DECOMPRESSED_BYTES, "gzip")?;
         return Ok(out);
     }
@@ -833,6 +837,38 @@ mod tests {
         assert_eq!(entries[1].sha256, None);
         assert_eq!(entries[2].name, "musl");
         assert_eq!(entries[2].sha256, None);
+    }
+
+    #[test]
+    fn test_parse_index_multimember_gzip_apkindex() {
+        // apk-tools concatenates gzip MEMBERS in APKINDEX.tar.gz: a SINGLE
+        // tar stream (signature entries first, APKINDEX last) split at an
+        // arbitrary byte boundary into separately-gzipped members. Plain
+        // GzDecoder stops after member 1 and the tar parse truncates —
+        // found live on the bench against a real archive.
+        let mut b = Builder::new(Vec::new());
+        b.append_data(
+            &mut tar_header(".SIGN.RSA.alpine.pub", 4),
+            ".SIGN.RSA.alpine.pub",
+            std::io::Cursor::new(b"sig!".as_slice()),
+        )
+        .unwrap();
+        b.append_data(
+            &mut tar_header("APKINDEX", apkindex_text().len() as u64),
+            "APKINDEX",
+            std::io::Cursor::new(apkindex_text()),
+        )
+        .unwrap();
+        let full_tar = b.into_inner().unwrap();
+        // Split the stream mid-archive, gzip each half, concatenate.
+        let mid = full_tar.len() / 2;
+        let mut multi = gzip(&full_tar[..mid]);
+        multi.extend_from_slice(&gzip(&full_tar[mid..]));
+        let parsed = parse_index(&multi).unwrap();
+        let ParsedIndex::Apk { entries } = parsed else {
+            panic!("expected apk variant");
+        };
+        assert_eq!(entries[0].name, "bash");
     }
 
     #[test]
