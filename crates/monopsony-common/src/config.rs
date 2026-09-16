@@ -145,6 +145,45 @@ impl Default for IntegrityConfig {
     }
 }
 
+/// Client monotonic ledger + downgrade enforcement ([ledger] section,
+/// Sprint 20 Phase 4). Manual Default (NOT derive) — derive(Default)
+/// bypasses per-field serde defaults when the whole [ledger] section is
+/// absent, which would zero `enabled` (feature permanently off) and yield
+/// an empty `policy` string (the exact trap hit by TelemetryConfig and
+/// DashboardConfig before this).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerConfig {
+    /// Master switch for ledger capture + downgrade enforcement.
+    #[serde(default = "default_ledger_enabled")]
+    pub enabled: bool,
+    /// Applied to downgrade and index parse-error verdicts:
+    /// "warn" (default, pass + header + tamper event) or "reject" (503).
+    #[serde(default = "default_ledger_policy")]
+    pub policy: String,
+    /// Warn-only staleness threshold for parsed indexes, in seconds
+    /// (0 = disabled).
+    #[serde(default)]
+    pub max_index_age_secs: u64,
+}
+
+fn default_ledger_enabled() -> bool {
+    true
+}
+
+fn default_ledger_policy() -> String {
+    "warn".to_string()
+}
+
+impl Default for LedgerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_ledger_enabled(),
+            policy: default_ledger_policy(),
+            max_index_age_secs: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpServerConfig {
     /// Bind address for HTTP cache proxy
@@ -660,6 +699,9 @@ pub struct ClientConfig {
     pub shadow_trust: ShadowPackageTrustConfig,
     #[serde(default)]
     pub auto_update: AutoUpdateConfig,
+    /// Monotonic ledger + downgrade enforcement (Sprint 20 Phase 4).
+    #[serde(default)]
+    pub ledger: LedgerConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

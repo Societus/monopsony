@@ -30,9 +30,7 @@ pub struct TamperEvent {
 
 /// Encode a spooled event into the gRPC TamperAlert message (slice-6 wiring
 /// sends this over the ControlStream).
-pub fn encode_tamper_alert(
-    event: &TamperEvent,
-) -> monopsony_common::proto::monopsony::TamperAlert {
+pub fn encode_tamper_alert(event: &TamperEvent) -> monopsony_common::proto::monopsony::TamperAlert {
     monopsony_common::proto::monopsony::TamperAlert {
         url: event.url.clone(),
         expected_sha256: event.expected_sha256.clone(),

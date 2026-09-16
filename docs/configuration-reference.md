@@ -151,6 +151,23 @@ Loaded by: `monopsony-client daemon`
 
 Same as server: `level` and `format` fields.
 
+### `[ledger]` — Integrity Ledger (downgrade enforcement)
+
+Client-side anti-rewind defense (Sprint 20 Phase 4). The daemon records the
+newest version seen per package (parsed from pacman `.db` / Alpine APKINDEX
+responses) and flags — or blocks — index/payload responses offering older
+versions. Ledger DB lives at `~/.local/state/monopsony/ledger.sqlite3`
+(outside the cert dir; survives re-pairing).
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | bool | `true` | Master switch. Absent section = enabled (defaults apply). |
+| `policy` | string | `"warn"` | Downgrade/index-parse-error verdicts: `"warn"` passes with an `X-Monopsony-Downgrade` header + tamper event; `"reject"` returns 503. |
+| `max_index_age_secs` | u64 | `0` | Warn-only staleness threshold for parsed indexes (`X-Monopsony-Index-Stale` header). `0` = disabled. |
+
+Verdicts also spool tamper events to the existing tamper-events JSONL, which
+the daemon drains to the server with heartbeats.
+
 ### Minimal client.toml Example
 
 ```toml

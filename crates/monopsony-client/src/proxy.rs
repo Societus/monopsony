@@ -79,6 +79,13 @@ pub struct ClientProxyState {
     /// provisions the server's mirror verify key; shared via Arc so the
     /// daemon can rotate the key without rebuilding the proxy.
     pub pin: std::sync::Arc<crate::pin_verify::PinState>,
+    /// Monotonic ledger + downgrade enforcement (Sprint 20 Phase 4).
+    /// None = disabled (fail-open availability; feature is off).
+    pub ledger: Option<std::sync::Arc<crate::ledger::Ledger>>,
+    /// Ledger policy from the [ledger] config section (warn | reject).
+    pub ledger_policy: String,
+    /// Warn-only index staleness threshold (0 = disabled).
+    pub ledger_max_index_age_secs: u64,
 }
 
 impl ClientProxyState {
@@ -87,14 +94,28 @@ impl ClientProxyState {
         Self {
             config,
             pin: std::sync::Arc::new(crate::pin_verify::PinState::new(None, events_path)),
+            ledger: None,
+            ledger_policy: "warn".to_string(),
+            ledger_max_index_age_secs: 0,
         }
     }
 
-    pub fn with_pin(
-        mut self,
-        pin: std::sync::Arc<crate::pin_verify::PinState>,
-    ) -> Self {
+    pub fn with_pin(mut self, pin: std::sync::Arc<crate::pin_verify::PinState>) -> Self {
         self.pin = pin;
+        self
+    }
+
+    /// Attach the ledger + policy knobs (Sprint 20 Phase 4). Called by the
+    /// daemon when [ledger] enabled; omitted → enforcement inert.
+    pub fn with_ledger(
+        mut self,
+        ledger: std::sync::Arc<crate::ledger::Ledger>,
+        policy: String,
+        max_index_age_secs: u64,
+    ) -> Self {
+        self.ledger = Some(ledger);
+        self.ledger_policy = policy;
+        self.ledger_max_index_age_secs = max_index_age_secs;
         self
     }
 
@@ -216,30 +237,27 @@ impl ClientProxyState {
         // Read the response head with a timeout, accumulating bytes until the
         // `\r\n\r\n` terminator. Only the head is buffered (hard-capped at
         // 16 KiB); tunnel bytes stream untouched afterwards.
-        let head = tokio::time::timeout(
-            Duration::from_millis(self.config.timeout_ms),
-            async {
-                let mut buf = Vec::with_capacity(256);
-                let mut chunk = [0u8; 512];
-                loop {
-                    let n = stream
-                        .read(&mut chunk)
-                        .await
-                        .map_err(|_| "Server proxy CONNECT failed")?;
-                    if n == 0 {
-                        // Unexpected EOF before a complete response head.
-                        return Err("Server proxy CONNECT failed");
-                    }
-                    buf.extend_from_slice(&chunk[..n]);
-                    if find_head_end(&buf).is_some() {
-                        return Ok(buf);
-                    }
-                    if buf.len() > 16 * 1024 {
-                        return Err("Server proxy CONNECT failed");
-                    }
+        let head = tokio::time::timeout(Duration::from_millis(self.config.timeout_ms), async {
+            let mut buf = Vec::with_capacity(256);
+            let mut chunk = [0u8; 512];
+            loop {
+                let n = stream
+                    .read(&mut chunk)
+                    .await
+                    .map_err(|_| "Server proxy CONNECT failed")?;
+                if n == 0 {
+                    // Unexpected EOF before a complete response head.
+                    return Err("Server proxy CONNECT failed");
                 }
-            },
-        )
+                buf.extend_from_slice(&chunk[..n]);
+                if find_head_end(&buf).is_some() {
+                    return Ok(buf);
+                }
+                if buf.len() > 16 * 1024 {
+                    return Err("Server proxy CONNECT failed");
+                }
+            }
+        })
         .await
         .map_err(|_| "Server proxy CONNECT timed out")??;
 
@@ -251,7 +269,11 @@ impl ClientProxyState {
         let status_code = std::str::from_utf8(&head)
             .ok()
             .and_then(|s| s.lines().next())
-            .and_then(|line| line.split_whitespace().nth(1).and_then(|c| c.parse::<u16>().ok()))
+            .and_then(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .and_then(|c| c.parse::<u16>().ok())
+            })
             .ok_or("Server proxy CONNECT failed")?;
 
         if status_code == 200 {
@@ -402,7 +424,14 @@ async fn proxy_handler(
                     // 206 partial responses are skipped — a partial body's
                     // hash cannot match the whole-object pin.
                     if method != Method::HEAD && response.status() == StatusCode::OK {
-                        return wrap_with_pin_check(state, &uri, response);
+                        // Ledger first (Sprint 20 Phase 4): index/payload
+                        // enforcement may 503 or add headers; the surviving
+                        // response then goes through the pin stream check
+                        // (pin check wraps THIS function's result — for
+                        // ledger-modified bodies the pin still verifies the
+                        // exact bytes handed to the PM).
+                        let resp = wrap_with_ledger_check(state.clone(), &uri, response).await;
+                        return wrap_with_pin_check(state, &uri, resp);
                     }
                     return response;
                 }
@@ -460,7 +489,10 @@ fn build_503(msg: &'static str) -> Response<Body> {
 /// `normalize_url_scheme` applied when the pin was recorded.
 fn pin_url(uri: &hyper::Uri) -> String {
     match uri.scheme_str() {
-        Some("http") => format!("https://{}", uri.authority().map(|a| a.as_str()).unwrap_or("")),
+        Some("http") => format!(
+            "https://{}",
+            uri.authority().map(|a| a.as_str()).unwrap_or("")
+        ),
         _ => uri.to_string(),
     }
 }
@@ -511,12 +543,8 @@ fn wrap_with_pin_check(
 
     let expected = att.expected_sha256.clone();
     let data_stream = body.into_data_stream();
-    let checked = crate::pin_verify::pin_check_stream(
-        data_stream,
-        state.pin.clone(),
-        url,
-        expected,
-    );
+    let checked =
+        crate::pin_verify::pin_check_stream(data_stream, state.pin.clone(), url, expected);
     parts
         .headers
         .insert("X-Monopsony-Verified", "pending".parse().expect("static"));
@@ -530,6 +558,317 @@ fn dirs_events_path() -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/monopsony"));
     base.join("tamper-events.jsonl")
 }
+
+// ---- Sprint 20 Phase 4: ledger enforcement (index + payload) ----
+
+/// Hard cap on buffered index bodies (pacman .db can reach tens of MB;
+/// 256 MB covers every current repo DB with margin).
+const MAX_INDEX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// PM identity used in ledger package keys, derived from the URL (host/path
+/// shapes — NOT full backend instantiation). Unknown → enforcement skipped.
+fn pm_kind_from_url(uri: &hyper::Uri) -> Option<&'static str> {
+    let host = uri.host().unwrap_or("").to_ascii_lowercase();
+    let path = uri.path();
+    if host.contains("archlinux") || path.contains(".pkg.tar") || path.ends_with(".db") {
+        return Some("pacman");
+    }
+    if host.contains("alpine") || path.contains("APKINDEX") {
+        return Some("apk");
+    }
+    None
+}
+
+/// Best-effort (name, version) from a pacman payload filename
+/// (`bash-5.2.38-1-x86_64.pkg.tar.zst`). Returns None when the shape does
+/// not parse unambiguously — enforcement is skipped, never guessed.
+fn pacman_payload_info(path: &str) -> Option<(String, String)> {
+    let fname = path.rsplit('/').next()?;
+    let stem = fname.split(".pkg.tar").next()?;
+    if stem == fname || stem.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = stem.split('-').collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let arch = parts[parts.len() - 1];
+    let rel = parts[parts.len() - 2];
+    let ver = parts[parts.len() - 3];
+    if arch.is_empty()
+        || !rel.bytes().all(|b| b.is_ascii_digit())
+        || !ver.bytes().next()?.is_ascii_digit()
+    {
+        return None;
+    }
+    let name = parts[..parts.len() - 3].join("-");
+    if name.is_empty() {
+        return None;
+    }
+    // Re-join version-pkgrel so normalize() splits the release back out.
+    Some((name, format!("{}-{}", ver, rel)))
+}
+
+/// Ledger enforcement for 200 GET responses (Sprint 20 Phase 4).
+///
+/// - Index responses (`.db`, APKINDEX): buffer (capped), parse off-thread,
+///   feed every entry through the high-water ledger. Downgrades and parse
+///   errors follow the configured policy: "reject" → 503 + tamper event,
+///   "warn" → pass + `X-Monopsony-Downgrade` / error header + event.
+/// - Payload responses parseable to (name, version): read-only cross-check
+///   against the held high-water (indexes are the only writers).
+/// - Ledger absent / URL unrecognized → untouched (feature inert).
+///
+/// Ordering with the pin check: the PIN check wraps the response this
+/// returns (call site), so pinned index bodies are still stream-hashed —
+/// a reconstituted body carries the same bytes.
+async fn wrap_with_ledger_check(
+    state: std::sync::Arc<ClientProxyState>,
+    uri: &hyper::Uri,
+    response: Response<Body>,
+) -> Response<Body> {
+    let Some(ledger) = state.ledger.clone() else {
+        return response;
+    };
+    let pm = match pm_kind_from_url(uri) {
+        Some(pm) => pm,
+        None => return response,
+    };
+
+    let canonical = pin_url(uri); // https-canonical form (repo_key / source)
+    let is_index = crate::index_parse::looks_like_index(uri.path());
+    let payload = if is_index { None } else { pacman_payload_info(uri.path()) };
+
+    // ---- Payload cross-check (read-only; no body buffering) ----
+    if let Some((name, version)) = payload {
+        let key = crate::index_parse::package_key_for(pm, &name);
+        let held = {
+            let ledger = ledger.clone();
+            let key = key.clone();
+            tokio::task::spawn_blocking(move || ledger.high_water_for(&key))
+                .await
+                .ok()
+                .flatten()
+        };
+        let Some(held) = held else { return response };
+        let offered = monopsony_common::version_ord::normalize(&version);
+        let held_norm = monopsony_common::version_ord::normalize(&held);
+        if monopsony_common::version_ord::vercmp(&offered, &held_norm)
+            != std::cmp::Ordering::Less
+        {
+            return response;
+        }
+        let detail = format!(
+            "downgrade: payload {} offered {} below held {}",
+            key, version, held
+        );
+        warn!("{}", detail);
+        state.pin.record_event(&crate::pin_verify::TamperEvent {
+            url: canonical,
+            expected_sha256: String::new(),
+            actual_sha256: String::new(),
+            detail,
+            observed_at: chrono::Utc::now().timestamp(),
+        });
+        if state.ledger_policy == "reject" {
+            return build_503("package version rewound - held by client ledger");
+        }
+        let (mut parts, body) = response.into_parts();
+        parts.headers.insert(
+            "X-Monopsony-Downgrade",
+            format!("{}={};held={}", key, version, held)
+                .parse()
+                .expect("header value"),
+        );
+        return Response::from_parts(parts, body);
+    }
+
+    if !is_index {
+        return response;
+    }
+
+    // ---- Index path: buffer → parse → ledger (off-thread) ----
+    let (mut parts, body) = response.into_parts();
+    use http_body_util::BodyExt;
+    let collected = match BodyExt::collect(body).await {
+        Ok(c) => c.to_bytes(),
+        Err(e) => {
+            warn!("Index body read failed for {}: {}", uri, e);
+            return build_503("index body read failed");
+        }
+    };
+    // Cap AFTER collect: warn policy must be able to serve the bytes it has;
+    // decompression bombs are separately bounded inside parse_index (256 MB
+    // decode cap / 100k entries).
+    if collected.len() as u64 > MAX_INDEX_BYTES {
+        let outcome = IndexOutcome::Oversize;
+        return ledger_index_verdict_response(state, outcome, parts, collected.to_vec());
+    }
+
+    let repo_key = crate::index_parse::repo_key_from_url(&canonical);
+    let max_age = state.ledger_max_index_age_secs;
+    let parse_bytes = collected.to_vec();
+    let canonical_for_task = canonical.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        let canonical = canonical_for_task;
+        let now = chrono::Utc::now().timestamp();
+        // Staleness v1: previous age BEFORE this response refreshes it.
+        let prev_age = ledger.repo_age_secs(&repo_key);
+        let parsed = crate::index_parse::parse_index(&parse_bytes);
+        let entries = match &parsed {
+            Ok(p) => match p {
+                crate::index_parse::ParsedIndex::Pacman { entries } => entries.clone(),
+                crate::index_parse::ParsedIndex::Apk { entries } => entries.clone(),
+            },
+            Err(_) => Vec::new(),
+        };
+        let mut downgrades: Vec<(String, String, String)> = Vec::new();
+        if parsed.is_ok() {
+            let _ = ledger.repo_seen(&repo_key, now);
+            for entry in &entries {
+                let key = crate::index_parse::package_key_for(pm, &entry.name);
+                let norm = monopsony_common::version_ord::normalize(&entry.version);
+                if let Ok(crate::ledger::CheckVerdict::Downgrade { held }) =
+                    ledger.check_and_update(&key, &entry.version, &norm, &canonical, now)
+                {
+                    downgrades.push((key, entry.version.clone(), held));
+                }
+            }
+        }
+        (parsed, downgrades, prev_age, now)
+    })
+    .await;
+
+    let (parsed, downgrades, prev_age, now) = match join {
+        Ok(v) => v,
+        Err(e) => {
+            // Join failure = panic inside parse; parse_index is panic-free by
+            // contract, so this is a poisoned worker — fail-open (serve) and
+            // record an event so it is not silent.
+            warn!("Ledger task panicked: {}", e);
+            state.pin.record_event(&crate::pin_verify::TamperEvent {
+                url: canonical,
+                expected_sha256: String::new(),
+                actual_sha256: String::new(),
+                detail: "ledger: index task join failure".to_string(),
+                observed_at: chrono::Utc::now().timestamp(),
+            });
+            parts.headers.insert(
+                "X-Monopsony-Index-Parse-Error",
+                "1".parse().expect("static"),
+            );
+            return Response::from_parts(parts, Body::from(collected));
+        }
+    };
+
+    // Staleness header (warn-only v1).
+    if max_age > 0 {
+        if let Some(age) = prev_age {
+            if age > max_age as i64 {
+                parts.headers.insert(
+                    "X-Monopsony-Index-Stale",
+                    age.to_string().parse().expect("digits"),
+                );
+            }
+        }
+    }
+
+    let outcome = match parsed {
+        Err(e) => IndexOutcome::ParseError(e.to_string()),
+        Ok(_) if downgrades.is_empty() => IndexOutcome::Clean,
+        Ok(_) => IndexOutcome::Downgrades(downgrades),
+    };
+    let _ = now;
+    ledger_index_verdict_response(state, outcome, parts, collected.to_vec())
+}
+
+/// Index-path outcomes for [`ledger_index_verdict_response`].
+enum IndexOutcome {
+    Clean,
+    Oversize,
+    ParseError(String),
+    Downgrades(Vec<(String, String, String)>), // (key, offered, held)
+}
+
+/// Apply the warn/reject policy to an index outcome and rebuild the response.
+/// `body` is the buffered index bytes (empty for reject/oversize, which do
+/// not forward the body).
+fn ledger_index_verdict_response(
+    state: std::sync::Arc<ClientProxyState>,
+    outcome: IndexOutcome,
+    mut parts: axum::http::response::Parts,
+    body: Vec<u8>,
+) -> Response<Body> {
+    let reject = state.ledger_policy == "reject";
+    match outcome {
+        IndexOutcome::Clean => Response::from_parts(parts, Body::from(body)),
+        IndexOutcome::Oversize => {
+            // Availability policy: oversize indexes are a capacity event, not
+            // proof of tampering — warn-policy passes them through unserved?
+            // No: the body is already buffered; forwarding is impossible
+            // without re-fetch. Treat as parse-error-class (policy split).
+            let detail = "index-parse-error: index exceeds 256MB cap".to_string();
+            state.pin.record_event(&crate::pin_verify::TamperEvent {
+                url: String::new(),
+                expected_sha256: String::new(),
+                actual_sha256: String::new(),
+                detail,
+                observed_at: chrono::Utc::now().timestamp(),
+            });
+            if reject {
+                build_503("package index rejected - size over ledger cap")
+            } else {
+                build_503("index over ledger cap - refetch with smaller index")
+            }
+        }
+        IndexOutcome::ParseError(e) => {
+            let detail = format!("index-parse-error: {}", e);
+            warn!("{}", detail);
+            state.pin.record_event(&crate::pin_verify::TamperEvent {
+                url: String::new(),
+                expected_sha256: String::new(),
+                actual_sha256: String::new(),
+                detail,
+                observed_at: chrono::Utc::now().timestamp(),
+            });
+            if reject {
+                build_503("package index failed parsing - rejected by ledger policy")
+            } else {
+                parts.headers.insert(
+                    "X-Monopsony-Index-Parse-Error",
+                    "1".parse().expect("static"),
+                );
+                Response::from_parts(parts, Body::from(body))
+            }
+        }
+        IndexOutcome::Downgrades(list) => {
+            let summary: Vec<String> = list
+                .iter()
+                .take(8)
+                .map(|(k, o, h)| format!("{}={};held={}", k, o, h))
+                .collect();
+            let detail = format!("downgrade: {}", summary.join(", "));
+            warn!("{}", detail);
+            state.pin.record_event(&crate::pin_verify::TamperEvent {
+                url: String::new(),
+                expected_sha256: String::new(),
+                actual_sha256: String::new(),
+                detail,
+                observed_at: chrono::Utc::now().timestamp(),
+            });
+            if reject {
+                build_503("package index rewound - held by client ledger")
+            } else {
+                parts.headers.insert(
+                    "X-Monopsony-Downgrade",
+                    summary.join(",").parse().expect("header value"),
+                );
+                Response::from_parts(parts, Body::from(body))
+            }
+        }
+    }
+}
+
 
 /// Handle a CONNECT request by relaying a tunnel through the server proxy.
 ///
@@ -628,8 +967,15 @@ pub async fn run_proxy(
     listen_addr: SocketAddr,
     config: ProxyConfig,
     pin: std::sync::Arc<crate::pin_verify::PinState>,
+    ledger: Option<std::sync::Arc<crate::ledger::Ledger>>,
+    ledger_policy: String,
+    ledger_max_index_age_secs: u64,
 ) -> anyhow::Result<()> {
-    let state = Arc::new(ClientProxyState::new(config).with_pin(pin));
+    let mut state = ClientProxyState::new(config).with_pin(pin);
+    if let Some(ledger) = ledger {
+        state = state.with_ledger(ledger, ledger_policy, ledger_max_index_age_secs);
+    }
+    let state = Arc::new(state);
 
     let app = axum::Router::new()
         .route("/*path", axum::routing::any(proxy_handler))
@@ -652,11 +998,10 @@ pub async fn run_proxy(
             state: state.clone(),
         };
         tokio::spawn(async move {
-            let _ = hyper_util::server::conn::auto::Builder::new(
-                hyper_util::rt::TokioExecutor::new(),
-            )
-            .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), svc)
-            .await;
+            let _ =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), svc)
+                    .await;
         });
     }
 }
@@ -675,10 +1020,7 @@ impl hyper::service::Service<Request<hyper::body::Incoming>> for ClientHyperServ
     type Response = axum::response::Response;
     type Error = std::convert::Infallible;
     type Future = std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Self::Response, Self::Error>>
-                + Send,
-        >,
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
     >;
 
     fn call(&self, req: Request<hyper::body::Incoming>) -> Self::Future {

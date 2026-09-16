@@ -1,0 +1,17 @@
+# Monopsony release artifact checksums
+
+Provenance record for the v0.1.0-rc1 binaries deployed to the test fleet.
+The binaries themselves were removed from git history 2026-09-15; these
+checksums pin the exact bytes of the deployed copies so any binary in the
+wild can still be verified as ours.
+
+```
+dd86f74cb1d1fc3fd3625b2bf345353ca0d783e69c97cc5dce7fba6d9fb17105  monopsony-client
+cb59cf11a8b174f07ed380cf20e022da00971ada5f8a55901c39701784e842a8  monopsony-server
+8dca83d932a47f9e088cf55ef0b8f6238805967beb962bca8b4a6ca7768eea2e  monopsony-tracker
+```
+
+Build provenance: v0.1.0-rc1 tag state (Sprint 5, commit subject
+"Sprint 5: Hardening + Auth Foundation → v0.1.0-rc1"). Rebuild with
+`RUSTFLAGS="--remap-path-prefix=/home/$USER=/build"` so future artifacts
+do not embed build-host paths.

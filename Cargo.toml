@@ -41,6 +41,7 @@ prost-types = "0.13"
 # Tracked upstream. Will resolve when sqlx 0.9 is stable. No action needed for RC.
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
+zstd = "0.13"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

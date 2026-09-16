@@ -37,6 +37,8 @@ fn default_cert_dir() -> String {
 mod auto_update;
 mod discovery;
 mod grpc_client;
+mod index_parse;
+mod ledger;
 mod pin_verify;
 mod proxy;
 mod self_update;
@@ -513,6 +515,15 @@ async fn resolve_server_addr(cert_dir: &Path) -> anyhow::Result<String> {
     Ok(addr)
 }
 
+/// Ledger DB parent dir: the client state dir (~/.local/state/monopsony),
+/// same convention as the tamper-event spool. NOT cert_dir — the anti-rewind
+/// anchor must survive re-pairing.
+fn dirs_ledger_parent(_cert_dir: &Path) -> PathBuf {
+    std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".local/state/monopsony"))
+        .unwrap_or_else(|_| PathBuf::from("/tmp/monopsony"))
+}
+
 /// Load the pinned mirror verifying key saved at pair/register time.
 /// Returns None when absent, wrong-sized, or zeroed (not provisioned).
 fn load_mirror_verify_key(cert_dir: &Path) -> Option<[u8; 32]> {
@@ -779,10 +790,8 @@ async fn run_daemon(
                         // failure so alarms are never lost.
                         let events = pin_for_drain.drain_events();
                         if !events.is_empty() {
-                            let alerts: Vec<_> = events
-                                .iter()
-                                .map(pin_verify::encode_tamper_alert)
-                                .collect();
+                            let alerts: Vec<_> =
+                                events.iter().map(pin_verify::encode_tamper_alert).collect();
                             match client.report_tamper_alerts(&alerts).await {
                                 Ok(()) => {
                                     info!("Reported {} tamper alert(s)", alerts.len())
@@ -889,7 +898,42 @@ async fn run_daemon(
 
     info!("Local proxy listening on {}", listen_addr);
     info!("Heartbeat and inventory sync running in background");
-    proxy::run_proxy(listen_addr, proxy_config, pin_state.clone()).await?;
+
+    // Ledger enforcement (Sprint 20 Phase 4): open the high-water ledger
+    // when [ledger] enabled in config. Lives under the client state dir
+    // (~/.local/state/monopsony/), NOT cert_dir — re-pairing must not wipe
+    // the anti-rewind anchor. Open failure = fail-open availability (daemon
+    // runs without the ledger; tamper events still work).
+    let (ledger, ledger_policy, ledger_max_age) = match &client_config {
+        Some(cfg) if cfg.ledger.enabled => {
+            let state_dir = dirs_ledger_parent(&cert_dir);
+            let path = state_dir.join("ledger.sqlite3");
+            match crate::ledger::Ledger::open(&path) {
+                Ok(l) => {
+                    info!(
+                        "Integrity ledger: enabled (policy={})",
+                        cfg.ledger.policy
+                    );
+                    (Some(std::sync::Arc::new(l)), cfg.ledger.policy.clone(), cfg.ledger.max_index_age_secs)
+                }
+                Err(e) => {
+                    tracing::error!("Ledger open failed ({}): {} — running without ledger", path.display(), e);
+                    (None, "warn".to_string(), 0)
+                }
+            }
+        }
+        _ => (None, "warn".to_string(), 0),
+    };
+
+    proxy::run_proxy(
+        listen_addr,
+        proxy_config,
+        pin_state.clone(),
+        ledger,
+        ledger_policy,
+        ledger_max_age,
+    )
+    .await?;
 
     heartbeat_handle.abort();
     if let Some(h) = auto_update_handle {

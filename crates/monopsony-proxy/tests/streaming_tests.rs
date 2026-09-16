@@ -560,7 +560,7 @@ async fn test_connect_chain_client_to_server() {
     };
     tokio::spawn(async move {
         let addr: SocketAddr = format!("127.0.0.1:{}", client_port).parse().unwrap();
-        if let Err(e) = run_proxy(addr, client_config, pin_state).await {
+        if let Err(e) = run_proxy(addr, client_config, pin_state, None, "warn".to_string(), 0).await {
             tracing::warn!("client proxy exited: {}", e);
         }
     });

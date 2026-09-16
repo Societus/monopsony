@@ -10,6 +10,7 @@ pub mod package_manager;
 pub mod pin_store;
 pub mod proto;
 pub mod shadow_types;
+pub mod version_ord;
 
 pub use config::*;
 pub use error::{Error, Result};
