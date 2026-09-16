@@ -547,6 +547,16 @@ fn wrap_with_pin_check(
     let data_stream = body.into_data_stream();
     let checked =
         crate::pin_verify::pin_check_stream(data_stream, state.pin.clone(), url, expected);
+    // Re-frame for enforcement (fleet verification 2026-09-16, Bug 2): the
+    // hash verdict lands at END of stream. If `content-length` survives, the
+    // h1 encoder stops polling the body once that many bytes are written —
+    // the terminal poll NEVER runs and the check silently no-ops. Drop the
+    // length headers; hyper re-frames an unknown-length body as chunked, so
+    // a mismatch's synthetic error chunk aborts the transfer mid-flight and
+    // the package manager sees a failed download instead of a complete but
+    // tampered file.
+    parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+    parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
     parts
         .headers
         .insert("X-Monopsony-Verified", "pending".parse().expect("static"));
@@ -1223,5 +1233,92 @@ mod tests {
             pm_kind_for_url("https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/APKINDEX.tar.gz"),
             Some("apk")
         );
+    }
+
+    // ---- Sprint 20 Phase 3 regression tests (fleet verification 2026-09-16) ----
+
+    /// Test helper: build a signed pin attestation like the server does.
+    /// Returns the attestation AND the 32-byte verify key (public key bytes,
+    /// what `mirror_verify_key` carries and PinState::set_key expects).
+    fn signed_pin_att(url: &str, sha: &str) -> (monopsony_common::pin_store::PinAttestation, [u8; 32]) {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let mut att = monopsony_common::pin_store::PinAttestation {
+            url: url.to_string(),
+            expected_sha256: sha.to_string(),
+            origin: monopsony_common::pin_store::PinOrigin::Sidecar,
+            key_id: String::new(),
+            observed_at: 1_700_000_000,
+            signature: String::new(),
+        };
+        att.sign(&key);
+        (att, key.verifying_key().to_bytes())
+    }
+
+    /// Bug 2 regression: a wrapped response MUST NOT carry content-length.
+    /// The hash verdict lands at end-of-stream; with a length-declared body
+    /// hyper stops polling after the declared bytes and the terminal poll
+    /// (the check itself) never runs. The fix strips the framing headers so
+    /// the body is re-framed chunked and a mismatch aborts mid-transfer.
+    #[tokio::test]
+    async fn pin_wrap_strips_content_length() {
+        let sha = "ab".repeat(32);
+        let url = "https://example.com/pkg-1.0.pkg.tar.zst";
+
+        let pin = std::sync::Arc::new(crate::pin_verify::PinState::new(
+            None,
+            std::env::temp_dir().join(format!("pin-strip-{}.jsonl", std::process::id())),
+        ));
+        let (att, verify_bytes) = signed_pin_att(url, &sha);
+        pin.set_key(verify_bytes); // provisioned AFTER construction (Bug 1 path)
+        assert!(pin.provisioned());
+
+        let state = std::sync::Arc::new(
+            ClientProxyState::new(ProxyConfig::default()).with_pin(pin),
+        );
+        let uri: hyper::Uri = "http://example.com/pkg-1.0.pkg.tar.zst".parse().unwrap();
+        let resp = Response::builder()
+            .status(200)
+            .header("x-monopsony-pin", monopsony_common::pin_store::to_json(&att))
+            .header("content-length", "44562")
+            .body(Body::from("junk body"))
+            .unwrap();
+        let wrapped = wrap_with_pin_check(state, &uri, resp);
+        assert!(wrapped.headers().get("content-length").is_none());
+        assert!(wrapped.headers().get("transfer-encoding").is_none());
+        assert_eq!(
+            wrapped.headers().get("x-monopsony-verified").unwrap(),
+            "pending"
+        );
+    }
+
+    /// Unpinned/unprovisioned passthrough keeps the original framing (inert).
+    #[tokio::test]
+    async fn pin_wrap_inert_without_key_keeps_framing() {
+        let sha = "ab".repeat(32);
+        let url = "https://example.com/pkg-1.0.pkg.tar.zst";
+        let (att, _key) = signed_pin_att(url, &sha);
+
+        // NOT provisioned — verification is inert, response passes through.
+        let pin = std::sync::Arc::new(crate::pin_verify::PinState::new(
+            None,
+            std::env::temp_dir().join(format!("pin-inert-{}.jsonl", std::process::id())),
+        ));
+        let state = std::sync::Arc::new(
+            ClientProxyState::new(ProxyConfig::default()).with_pin(pin),
+        );
+        let uri: hyper::Uri = "http://example.com/pkg-1.0.pkg.tar.zst".parse().unwrap();
+        let resp = Response::builder()
+            .status(200)
+            .header("x-monopsony-pin", monopsony_common::pin_store::to_json(&att))
+            .header("content-length", "44562")
+            .body(Body::from("junk body"))
+            .unwrap();
+        let wrapped = wrap_with_pin_check(state, &uri, resp);
+        assert_eq!(
+            wrapped.headers().get("content-length").unwrap(),
+            "44562",
+            "inert path must not re-frame"
+        );
+        assert!(wrapped.headers().get("x-monopsony-verified").is_none());
     }
 }

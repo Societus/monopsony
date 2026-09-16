@@ -860,6 +860,19 @@ async fn run_daemon(
                     )
                     .await?;
                 store_mirror_verify_key(&cert_dir, &mirror_key);
+                // Provision the in-memory PinState too: it was built from the
+                // key file BEFORE this register, so without this the proxy
+                // serves unverified until the next daemon restart (fleet
+                // verification 2026-09-16, Bug 1). PinState is interior-
+                // mutable — the Arc held by the proxy picks this up live.
+                // A zeroed delivery legitimately disables (server turned
+                // pinning off); set_key maps zeroed → None.
+                if let Ok(key) = <[u8; 32]>::try_from(mirror_key.as_slice()) {
+                    pin_state.set_key(key);
+                }
+                if pin_state.provisioned() {
+                    info!("Integrity pin verification enabled (mirror key delivered at register)");
+                }
                 std::fs::write(&id_file, &id)?;
                 info!("Registered with server, client ID: {}", id);
                 id
