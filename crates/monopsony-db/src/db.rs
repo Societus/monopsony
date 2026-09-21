@@ -394,6 +394,121 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+        // Sourcedb observation log (Sprint 21): append-only version
+        // observations per canonical package_key.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS observations (
+                id              BIGSERIAL PRIMARY KEY,
+                package_key     TEXT NOT NULL,
+                source          TEXT NOT NULL,
+                version         TEXT NOT NULL,
+                version_ord     TEXT NOT NULL,
+                scheme          TEXT NOT NULL,
+                observed_at     BIGINT NOT NULL,
+                observed_by     TEXT NOT NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_observations_package_key ON observations(package_key)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Per-key resolution state (Sprint 21): chosen source, method, and
+        // poll bookkeeping for each canonical package_key.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS package_map (
+                package_key     TEXT PRIMARY KEY,
+                source          TEXT,
+                resolved_at     BIGINT,
+                resolve_method  TEXT,
+                etag            TEXT,
+                last_poll       BIGINT
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Sprint 22 (22-C1): server-global shadow recipe catalog.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS shadow_recipes (
+                name                   TEXT PRIMARY KEY,
+                recipe_toml            TEXT NOT NULL,
+                signature              TEXT NOT NULL,
+                key_id                 TEXT NOT NULL,
+                catalog_hash           TEXT NOT NULL,
+                published_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+                provenance_client_id   UUID,
+                updated_at             TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS shadow_scan_results (
+                id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                client_id         UUID REFERENCES clients(id) ON DELETE CASCADE,
+                recipe_name       TEXT NOT NULL,
+                installed         BOOLEAN NOT NULL,
+                detected_version  TEXT,
+                method            TEXT,
+                scanned_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+                UNIQUE(client_id, recipe_name)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_shadow_scan_results_client ON shadow_scan_results(client_id)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_shadow_scan_results_recipe ON shadow_scan_results(recipe_name)")
+            .execute(&self.pool)
+            .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS shadow_assignment_audit (
+                id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                client_id      UUID,
+                recipe_name    TEXT NOT NULL,
+                outcome        TEXT NOT NULL,
+                reason         TEXT,
+                acted_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_shadow_assignment_audit_client ON shadow_assignment_audit(client_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pending_shadow_assignments (
+                id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                client_id    UUID REFERENCES clients(id) ON DELETE CASCADE,
+                recipe_name  TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                delivered_at TIMESTAMPTZ,
+                resolved_at  TIMESTAMPTZ,
+                UNIQUE(client_id, recipe_name)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pending_shadow_assignments_client ON pending_shadow_assignments(client_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         info!("Database migrations complete");
         Ok(())
     }
@@ -819,6 +934,31 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Record a shadow recipe remote-assignment audit entry (Sprint 22 Phase F).
+    pub async fn record_shadow_assignment_audit(
+        &self,
+        client_id: Option<Uuid>,
+        recipe_name: &str,
+        outcome: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO shadow_assignment_audit (client_id, recipe_name, outcome, reason)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(client_id)
+        .bind(recipe_name)
+        .bind(outcome)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        debug!(
+            "Shadow assignment audit: client={:?} recipe={} outcome={} reason={:?}",
+            client_id, recipe_name, outcome, reason
+        );
+        Ok(())
+    }
+
     /// Record a client-reported tamper alert. Returns the new row id.
     pub async fn record_tamper_alert(&self, alert: &TamperAlertInsert) -> Result<i64> {
         let row = sqlx::query(
@@ -844,10 +984,11 @@ impl Database {
 
     /// True if any tamper alert has been recorded for the URL (quarantine check).
     pub async fn has_tamper_alert(&self, url: &str) -> Result<bool> {
-        let row = sqlx::query("SELECT EXISTS(SELECT 1 FROM tamper_alerts WHERE url = $1) as present")
-            .bind(url)
-            .fetch_one(&self.pool)
-            .await?;
+        let row =
+            sqlx::query("SELECT EXISTS(SELECT 1 FROM tamper_alerts WHERE url = $1) as present")
+                .bind(url)
+                .fetch_one(&self.pool)
+                .await?;
         let present: bool = row.get("present");
         Ok(present)
     }
@@ -1647,4 +1788,416 @@ impl Database {
         .await?;
         Ok(())
     }
+
+    /// Append one observation to the sourcedb observation log. The log is
+    /// append-only: duplicates by (package_key, source, version) are resolved
+    /// at read time via floor_for_package / merge, never mutated here.
+    pub async fn append_observation(
+        &self,
+        package_key: &str,
+        source: &str,
+        version: &str,
+        version_ord: &str,
+        scheme: &str,
+        observed_at: i64,
+        observed_by: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO observations (package_key, source, version, version_ord, scheme, observed_at, observed_by)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(package_key)
+        .bind(source)
+        .bind(version)
+        .bind(version_ord)
+        .bind(scheme)
+        .bind(observed_at)
+        .bind(observed_by)
+        .execute(&self.pool)
+        .await?;
+        debug!("Recorded observation for {}", package_key);
+        Ok(())
+    }
+
+    /// The floor (max by version_ord) observation for a package_key.
+    /// version_ord is lexicographically sortable, so plain DESC string order.
+    pub async fn floor_for_package(&self, package_key: &str) -> Result<Option<ObservationRow>> {
+        let row = sqlx::query(
+            "SELECT package_key, source, version, version_ord, scheme, observed_at, observed_by
+             FROM observations WHERE package_key = $1
+             ORDER BY version_ord DESC LIMIT 1",
+        )
+        .bind(package_key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| ObservationRow {
+            package_key: r.get("package_key"),
+            source: r.get("source"),
+            version: r.get("version"),
+            version_ord: r.get("version_ord"),
+            scheme: r.get("scheme"),
+            observed_at: r.get("observed_at"),
+            observed_by: r.get("observed_by"),
+        }))
+    }
+
+    /// All floors — the max-by-version_ord observation for EVERY package_key
+    /// — for oracle delta generation. Companion to floor_for_package.
+    pub async fn all_floors(&self) -> Result<Vec<ObservationRow>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT ON (package_key)
+                    package_key, source, version, version_ord, scheme, observed_at, observed_by
+             FROM observations
+             ORDER BY package_key, version_ord DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| ObservationRow {
+                package_key: r.get("package_key"),
+                source: r.get("source"),
+                version: r.get("version"),
+                version_ord: r.get("version_ord"),
+                scheme: r.get("scheme"),
+                observed_at: r.get("observed_at"),
+                observed_by: r.get("observed_by"),
+            })
+            .collect())
+    }
+
+    /// MAX(resolved_at) from package_map — freshest oracle resolution time
+    /// (unix ms), for the dashboard stat + delta metadata. None when empty.
+    pub async fn oracle_last_resolved(&self) -> Result<Option<i64>> {
+        let row: (Option<i64>,) =
+            sqlx::query_as("SELECT MAX(resolved_at) FROM package_map")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(row.0)
+    }
+
+    /// Upsert per-key resolution state.
+    pub async fn upsert_package_map(
+        &self,
+        package_key: &str,
+        source: Option<&str>,
+        resolved_at: Option<i64>,
+        resolve_method: Option<&str>,
+        etag: Option<&str>,
+        last_poll: Option<i64>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO package_map (package_key, source, resolved_at, resolve_method, etag, last_poll)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (package_key) DO UPDATE SET
+                 source = EXCLUDED.source,
+                 resolved_at = EXCLUDED.resolved_at,
+                 resolve_method = EXCLUDED.resolve_method,
+                 etag = EXCLUDED.etag,
+                 last_poll = EXCLUDED.last_poll",
+        )
+        .bind(package_key)
+        .bind(source)
+        .bind(resolved_at)
+        .bind(resolve_method)
+        .bind(etag)
+        .bind(last_poll)
+        .execute(&self.pool)
+        .await?;
+        debug!("Upserted package_map for {}", package_key);
+        Ok(())
+    }
+
+    /// Fetch per-key resolution state, if any.
+    pub async fn get_package_map(&self, package_key: &str) -> Result<Option<PackageMapRow>> {
+        let row = sqlx::query(
+            "SELECT package_key, source, resolved_at, resolve_method, etag, last_poll
+             FROM package_map WHERE package_key = $1",
+        )
+        .bind(package_key)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| PackageMapRow {
+            package_key: r.get("package_key"),
+            source: r.get("source"),
+            resolved_at: r.get("resolved_at"),
+            resolve_method: r.get("resolve_method"),
+            etag: r.get("etag"),
+            last_poll: r.get("last_poll"),
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Shadow recipe catalog (Sprint 22, 22-C1)
+    // -----------------------------------------------------------------------
+
+    /// Insert or update a server-global shadow recipe catalog entry.
+    pub async fn upsert_shadow_recipe(
+        &self,
+        name: &str,
+        recipe_toml: &str,
+        signature: &str,
+        key_id: &str,
+        catalog_hash: &str,
+        provenance_client_id: Option<&uuid::Uuid>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO shadow_recipes (name, recipe_toml, signature, key_id, catalog_hash, provenance_client_id, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, now())
+             ON CONFLICT (name) DO UPDATE SET
+                 recipe_toml = EXCLUDED.recipe_toml,
+                 signature = EXCLUDED.signature,
+                 key_id = EXCLUDED.key_id,
+                 catalog_hash = EXCLUDED.catalog_hash,
+                 provenance_client_id = EXCLUDED.provenance_client_id,
+                 updated_at = now()",
+        )
+        .bind(name)
+        .bind(recipe_toml)
+        .bind(signature)
+        .bind(key_id)
+        .bind(catalog_hash)
+        .bind(provenance_client_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List every shadow recipe catalog entry, ordered by name.
+    pub async fn list_shadow_catalog(&self) -> Result<Vec<ShadowRecipeRow>> {
+        let rows = sqlx::query(
+            "SELECT name, recipe_toml, signature, key_id, catalog_hash, published_at, provenance_client_id
+             FROM shadow_recipes ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| ShadowRecipeRow {
+                name: r.get("name"),
+                recipe_toml: r.get("recipe_toml"),
+                signature: r.get("signature"),
+                key_id: r.get("key_id"),
+                catalog_hash: r.get("catalog_hash"),
+                published_at: r.get::<chrono::DateTime<Utc>, _>("published_at").timestamp(),
+                provenance_client_id: r.get("provenance_client_id"),
+            })
+            .collect())
+    }
+
+    /// Insert or update a per-client shadow scan finding.
+    pub async fn upsert_shadow_scan_result(
+        &self,
+        client_id: &uuid::Uuid,
+        recipe_name: &str,
+        installed: bool,
+        detected_version: Option<&str>,
+        method: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO shadow_scan_results (client_id, recipe_name, installed, detected_version, method, scanned_at)
+             VALUES ($1, $2, $3, $4, $5, now())
+             ON CONFLICT (client_id, recipe_name) DO UPDATE SET
+                 installed = EXCLUDED.installed,
+                 detected_version = EXCLUDED.detected_version,
+                 method = EXCLUDED.method,
+                 scanned_at = now()",
+        )
+        .bind(client_id)
+        .bind(recipe_name)
+        .bind(installed)
+        .bind(detected_version)
+        .bind(method)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List all shadow scan results (dashboard coverage view).
+    pub async fn list_shadow_scan_results(&self) -> Result<Vec<ShadowScanResultRow>> {
+        let rows = sqlx::query(
+            "SELECT id, client_id, recipe_name, installed, detected_version, method, scanned_at
+             FROM shadow_scan_results ORDER BY recipe_name, client_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| ShadowScanResultRow {
+                id: r.get("id"),
+                client_id: r.get("client_id"),
+                recipe_name: r.get("recipe_name"),
+                installed: r.get("installed"),
+                detected_version: r.get("detected_version"),
+                method: r.get("method"),
+                scanned_at: r.get::<chrono::DateTime<Utc>, _>("scanned_at").timestamp(),
+            })
+            .collect())
+    }
+
+    // ── Pending shadow assignments (Sprint 22 slice 22-E2a) ──
+
+    /// Queue a shadow recipe for push to a client. Upsert: re-assigning an
+    /// existing (client, recipe) pair resets the row to 'pending' and clears
+    /// delivery/resolution timestamps.
+    pub async fn create_pending_assignment(
+        &self,
+        client_id: Uuid,
+        recipe_name: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pending_shadow_assignments (client_id, recipe_name, status)
+             VALUES ($1, $2, 'pending')
+             ON CONFLICT (client_id, recipe_name)
+             DO UPDATE SET status = 'pending', delivered_at = NULL, resolved_at = NULL",
+        )
+        .bind(client_id)
+        .bind(recipe_name)
+        .execute(&self.pool)
+        .await?;
+        debug!(
+            "Pending shadow assignment created: client={} recipe={}",
+            client_id, recipe_name
+        );
+        Ok(())
+    }
+
+    /// Fetch and mark-delivery pending assignments for a client.
+    /// Rows keep status 'pending' (resolution happens via
+    /// complete_pending_assignment when the client acks); delivered_at
+    /// records the push. Only never-delivered rows are returned — a
+    /// delivered-but-un-acked row must not re-push every tick (caught
+    /// live: re-delivery created 1800+ duplicate registrations).
+    pub async fn take_pending_assignments(
+        &self,
+        client_id: Uuid,
+    ) -> Result<Vec<PendingAssignmentRow>> {
+        let rows = sqlx::query(
+            "UPDATE pending_shadow_assignments
+             SET delivered_at = now()
+             WHERE client_id = $1 AND status = 'pending' AND delivered_at IS NULL
+             RETURNING id, client_id, recipe_name, status, created_at, delivered_at, resolved_at",
+        )
+        .bind(client_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let out: Vec<PendingAssignmentRow> = rows
+            .into_iter()
+            .map(|r| PendingAssignmentRow {
+                id: r.get("id"),
+                client_id: r.get("client_id"),
+                recipe_name: r.get("recipe_name"),
+                status: r.get("status"),
+                created_at: r.get::<chrono::DateTime<Utc>, _>("created_at").timestamp(),
+                delivered_at: r
+                    .try_get::<Option<chrono::DateTime<Utc>>, _>("delivered_at")
+                    .ok()
+                    .flatten()
+                    .map(|t| t.timestamp()),
+                resolved_at: r
+                    .try_get::<Option<chrono::DateTime<Utc>>, _>("resolved_at")
+                    .ok()
+                    .flatten()
+                    .map(|t| t.timestamp()),
+            })
+            .collect();
+        debug!(
+            "Took {} pending shadow assignments for client {}",
+            out.len(),
+            client_id
+        );
+        Ok(out)
+    }
+
+    /// Mark an assignment resolved: status 'applied' | 'refused'.
+    pub async fn complete_pending_assignment(
+        &self,
+        client_id: Uuid,
+        recipe_name: &str,
+        status: &str,
+    ) -> Result<()> {
+        debug_assert!(status == "applied" || status == "refused");
+        sqlx::query(
+            "UPDATE pending_shadow_assignments
+             SET status = $3, resolved_at = now()
+             WHERE client_id = $1 AND recipe_name = $2",
+        )
+        .bind(client_id)
+        .bind(recipe_name)
+        .bind(status)
+        .execute(&self.pool)
+        .await?;
+        debug!(
+            "Pending shadow assignment completed: client={} recipe={} status={}",
+            client_id, recipe_name, status
+        );
+        Ok(())
+    }
+}
+
+/// Row from observations (Sprint 21 sourcedb observation log).
+#[derive(Debug, Clone)]
+pub struct ObservationRow {
+    pub package_key: String,
+    pub source: String,
+    pub version: String,
+    pub version_ord: String,
+    pub scheme: String,
+    pub observed_at: i64,
+    pub observed_by: String,
+}
+
+/// Row from package_map: per-key source resolution state.
+#[derive(Debug, Clone)]
+pub struct PackageMapRow {
+    pub package_key: String,
+    pub source: Option<String>,
+    pub resolved_at: Option<i64>,
+    pub resolve_method: Option<String>,
+    pub etag: Option<String>,
+    pub last_poll: Option<i64>,
+}
+
+/// Row from shadow_recipes: one server-global shadow recipe catalog entry.
+#[derive(Debug, Clone)]
+pub struct ShadowRecipeRow {
+    pub name: String,
+    pub recipe_toml: String,
+    pub signature: String,
+    pub key_id: String,
+    pub catalog_hash: String,
+    pub published_at: i64,
+    pub provenance_client_id: Option<Uuid>,
+}
+
+/// Row from shadow_scan_results: one per-client shadow scan finding.
+#[derive(Debug, Clone)]
+pub struct ShadowScanResultRow {
+    pub id: Uuid,
+    pub client_id: Option<Uuid>,
+    pub recipe_name: String,
+    pub installed: bool,
+    pub detected_version: Option<String>,
+    pub method: Option<String>,
+    pub scanned_at: i64,
+}
+
+/// Row from pending_shadow_assignments (Sprint 22 slice 22-E2a):
+/// a shadow recipe queued for push to a client via control-stream Command.
+#[derive(Debug, Clone)]
+pub struct PendingAssignmentRow {
+    pub id: Uuid,
+    pub client_id: Option<Uuid>,
+    pub recipe_name: String,
+    /// 'pending' | 'applied' | 'refused'
+    pub status: String,
+    pub created_at: i64,
+    pub delivered_at: Option<i64>,
+    pub resolved_at: Option<i64>,
 }

@@ -21,6 +21,10 @@ service MonopsonyControl {
     rpc RollbackShadowUpdate(RollbackShadowUpdateRequest) returns (ShadowUpdateResult);
     rpc GetShadowRecipe(GetShadowRecipeRequest) returns (SignedShadowRecipe);
     rpc DownloadShadowAsset(DownloadShadowAssetRequest) returns (stream ShadowAssetChunk);
+
+    // Server-global recipe catalog (Sprint 22 Phase C, tracker-shaped edges)
+    rpc ListShadowCatalog(ListShadowCatalogRequest) returns (ShadowCatalog);
+    rpc ReportShadowScan(ShadowScanReport) returns (ShadowScanAck);
 }
 
 // Client -> Server messages (for streaming)
@@ -333,4 +337,44 @@ message ShadowAssetChunk {
     int64 offset = 2;
     int64 total_size = 3;
     string blob_hash = 4;
+}
+
+// ── Shadow Recipe Catalog (Sprint 22 Phase C) ──
+
+message ListShadowCatalogRequest {
+    string client_id = 1;
+    string catalog_hash = 2; // client's current hash; empty = full pull
+}
+
+message ShadowCatalogEntry {
+    string name = 1;
+    string recipe_toml = 2;
+    string signature = 3;    // server recipe key Ed25519 over canonical JSON
+    string key_id = 4;
+    string catalog_hash = 5; // sha256 of canonical JSON of this entry's {name, recipe_toml}
+    int64 published_at = 6;
+    string provenance_client_id = 7;
+}
+
+message ShadowCatalog {
+    string catalog_hash = 1;              // hash of the whole catalog (change detection)
+    repeated ShadowCatalogEntry entries = 2;
+}
+
+message ShadowScanReport {
+    string client_id = 1;
+    string catalog_hash = 2;              // the catalog version the scan ran against
+    repeated ShadowScanFinding findings = 3;
+}
+
+message ShadowScanFinding {
+    string recipe_name = 1;
+    bool installed = 2;
+    string detected_version = 3; // empty when not installed / undetected
+    string method = 4;           // "install_path" | "detect_command"
+}
+
+message ShadowScanAck {
+    bool accepted = 1;
+    string message = 2;
 }

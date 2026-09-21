@@ -604,6 +604,23 @@ pub struct ShadowPackageTrustConfig {
     /// Operator key IDs to trust (for verifying countersignatures)
     #[serde(default)]
     pub trusted_operator_keys: Vec<String>,
+
+    /// Path to the operator (server shadow-manager) verifying key, hex-encoded
+    /// 32-byte Ed25519 public key. Required for `trusted_server_only` (the
+    /// default policy) to pass: provisioned once per client alongside the CA
+    /// and oracle pin, from the server's shadow signing key.
+    #[serde(default)]
+    pub operator_verifying_key_path: Option<String>,
+
+    /// Client-side opt-in to consuming remote shadow assignments pushed by
+    /// the server (`shadow_assign` UPDATE_CONFIG commands). Default: false.
+    /// NOTE: plain `#[serde(default)]` is correct here ONLY because bool's
+    /// default is false. The project does NOT derive(Default) on config
+    /// structs precisely so non-false defaults must be explicit — if you add
+    /// a field whose default is not Rust's zero value, give it an explicit
+    /// `#[serde(default = "...")]` fn and update the Default impl below.
+    #[serde(default)]
+    pub accept_remote_assignment: bool,
 }
 
 impl Default for ShadowPackageTrustConfig {
@@ -612,6 +629,8 @@ impl Default for ShadowPackageTrustConfig {
             policy: default_trust_policy(),
             trusted_author_keys: Vec::new(),
             trusted_operator_keys: Vec::new(),
+            operator_verifying_key_path: None,
+            accept_remote_assignment: false,
         }
     }
 }
@@ -731,6 +750,12 @@ pub struct ServerConnectionConfig {
     /// Alternate addresses to try if primary fails.
     #[serde(default)]
     pub alt_addresses: Vec<String>,
+    /// Oracle delta URL (Sprint 21): absolute, e.g.
+    /// "http://10.10.20.58:3130/.well-known/monopsony/oracle-delta.json".
+    /// Empty/absent = oracle sync off (floors stay whatever is on disk).
+    /// The delta is fetched directly, NEVER routed through the proxy.
+    #[serde(default)]
+    pub oracle_url: Option<String>,
 }
 
 fn default_grpc_port() -> u16 {

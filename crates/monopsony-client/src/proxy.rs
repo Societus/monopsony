@@ -86,6 +86,9 @@ pub struct ClientProxyState {
     pub ledger_policy: String,
     /// Warn-only index staleness threshold (0 = disabled).
     pub ledger_max_index_age_secs: u64,
+    /// Oracle floor enforcement (Sprint 21 slice 21-5b).
+    /// None = disabled (feature off; enforcement inert).
+    pub floor_store: Option<std::sync::Arc<std::sync::RwLock<crate::floor_guard::FloorStore>>>,
 }
 
 impl ClientProxyState {
@@ -97,6 +100,7 @@ impl ClientProxyState {
             ledger: None,
             ledger_policy: "warn".to_string(),
             ledger_max_index_age_secs: 0,
+            floor_store: None,
         }
     }
 
@@ -510,8 +514,44 @@ fn wrap_with_pin_check(
     uri: &hyper::Uri,
     response: Response<Body>,
 ) -> Response<Body> {
-    let (mut parts, body) = response.into_parts();
     let url = pin_url(uri);
+
+    // Oracle floor enforcement (Sprint 21 slice 21-5b): reject downloads
+    // below the oracle floor once the repo class's grace window has
+    // elapsed. Fail-open: feature off / no floor match / undeterminable
+    // version all pass through.
+    if let Some(store) = &state.floor_store {
+        // Observed age comes from the floor's own observed_at (carried from
+        // the oracle delta); the wall clock only anchors `now`.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let guard = store.read().unwrap_or_else(|e| e.into_inner());
+        if let crate::floor_guard::FloorVerdict::BelowFloor {
+            package_key,
+            version,
+            floor,
+        } = guard.check_url(&url, now)
+        {
+            warn!(
+                "Floor block: {} served {} below oracle floor {}",
+                url, version, floor
+            );
+            let body = serde_json::json!({
+                "error": "below_oracle_floor",
+                "package_key": package_key,
+                "floor": floor,
+                "version": version,
+            });
+            return Response::builder()
+                .status(StatusCode::CONFLICT)
+                .body(Body::from(body.to_string()))
+                .unwrap_or_else(|_| Response::new(Body::from("{\"error\":\"below_oracle_floor\"}")));
+        }
+    }
+
+    let (mut parts, body) = response.into_parts();
 
     let Some(pin_json) = parts
         .headers
@@ -657,7 +697,11 @@ async fn wrap_with_ledger_check(
 
     let canonical = pin_url(uri); // https-canonical form (repo_key / source)
     let is_index = crate::index_parse::looks_like_index(uri.path());
-    let payload = if is_index { None } else { pacman_payload_info(uri.path()) };
+    let payload = if is_index {
+        None
+    } else {
+        pacman_payload_info(uri.path())
+    };
 
     // ---- Payload cross-check (read-only; no body buffering) ----
     if let Some((name, version)) = payload {
@@ -673,9 +717,7 @@ async fn wrap_with_ledger_check(
         let Some(held) = held else { return response };
         let offered = monopsony_common::version_ord::normalize(&version);
         let held_norm = monopsony_common::version_ord::normalize(&held);
-        if monopsony_common::version_ord::vercmp(&offered, &held_norm)
-            != std::cmp::Ordering::Less
-        {
+        if monopsony_common::version_ord::vercmp(&offered, &held_norm) != std::cmp::Ordering::Less {
             return response;
         }
         let detail = format!(
@@ -911,7 +953,6 @@ fn ledger_index_verdict_response(
     }
 }
 
-
 /// Handle a CONNECT request by relaying a tunnel through the server proxy.
 ///
 /// Opaque by design: no cache, no tee/spool, no X-Cache header, no body
@@ -1012,6 +1053,9 @@ pub async fn run_proxy(
     ledger: Option<std::sync::Arc<crate::ledger::Ledger>>,
     ledger_policy: String,
     ledger_max_index_age_secs: u64,
+    floor_store: Option<
+        std::sync::Arc<std::sync::RwLock<crate::floor_guard::FloorStore>>,
+    >,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     run_proxy_with_listener(
@@ -1021,6 +1065,7 @@ pub async fn run_proxy(
         ledger,
         ledger_policy,
         ledger_max_index_age_secs,
+        floor_store,
     )
     .await
 }
@@ -1028,6 +1073,7 @@ pub async fn run_proxy(
 /// Test/integration entry: identical to [`run_proxy`] but the caller
 /// supplies an already-bound listener, so `bind(127.0.0.1:0)` tests can
 /// discover the port via `local_addr()` before serving begins.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_proxy_with_listener(
     listener: tokio::net::TcpListener,
     config: ProxyConfig,
@@ -1035,11 +1081,13 @@ pub async fn run_proxy_with_listener(
     ledger: Option<std::sync::Arc<crate::ledger::Ledger>>,
     ledger_policy: String,
     ledger_max_index_age_secs: u64,
+    floor_store: Option<std::sync::Arc<std::sync::RwLock<crate::floor_guard::FloorStore>>>,
 ) -> anyhow::Result<()> {
     let mut state = ClientProxyState::new(config).with_pin(pin);
     if let Some(ledger) = ledger {
         state = state.with_ledger(ledger, ledger_policy, ledger_max_index_age_secs);
     }
+    state.floor_store = floor_store;
     let state = Arc::new(state);
 
     let app = axum::Router::new()
@@ -1192,7 +1240,9 @@ mod tests {
     #[test]
     fn pm_kind_primary_xml_gz_is_dnf() {
         assert_eq!(
-            pm_kind_for_url("https://mirrors.rockylinux.org/rocky/9/BaseOS/x86_64/os/repodata/primary.xml.gz"),
+            pm_kind_for_url(
+                "https://mirrors.rockylinux.org/rocky/9/BaseOS/x86_64/os/repodata/primary.xml.gz"
+            ),
             Some("dnf")
         );
         assert_eq!(
@@ -1220,7 +1270,10 @@ mod tests {
             pm_kind_for_url("https://deb.debian.org/debian/dists/bookworm/Release.gpg"),
             None
         );
-        assert_eq!(pm_kind_for_url("https://example.com/some/random/path"), None);
+        assert_eq!(
+            pm_kind_for_url("https://example.com/some/random/path"),
+            None
+        );
     }
 
     #[test]
@@ -1230,7 +1283,9 @@ mod tests {
             Some("pacman")
         );
         assert_eq!(
-            pm_kind_for_url("https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/APKINDEX.tar.gz"),
+            pm_kind_for_url(
+                "https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/APKINDEX.tar.gz"
+            ),
             Some("apk")
         );
     }
@@ -1240,7 +1295,10 @@ mod tests {
     /// Test helper: build a signed pin attestation like the server does.
     /// Returns the attestation AND the 32-byte verify key (public key bytes,
     /// what `mirror_verify_key` carries and PinState::set_key expects).
-    fn signed_pin_att(url: &str, sha: &str) -> (monopsony_common::pin_store::PinAttestation, [u8; 32]) {
+    fn signed_pin_att(
+        url: &str,
+        sha: &str,
+    ) -> (monopsony_common::pin_store::PinAttestation, [u8; 32]) {
         let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
         let mut att = monopsony_common::pin_store::PinAttestation {
             url: url.to_string(),
@@ -1272,13 +1330,15 @@ mod tests {
         pin.set_key(verify_bytes); // provisioned AFTER construction (Bug 1 path)
         assert!(pin.provisioned());
 
-        let state = std::sync::Arc::new(
-            ClientProxyState::new(ProxyConfig::default()).with_pin(pin),
-        );
+        let state =
+            std::sync::Arc::new(ClientProxyState::new(ProxyConfig::default()).with_pin(pin));
         let uri: hyper::Uri = "http://example.com/pkg-1.0.pkg.tar.zst".parse().unwrap();
         let resp = Response::builder()
             .status(200)
-            .header("x-monopsony-pin", monopsony_common::pin_store::to_json(&att))
+            .header(
+                "x-monopsony-pin",
+                monopsony_common::pin_store::to_json(&att),
+            )
             .header("content-length", "44562")
             .body(Body::from("junk body"))
             .unwrap();
@@ -1303,13 +1363,15 @@ mod tests {
             None,
             std::env::temp_dir().join(format!("pin-inert-{}.jsonl", std::process::id())),
         ));
-        let state = std::sync::Arc::new(
-            ClientProxyState::new(ProxyConfig::default()).with_pin(pin),
-        );
+        let state =
+            std::sync::Arc::new(ClientProxyState::new(ProxyConfig::default()).with_pin(pin));
         let uri: hyper::Uri = "http://example.com/pkg-1.0.pkg.tar.zst".parse().unwrap();
         let resp = Response::builder()
             .status(200)
-            .header("x-monopsony-pin", monopsony_common::pin_store::to_json(&att))
+            .header(
+                "x-monopsony-pin",
+                monopsony_common::pin_store::to_json(&att),
+            )
             .header("content-length", "44562")
             .body(Body::from("junk body"))
             .unwrap();

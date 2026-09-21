@@ -214,6 +214,8 @@ mod tests {
             policy: "paranoid".to_string(),
             trusted_author_keys: vec![author_kid],
             trusted_operator_keys: vec![],
+            operator_verifying_key_path: None,
+            accept_remote_assignment: false,
         };
 
         let result = verify_recipe_trust(&signed, &trust, Some(&vk));
@@ -230,6 +232,8 @@ mod tests {
             policy: "paranoid".to_string(),
             trusted_author_keys: vec!["somekey".into()],
             trusted_operator_keys: vec![],
+            operator_verifying_key_path: None,
+            accept_remote_assignment: false,
         };
 
         let result = verify_recipe_trust(&signed, &trust, Some(&vk));
@@ -258,6 +262,8 @@ mod tests {
             policy: "trusted_authors".to_string(),
             trusted_author_keys: vec![author_kid],
             trusted_operator_keys: vec![],
+            operator_verifying_key_path: None,
+            accept_remote_assignment: false,
         };
 
         let result = verify_recipe_trust(&signed, &trust, None);
@@ -282,6 +288,8 @@ mod tests {
             policy: "trusted_authors".to_string(),
             trusted_author_keys: vec!["different_key".into()],
             trusted_operator_keys: vec![],
+            operator_verifying_key_path: None,
+            accept_remote_assignment: false,
         };
 
         let result = verify_recipe_trust(&signed, &trust, None);
@@ -302,6 +310,8 @@ mod tests {
             policy: "unknown_policy".to_string(),
             trusted_author_keys: vec![],
             trusted_operator_keys: vec![],
+            operator_verifying_key_path: None,
+            accept_remote_assignment: false,
         };
 
         let result = verify_recipe_trust(&signed, &trust, Some(&vk));

@@ -98,6 +98,62 @@ pub enum PackageCommand {
         #[command(subcommand)]
         command: RecipeCommand,
     },
+
+    /// Detect a local binary and emit a DRAFT recipe TOML (read-only; never registers)
+    Detect {
+        /// Path to the installed binary
+        path: String,
+        /// Source URL (GitHub repo, git repo, or direct URL)
+        #[arg(long)]
+        source: Option<String>,
+        /// Override package name
+        #[arg(long)]
+        name: Option<String>,
+        /// Write the draft TOML to this file instead of stdout only
+        #[arg(long)]
+        out: Option<String>,
+    },
+
+    /// Adopt an already-installed copy of a catalog package (by catalog name)
+    Adopt {
+        /// Catalog package name to adopt
+        name: String,
+    },
+}
+
+/// Adopted-package recipe field extraction (Sprint 22 slice 22-D).
+///
+/// Parses `[install] install_paths` and `[install] service` out of a recipe
+/// TOML without requiring a full `ShadowRecipe` (catalog recipes may carry
+/// extra keys the strict struct rejects). Mirrors the lenient parsing used by
+/// `catalog_scan` ([install] first, top-level tolerated).
+pub fn extract_install_fields(recipe_toml: &str) -> (Vec<String>, String) {
+    let doc: toml::Value = match toml::from_str(recipe_toml) {
+        Ok(d) => d,
+        Err(_) => return (Vec::new(), String::new()),
+    };
+    let table = match doc.as_table() {
+        Some(t) => t,
+        None => return (Vec::new(), String::new()),
+    };
+    let install = table.get("install").and_then(|i| i.as_table());
+    let paths: Vec<String> = install
+        .and_then(|i| i.get("install_paths"))
+        .or_else(|| table.get("install_paths"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let service = install
+        .and_then(|i| i.get("service"))
+        .or_else(|| table.get("service"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    (paths, service)
 }
 
 #[derive(Subcommand, Debug)]
@@ -367,4 +423,25 @@ fn format_variant_display() {
     assert!(out.contains("sonarr"));
     assert!(out.contains("keypad"));
     assert!(out.contains("47.0"));
+}
+
+#[test]
+fn extract_install_fields_parses_paths_and_service() {
+    let recipe = "[package]\nname = \"sonarr\"\n\n[install]\nmethod = \"extract\"\ninstall_paths = [\"/usr/bin/sonarr\", \"/opt/sonarr\"]\nservice = \"sonarr\"\n";
+    let (paths, service) = extract_install_fields(recipe);
+    assert_eq!(paths, vec!["/usr/bin/sonarr", "/opt/sonarr"]);
+    assert_eq!(service, "sonarr");
+}
+
+#[test]
+fn extract_install_fields_empty_when_missing() {
+    // No [install] section at all → empty vec + empty service.
+    let (paths, service) = extract_install_fields("[package]\nname = \"x\"\n");
+    assert!(paths.is_empty());
+    assert!(service.is_empty());
+
+    // Invalid TOML → empty vec + empty service (never panics).
+    let (paths, service) = extract_install_fields("not [ valid toml ===");
+    assert!(paths.is_empty());
+    assert!(service.is_empty());
 }

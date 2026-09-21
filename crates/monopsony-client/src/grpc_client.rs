@@ -1,8 +1,12 @@
 use monopsony_common::package_manager::PackageRef;
 use monopsony_common::proto::monopsony::monopsony_control_client::MonopsonyControlClient;
 use monopsony_common::proto::monopsony::{
-    client_message, HeartbeatRequest, InventoryReport, PackageEntry, PairRequest, PairResponse,
-    RegisterRequest, TamperAlert,
+    client_message, ApplyShadowUpdateRequest, CheckShadowUpdatesRequest,
+    DownloadShadowAssetRequest, GetShadowRecipeRequest, HeartbeatRequest, InventoryReport,
+    ListShadowCatalogRequest, ListShadowPackagesRequest, PackageEntry, PairRequest, PairResponse,
+    RegisterRequest, RegisterShadowPackageRequest, RollbackShadowUpdateRequest,
+    ShadowCatalogEntry, ShadowPackageInfo, ShadowScanFinding, ShadowScanReport, ShadowUpdateInfo,
+    TamperAlert, UnregisterShadowPackageRequest,
 };
 use std::path::Path;
 use tonic::transport::Channel;
@@ -266,6 +270,53 @@ impl MonopsonyGrpcClient {
             .map_err(|_| anyhow::anyhow!("timed out draining tamper-alert acks"))?;
 
         Ok(())
+    }
+
+    /// Poll for server-pushed commands (Sprint 22 slice 22-E2b).
+    /// Opens a one-shot ControlStream carrying a single Heartbeat
+    /// ClientMessage; the server may yield a Command (e.g. shadow_assign)
+    /// instead of/alongside its ack. Drains replies with a bounded timeout
+    /// like report_tamper_alerts and returns the FIRST Command found.
+    pub async fn poll_pending_commands(
+        &mut self,
+        client_id: &str,
+    ) -> anyhow::Result<Option<monopsony_common::proto::monopsony::Command>> {
+        use futures_util::StreamExt;
+        use monopsony_common::proto::monopsony::{client_message, server_message, ClientMessage};
+
+        let message = ClientMessage {
+            msg: Some(client_message::Msg::Heartbeat(HeartbeatRequest {
+                client_id: client_id.to_string(),
+                timestamp: chrono::Utc::now().timestamp(),
+            })),
+        };
+        let outbound = futures_util::stream::iter(vec![message]);
+
+        let mut inbound = self
+            .client
+            .control_stream(tonic::Request::new(outbound))
+            .await?
+            .into_inner();
+
+        let mut found: Option<monopsony_common::proto::monopsony::Command> = None;
+        let drain = async {
+            while let Some(msg) = inbound.next().await {
+                match msg {
+                    Ok(server) => {
+                        if let Some(server_message::Msg::Command(cmd)) = server.msg {
+                            if found.is_none() {
+                                found = Some(cmd);
+                            }
+                        }
+                        // Keep draining acks; stream closes from the server side.
+                    }
+                    Err(_) => break,
+                }
+            }
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), drain).await;
+
+        Ok(found)
     }
 
     pub async fn report_inventory(
@@ -551,5 +602,310 @@ impl MonopsonyGrpcClient {
     #[allow(dead_code)] // Will be used by Status subcommand
     pub fn client_id(&self) -> Option<&str> {
         self.client_id.as_deref()
+    }
+
+    // ── Shadow package RPCs (Sprint 22 slice 22-A) ──
+    // Thin transport: build the proto request, call the RPC, map Status errors
+    // through anyhow, same as register()/heartbeat() above.
+
+    /// List shadow packages registered for this client.
+    #[allow(dead_code)]
+    pub async fn list_shadow_packages(
+        &mut self,
+        client_id: &str,
+    ) -> anyhow::Result<Vec<ShadowPackageInfo>> {
+        let req = ListShadowPackagesRequest {
+            client_id: client_id.to_string(),
+        };
+        debug!(client_id = client_id, "Listing shadow packages");
+        let resp = self.client.list_shadow_packages(req).await?;
+        let packages = resp.into_inner().packages;
+        debug!(count = packages.len(), "Shadow package list received");
+        Ok(packages)
+    }
+
+    /// Register a shadow package from a recipe TOML.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn register_shadow_package(
+        &mut self,
+        client_id: &str,
+        name: &str,
+        version: &str,
+        architecture: &str,
+        os_family: &str,
+        libc: &str,
+        source_type: &str,
+        source_url: &str,
+        recipe_toml: &str,
+        install_paths: &[String],
+        config_paths: &[String],
+        service_name: &str,
+        mask_from_pm: bool,
+    ) -> anyhow::Result<ShadowPackageInfo> {
+        let req = RegisterShadowPackageRequest {
+            client_id: client_id.to_string(),
+            name: name.to_string(),
+            version: version.to_string(),
+            architecture: architecture.to_string(),
+            os_family: os_family.to_string(),
+            libc: libc.to_string(),
+            source_type: source_type.to_string(),
+            source_url: source_url.to_string(),
+            recipe_toml: recipe_toml.to_string(),
+            install_paths: install_paths.to_vec(),
+            config_paths: config_paths.to_vec(),
+            service_name: service_name.to_string(),
+            mask_from_pm,
+        };
+        info!(client_id = client_id, name = name, "Registering shadow package");
+        let resp = self.client.register_shadow_package(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Remove a shadow package registration.
+    #[allow(dead_code)]
+    pub async fn unregister_shadow_package(
+        &mut self,
+        client_id: &str,
+        package_id: &str,
+        unmask_from_pm: bool,
+    ) -> anyhow::Result<(bool, String)> {
+        let req = UnregisterShadowPackageRequest {
+            client_id: client_id.to_string(),
+            package_id: package_id.to_string(),
+            unmask_from_pm,
+        };
+        info!(
+            client_id = client_id,
+            package_id = package_id,
+            "Unregistering shadow package"
+        );
+        let resp = self.client.unregister_shadow_package(req).await?;
+        let resp = resp.into_inner();
+        Ok((resp.deleted, resp.message))
+    }
+
+    /// Check for available updates. Empty `package_ids` checks all packages.
+    #[allow(dead_code)]
+    pub async fn check_shadow_updates(
+        &mut self,
+        client_id: &str,
+        package_ids: &[String],
+    ) -> anyhow::Result<Vec<ShadowUpdateInfo>> {
+        let req = CheckShadowUpdatesRequest {
+            client_id: client_id.to_string(),
+            package_ids: package_ids.to_vec(),
+        };
+        debug!(
+            client_id = client_id,
+            count = package_ids.len(),
+            "Checking shadow updates"
+        );
+        let resp = self.client.check_shadow_updates(req).await?;
+        let updates = resp.into_inner().updates;
+        debug!(count = updates.len(), "Shadow update check complete");
+        Ok(updates)
+    }
+
+    /// Fetch the signed recipe TOML for a package.
+    /// Returns (recipe_toml, key_id, signature, signed_at).
+    #[allow(dead_code)]
+    pub async fn get_shadow_recipe(
+        &mut self,
+        client_id: &str,
+        package_name: &str,
+    ) -> anyhow::Result<(String, String, String, i64)> {
+        let req = GetShadowRecipeRequest {
+            client_id: client_id.to_string(),
+            package_name: package_name.to_string(),
+        };
+        debug!(
+            client_id = client_id,
+            package_name = package_name,
+            "Fetching shadow recipe"
+        );
+        let resp = self.client.get_shadow_recipe(req).await?;
+        let resp = resp.into_inner();
+        Ok((resp.recipe_toml, resp.key_id, resp.signature, resp.signed_at))
+    }
+
+    /// Ask the server to apply an update to a shadow package.
+    /// Returns (success, message, new_version, backup_path).
+    #[allow(dead_code)]
+    pub async fn apply_shadow_update(
+        &mut self,
+        client_id: &str,
+        package_id: &str,
+        target_version: &str,
+        asset_url: &str,
+        create_backup: bool,
+    ) -> anyhow::Result<(bool, String, String, String)> {
+        let req = ApplyShadowUpdateRequest {
+            client_id: client_id.to_string(),
+            package_id: package_id.to_string(),
+            target_version: target_version.to_string(),
+            asset_url: asset_url.to_string(),
+            create_backup,
+        };
+        info!(
+            client_id = client_id,
+            package_id = package_id,
+            target_version = target_version,
+            "Applying shadow update"
+        );
+        let resp = self.client.apply_shadow_update(req).await?;
+        let resp = resp.into_inner();
+        Ok((resp.success, resp.message, resp.new_version, resp.backup_path))
+    }
+
+    /// Ask the server to roll back a shadow package to its previous version.
+    /// Returns (success, message, new_version, backup_path).
+    #[allow(dead_code)]
+    pub async fn rollback_shadow_update(
+        &mut self,
+        client_id: &str,
+        package_id: &str,
+    ) -> anyhow::Result<(bool, String, String, String)> {
+        let req = RollbackShadowUpdateRequest {
+            client_id: client_id.to_string(),
+            package_id: package_id.to_string(),
+        };
+        info!(
+            client_id = client_id,
+            package_id = package_id,
+            "Rolling back shadow update"
+        );
+        let resp = self.client.rollback_shadow_update(req).await?;
+        let resp = resp.into_inner();
+        Ok((resp.success, resp.message, resp.new_version, resp.backup_path))
+    }
+
+    /// Download a shadow package asset via server-side streaming.
+    /// Chunks are collected in order; each chunk carrying a non-empty
+    /// blob_hash is verified with SHA-256 before its bytes are accepted.
+    #[allow(dead_code)]
+    pub async fn download_shadow_asset(
+        &mut self,
+        client_id: &str,
+        package_id: &str,
+        target_version: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        use futures_util::StreamExt;
+        use sha2::{Digest, Sha256};
+
+        let req = DownloadShadowAssetRequest {
+            client_id: client_id.to_string(),
+            package_id: package_id.to_string(),
+            target_version: target_version.to_string(),
+        };
+        info!(
+            client_id = client_id,
+            package_id = package_id,
+            target_version = target_version,
+            "Downloading shadow asset"
+        );
+
+        let mut inbound = self.client.download_shadow_asset(req).await?.into_inner();
+
+        let mut blob: Vec<u8> = Vec::new();
+        let mut expected_total: i64 = 0;
+        while let Some(chunk) = inbound.next().await {
+            let chunk = chunk.map_err(|e| {
+                anyhow::anyhow!("shadow asset stream failed: {}", tonic::Status::from(e))
+            })?;
+
+            if !chunk.blob_hash.is_empty() {
+                let mut hasher = Sha256::new();
+                hasher.update(&chunk.data);
+                let actual = hex::encode(hasher.finalize());
+                if actual != chunk.blob_hash.to_lowercase() {
+                    anyhow::bail!(
+                        "shadow asset chunk hash mismatch at offset {}: expected {}, got {}",
+                        chunk.offset,
+                        chunk.blob_hash,
+                        actual
+                    );
+                }
+            }
+
+            if chunk.offset != blob.len() as i64 {
+                anyhow::bail!(
+                    "shadow asset chunk out of order: expected offset {}, got {}",
+                    blob.len(),
+                    chunk.offset
+                );
+            }
+            blob.extend_from_slice(&chunk.data);
+            if chunk.total_size > 0 {
+                expected_total = chunk.total_size;
+            }
+        }
+
+        if expected_total > 0 && blob.len() as i64 != expected_total {
+            anyhow::bail!(
+                "shadow asset size mismatch: expected {} bytes, received {}",
+                expected_total,
+                blob.len()
+            );
+        }
+
+        info!(bytes = blob.len(), "Shadow asset download complete");
+        Ok(blob)
+    }
+
+    // ── Shadow recipe catalog RPCs (Sprint 22 slice 22-C2) ──
+
+    /// Pull the server's shadow recipe catalog. `known_hash` is the client's
+    /// last-seen catalog hash (empty = full pull). Returns the server's
+    /// current catalog hash plus all entries.
+    #[allow(dead_code)]
+    pub async fn list_shadow_catalog(
+        &mut self,
+        client_id: &str,
+        known_hash: &str,
+    ) -> anyhow::Result<(String, Vec<ShadowCatalogEntry>)> {
+        let req = ListShadowCatalogRequest {
+            client_id: client_id.to_string(),
+            catalog_hash: known_hash.to_string(),
+        };
+        debug!(client_id = client_id, known_hash = known_hash, "Listing shadow catalog");
+        let resp = self.client.list_shadow_catalog(req).await?;
+        let resp = resp.into_inner();
+        debug!(
+            catalog_hash = %resp.catalog_hash,
+            entries = resp.entries.len(),
+            "Shadow catalog received"
+        );
+        Ok((resp.catalog_hash, resp.entries))
+    }
+
+    /// Report local shadow-package scan findings for a catalog version.
+    /// Returns (accepted, message).
+    #[allow(dead_code)]
+    pub async fn report_shadow_scan(
+        &mut self,
+        client_id: &str,
+        catalog_hash: &str,
+        findings: Vec<crate::catalog_scan::ScanFinding>,
+    ) -> anyhow::Result<(bool, String)> {
+        let findings = findings
+            .into_iter()
+            .map(|f| ShadowScanFinding {
+                recipe_name: f.recipe_name,
+                installed: f.installed,
+                detected_version: f.detected_version,
+                method: f.method,
+            })
+            .collect();
+        let req = ShadowScanReport {
+            client_id: client_id.to_string(),
+            catalog_hash: catalog_hash.to_string(),
+            findings,
+        };
+        let resp = self.client.report_shadow_scan(req).await?;
+        let resp = resp.into_inner();
+        debug!(accepted = resp.accepted, message = %resp.message, "Shadow scan ack");
+        Ok((resp.accepted, resp.message))
     }
 }

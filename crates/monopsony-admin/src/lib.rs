@@ -4,12 +4,14 @@
 //! SPA at `/dashboard/*`. Uses Tailscale-aware authentication.
 
 pub mod auth;
+pub mod assign;
 pub mod cache;
 pub mod clients;
 pub mod features;
 pub mod health;
 pub mod help;
 pub mod mirrors;
+pub mod oracle;
 pub mod pairing;
 pub mod recipe;
 pub mod settings;
@@ -67,6 +69,14 @@ pub struct AdminState {
     /// Pin-store verifying key (Sprint 20 Phase 3) — 32 raw Ed25519 bytes,
     /// delivered to clients in PairResponse so they can verify pin attestations.
     pub mirror_verify_key: [u8; 32],
+    /// MAX(resolved_at) from package_map (Sprint 21 slice 21-5a) — freshest
+    /// oracle source resolution timestamp for the dashboard. None in DB-less
+    /// mode or when the table is empty. RwLock so the oracle refresh loop
+    /// (sourcedb) can keep it live as deltas are generated.
+    pub oracle_last_update: std::sync::Arc<std::sync::RwLock<Option<i64>>>,
+    /// Serialized signed oracle delta + verify-key pin for clients, refreshed
+    /// periodically from the observations table. None = endpoint serves 404.
+    pub oracle_delta: std::sync::Arc<std::sync::RwLock<Option<String>>>,
 }
 
 /// Dashboard configuration from `[dashboard]` in server.toml.
@@ -224,6 +234,15 @@ pub fn admin_router(state: AdminState) -> Router {
         )
         // Help system
         .route("/api/v1/help/:key", get(help::handle_get_help))
+        // Sprint 22 slice 22-E2a: remote shadow-recipe assignment
+        .route(
+            "/api/v1/admin/clients/:id/shadow-context",
+            get(assign::handle_shadow_context),
+        )
+        .route(
+            "/api/v1/admin/clients/:id/assign-recipe",
+            post(assign::handle_assign_recipe),
+        )
         // Protected by auth middleware
         .layer(from_fn_with_state(state.clone(), auth::auth_middleware));
 
@@ -238,7 +257,13 @@ pub fn admin_router(state: AdminState) -> Router {
     //   the credential.
     let ws = Router::new()
         .route("/ws/tunnel", get(ws_tunnel::handle_ws_tunnel))
-        .route("/ws/pair", get(ws_tunnel::handle_ws_pair));
+        .route("/ws/pair", get(ws_tunnel::handle_ws_pair))
+        // Oracle delta (Sprint 21 fleet wiring): unauthed like the WS tier —
+        // integrity comes from the Ed25519 signature, not the channel.
+        .route(
+            "/.well-known/monopsony/oracle-delta.json",
+            get(oracle::handle_oracle_delta),
+        );
 
     Router::new()
         .merge(api)

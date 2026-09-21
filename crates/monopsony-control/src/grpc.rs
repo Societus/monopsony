@@ -15,12 +15,14 @@ use monopsony_common::proto::monopsony::monopsony_control_server::{
     MonopsonyControl, MonopsonyControlServer,
 };
 use monopsony_common::proto::monopsony::{
-    client_message, server_message, ApplyShadowUpdateRequest, CheckShadowUpdatesRequest,
-    ClientMessage, DownloadShadowAssetRequest, GetShadowRecipeRequest, HeartbeatRequest,
+    client_message, command, server_message, ApplyShadowUpdateRequest, CheckShadowUpdatesRequest,
+    ClientMessage, Command, DownloadShadowAssetRequest, GetShadowRecipeRequest, HeartbeatRequest,
     HeartbeatResponse, InventoryDelta, InventoryReport, InventoryResponse,
-    ListShadowPackagesRequest, RegisterRequest, RegisterResponse, RegisterShadowPackageRequest,
-    RollbackShadowUpdateRequest, ServerMessage, ShadowAssetChunk, ShadowPackageInfo,
-    ShadowPackageList, ShadowUpdateList, ShadowUpdateResult, SignedShadowRecipe, SyncRequest,
+    ListShadowCatalogRequest, ListShadowPackagesRequest, RegisterRequest, RegisterResponse,
+    RegisterShadowPackageRequest, RollbackShadowUpdateRequest, ServerMessage, ShadowAssetChunk,
+    ShadowCatalog, ShadowCatalogEntry, ShadowPackageInfo, ShadowPackageList, ShadowScanAck,
+    ShadowScanReport,
+    ShadowUpdateList, ShadowUpdateResult, SignedShadowRecipe, SyncRequest,
     UnregisterShadowPackageRequest, UnregisterShadowPackageResponse,
 };
 
@@ -29,6 +31,7 @@ use monopsony_db::db::TamperAlertInsert;
 use monopsony_db::Database;
 use monopsony_mirror::MirrorManager;
 use monopsony_shadow::ShadowPackageManager;
+use monopsony_shadow::catalog_hash::{catalog_hash, entry_hash, sign_entry};
 
 pub struct MonopsonyGrpc {
     db: Arc<Database>,
@@ -326,10 +329,19 @@ impl MonopsonyGrpc {
                 })
             }
             client_message::Msg::Heartbeat(req) => {
+                let client_id_str = req.client_id.clone();
                 let _resp = self.handle_heartbeat(req).await.map_err(|e| {
                     error!(error = %e, "Heartbeat handler failed");
                     Status::internal(format!("Heartbeat failed: {}", e))
                 })?;
+                // Sprint 22 slice 22-E2a: a pending shadow assignment is
+                // pushed INSTEAD of the sync_request ack, one ServerMessage
+                // per ClientMessage. Status stays 'pending' — the client
+                // reports applied/refused in a later slice, which resolves
+                // the row via complete_pending_assignment.
+                if let Some(cmd_msg) = self.take_pending_assignment_command(&client_id_str).await {
+                    return Ok(cmd_msg);
+                }
                 // Heartbeat response goes via the unary RPC; for streaming, send a sync_request as ack
                 Ok(ServerMessage {
                     msg: Some(server_message::Msg::SyncRequest(SyncRequest {})),
@@ -385,6 +397,95 @@ impl MonopsonyGrpc {
                 })
             }
         }
+    }
+
+    /// Sprint 22 slice 22-E2a: build the pending-assignment push Command for
+    /// a client, if one is queued. Marks the row delivered (status stays
+    /// 'pending' until the client reports applied/refused) and returns
+    /// ServerMessage{ Command(UPDATE_CONFIG, shadow_assign params) } per the
+    /// pinned contract. Recipe fields come from the shadow_recipes catalog.
+    async fn take_pending_assignment_command(
+        &self,
+        client_id_str: &str,
+    ) -> Option<ServerMessage> {
+        let client_id = match monopsony_common::models::ClientId::parse(client_id_str) {
+            Ok(id) => id.0,
+            Err(e) => {
+                warn!(client_id = %client_id_str, error = %e, "Invalid client id for pending-assignment push");
+                return None;
+            }
+        };
+
+        let pending = match self.db.take_pending_assignments(client_id).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "Failed to query pending shadow assignments");
+                return None;
+            }
+        };
+        let first = pending.first()?;
+
+        let catalog = match self.db.list_shadow_catalog().await {
+            Ok(rows) => rows,
+            Err(e) => {
+                error!(error = %e, "Failed to load shadow catalog for assignment push");
+                return None;
+            }
+        };
+        let recipe = match catalog.iter().find(|r| r.name == first.recipe_name) {
+            Some(r) => r,
+            None => {
+                // Recipe removed from catalog after assignment; leave the row
+                // pending rather than resolving it server-side (v1 contract).
+                warn!(recipe = %first.recipe_name, "Pending assignment recipe missing from catalog");
+                return None;
+            }
+        };
+
+        // Sign the raw recipe_toml with the server recipe key — the client's
+        // trust check verifies a signature over the TOML bytes. The catalog's
+        // stored signature covers canonical_entry_json instead and will NOT
+        // verify client-side (same contract as get_shadow_recipe).
+        let (sig_b64, key_id_str) = match self.shadow_manager.as_ref() {
+            Some(mgr) => {
+                use monopsony_shadow::shadow_signing::{key_id, sign_recipe};
+                let sk = mgr.signing_key_ref();
+                // Parse the stored TOML so the SignedRecipe carries a real
+                // recipe struct (Default is not implemented for ShadowRecipe).
+                let parsed =
+                    monopsony_shadow::shadow_recipe::parse_recipe_str(&recipe.recipe_toml)
+                        .ok()?;
+                let signed = sign_recipe(&recipe.recipe_toml, parsed, sk);
+                (
+                    signed.operator_signature.signature,
+                    key_id(&sk.verifying_key()),
+                )
+            }
+            None => {
+                warn!("Shadow manager unavailable; cannot sign assignment push");
+                return None;
+            }
+        };
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("operation".to_string(), "shadow_assign".to_string());
+        params.insert("recipe_name".to_string(), recipe.name.clone());
+        params.insert("recipe_toml".to_string(), recipe.recipe_toml.clone());
+        params.insert("signature".to_string(), sig_b64);
+        params.insert("key_id".to_string(), key_id_str);
+
+        info!(
+            client_id = %client_id_str,
+            recipe = %first.recipe_name,
+            "Pushing pending shadow assignment via control-stream Command"
+        );
+
+        Some(ServerMessage {
+            msg: Some(server_message::Msg::Command(Command {
+                r#type: command::CommandType::UpdateConfig as i32,
+                params,
+            })),
+        })
     }
 }
 
@@ -604,6 +705,17 @@ impl MonopsonyControl for MonopsonyGrpc {
             return Err(Status::invalid_argument("name is required"));
         }
 
+        // Validate the recipe TOML at ingest: a recipe that cannot parse
+        // would poison the catalog for every other client (adoption parses
+        // before serving). Reject early instead of storing garbage.
+        if !req.recipe_toml.trim().is_empty() {
+            monopsony_shadow::shadow_recipe::parse_recipe_str(&req.recipe_toml).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "recipe TOML is invalid: {e}"
+                ))
+            })?;
+        }
+
         let install_paths = serde_json::json!(req.install_paths);
         // TODO: serialize config_paths to JSON value when proto supports it
         let config_paths_val: Option<&serde_json::Value> = None;
@@ -638,6 +750,37 @@ impl MonopsonyControl for MonopsonyGrpc {
             )
             .await
             .map_err(|e| Status::internal(format!("DB error creating shadow package: {e}")))?;
+
+        // Sprint 22 (22-C1): publish to the server-global recipe catalog with
+        // an Ed25519 signature from the server recipe key (when available).
+        {
+            let ehash = entry_hash(&req.name, &req.recipe_toml);
+            let (signature, key_id_str) = if let Some(ref mgr) = self.shadow_manager {
+                let signing_key = mgr.signing_key_ref();
+                let sig_b64 = sign_entry(signing_key, &req.name, &req.recipe_toml);
+                (
+                    sig_b64,
+                    monopsony_shadow::shadow_signing::key_id(&signing_key.verifying_key()),
+                )
+            } else {
+                // No signing key reachable — store unsigned and report as not_done.
+                (String::new(), "unsigned".to_string())
+            };
+            if let Err(e) = self
+                .db
+                .upsert_shadow_recipe(
+                    &req.name,
+                    &req.recipe_toml,
+                    &signature,
+                    &key_id_str,
+                    &ehash,
+                    Some(&client_id.0),
+                )
+                .await
+            {
+                tracing::warn!(name = %req.name, error = %e, "failed to publish shadow recipe to global catalog");
+            }
+        }
 
         Ok(Response::new(ShadowPackageInfo {
             id: id.to_string(),
@@ -827,7 +970,41 @@ impl MonopsonyControl for MonopsonyGrpc {
             return Err(Status::invalid_argument("package_name is required"));
         }
 
-        // Look up the shadow package by name within the client's packages
+        // Catalog-first lookup (Sprint 22): a published global recipe is the
+        // canonical copy — any paired client may adopt it. Fall back to the
+        // requesting client's own registrations for unpublished local recipes.
+        if let Ok(catalog) = self.db.list_shadow_catalog().await {
+            if let Some(row) = catalog.iter().find(|r| r.name == package_name) {
+                // Validate the stored TOML still parses, then sign the raw
+                // recipe_toml with the server's recipe key — the client's
+                // trust check verifies a signature over the TOML bytes
+                // (same contract as the per-client path below). The catalog's
+                // stored entry signature covers canonical_entry_json instead
+                // and is NOT what adopt verifies.
+                let recipe = monopsony_shadow::shadow_recipe::parse_recipe_str(&row.recipe_toml)
+                    .map_err(|e| {
+                        Status::internal(format!(
+                            "Failed to parse catalog recipe for '{package_name}': {e}"
+                        ))
+                    })?;
+                let mgr = self.shadow_manager.as_ref().ok_or_else(|| {
+                    Status::unimplemented("Shadow manager not available for recipe signing")
+                })?;
+                let signed = {
+                    use monopsony_shadow::shadow_signing::{key_id, sign_recipe};
+                    let s = sign_recipe(&row.recipe_toml, recipe, mgr.signing_key_ref());
+                    SignedShadowRecipe {
+                        recipe_toml: s.recipe_toml,
+                        key_id: key_id(&mgr.signing_key_ref().verifying_key()),
+                        signature: s.operator_signature.signature,
+                        signed_at: s.operator_signature.signed_at.timestamp(),
+                    }
+                };
+                return Ok(Response::new(signed));
+            }
+        }
+
+        // Fallback: look up the shadow package by name within the client's packages
         let rows = self
             .db
             .list_shadow_packages_for_client(&client_id.0)
@@ -922,6 +1099,97 @@ impl MonopsonyControl for MonopsonyGrpc {
         };
 
         Ok(Response::new(Box::pin(output)))
+    }
+    async fn list_shadow_catalog(
+        &self,
+        request: Request<ListShadowCatalogRequest>,
+    ) -> Result<Response<ShadowCatalog>, Status> {
+        let req = request.into_inner();
+        if !req.client_id.is_empty() {
+            ClientId::parse(&req.client_id)
+                .map_err(|e| Status::invalid_argument(format!("Invalid client ID: {e}")))?;
+        }
+
+        let rows = self
+            .db
+            .list_shadow_catalog()
+            .await
+            .map_err(|e| Status::internal(format!("DB error listing shadow catalog: {e}")))?;
+
+        let whole_hash = catalog_hash(
+            &rows.iter().map(|r| r.catalog_hash.clone()).collect::<Vec<_>>(),
+        );
+
+        // Change-detection short-circuit: client already has this version.
+        if !req.catalog_hash.is_empty() && req.catalog_hash == whole_hash {
+            return Ok(Response::new(ShadowCatalog {
+                catalog_hash: whole_hash,
+                entries: vec![],
+            }));
+        }
+
+        let entries = rows
+            .into_iter()
+            .map(|r| ShadowCatalogEntry {
+                name: r.name,
+                recipe_toml: r.recipe_toml,
+                signature: r.signature,
+                key_id: r.key_id,
+                catalog_hash: r.catalog_hash,
+                published_at: r.published_at,
+                provenance_client_id: r
+                    .provenance_client_id
+                    .map(|u| u.to_string())
+                    .unwrap_or_default(),
+            })
+            .collect();
+
+        Ok(Response::new(ShadowCatalog {
+            catalog_hash: whole_hash,
+            entries,
+        }))
+    }
+
+    async fn report_shadow_scan(
+        &self,
+        request: Request<ShadowScanReport>,
+    ) -> Result<Response<ShadowScanAck>, Status> {
+        let req = request.into_inner();
+        let client_id = ClientId::parse(&req.client_id)
+            .map_err(|e| Status::invalid_argument(format!("Invalid client ID: {e}")))?;
+
+        let mut accepted = 0usize;
+        for finding in &req.findings {
+            if finding.recipe_name.is_empty() {
+                return Err(Status::invalid_argument("finding.recipe_name is required"));
+            }
+            let detected_version = if finding.detected_version.is_empty() {
+                None
+            } else {
+                Some(finding.detected_version.as_str())
+            };
+            let method = if finding.method.is_empty() {
+                None
+            } else {
+                Some(finding.method.as_str())
+            };
+            self.db
+                .upsert_shadow_scan_result(
+                    &client_id.0,
+                    &finding.recipe_name,
+                    finding.installed,
+                    detected_version,
+                    method,
+                )
+                .await
+                .map_err(|e| Status::internal(format!("DB error recording scan result: {e}")))?;
+            accepted += 1;
+        }
+
+        Ok(Response::new(ShadowScanAck {
+            accepted: true,
+            message: format!("Recorded {} shadow scan finding(s)", accepted),
+        }))
     }
 }
 

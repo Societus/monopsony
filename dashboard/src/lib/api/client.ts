@@ -10,6 +10,7 @@ import type {
   ShadowPackage,
   RecipeValidationResult, EstimateResponse,
   ClientInfo, ConfigResponse,
+  ShadowContext, AssignRecipeResponse,
   MirrorConfig, MirrorStatus,
   TrackerStatus,
   FeatureFlags, MonetizationConfig,
@@ -49,7 +50,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.message || body.error || `HTTP ${res.status}`);
+    throw new Error(body.message || body.reason || body.error || `HTTP ${res.status}`);
   }
 
   return res.json();
@@ -104,6 +105,13 @@ export const api = {
     list: () => request<ClientInfo[]>('/clients'),
     get: (id: string) => request<ClientInfo>(`/clients/${id}`),
     inventory: (id: string) => request<{ packages: { name: string; version: string }[] }>(`/clients/${id}/inventory`),
+    getShadowContext: (id: string) =>
+      request<ShadowContext>(`/admin/clients/${encodeURIComponent(id)}/shadow-context`),
+    assignRecipe: (id: string, recipeName: string) =>
+      request<AssignRecipeResponse>(`/admin/clients/${encodeURIComponent(id)}/assign-recipe`, {
+        method: 'POST',
+        body: JSON.stringify({ recipe_name: recipeName }),
+      }),
   },
 
   mirrors: {

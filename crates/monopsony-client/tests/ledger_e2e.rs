@@ -209,6 +209,7 @@ async fn setup(
         ledger,
         policy.to_string(),
         max_index_age_secs,
+        None,
     ));
     Harness {
         proxy_addr,

@@ -41,6 +41,10 @@ pub struct FeatureFlags {
     /// Auto-blacklist threshold (number of reports before auto-blacklist)
     #[serde(default = "default_auto_blacklist_threshold")]
     pub auto_blacklist_threshold: i64,
+    /// Whether the server may remotely assign shadow recipes to clients.
+    /// Disabled (and refusing to enable) when the server is publicly exposed.
+    #[serde(default)]
+    pub remote_assignment_enabled: bool,
 }
 
 fn default_trust_mode() -> String {
@@ -91,6 +95,59 @@ pub async fn handle_update_features(
             "success": false,
             "error": "Database not available"
         })),
+    }
+}
+
+// ─── Remote Assignment Gate (Sprint 22 Phase F) ─────────────────────
+
+/// Gate for enabling `remote_assignment_enabled`.
+///
+/// Remote assignment lets the server push shadow recipes to clients, which is
+/// dangerous on a publicly exposed server. Refuse to enable the flag when the
+/// server appears publicly exposed (funnel mode); that requires proven
+/// ownership + hardware-key 2FA for all admins per Sprint 22 Phase F.
+pub fn check_remote_assignment_enable(permitted: bool, flag_wanted: bool) -> Result<(), String> {
+    if flag_wanted && !permitted {
+        Err("remote assignment refused: server appears publicly exposed (funnel mode); requires proven ownership + hardware-key 2FA for all admins (see Sprint 22 Phase F docs)".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gate_wanted_and_permitted_ok() {
+        assert!(check_remote_assignment_enable(true, true).is_ok());
+    }
+
+    #[test]
+    fn gate_wanted_not_permitted_errs() {
+        let err = check_remote_assignment_enable(false, true).unwrap_err();
+        assert!(err.contains("remote assignment refused"));
+    }
+
+    #[test]
+    fn gate_not_wanted_always_ok() {
+        assert!(check_remote_assignment_enable(true, false).is_ok());
+        assert!(check_remote_assignment_enable(false, false).is_ok());
+    }
+
+    #[test]
+    fn flags_empty_json_defaults_remote_assignment_false() {
+        let flags: FeatureFlags = serde_json::from_str("{}").unwrap();
+        assert!(!flags.remote_assignment_enabled);
+    }
+
+    #[test]
+    fn flags_round_trip_remote_assignment_true() {
+        let flags: FeatureFlags =
+            serde_json::from_str("{\"remote_assignment_enabled\":true}").unwrap();
+        assert!(flags.remote_assignment_enabled);
+        let back = serde_json::to_value(&flags).unwrap();
+        assert_eq!(back["remote_assignment_enabled"], serde_json::json!(true));
     }
 }
 

@@ -35,10 +35,14 @@ fn default_cert_dir() -> String {
 }
 
 mod auto_update;
+mod catalog_scan;
+mod detect;
 mod discovery;
+mod floor_guard;
 mod grpc_client;
 mod index_parse;
 mod ledger;
+mod oracle_update;
 mod pin_verify;
 mod proxy;
 mod self_update;
@@ -476,7 +480,7 @@ async fn main() -> anyhow::Result<()> {
             run_cache_stats(&server).await?;
         }
         Some(Commands::Package { cmd }) => {
-            run_shadow_package(cmd)?;
+            run_shadow_package(cmd, &cert_dir).await?;
         }
         Some(Commands::SelfUpdate { cmd }) => {
             run_self_update(cmd).await?;
@@ -547,6 +551,83 @@ async fn resolve_server_addr(cert_dir: &Path) -> anyhow::Result<String> {
     Ok(addr)
 }
 
+/// Build an mTLS-enabled connection to the server for shadow package
+/// commands (Sprint 22 slice 22-A). Requires paired certificates; without
+/// them the caller prints pairing guidance and exits non-zero.
+async fn connect_shadow_client(
+    server: Option<&str>,
+    cert_dir: &Path,
+) -> anyhow::Result<(grpc_client::MonopsonyGrpcClient, String)> {
+    use tracing::warn;
+
+    let certs = grpc_client::ClientCerts::load(cert_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "No client certificates found in {}.\n\
+             Shadow package commands require a paired client. Run:\n  \
+             monopsony-client pair --server <host> --code <code>\n\
+             then retry.",
+            cert_dir.display()
+        )
+    })?;
+
+    let server_addr = match server {
+        Some(s) => s.to_string(),
+        None => resolve_server_addr(cert_dir).await?,
+    };
+
+    let tls = tonic::transport::ClientTlsConfig::new()
+        .ca_certificate(tonic::transport::Certificate::from_pem(&certs.ca_cert_pem))
+        .identity(tonic::transport::Identity::from_pem(
+            &certs.client_cert_pem,
+            &certs.client_key_pem,
+        ))
+        .domain_name("monopsony-server")
+        .assume_http2(true);
+
+    let mut client = if server_addr.starts_with("wss://") || server_addr.starts_with("ws://") {
+        grpc_client::MonopsonyGrpcClient::connect_ws(&server_addr, Some(tls)).await?
+    } else {
+        grpc_client::MonopsonyGrpcClient::connect(&server_addr, Some(tls)).await?
+    };
+
+    // Read the persisted client ID (written at pair/register time). If the
+    // file is missing, re-register to recover the identity.
+    let client_id = match std::fs::read_to_string(cert_dir.join("client_id")) {
+        Ok(id) if !id.trim().is_empty() => id.trim().to_string(),
+        _ => {
+            warn!("client_id file missing; re-registering with server");
+            let hostname = hostname::get()?.to_string_lossy().to_string();
+            let backends = monopsony_common::package_manager::get_available_backends();
+            let managers: Vec<String> = backends
+                .iter()
+                .map(|b| b.kind().as_str().to_string())
+                .collect();
+            let (id, _, _) = client
+                .register(
+                    &hostname,
+                    std::env::consts::OS,
+                    std::env::consts::ARCH,
+                    &managers,
+                )
+                .await?;
+            std::fs::write(cert_dir.join("client_id"), &id)?;
+            id
+        }
+    };
+
+    Ok((client, client_id))
+}
+
+/// Serialize a ShadowSource the same way serde snake_case does on the wire
+/// ("github_release" / "git_build" / "direct_url").
+fn shadow_source_as_str(source: &monopsony_common::shadow_types::ShadowSource) -> &'static str {
+    match source {
+        monopsony_common::shadow_types::ShadowSource::GithubRelease => "github_release",
+        monopsony_common::shadow_types::ShadowSource::GitBuild => "git_build",
+        monopsony_common::shadow_types::ShadowSource::DirectUrl => "direct_url",
+    }
+}
+
 /// Ledger DB parent dir: the client state dir (~/.local/state/monopsony),
 /// same convention as the tamper-event spool. NOT cert_dir — the anti-rewind
 /// anchor must survive re-pairing.
@@ -597,8 +678,9 @@ async fn run_override(mode: OverrideMode, cert_dir: &Path) -> anyhow::Result<()>
             let key_path = state_dir.join("ledger-override.key");
             let key_bytes: [u8; 32] = match std::fs::read_to_string(&key_path) {
                 Ok(text) => {
-                    let raw = hex::decode(text.trim())
-                        .map_err(|e| anyhow::anyhow!("Corrupt override key {:?}: {}", key_path, e))?;
+                    let raw = hex::decode(text.trim()).map_err(|e| {
+                        anyhow::anyhow!("Corrupt override key {:?}: {}", key_path, e)
+                    })?;
                     raw.try_into().map_err(|v: Vec<u8>| {
                         anyhow::anyhow!(
                             "Corrupt override key {:?}: {} bytes (expected 32)",
@@ -651,7 +733,10 @@ async fn run_override(mode: OverrideMode, cert_dir: &Path) -> anyhow::Result<()>
             println!("Reason: {}", rec.reason);
             println!("Expires: {}", expiry_rfc3339);
             if let Some(held) = ledger.high_water_for(&rec.package_key) {
-                println!("Current high-water (ledger will hold downgrades below): {}", held);
+                println!(
+                    "Current high-water (ledger will hold downgrades below): {}",
+                    held
+                );
             }
             println!(
                 "Downgrades of {} will be permitted until {}.",
@@ -687,6 +772,20 @@ async fn run_override(mode: OverrideMode, cert_dir: &Path) -> anyhow::Result<()>
 
 /// Load the pinned mirror verifying key saved at pair/register time.
 /// Returns None when absent, wrong-sized, or zeroed (not provisioned).
+/// Load the operator (server shadow-manager) verifying key if configured.
+/// Accepts a hex-encoded 32-byte Ed25519 public key at
+/// `[shadow_trust].operator_verifying_key_path`. Returns None (and warns)
+/// when unset or unreadable — trust policy then fails closed, by design.
+fn load_operator_verifying_key(
+    trust_config: &monopsony_common::config::ShadowPackageTrustConfig,
+) -> Option<ed25519_dalek::VerifyingKey> {
+    let path = trust_config.operator_verifying_key_path.as_deref()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let bytes = hex::decode(text.trim()).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    ed25519_dalek::VerifyingKey::from_bytes(&arr).ok()
+}
+
 fn load_mirror_verify_key(cert_dir: &Path) -> Option<[u8; 32]> {
     let bytes = std::fs::read(cert_dir.join("mirror-verify.key")).ok()?;
     if bytes.len() != 32 {
@@ -714,6 +813,284 @@ fn store_mirror_verify_key(cert_dir: &Path, key: &[u8]) {
         Ok(()) => info!("Mirror verify key saved for pin verification"),
         Err(e) => warn!("Could not persist mirror verify key: {}", e),
     }
+}
+
+/// Pure gate decision for remote shadow assignments (Sprint 22 slice 22-E2b):
+/// both the client opt-in ([shadow_trust].accept_remote_assignment) and the
+/// trust check must pass.
+fn remote_assignment_allowed(policy_accepts: bool, trust_ok: bool) -> bool {
+    policy_accepts && trust_ok
+}
+
+/// The wire carries the operator signature as hex or base64; trust.rs decodes
+/// base64 only. Re-encode hex input (an Ed25519 signature is exactly 64 bytes)
+/// as base64 so either encoding verifies.
+fn normalize_signature_encoding(signature: &str) -> String {
+    use base64::Engine;
+    if let Ok(bytes) = hex::decode(signature) {
+        if bytes.len() == 64 {
+            return base64::engine::general_purpose::STANDARD.encode(bytes);
+        }
+    }
+    signature.to_string()
+}
+
+/// Build the `SignedRecipe` shape trust.rs expects from the wire params and
+/// verify it against the client trust policy. The operator verifying key is
+/// the pinned mirror key — the only operator key the client holds locally.
+fn verify_signed_recipe(
+    recipe_toml: &str,
+    key_id: &str,
+    signature: &str,
+    parsed: Option<&monopsony_common::shadow_types::ShadowRecipe>,
+    trust_config: &monopsony_common::config::ShadowPackageTrustConfig,
+    mirror_verify_key: Option<[u8; 32]>,
+) -> anyhow::Result<()> {
+    let recipe = parsed
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("recipe TOML failed strict parse"))?;
+    let signed = monopsony_common::shadow_types::SignedRecipe {
+        recipe_toml: recipe_toml.to_string(),
+        recipe,
+        operator_signature: monopsony_common::shadow_types::RecipeSignature {
+            key_id: key_id.to_string(),
+            signature: normalize_signature_encoding(signature),
+            signed_at: chrono::Utc::now(),
+        },
+        author_signature: None,
+    };
+    let vk = mirror_verify_key
+        .map(|k| ed25519_dalek::VerifyingKey::from_bytes(&k))
+        .transpose()?;
+    // Fall back to the configured operator verifying key when no pairing-time
+    // mirror key is present — the operator key is the canonical server signer
+    // for shadow recipes (mirror-verify.key predates Sprint 22 and only
+    // exists on clients that stored one at pair time).
+    let vk = match vk {
+        Some(k) => Some(k),
+        None => load_operator_verifying_key(trust_config),
+    };
+    trust::verify_recipe_trust(&signed, trust_config, vk.as_ref())
+}
+
+/// Consume a `shadow_assign` remote assignment (Sprint 22 slice 22-E2b).
+///
+/// Gate order: client opt-in → trust policy → local install detection →
+/// registration. Every refusal/failure logs a warning and returns; nothing
+/// is printed to stdout and the daemon loop continues untouched.
+#[allow(clippy::too_many_arguments)]
+async fn handle_remote_assignment(
+    client: &mut grpc_client::MonopsonyGrpcClient,
+    client_id: &str,
+    params: &std::collections::HashMap<String, String>,
+    accept_remote: bool,
+    trust_config: &monopsony_common::config::ShadowPackageTrustConfig,
+    mirror_verify_key: Option<[u8; 32]>,
+) {
+    // (a) Client opt-in gate — refuse before touching the payload.
+    if !accept_remote {
+        warn!("remote assignment refused: client opt-in disabled");
+        return;
+    }
+
+    // (a2) Idempotency: if this package is already registered locally the
+    // assignment was already consumed — re-pushed pendings must not create
+    // duplicate registrations (caught live on the bench: 1800+ duplicates
+    // from a re-delivered pending).
+    let recipe_name_probe = params
+        .get("recipe_name")
+        .map(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    if !recipe_name_probe.is_empty() {
+        if let Ok(packages) = client.list_shadow_packages(client_id).await {
+            if packages.iter().any(|p| p.name == recipe_name_probe) {
+                debug!(
+                    package = %recipe_name_probe,
+                    "remote assignment already registered — skipping duplicate"
+                );
+                return;
+            }
+        }
+    }
+
+    // (b) Parse the payload leniently. Empty recipe_toml → warn + ignore;
+    // recipe_name comes from params with a fallback to [package].name.
+    let recipe_toml = params
+        .get("recipe_toml")
+        .map(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    if recipe_toml.trim().is_empty() {
+        warn!("remote assignment ignored: empty recipe_toml");
+        return;
+    }
+    let wire_sig = params
+        .get("signature")
+        .map(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let key_id = params
+        .get("key_id")
+        .map(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Strict parse for the trust path; lenient parse for the name fallback.
+    let parsed: Option<monopsony_common::shadow_types::ShadowRecipe> =
+        toml::from_str(&recipe_toml).ok();
+    let lenient: Option<toml::Value> = toml::from_str(&recipe_toml).ok();
+    let param_name = params
+        .get("recipe_name")
+        .map(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let recipe_name = if !param_name.is_empty() {
+        param_name
+    } else {
+        match lenient
+            .as_ref()
+            .and_then(|doc| doc.get("package"))
+            .and_then(|p| p.get("name"))
+            .and_then(|v| v.as_str())
+            .filter(|n| !n.is_empty())
+        {
+            Some(n) => n.to_string(),
+            None => {
+                warn!(
+                    "remote assignment ignored: no recipe_name param and recipe TOML has no [package].name"
+                );
+                return;
+            }
+        }
+    };
+
+    // (c) Trust verification per client policy. Empty signature is decided
+    // by policy: strict policies refuse, permissive ones accept with a warn.
+    let trust_ok = if wire_sig.trim().is_empty() {
+        match trust_config.policy.as_str() {
+            "trusted_server_only" | "paranoid" => {
+                warn!(
+                    "remote assignment refused: unsigned recipe under strict policy '{}'",
+                    trust_config.policy
+                );
+                false
+            }
+            _ => {
+                warn!("unsigned recipe accepted under permissive policy");
+                true
+            }
+        }
+    } else {
+        match verify_signed_recipe(
+            &recipe_toml,
+            &key_id,
+            &wire_sig,
+            parsed.as_ref(),
+            trust_config,
+            mirror_verify_key,
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("remote assignment refused: trust verification failed: {}", e);
+                false
+            }
+        }
+    };
+
+    if !remote_assignment_allowed(accept_remote, trust_ok) {
+        // Specific reason already warned above.
+        return;
+    }
+
+    // (d) Local confirm: the package must already exist on this host.
+    let finding = catalog_scan::scan_entry(&recipe_name, &recipe_toml);
+    if !finding.installed {
+        warn!("assignment ignored: package not detected on this host");
+        return;
+    }
+    let detected_version = if finding.detected_version.is_empty() {
+        String::new()
+    } else {
+        finding.detected_version.clone()
+    };
+
+    // (e) Record the assignment — same shape as the Adopt arm, but with
+    // source_type "remote_assigned". Errors are warned and swallowed: the
+    // daemon must never degrade.
+    let source_url = lenient
+        .as_ref()
+        .and_then(|doc| doc.get("package"))
+        .and_then(|p| p.get("source_url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let (install_paths, service_name) = shadow_cli::extract_install_fields(&recipe_toml);
+    match client
+        .register_shadow_package(
+            client_id,
+            &recipe_name,
+            &detected_version,
+            std::env::consts::ARCH,
+            std::env::consts::OS,
+            "", // libc: unknown from the heartbeat path
+            "remote_assigned",
+            &source_url,
+            &recipe_toml,
+            &install_paths,
+            &[], // config_paths: not consumed from the pushed recipe
+            &service_name,
+            false, // mask_from_pm: opt-in only
+        )
+        .await
+    {
+        Ok(info) => info!(
+            package = %recipe_name,
+            id = %info.id,
+            version = %detected_version,
+            "Remote shadow assignment recorded"
+        ),
+        Err(e) => warn!("remote assignment registration failed (ignored): {}", e),
+    }
+}
+
+/// Handle a Command yielded alongside a heartbeat (Sprint 22 slice 22-E2b).
+/// Currently the only consumer is the `shadow_assign` UPDATE_CONFIG command;
+/// anything else is logged at debug and ignored. Never propagates errors to
+/// the heartbeat loop.
+async fn handle_heartbeat_command(
+    client: &mut grpc_client::MonopsonyGrpcClient,
+    client_id: &str,
+    command: monopsony_common::proto::monopsony::Command,
+    accept_remote: bool,
+    trust_config: &monopsony_common::config::ShadowPackageTrustConfig,
+    mirror_verify_key: Option<[u8; 32]>,
+) {
+    use monopsony_common::proto::monopsony::command::CommandType;
+
+    let ctype = command.r#type();
+    if ctype != CommandType::UpdateConfig {
+        debug!(command_type = ?ctype, "Ignoring server command");
+        return;
+    }
+    let operation = command
+        .params
+        .get("operation")
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    if operation != "shadow_assign" {
+        debug!(operation, "Ignoring UPDATE_CONFIG command");
+        return;
+    }
+    handle_remote_assignment(
+        client,
+        client_id,
+        &command.params,
+        accept_remote,
+        trust_config,
+        mirror_verify_key,
+    )
+    .await;
 }
 
 async fn run_daemon(
@@ -880,11 +1257,22 @@ async fn run_daemon(
         }
     };
 
+    // Load the trust config once for remote-assignment handling (Sprint 22
+    // slice 22-E2b). Defaults to the strict policy when no config exists.
+    let trust_config = client_config
+        .as_ref()
+        .map(|c| c.shadow_trust.clone())
+        .unwrap_or_default();
+    let accept_remote = trust_config.accept_remote_assignment;
+    let mirror_key_for_task = load_mirror_verify_key(&cert_dir);
+
     // Spawn background task for heartbeat and inventory sync
     let client_id_for_task = client_id.clone();
     let cert_dir_for_task = cert_dir.clone();
     let server_addr_for_task = server_addr.clone();
     let pin_for_heartbeat = pin_state.clone();
+    let mut catalog_scan_guard = catalog_scan::ScanGuard::new(Duration::from_secs(600));
+    let trust_config_for_task = trust_config.clone();
     let heartbeat_handle = tokio::spawn(async move {
         let mut last_inventory = std::time::Instant::now();
         let mut backoff: std::time::Duration = Duration::from_secs(1);
@@ -959,6 +1347,26 @@ async fn run_daemon(
                 match client.heartbeat(&client_id_for_task).await {
                     Ok(_) => {
                         info!("Heartbeat sent");
+                        // Poll server-pushed commands (Sprint 22 slice 22-E2b):
+                        // the server yields a Command (e.g. shadow_assign) on
+                        // the ControlStream when an assignment is pending.
+                        // Failures are logged and swallowed so the heartbeat
+                        // loop never degrades.
+                        match client.poll_pending_commands(&client_id_for_task).await {
+                            Ok(Some(command)) => {
+                                handle_heartbeat_command(
+                                    &mut client,
+                                    &client_id_for_task,
+                                    command,
+                                    trust_config_for_task.accept_remote_assignment,
+                                    &trust_config_for_task,
+                                    mirror_key_for_task,
+                                )
+                                .await;
+                            }
+                            Ok(None) => {}
+                            Err(e) => warn!("command poll failed (ignored): {}", e),
+                        }
                         // Drain spooled tamper events (Sprint 20 Phase 3):
                         // forward to the server as TamperAlerts; re-append on
                         // failure so alarms are never lost.
@@ -1014,6 +1422,48 @@ async fn run_daemon(
                         }
                     }
                     last_inventory = std::time::Instant::now();
+                }
+
+                // Shadow recipe catalog scan (Sprint 22 slice 22-C2), on
+                // its own cadence. Runs inline but any failure is logged
+                // and swallowed: the daemon must never degrade.
+                if catalog_scan_guard.ready() {
+                    let result: anyhow::Result<()> = async {
+                        let known = catalog_scan::load_last_hash(&cert_dir_for_task)
+                            .unwrap_or_default();
+                        let (catalog_hash, entries) = client
+                            .list_shadow_catalog(&client_id_for_task, &known)
+                            .await?;
+                        if catalog_hash == known {
+                            return Ok(());
+                        }
+                        let local = client.list_shadow_packages(&client_id_for_task).await?;
+                        let mut findings = Vec::new();
+                        for entry in &entries {
+                            if local.iter().any(|p| p.name == entry.name) {
+                                continue;
+                            }
+                            findings.push(catalog_scan::scan_entry(
+                                &entry.name,
+                                &entry.recipe_toml,
+                            ));
+                        }
+                        let (accepted, message) = client
+                            .report_shadow_scan(&client_id_for_task, &catalog_hash, findings)
+                            .await?;
+                        info!(
+                            accepted = accepted,
+                            message = %message,
+                            catalog_hash = %catalog_hash,
+                            "Shadow catalog scan reported"
+                        );
+                        catalog_scan::save_last_hash(&cert_dir_for_task, &catalog_hash);
+                        Ok(())
+                    }
+                    .await;
+                    if let Err(e) = result {
+                        warn!("Shadow catalog scan failed (ignored): {}", e);
+                    }
                 }
             }
 
@@ -1073,6 +1523,89 @@ async fn run_daemon(
     info!("Local proxy listening on {}", listen_addr);
     info!("Heartbeat and inventory sync running in background");
 
+    // Oracle floor store (Sprint 21 fleet loop): load floors.json from the
+    // state dir. Missing/corrupt file → empty store, sync still runs and will
+    // populate it (fail-open availability; integrity is enforced by the
+    // signature check, never by the file). Store lives in the RwLock slot the
+    // proxy reads — refreshes apply live, no proxy restart.
+    let floor_state_path = dirs_ledger_parent(&cert_dir).join("floors.json");
+    let floor_store: std::sync::Arc<std::sync::RwLock<crate::floor_guard::FloorStore>> =
+        std::sync::Arc::new(std::sync::RwLock::new(
+            match crate::floor_guard::load(&floor_state_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    info!(
+                        "No floor store at {} ({}): starting empty — oracle sync will populate",
+                        floor_state_path.display(),
+                        e
+                    );
+                    crate::floor_guard::FloorStore::default()
+                }
+            },
+        ));
+    let oracle_url = client_config
+        .as_ref()
+        .and_then(|c| c.server.oracle_url.clone());
+    if let Some(ref url) = oracle_url {
+        let url = url.clone();
+        let store = floor_store.clone();
+        let pin_dir = cert_dir.clone();
+        let floor_path = floor_state_path.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                ticker.tick().await;
+                let pin_hex = match crate::oracle_update::load_pin(&pin_dir) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        debug!("oracle sync: no verify pin — skipping (feature off until pinned)");
+                        continue;
+                    }
+                };
+                let http = match reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("oracle sync: http client build failed: {}", e);
+                        continue;
+                    }
+                };
+                match crate::oracle_update::fetch_delta(&http, &url).await {
+                    Ok(delta_json) => {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        match crate::oracle_update::verify_and_merge(&pin_hex, &delta_json, now) {
+                            Ok(obs) => {
+                                let mut guard =
+                                    store.write().unwrap_or_else(|e| e.into_inner());
+                                guard.merge_delta(&obs);
+                                if let Err(e) = guard.save(&floor_path) {
+                                    warn!("oracle sync: floor persist failed: {}", e);
+                                }
+                                info!(
+                                    "oracle sync: merged {} observations from delta",
+                                    obs.len()
+                                );
+                            }
+                            Err(e) => {
+                                // Includes Expired — the freeze-alarm path:
+                                // never silently accept a stale snapshot.
+                                warn!("oracle sync: delta rejected: {:?}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        debug!("oracle sync: fetch failed: {:?}", e);
+                    }
+                }
+            }
+        });
+    }
+
     // Ledger enforcement (Sprint 20 Phase 4): open the high-water ledger
     // when [ledger] enabled in config. Lives under the client state dir
     // (~/.local/state/monopsony/), NOT cert_dir — re-pairing must not wipe
@@ -1084,14 +1617,19 @@ async fn run_daemon(
             let path = state_dir.join("ledger.sqlite3");
             match crate::ledger::Ledger::open(&path) {
                 Ok(l) => {
-                    info!(
-                        "Integrity ledger: enabled (policy={})",
-                        cfg.ledger.policy
-                    );
-                    (Some(std::sync::Arc::new(l)), cfg.ledger.policy.clone(), cfg.ledger.max_index_age_secs)
+                    info!("Integrity ledger: enabled (policy={})", cfg.ledger.policy);
+                    (
+                        Some(std::sync::Arc::new(l)),
+                        cfg.ledger.policy.clone(),
+                        cfg.ledger.max_index_age_secs,
+                    )
                 }
                 Err(e) => {
-                    tracing::error!("Ledger open failed ({}): {} — running without ledger", path.display(), e);
+                    tracing::error!(
+                        "Ledger open failed ({}): {} — running without ledger",
+                        path.display(),
+                        e
+                    );
                     (None, "warn".to_string(), 0)
                 }
             }
@@ -1106,6 +1644,7 @@ async fn run_daemon(
         ledger,
         ledger_policy,
         ledger_max_age,
+        Some(floor_store),
     )
     .await?;
 
@@ -1512,8 +2051,86 @@ async fn run_cache_stats(server: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_shadow_package(cmd: shadow_cli::PackageCommand) -> anyhow::Result<()> {
+async fn run_shadow_package(
+    cmd: shadow_cli::PackageCommand,
+    cert_dir: &Path,
+) -> anyhow::Result<()> {
     use shadow_cli::PackageCommand::*;
+
+    // Helper: resolve server addr + connect (Sprint 22 slice 22-A).
+    async fn connect(
+        cert_dir: &Path,
+    ) -> anyhow::Result<(grpc_client::MonopsonyGrpcClient, String)> {
+        let server_addr = resolve_server_addr(cert_dir).await?;
+        connect_shadow_client(Some(&server_addr), cert_dir).await
+    }
+
+    // Helper: find the package id for a name-or-id selector.
+    async fn resolve_package_id(
+        client: &mut grpc_client::MonopsonyGrpcClient,
+        client_id: &str,
+        name_or_id: &str,
+    ) -> anyhow::Result<String> {
+        let packages = client.list_shadow_packages(client_id).await?;
+        if let Some(p) = packages.iter().find(|p| p.id == name_or_id) {
+            return Ok(p.id.clone());
+        }
+        let by_name: Vec<_> = packages.iter().filter(|p| p.name == name_or_id).collect();
+        match by_name.len() {
+            1 => Ok(by_name[0].id.clone()),
+            0 => anyhow::bail!("No shadow package found matching '{}' (id or name)", name_or_id),
+            _ => anyhow::bail!(
+                "Multiple shadow packages named '{}': {} — use the package id instead",
+                name_or_id,
+                by_name.iter().map(|p| p.id.as_str()).collect::<Vec<_>>().join(", ")
+            ),
+        }
+    }
+
+    // Helper: fetch the signed recipe for a package and verify it against the
+    // client trust policy. Returns the recipe TOML on success. Without a
+    // verifying key configured we still check policy shape via
+    // trust::verify_recipe_trust (which bails when the policy needs a key).
+    async fn load_verified_recipe(
+        client: &mut grpc_client::MonopsonyGrpcClient,
+        client_id: &str,
+        name: &str,
+    ) -> anyhow::Result<String> {
+        let (recipe_toml, key_id, signature_b64, signed_at) =
+            client.get_shadow_recipe(client_id, name).await?;
+        let recipe: monopsony_common::shadow_types::ShadowRecipe =
+            toml::from_str(&recipe_toml).context("server recipe failed to parse as TOML")?;
+        let signed = monopsony_common::shadow_types::SignedRecipe {
+            recipe_toml: recipe_toml.clone(),
+            recipe,
+            operator_signature: monopsony_common::shadow_types::RecipeSignature {
+                key_id,
+                signature: signature_b64,
+                signed_at: chrono::DateTime::<chrono::Utc>::from_timestamp(signed_at, 0)
+                    .unwrap_or_default(),
+            },
+            author_signature: None,
+        };
+
+        // Load trust config (same source the Update arm documents).
+        let config_path = std::env::var("MONOPSONY_CLIENT_CONFIG")
+            .unwrap_or_else(|_| "/etc/monopsony/client.toml".to_string());
+        let trust_config = std::fs::read_to_string(&config_path)
+            .ok()
+            .and_then(|c| toml::from_str::<monopsony_common::config::ClientConfig>(&c).ok())
+            .map(|c| c.shadow_trust)
+            .unwrap_or_default();
+
+        // Without a locally configured operator verifying key we pass None;
+        // verify_recipe_trust enforces the policy (e.g. trusted_authors works
+        // without the raw key, trusted_server_only fails closed without one).
+        let operator_vk = load_operator_verifying_key(&trust_config);
+        trust::verify_recipe_trust(&signed, &trust_config, operator_vk.as_ref()).context(format!(
+            "trust verification failed for recipe of '{}' (key_id: {})",
+            name, signed.operator_signature.key_id
+        ))?;
+        Ok(recipe_toml)
+    }
 
     match cmd {
         Register {
@@ -1542,9 +2159,46 @@ fn run_shadow_package(cmd: shadow_cli::PackageCommand) -> anyhow::Result<()> {
             if let Some(recipe_path) = &recipe {
                 println!("  Recipe file: {}", recipe_path);
             }
-            println!();
-            println!("Note: Full registration requires a running server connection.");
-            println!("Use 'monopsony-client daemon' to connect, then register via gRPC.");
+
+            // Build the recipe TOML (from file when provided, else minimal).
+            let recipe_toml = if let Some(recipe_path) = &recipe {
+                std::fs::read_to_string(recipe_path)
+                    .with_context(|| format!("reading recipe file {}", recipe_path))?
+            } else {
+                format!(
+                    "[package]\nname = \"{}\"\nsource_type = \"{}\"\nsource_url = \"{}\"\n\n[install]\nmethod = \"{}\"\nbranch = \"{}\"\n",
+                    pkg_name,
+                    shadow_source_as_str(&source_type),
+                    source,
+                    method,
+                    branch
+                )
+            };
+
+            let install_paths = vec![path.clone()];
+            println!("Connecting to server to register...");
+            let (mut client, client_id) = connect(cert_dir).await?;
+            let info = client
+                .register_shadow_package(
+                    &client_id,
+                    &pkg_name,
+                    "",          // version: server/recipe decides
+                    std::env::consts::ARCH,
+                    std::env::consts::OS,
+                    "",          // libc: unknown from CLI
+                    shadow_source_as_str(&source_type),
+                    &source,
+                    &recipe_toml,
+                    &install_paths,
+                    &[],         // config_paths: not provided by CLI
+                    "",          // service_name: not provided by CLI
+                    false,       // mask_from_pm: opt-in only
+                )
+                .await?;
+            println!("Registered shadow package:");
+            println!("  ID:      {}", info.id);
+            println!("  Name:    {}", info.name);
+            println!("  Version: {}", info.version);
         }
         Add {
             name,
@@ -1564,23 +2218,76 @@ fn run_shadow_package(cmd: shadow_cli::PackageCommand) -> anyhow::Result<()> {
         }
         Unregister { name } => {
             println!("Unregistering shadow package: {}", name);
-            println!("Note: Requires server connection.");
+            let (mut client, client_id) = connect(cert_dir).await?;
+            let package_id = resolve_package_id(&mut client, &client_id, &name).await?;
+            let (deleted, message) = client
+                .unregister_shadow_package(&client_id, &package_id, true)
+                .await?;
+            if deleted {
+                println!("✓ Unregistered: {}", message);
+            } else {
+                anyhow::bail!("Unregister failed: {}", message);
+            }
         }
         List => {
-            println!("Listing registered shadow packages...");
-            println!("Note: Requires server connection.");
+            let (mut client, client_id) = connect(cert_dir).await?;
+            let packages = client.list_shadow_packages(&client_id).await?;
+            if packages.is_empty() {
+                println!("No shadow packages registered.");
+            } else {
+                println!(
+                    "{:<28} {:<14} {:<24} {}",
+                    "NAME", "VERSION", "SERVICE", "ID"
+                );
+                for p in &packages {
+                    println!(
+                        "{:<28} {:<14} {:<24} {}",
+                        p.name, p.version, p.service_name, p.id
+                    );
+                }
+                println!();
+                println!("{} package(s)", packages.len());
+            }
         }
         Inspect { name } => {
-            println!("Inspecting shadow package: {}", name);
-            println!("Note: Requires server connection.");
+            let (mut client, client_id) = connect(cert_dir).await?;
+            let (recipe_toml, key_id, _signature, signed_at) =
+                client.get_shadow_recipe(&client_id, &name).await?;
+            println!("Recipe for '{}':", name);
+            println!("{}", recipe_toml);
+            println!();
+            println!("Signed by key: {}", key_id);
+            match chrono::DateTime::<chrono::Utc>::from_timestamp(signed_at, 0) {
+                Some(t) => println!("Signed at:     {}", t.to_rfc3339()),
+                None => println!("Signed at:     {} (unix)", signed_at),
+            }
         }
         Check { name } => {
-            if let Some(pkg) = name {
-                println!("Checking updates for: {}", pkg);
+            let (mut client, client_id) = connect(cert_dir).await?;
+            // Resolve the optional name filter to an id (empty = check all).
+            let ids: Vec<String> = match &name {
+                Some(n) => vec![resolve_package_id(&mut client, &client_id, n).await?],
+                None => vec![],
+            };
+            let updates = client.check_shadow_updates(&client_id, &ids).await?;
+            if let Some(n) = &name {
+                println!("Checking updates for: {}", n);
             } else {
                 println!("Checking updates for all shadow packages...");
             }
-            println!("Note: Requires server connection.");
+            println!();
+            if updates.is_empty() {
+                println!("All packages up to date.");
+            } else {
+                for u in &updates {
+                    println!("{}: {} → {}", u.package_name, u.current_version, u.latest_version);
+                    if !u.asset_url.is_empty() {
+                        println!("  Asset: {}", u.asset_url);
+                    }
+                }
+                println!();
+                println!("{} update(s) available", updates.len());
+            }
         }
         Update {
             name,
@@ -1593,49 +2300,121 @@ fn run_shadow_package(cmd: shadow_cli::PackageCommand) -> anyhow::Result<()> {
                 println!("Updating shadow package: {}", name);
             }
 
-            // Load trust configuration from client config
-            let config_path = std::env::var("MONOPSONY_CLIENT_CONFIG")
-                .unwrap_or_else(|_| "/etc/monopsony/client.toml".to_string());
-            match std::fs::read_to_string(&config_path) {
-                Ok(content) => {
-                    match toml::from_str::<monopsony_common::config::ClientConfig>(&content) {
-                        Ok(config) => {
-                            let trust_config = &config.shadow_trust;
-                            println!("Trust policy: {}", trust_config.policy);
-                            if !trust_config.trusted_author_keys.is_empty() {
-                                println!(
-                                    "Trusted author keys: {}",
-                                    trust_config.trusted_author_keys.join(", ")
-                                );
-                            }
-                            if !trust_config.trusted_operator_keys.is_empty() {
-                                println!(
-                                    "Trusted operator keys: {}",
-                                    trust_config.trusted_operator_keys.join(", ")
-                                );
-                            }
-                            // When a signed recipe arrives from the server, trust
-                            // verification happens before execute_build/execute_script.
-                            // See: trust::verify_recipe_trust()
-                            println!(
-                                "Trust enforcement: enabled (policy: {})",
-                                trust_config.policy
-                            );
-                        }
-                        Err(e) => eprintln!("Warning: could not parse client config: {}", e),
+            let (mut client, client_id) = connect(cert_dir).await?;
+            let package_id = resolve_package_id(&mut client, &client_id, &name).await?;
+
+            // Latest known update info (current→latest + asset URL).
+            let updates = client.check_shadow_updates(&client_id, &[package_id.clone()]).await?;
+            let update = updates
+                .iter()
+                .find(|u| u.package_id == package_id)
+                .or_else(|| updates.first());
+            match update {
+                Some(u) if u.latest_version != u.current_version => {
+                    println!("  Available: {} → {}", u.current_version, u.latest_version);
+                    if !u.asset_url.is_empty() {
+                        println!("  Asset:     {}", u.asset_url);
                     }
                 }
-                Err(_) => {
-                    println!("Trust enforcement: default (no client config found)");
+                _ => {
+                    println!("No update available for '{}'.", name);
+                    return Ok(());
                 }
             }
 
-            println!("Note: Requires server connection for full update.");
+            if dry_run {
+                println!("Dry-run complete (no changes made).");
+                return Ok(());
+            }
+
+            // Verify the recipe's signature key against the trust policy
+            // before executing anything.
+            let recipe_toml = match load_verified_recipe(&mut client, &client_id, &name).await {
+                Ok(t) => {
+                    println!("Trust check: PASSED");
+                    t
+                }
+                Err(e) => {
+                    eprintln!("WARNING: recipe trust could not be verified: {}", e);
+                    eprintln!("Recipe NOT executed. Recipe content:");
+                    match client.get_shadow_recipe(&client_id, &name).await {
+                        Ok((toml, key_id, _, _)) => {
+                            println!("{}", toml);
+                            println!("(signed by key: {})", key_id);
+                        }
+                        Err(_) => {}
+                    }
+                    println!("Update aborted (trust-UNVERIFIED).");
+                    return Ok(());
+                }
+            };
+            let _ = recipe_toml;
+
+            let (success, message, new_version, backup_path) = client
+                .apply_shadow_update(&client_id, &package_id, "", "", true)
+                .await?;
+            if success {
+                println!("✓ Update applied: {}", message);
+                println!("  New version: {}", new_version);
+                if !backup_path.is_empty() {
+                    println!("  Backup:      {}", backup_path);
+                }
+            } else {
+                anyhow::bail!("Update failed: {}", message);
+            }
         }
         Rollback { name } => {
             println!("Rolling back shadow package: {}", name);
-            println!("Note: Requires server connection for full rollback.");
-            println!("Available rollback versions can be listed once connected.");
+            let (mut client, client_id) = connect(cert_dir).await?;
+            let package_id = resolve_package_id(&mut client, &client_id, &name).await?;
+            let (success, message, new_version, backup_path) = client
+                .rollback_shadow_update(&client_id, &package_id)
+                .await?;
+            if success {
+                println!("✓ Rollback applied: {}", message);
+                println!("  Restored version: {}", new_version);
+                if !backup_path.is_empty() {
+                    println!("  Backup:           {}", backup_path);
+                }
+            } else {
+                anyhow::bail!("Rollback failed: {}", message);
+            }
+        }
+        Detect {
+            path,
+            source,
+            name,
+            out,
+        } => {
+            let pkg_name = name.clone().unwrap_or_else(|| {
+                std::path::Path::new(&path)
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            });
+            let report = detect::detect(Path::new(&path), name.as_deref()).await?;
+            let draft = detect::render_draft_toml(&report, &pkg_name, source.as_deref());
+            print!("{}", draft);
+            if let Some(out_path) = out {
+                std::fs::write(&out_path, &draft)
+                    .with_context(|| format!("writing draft to {}", out_path))?;
+                println!("# Draft written to {}", out_path);
+            }
+            println!(
+                "# Detection summary: sha256={:?} arch={:?} service={:?} needs_manual_verify={}",
+                report.sha256.as_deref().unwrap_or("n/a"),
+                report
+                    .elf
+                    .as_ref()
+                    .map(|e| e.arch.as_str())
+                    .unwrap_or("non-elf"),
+                report
+                    .service
+                    .as_ref()
+                    .map(|s| s.unit_name.as_str())
+                    .unwrap_or("none"),
+                report.needs_manual_verify
+            );
         }
         Recipe { command: sub } => match sub {
             shadow_cli::RecipeCommand::Edit { name } => {
@@ -1655,6 +2434,100 @@ fn run_shadow_package(cmd: shadow_cli::PackageCommand) -> anyhow::Result<()> {
                 Err(e) => eprintln!("Cannot read {}: {}", path, e),
             },
         },
+        Adopt { name } => {
+            println!("Adopting catalog package: {}", name);
+
+            // 1. Fetch the catalog recipe and verify it against the trust
+            //    policy. Unlike Update, a trust failure is a HARD abort: we
+            //    never adopt (register + manage) an unverified recipe.
+            let (mut client, client_id) = connect(cert_dir).await?;
+            let recipe_toml = match load_verified_recipe(&mut client, &client_id, &name).await {
+                Ok(t) => {
+                    println!("Trust check: PASSED");
+                    t
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "Adopt aborted: recipe trust could not be verified ({}). \
+                         Recipe content NOT adopted.",
+                        e
+                    );
+                }
+            };
+
+            // Parse the recipe's [install] fields leniently (source url from
+            // [package]; no strict full-recipe parse — catalog recipes may
+            // carry extra keys).
+            let source_url: String = toml::from_str::<toml::Value>(&recipe_toml)
+                .ok()
+                .and_then(|doc| {
+                    doc.get("package")
+                        .and_then(|p| p.get("source_url"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_default();
+            let (install_paths, service_name) =
+                shadow_cli::extract_install_fields(&recipe_toml);
+
+            // 2. Confirm the local install actually exists before adopting:
+            //    install-path existence + detect_command version probe.
+            let finding = catalog_scan::scan_entry(&name, &recipe_toml);
+            if !finding.installed {
+                anyhow::bail!(
+                    "'{}' not detected on this host; adopt refused (no local install to manage)",
+                    name
+                );
+            }
+            let detected_version = if finding.detected_version.is_empty() {
+                String::new()
+            } else {
+                finding.detected_version.clone()
+            };
+            println!(
+                "  Detected: {} (method: {})",
+                if detected_version.is_empty() {
+                    "<unknown>".to_string()
+                } else {
+                    detected_version.clone()
+                },
+                finding.method
+            );
+
+            // 3. Register the shadow package locally = record the
+            //    assignment. Server-side register publishes/updates the
+            //    catalog entry and creates the per-client row.
+            let info = client
+                .register_shadow_package(
+                    &client_id,
+                    &name,
+                    &detected_version,
+                    std::env::consts::ARCH,
+                    std::env::consts::OS,
+                    "", // libc: unknown from CLI
+                    "adopted",
+                    &source_url,
+                    &recipe_toml,
+                    &install_paths,
+                    &[], // config_paths: not adopted from recipe install config_paths
+                    &service_name,
+                    false, // mask_from_pm: opt-in only
+                )
+                .await?;
+
+            println!("✓ Adopted shadow package:");
+            println!("  Name:    {}", name);
+            println!(
+                "  Version: {}",
+                if detected_version.is_empty() {
+                    "<unknown>".to_string()
+                } else {
+                    detected_version
+                }
+            );
+            println!("  Method:  {}", finding.method);
+            println!("  ID:      {}", info.id);
+        }
     }
     Ok(())
 }
@@ -1780,4 +2653,23 @@ async fn run_proxy_command(cmd: ProxyCommand, cert_dir: &Path) -> anyhow::Result
         }
     }
     Ok(())
+}
+#[cfg(test)]
+mod remote_assignment_tests {
+    use super::remote_assignment_allowed;
+
+    #[test]
+    fn test_remote_assignment_gate_requires_both() {
+        // Opt-in and trust must both pass.
+        assert!(remote_assignment_allowed(true, true));
+    }
+
+    #[test]
+    fn test_remote_assignment_gate_defaults_closed() {
+        // Default posture: no opt-in → refused regardless of trust.
+        assert!(!remote_assignment_allowed(false, true));
+        // Opted in but trust failed → refused.
+        assert!(!remote_assignment_allowed(true, false));
+        assert!(!remote_assignment_allowed(false, false));
+    }
 }

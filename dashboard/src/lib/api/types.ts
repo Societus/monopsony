@@ -107,6 +107,32 @@ export interface ClientInfo {
   last_seen: string;
 }
 
+// ─── Shadow Context / Assign Recipe ────────────────────────────────
+
+export interface ShadowInventoryItem {
+  name: string;
+  version: string;
+  manager: string;
+}
+
+export interface ScanFindingView {
+  recipe_name: string;
+  installed: boolean;
+  detected_version: string;
+  method: string;
+}
+
+export interface ShadowContext {
+  inventory: ShadowInventoryItem[];
+  scan_findings: ScanFindingView[];
+  catalog: string[];
+}
+
+export interface AssignRecipeResponse {
+  accepted: boolean;
+  reason?: string;
+}
+
 export interface ConfigResponse {
   path: string;
   toml: string;

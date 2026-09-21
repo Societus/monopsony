@@ -260,6 +260,12 @@ pub struct RecipeBuild {
     pub steps: Vec<String>,
     #[serde(default)]
     pub requires: Vec<String>,
+    /// Allow network access during build step execution. Default (false)
+    /// DENIES network: steps run under `unshare -n` where available, with
+    /// proxy env-poisoning as fallback. Opt in explicitly per recipe with
+    /// `allow_network = true` in the `[build]` table.
+    #[serde(default)]
+    pub allow_network: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

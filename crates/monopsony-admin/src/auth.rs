@@ -234,6 +234,13 @@ impl TailscaleDetector {
         }
     }
 
+    /// Returns true when the server is publicly exposed (tailscale funnel
+    /// mode). Funnel == reachable from the public internet, so it is the
+    /// exposure signal used to gate remote assignment.
+    pub async fn detect_public_exposure(&self) -> bool {
+        exposure_from_modes(self.detect().await.funnel_mode)
+    }
+
     /// Query the Tailscale local API via Unix socket.
     async fn query_local_api(&self, path: &str) -> Result<String, std::io::Error> {
         use tokio::io::AsyncReadExt;
@@ -363,6 +370,12 @@ pub enum AuthMethod {
 }
 
 // ─── Axum Handlers ────────────────────────────────────────────────────
+
+/// True when the given Tailscale modes indicate public exposure.
+/// Funnel mode == the server is reachable from the public internet.
+pub fn exposure_from_modes(funnel_mode: bool) -> bool {
+    funnel_mode
+}
 
 /// Evaluate auth context for a request.
 pub async fn evaluate_auth(state: &AdminState, client_ip: &IpAddr) -> AuthContext {

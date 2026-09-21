@@ -608,6 +608,83 @@ pub async fn check_build_deps(requires: &[String]) -> Result<(), ShadowClientErr
     }
 }
 
+/// Network access policy for build/script step execution.
+#[derive(Debug, PartialEq)]
+pub enum NetworkPolicy {
+    /// Steps run without network access (default; deny by default).
+    Denied,
+    /// Steps may access the network (explicit recipe opt-in).
+    Allowed,
+}
+
+/// Resolve a recipe's `allow_network` flag into a NetworkPolicy.
+/// False (the serde default for old recipes) maps to Denied.
+pub fn resolve_network_policy(allow_network: bool) -> NetworkPolicy {
+    if allow_network {
+        NetworkPolicy::Allowed
+    } else {
+        NetworkPolicy::Denied
+    }
+}
+
+/// One-time detection of `unshare -n` usability (user namespace with
+/// network isolation). Cached in a OnceLock so we pay the spawn cost once.
+fn unshare_available() -> bool {
+    static UNSHARE_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *UNSHARE_OK.get_or_init(|| {
+        use std::process::{Command as StdCommand, Stdio};
+        // Blocking detection via the std Command: safe to call from async
+        // context because `unshare -n true` exits immediately (well under
+        // the 2s budget; no runtime re-entrancy as with Handle::block_on).
+        StdCommand::new("unshare")
+            .args(["-n", "true"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// Apply network-denial hardening to a command about to be spawned.
+///
+/// `program`/`args` describe the step exactly as it would be spawned
+/// (typically `bash`, `["-c", script]`). Primary control: when `unshare -n`
+/// works on this host, the command is rewritten to spawn
+/// `unshare -n bash -c <step>` (real kernel-level network isolation).
+/// Fallback (unshare unavailable, e.g. unprivileged containers with userns
+/// disabled): the argv is unchanged but proxy env vars are poisoned so
+/// network tools that honor proxy configuration are diverted to a dead
+/// local port. Env-poisoning is BEST-EFFORT ONLY — a build step using raw
+/// sockets bypasses it; unshare is the real control. Landlock
+/// write-confinement is a planned follow-up hardening layer.
+pub fn build_network_denial(command: &mut tokio::process::Command) {
+    if unshare_available() {
+        // Real control: re-run the whole step inside a network-less namespace
+        // by rebuilding the command as `unshare -n <program> <args...>`.
+        let std_cmd = command.as_std();
+        let program = std_cmd.get_program().to_string_lossy().into_owned();
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let mut rebuilt = tokio::process::Command::new("unshare");
+        rebuilt.arg("-n").arg(program);
+        for a in args {
+            rebuilt.arg(a);
+        }
+        *command = rebuilt;
+    } else {
+        // Env-poison is best-effort; unshare is the real control (above).
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            command.env(key, "http://127.0.0.1:9");
+        }
+        // NO_PROXY cleared so the poisoned proxy is not bypassed.
+        command.env_remove("NO_PROXY");
+        command.env_remove("no_proxy");
+    }
+}
+
 /// Execute build steps sequentially in the source directory.
 /// Variables: {src_dir}, {target_dir}, {version}, {arch}
 pub async fn execute_build(
@@ -616,6 +693,7 @@ pub async fn execute_build(
     target_dir: &str,
     version: &str,
     arch: &str,
+    policy: NetworkPolicy,
 ) -> Result<(), ShadowClientError> {
     for (i, step) in steps.iter().enumerate() {
         let cmd = step
@@ -624,7 +702,11 @@ pub async fn execute_build(
             .replace("{version}", version)
             .replace("{arch}", arch);
 
-        let output = Command::new("bash")
+        let mut command = Command::new("bash");
+        if policy == NetworkPolicy::Denied {
+            build_network_denial(&mut command);
+        }
+        let output = command
             .arg("-c")
             .arg(&cmd)
             .current_dir(src_dir)
@@ -655,13 +737,18 @@ pub async fn execute_script(
     version: &str,
     arch: &str,
     os: &str,
+    policy: NetworkPolicy,
 ) -> Result<(), ShadowClientError> {
     let cmd = script
         .replace("{version}", version)
         .replace("{arch}", arch)
         .replace("{os}", os);
 
-    let output = Command::new("bash")
+    let mut command = Command::new("bash");
+    if policy == NetworkPolicy::Denied {
+        build_network_denial(&mut command);
+    }
+    let output = command
         .arg("-c")
         .arg(&cmd)
         .env("MONOPSONY_VERSION", version)
@@ -881,9 +968,16 @@ mod tests {
             format!("echo world > {}/file2.txt", dst.to_string_lossy()),
         ];
 
-        execute_build(&steps, &src, &dst.to_string_lossy(), "1.0.0", "x86_64")
-            .await
-            .unwrap();
+        execute_build(
+            &steps,
+            &src,
+            &dst.to_string_lossy(),
+            "1.0.0",
+            "x86_64",
+            NetworkPolicy::Allowed,
+        )
+        .await
+        .unwrap();
 
         assert!(dst.join("file1.txt").exists());
         assert!(dst.join("file2.txt").exists());
@@ -896,7 +990,8 @@ mod tests {
         fs::create_dir_all(&src).await.unwrap();
 
         let steps = vec!["exit 1".to_string()];
-        let result = execute_build(&steps, &src, "/tmp", "1.0.0", "x86_64").await;
+        let result = execute_build(&steps, &src, "/tmp", "1.0.0", "x86_64", NetworkPolicy::Allowed)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("step 1"));
     }
@@ -907,7 +1002,7 @@ mod tests {
         let outfile = tmp.path().join("env_output.txt");
 
         let script = format!("echo $MONOPSONY_VERSION > {}", outfile.to_string_lossy());
-        execute_script(&script, "2.0.0", "x86_64", "linux")
+        execute_script(&script, "2.0.0", "x86_64", "linux", NetworkPolicy::Allowed)
             .await
             .unwrap();
 
@@ -917,9 +1012,104 @@ mod tests {
 
     #[tokio::test]
     async fn execute_script_fails() {
-        let result = execute_script("exit 42", "1.0", "x86_64", "linux").await;
+        let result = execute_script("exit 42", "1.0", "x86_64", "linux", NetworkPolicy::Allowed)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("42"));
+    }
+
+    // --- Network sandbox tests (Sprint 22 Phase G) ---
+
+    #[test]
+    fn network_policy_goldens() {
+        // Default (false) must be Denied — old recipes deny by default.
+        assert_eq!(resolve_network_policy(false), NetworkPolicy::Denied);
+        assert_eq!(resolve_network_policy(true), NetworkPolicy::Allowed);
+    }
+
+    #[test]
+    fn unshare_detection_does_not_panic() {
+        // Must return a bool without panicking, whatever the host supports.
+        let _available = unshare_available();
+    }
+
+    #[tokio::test]
+    async fn poisoned_env_when_denied() {
+        if !std::path::Path::new("/bin/bash").exists() {
+            return; // skip if /bin/bash missing
+        }
+        let mut command = Command::new("bash");
+        build_network_denial(&mut command);
+        let output = command
+            .arg("-c")
+            .arg("echo $HTTP_PROXY")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !unshare_available() {
+            // On hosts without unshare, the env-poison fallback must be active.
+            assert_eq!(stdout.trim(), "http://127.0.0.1:9");
+        }
+        // On hosts WITH unshare the command was wrapped; stdout may be the
+        // poison URL or empty depending on env inheritance — no assertion.
+    }
+
+    #[test]
+    fn allow_network_recipe_roundtrips() {
+        let toml_str = r#"
+[package]
+name = "netty"
+source_type = "direct_url"
+source_url = "https://example.com"
+
+[install]
+method = "build"
+target_dir = "/opt/netty"
+
+[build]
+steps = ["make"]
+requires = ["make"]
+allow_network = true
+
+[version]
+detect_command = "netty --version"
+detect_pattern = "([0-9]+\\.[0-9]+)"
+"#;
+        let recipe: ShadowRecipe = toml::from_str(toml_str).unwrap();
+        assert!(recipe.build.as_ref().unwrap().allow_network);
+    }
+
+    #[test]
+    fn old_recipe_without_allow_network_parses_denied() {
+        // Compat golden: old recipe TOML without `allow_network` must parse
+        // unchanged and default to false (Denied).
+        let toml_str = r#"
+[package]
+name = "oldpkg"
+source_type = "direct_url"
+source_url = "https://example.com"
+
+[install]
+method = "build"
+target_dir = "/opt/oldpkg"
+
+[build]
+steps = ["make"]
+
+[version]
+detect_command = "oldpkg --version"
+detect_pattern = "([0-9]+\\.[0-9]+)"
+"#;
+        let recipe: ShadowRecipe = toml::from_str(toml_str).unwrap();
+        let build = recipe.build.as_ref().unwrap();
+        assert!(!build.allow_network);
+        assert_eq!(
+            resolve_network_policy(build.allow_network),
+            NetworkPolicy::Denied
+        );
     }
 
     #[tokio::test]

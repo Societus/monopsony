@@ -19,6 +19,9 @@ use monopsony_shadow::ShadowPackageManager;
 mod ca_guard;
 mod self_update;
 mod setup;
+mod sourcedb;
+
+pub use sourcedb::{package_key, ObservedVersion};
 
 #[derive(Parser, Debug)]
 #[command(name = "monopsony-server", version)]
@@ -494,7 +497,8 @@ async fn main() -> anyhow::Result<()> {
     // never generate a new one; a zeroed verify key = "not provisioned".
     let pin_key_path = PathBuf::from(&args.shadow_dir).join("pin-signing.key");
     let pin_key = if integrity_cfg.pinning_enabled {
-        let key = monopsony_shadow::shadow_signing::load_or_generate_signing_key(Some(&pin_key_path));
+        let key =
+            monopsony_shadow::shadow_signing::load_or_generate_signing_key(Some(&pin_key_path));
         info!(
             "Integrity pinning: enabled (policy={}), key: {}",
             integrity_cfg.unverified_policy,
@@ -502,7 +506,8 @@ async fn main() -> anyhow::Result<()> {
         );
         Some(key)
     } else if pin_key_path.exists() {
-        let key = monopsony_shadow::shadow_signing::load_or_generate_signing_key(Some(&pin_key_path));
+        let key =
+            monopsony_shadow::shadow_signing::load_or_generate_signing_key(Some(&pin_key_path));
         info!(
             "Integrity pinning: disabled (policy={}), existing key loaded for pin verification: {}",
             integrity_cfg.unverified_policy,
@@ -840,7 +845,34 @@ async fn main() -> anyhow::Result<()> {
         info!("WebSocket tunnel URL from config: {}", url);
     }
 
-    let admin_state = AdminState {
+    // Oracle delta wiring (Sprint 21 fleet loop): load/generate the oracle
+    // signing key and spawn the periodic refresh so the well-known endpoint
+    // serves a signed snapshot built from the observations table. DB-less
+    // mode → endpoint stays 404 (feature off).
+    let oracle_delta_slot: std::sync::Arc<std::sync::RwLock<Option<String>>> =
+        std::sync::Arc::new(std::sync::RwLock::new(None));
+    let oracle_last_update_slot: std::sync::Arc<std::sync::RwLock<Option<i64>>> =
+        std::sync::Arc::new(std::sync::RwLock::new(None));
+    if let Some(ref database) = db {
+        let oracle_key_path = PathBuf::from(&args.shadow_dir).join("oracle-signing.key");
+        let oracle_kp = sourcedb::delivery::load_or_generate(&oracle_key_path)
+            .map_err(|e| anyhow::anyhow!("oracle key init failed: {}", e))?;
+        sourcedb::refresh::spawn(
+            database.clone(),
+            oracle_kp,
+            oracle_delta_slot.clone(),
+            oracle_last_update_slot.clone(),
+            300,
+        );
+        info!(
+            "Oracle delta refresh: every 300s (key: {})",
+            oracle_key_path.display()
+        );
+    } else {
+        info!("Oracle delta: disabled (no database)");
+    }
+
+    let admin_state = monopsony_admin::AdminState {
         db: db.clone(),
         cache_dir: cache_dir.clone(),
         shadow_manager: shared_shadow_manager.clone(),
@@ -852,6 +884,8 @@ async fn main() -> anyhow::Result<()> {
         grpc_addr: args.grpc_addr.clone(),
         ws_url,
         mirror_verify_key,
+        oracle_last_update: oracle_last_update_slot.clone(),
+        oracle_delta: oracle_delta_slot.clone(),
         pairing_manager: Arc::new(tokio::sync::Mutex::new(None)),
         pairing_task: Arc::new(tokio::sync::Mutex::new(None)),
     };

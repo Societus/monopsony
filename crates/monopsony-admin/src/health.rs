@@ -108,6 +108,8 @@ pub struct StatsResponse {
     pub total_clients: i64,
     pub total_packages: i64,
     pub shadow_package_count: usize,
+    /// MAX(resolved_at) from package_map — freshest oracle resolution (unix ms).
+    pub oracle_last_update: Option<i64>,
 }
 
 /// GET /api/v1/stats — quick statistics for the dashboard overview.
@@ -135,5 +137,9 @@ pub async fn handle_stats(State(state): State<AdminState>) -> impl IntoResponse 
         total_clients,
         total_packages,
         shadow_package_count: 0,
+        oracle_last_update: *state
+            .oracle_last_update
+            .read()
+            .unwrap_or_else(|e| e.into_inner()),
     })
 }
