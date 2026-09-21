@@ -489,6 +489,28 @@ async fn main() -> anyhow::Result<()> {
             Err(_) => monopsony_common::config::IntegrityConfig::default(),
         };
 
+    // Read language-artifact cache config ([cache.language_artifacts] section,
+    // Sprint 23) with the same fallback-to-defaults pattern.
+    let language_artifacts_cfg: monopsony_common::config::LanguageArtifactConfig =
+        match std::fs::read_to_string(&args.config) {
+            Ok(content) => {
+                #[derive(serde::Deserialize, Default)]
+                struct CacheSectionWrapper {
+                    #[serde(default)]
+                    cache: CacheSectionInner,
+                }
+                #[derive(serde::Deserialize, Default)]
+                struct CacheSectionInner {
+                    #[serde(default)]
+                    language_artifacts: monopsony_common::config::LanguageArtifactConfig,
+                }
+                toml::from_str::<CacheSectionWrapper>(&content)
+                    .map(|w| w.cache.language_artifacts)
+                    .unwrap_or_default()
+            }
+            Err(_) => monopsony_common::config::LanguageArtifactConfig::default(),
+        };
+
     // Pin key custody: the dedicated pin-signing key
     // (<shadow_dir>/pin-signing.key) — NEVER the mTLS CA and NEVER the
     // shadow recipe signing key (`signing.key`). Owned by main; cloned into
@@ -540,6 +562,7 @@ async fn main() -> anyhow::Result<()> {
             connect_config,
             pin_key_for_proxy,
             integrity_cfg.clone(),
+            language_artifacts_cfg.clone(),
         )
         .await
         {

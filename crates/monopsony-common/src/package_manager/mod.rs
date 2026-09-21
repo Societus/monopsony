@@ -135,16 +135,39 @@ pub struct UrlPattern {
     pub priority: u32,
     /// Description of what this pattern matches
     pub description: String,
+    /// Cache class assigned to URLs matching this pattern (Sprint 23).
+    /// Classification happens at miss time: the matched pattern's class
+    /// becomes the stored object's class. Defaults to `Distro` via
+    /// `UrlPattern::new` so existing backends are unaffected.
+    pub cache_class: crate::config::CacheClass,
 }
 
 impl UrlPattern {
     pub fn new(pattern: &str, priority: u32, description: &str) -> crate::Result<Self> {
+        Self::with_class(
+            pattern,
+            priority,
+            description,
+            crate::config::CacheClass::Distro,
+        )
+    }
+
+    /// Construct a pattern with an explicit cache class (Sprint 23). Language
+    /// backends use this to distinguish immutable artifacts (LangArtifact)
+    /// from TTL-revalidated registry metadata (LangMetadata).
+    pub fn with_class(
+        pattern: &str,
+        priority: u32,
+        description: &str,
+        cache_class: crate::config::CacheClass,
+    ) -> crate::Result<Self> {
         let regex = Regex::new(pattern)
             .map_err(|e| crate::Error::Parse(format!("Invalid URL pattern: {}", e)))?;
         Ok(Self {
             pattern: regex,
             priority,
             description: description.to_string(),
+            cache_class,
         })
     }
 

@@ -24,6 +24,10 @@ pub struct StorageMeta {
     pub size_bytes: u64,
     pub etag: Option<String>,
     pub storage_class: Option<String>,
+    /// Cache class assigned at miss time (Sprint 23). Not persisted through
+    /// this struct — the JSON sidecar (CacheEntry) and DB row carry it; this
+    /// field lets the tee/commit path return the class without a re-read.
+    pub cache_class: monopsony_common::config::CacheClass,
 }
 
 impl StorageMeta {
@@ -35,6 +39,7 @@ impl StorageMeta {
             size_bytes: size,
             etag: None,
             storage_class: None,
+            cache_class: monopsony_common::config::CacheClass::Distro,
         }
     }
 }
@@ -60,6 +65,10 @@ pub struct SpoolHandle {
     inner: Option<WriteMultipart>,
     hasher: sha2::Sha256,
     size: u64,
+    /// Cache class assigned by the caller before commit (Sprint 23).
+    /// Defaults to `Distro`; the tee task sets it from the URL classification
+    /// so the commit-time sidecar records the right class.
+    cache_class: monopsony_common::config::CacheClass,
 }
 
 impl SpoolHandle {
@@ -69,7 +78,13 @@ impl SpoolHandle {
             inner: Some(inner),
             hasher: sha2::Sha256::new(),
             size: 0,
+            cache_class: monopsony_common::config::CacheClass::Distro,
         }
+    }
+
+    /// Assign the cache class recorded in the commit-time sidecar.
+    pub fn set_cache_class(&mut self, class: monopsony_common::config::CacheClass) {
+        self.cache_class = class;
     }
 
     /// Append a chunk. Data is invisible to readers until commit.
@@ -106,6 +121,7 @@ impl SpoolHandle {
             size_bytes: self.size,
             etag: put.e_tag,
             storage_class: None,
+            cache_class: self.cache_class,
         })
     }
 

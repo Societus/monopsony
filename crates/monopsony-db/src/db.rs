@@ -13,11 +13,25 @@ pub struct Database {
     pool: PgPool,
 }
 
+/// server_settings key holding the per-PM language enablement map (Sprint 23).
+pub const LANGUAGE_PMS_KEY: &str = "language_pms";
+
+/// Enablement state of one language package manager (Sprint 23 §2.4).
+/// `source`: "default" | "auto" (auto-enable-on-first-use) | "dashboard" |
+/// "config" (server.toml boot value).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LanguagePmState {
+    pub enabled: bool,
+    pub source: String,
+}
+
 /// Cache entry metadata for recording cache misses
 #[derive(Debug, Clone)]
 pub struct CacheMissConfig {
     pub url: String,
     pub cache_path: String,
+    /// Cache class (Sprint 23). Callers default to "distro".
+    pub cache_class: String,
     pub content_type: Option<String>,
     pub content_length: i64,
     pub etag: Option<String>,
@@ -193,6 +207,39 @@ impl Database {
         .execute(&self.pool)
         .await?;
         info!("Created cache_entries table");
+
+        // Sprint 23: cache class column. Additive ALTER for pre-Sprint-23
+        // DBs — swallow only the exact duplicate-column error so fresh
+        // CREATE TABLEs (column inline above for NEW deployments would
+        // conflict with this ALTER; the ALTER is the single source) and
+        // existing DBs converge on one schema. Fresh DBs: CREATE TABLE has
+        // no class column, ALTER adds it — one code path for both.
+        match sqlx::query(
+            "ALTER TABLE cache_entries ADD COLUMN IF NOT EXISTS cache_class TEXT NOT NULL DEFAULT 'distro'",
+        )
+        .execute(&self.pool)
+        .await
+        {
+            Ok(_) => debug!("cache_entries.cache_class column ensured"),
+            Err(e) => warn!("cache_class column ensure failed (may already exist): {}", e),
+        }
+
+        // Per-PM language enablement audit trail (Sprint 23 §2.4). One row
+        // per enablement transition (auto-on-first-use, dashboard toggle,
+        // config-file boot win). Outcome: "enabled" | "disabled".
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pm_enablement_audit (
+                id BIGSERIAL PRIMARY KEY,
+                pm TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                source TEXT NOT NULL,
+                reason TEXT NULL,
+                recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("Created pm_enablement_audit table");
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS api_keys (
@@ -806,26 +853,28 @@ impl Database {
 
     pub async fn record_cache_miss(&self, config: &CacheMissConfig) -> Result<()> {
         sqlx::query(
-            "INSERT INTO cache_entries (url, cache_path, content_type, content_length, etag, last_modified, cached_at, last_accessed, hit_count)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0)
-             ON CONFLICT (url) DO UPDATE SET
-                 cache_path = EXCLUDED.cache_path,
-                 content_type = EXCLUDED.content_type,
-                 content_length = EXCLUDED.content_length,
-                 etag = EXCLUDED.etag,
-                 last_modified = EXCLUDED.last_modified,
-                 cached_at = EXCLUDED.cached_at,
-                 last_accessed = EXCLUDED.last_accessed,
-                 hit_count = 0",
-        )
-        .bind(&config.url)
-        .bind(&config.cache_path)
-        .bind(&config.content_type)
-        .bind(config.content_length)
-        .bind(&config.etag)
-        .bind(&config.last_modified)
-        .bind(config.cached_at)
-        .bind(config.cached_at)
+            "INSERT INTO cache_entries (url, cache_path, content_type, content_length, etag, last_modified, cached_at, last_accessed, hit_count, cache_class)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 0, $9)
+                     ON CONFLICT (url) DO UPDATE SET
+                         cache_path = EXCLUDED.cache_path,
+                         content_type = EXCLUDED.content_type,
+                         content_length = EXCLUDED.content_length,
+                         etag = EXCLUDED.etag,
+                         last_modified = EXCLUDED.last_modified,
+                         cached_at = EXCLUDED.cached_at,
+                         last_accessed = EXCLUDED.last_accessed,
+                         hit_count = 0,
+                         cache_class = EXCLUDED.cache_class",
+                )
+                .bind(&config.url)
+                .bind(&config.cache_path)
+                .bind(&config.content_type)
+                .bind(config.content_length)
+                .bind(&config.etag)
+                .bind(&config.last_modified)
+                .bind(config.cached_at)
+                .bind(config.cached_at)
+                .bind(&config.cache_class)
         .execute(&self.pool)
         .await?;
 
@@ -1787,6 +1836,115 @@ impl Database {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // ─── Language PM enablement (Sprint 23 §2.4) ──────────────────────
+
+    /// Read the `language_pms` runtime setting: a map of PM name →
+    /// {enabled, source}. Returns an empty map when unset (all disabled
+    /// by default; the proxy auto-enables on first matching request).
+    pub async fn get_language_pms(
+        &self,
+    ) -> Result<std::collections::HashMap<String, LanguagePmState>> {
+        let mut out = std::collections::HashMap::new();
+        if let Some(v) = self.get_setting(LANGUAGE_PMS_KEY).await? {
+            if let Some(obj) = v.as_object() {
+                for (pm, state) in obj {
+                    if let (Some(enabled), Some(source)) =
+                        (state.get("enabled").and_then(|e| e.as_bool()), state.get("source").and_then(|s| s.as_str()))
+                    {
+                        out.insert(
+                            pm.clone(),
+                            LanguagePmState {
+                                enabled,
+                                source: source.to_string(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Write the full `language_pms` map (dashboard toggle, auto-enable).
+    pub async fn set_language_pms(
+        &self,
+        states: &std::collections::HashMap<String, LanguagePmState>,
+    ) -> Result<()> {
+        let mut obj = serde_json::Map::new();
+        for (pm, state) in states {
+            obj.insert(
+                pm.clone(),
+                serde_json::json!({"enabled": state.enabled, "source": state.source}),
+            );
+        }
+        self.set_setting(LANGUAGE_PMS_KEY, &serde_json::Value::Object(obj))
+            .await
+    }
+
+    /// Record one enablement transition in the audit trail.
+    pub async fn record_pm_enablement_audit(
+        &self,
+        pm: &str,
+        outcome: &str,
+        source: &str,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pm_enablement_audit (pm, outcome, source, reason)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(pm)
+        .bind(outcome)
+        .bind(source)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        debug!(
+            "PM enablement audit: pm={} outcome={} source={} reason={:?}",
+            pm, outcome, source, reason
+        );
+        Ok(())
+    }
+
+    /// Set the cache class on one cache entry (Sprint 23 classification).
+    pub async fn update_cache_class(
+        &self,
+        url: &str,
+        cache_class: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE cache_entries SET cache_class = $1 WHERE url = $2")
+            .bind(cache_class)
+            .bind(url)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// List cache entries of one class with size + last_accessed, oldest
+    /// access first. Retention/scrubber janitor query surface.
+    pub async fn list_cache_entries_by_class(
+        &self,
+        cache_class: &str,
+    ) -> Result<Vec<(String, i64, i64)>> {
+        let rows = sqlx::query(
+            "SELECT url, content_length, last_accessed FROM cache_entries
+             WHERE cache_class = $1 ORDER BY last_accessed ASC",
+        )
+        .bind(cache_class)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("url"),
+                    r.get::<i64, _>("content_length"),
+                    r.get::<i64, _>("last_accessed"),
+                )
+            })
+            .collect())
     }
 
     /// Append one observation to the sourcedb observation log. The log is

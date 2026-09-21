@@ -61,6 +61,15 @@ pub struct CacheEntry {
     pub cached_at: u64,
     pub last_accessed: u64,
     pub hit_count: u64,
+    /// Cache class (Sprint 23). Serde-defaulted so pre-Sprint-23 sidecars
+    /// load as "distro" — backward compatible.
+    #[serde(default = "default_cache_class_string")]
+    pub cache_class: String,
+}
+
+/// Sidecar default for pre-Sprint-23 entries: "distro" (legacy behavior).
+fn default_cache_class_string() -> String {
+    "distro".to_string()
 }
 
 /// Shared state for the proxy
@@ -89,6 +98,9 @@ pub struct ProxyState {
     pub pin_key: Option<ed25519_dalek::SigningKey>,
     /// [integrity] config section (pinning_enabled, unverified_policy).
     pub integrity: monopsony_common::config::IntegrityConfig,
+    /// [cache.language_artifacts] config section (Sprint 23): TTL metadata
+    /// revalidation, retention budget, scrubber cadence, master switch.
+    pub language_artifacts: monopsony_common::config::LanguageArtifactConfig,
 }
 
 impl ProxyState {
@@ -111,7 +123,29 @@ impl ProxyState {
             connect_config: monopsony_common::config::ProxyServerConfig::default(),
             pin_key: None,
             integrity: monopsony_common::config::IntegrityConfig::default(),
+            language_artifacts:
+                monopsony_common::config::LanguageArtifactConfig::default(),
         }
+    }
+
+    /// Classify a URL's cache class (Sprint 23). Returns the class declared
+    /// by the first matching pattern; None when no backend matches (generic
+    /// pass-through URLs are never classified — they cache as before via the
+    /// `other/` key space and behave as Distro).
+    pub fn classify_url(&self, url: &str) -> Option<monopsony_common::config::CacheClass> {
+        let mut best: Option<(u32, monopsony_common::config::CacheClass)> = None;
+        for backend in &self.backends {
+            for pattern in backend.upstream_url_patterns() {
+                if pattern.matches(url) {
+                    // Highest-priority matching pattern wins (same tie-break
+                    // direction as find_backend_for_url's first-match scan).
+                    if best.map_or(true, |(p, _)| pattern.priority > p) {
+                        best = Some((pattern.priority, pattern.cache_class));
+                    }
+                }
+            }
+        }
+        best.map(|(_, class)| class)
     }
 
     /// Find a backend that matches the given URL
@@ -488,11 +522,52 @@ async fn serve_cache_hit(
     state.update_access(cache_key, url).await;
 
     // Load metadata for content type
-    let meta = state.load_meta(cache_key).await;
+    let mut meta = state.load_meta(cache_key).await;
     let content_type = meta
         .as_ref()
         .and_then(|m| m.content_type.clone())
         .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    // Sprint 23 Phase A: TTL metadata revalidation for lang_artifact class.
+    // Fresh/Revalidated → serve from cache; ServeStale → serve with
+    // X-Monopsony-Stale; Expired → fall through to the miss path (None).
+    let mut stale = false;
+    if let Some(entry) = meta.as_mut() {
+        match crate::language_artifacts::check_freshness(state, entry).await {
+            crate::language_artifacts::Freshness::Revalidated => {
+                // Persist refreshed TTL bookkeeping.
+                if let Err(e) = state.save_meta(cache_key, entry).await {
+                    debug!("Failed to persist revalidated TTL for {}: {}", url, e);
+                }
+            }
+            crate::language_artifacts::Freshness::ServeStale => {
+                stale = true;
+            }
+            crate::language_artifacts::Freshness::Expired => {
+                info!("Cached lang_artifact {} expired (origin changed)", url);
+                return None;
+            }
+            crate::language_artifacts::Freshness::Fresh => {}
+        }
+    }
+
+    // Sprint 23 Phase A: verify-on-serve for lang_artifact class. Hash the
+    // cached blob; on mismatch quarantine (tamper_alerts) and refuse.
+    if let Some(entry) = meta.as_ref() {
+        if !crate::language_artifacts::verify_on_serve(state, cache_key, url, entry).await {
+            return Some(
+                Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("X-Monopsony-Quarantine", "1")
+                    .body(Body::from("Cached artifact failed integrity verification"))
+                    .unwrap_or_else(|_| {
+                        Response::new(Body::from(
+                            "Cached artifact failed integrity verification",
+                        ))
+                    }),
+            );
+        }
+    }
 
     // Open a streaming read for the requested range (full object when no
     // Range header). This replaces the old whole-file `read()` — serving
@@ -537,7 +612,7 @@ async fn serve_cache_hit(
                     builder = builder.header(header::LAST_MODIFIED, lm);
                 }
             }
-            builder = builder.header("X-Cache", "HIT");
+            builder = builder.header("X-Cache", if stale { "STALE" } else { "HIT" });
             builder = attach_pin_header(builder, state, cache_key).await;
 
             // Scan policy enforcement: query DB for scan status on HIT
@@ -742,7 +817,7 @@ async fn fetch_and_stream_get(
 
     // Begin the spool: everything streams upstream → spool + client with
     // O(1) memory. The object becomes visible in the cache only on commit.
-    let spool = match state.storage.spool(&cache_key).await {
+    let mut spool = match state.storage.spool(&cache_key).await {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to open spool for {}: {}", cache_key, e);
@@ -755,6 +830,13 @@ async fn fetch_and_stream_get(
     };
 
     let (parts, upstream_body) = upstream_response.into_parts();
+
+    // Sprint 23: classify once, share between the spool stamp (sidecar on
+    // commit) and the tee task (DB record + entry metadata).
+    let cache_class = state
+        .classify_url(url)
+        .unwrap_or(monopsony_common::config::CacheClass::Distro);
+    spool.set_cache_class(cache_class);
 
     // Capture the upstream response headers for the tee task (pin capture).
     let upstream_headers: Option<HashMap<String, String>> = Some(
@@ -780,6 +862,7 @@ async fn fetch_and_stream_get(
         etag,
         last_modified,
         upstream_headers,
+        cache_class,
     };
     tokio::spawn(run_tee(upstream_body, spool, tx, tee_ctx));
 
@@ -844,8 +927,6 @@ async fn wait_for_fetcher(waiter: &tokio::sync::Notify, timeout: Duration) -> bo
 /// are supported (that's what pacman `curl -C -` and apt send). Returns
 /// `0..u64::MAX` when absent or unparseable — serving the whole object.
 fn parse_range_header(value: Option<&axum::http::HeaderValue>) -> ByteRange {
-    use crate::cache_storage::ByteRange;
-
     let Some(v) = value else { return 0..u64::MAX };
     let Some(s) = v.to_str().ok() else {
         return 0..u64::MAX;
@@ -890,6 +971,9 @@ struct TeeContext {
     /// Upstream response headers (name, value), captured at the construction
     /// site so the tee task can extract origin-declared checksums for pinning.
     upstream_headers: Option<HashMap<String, String>>,
+    /// Cache class assigned at miss time (Sprint 23). Distro when no
+    /// backend pattern matched (generic `other/` keyspace).
+    cache_class: monopsony_common::config::CacheClass,
 }
 
 /// Tee task body: pump upstream chunks to the spool and the client channel.
@@ -1033,6 +1117,8 @@ async fn run_tee(
         cached_at: now,
         last_accessed: now,
         hit_count: 1,
+        // Sprint 23: class assigned at miss time (spool stamp + DB row agree).
+        cache_class: ctx.cache_class.as_str().to_string(),
     };
     if let Err(e) = ctx.state.save_meta(&ctx.cache_key, &entry).await {
         warn!("Failed to save cache metadata: {}", e);
@@ -1100,6 +1186,7 @@ async fn run_tee(
             .record_cache_miss(&monopsony_db::db::CacheMissConfig {
                 url: normalize_url_scheme(&ctx.url),
                 cache_path: entry.cache_path.clone(),
+                cache_class: ctx.cache_class.as_str().to_string(),
                 content_type: entry.content_type.clone(),
                 content_length: entry.content_length as i64,
                 etag: entry.etag.clone(),
@@ -1924,6 +2011,7 @@ pub async fn run_proxy(
     connect_config: monopsony_common::config::ProxyServerConfig,
     pin_key: Option<ed25519_dalek::SigningKey>,
     integrity: monopsony_common::config::IntegrityConfig,
+    language_artifacts: monopsony_common::config::LanguageArtifactConfig,
 ) -> anyhow::Result<()> {
     storage.init_dirs().await?;
 
@@ -1962,6 +2050,13 @@ pub async fn run_proxy(
             .expect("state should be uniquely owned at this point");
         st.pin_key = pin_key;
         st.integrity = integrity;
+    }
+    // Wire language-artifact cache policy (Sprint 23): master switch, TTL
+    // revalidation, retention budget, scrubber cadence.
+    {
+        Arc::get_mut(&mut state)
+            .expect("state should be uniquely owned at this point")
+            .language_artifacts = language_artifacts;
     }
 
     // Spawn the staged-part janitor: sweeps orphaned `#N` multipart staging

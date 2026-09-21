@@ -456,6 +456,138 @@ impl Default for ProxyLimitsConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Language artifact cache ([cache.language_artifacts]) — Sprint 23
+// ---------------------------------------------------------------------------
+
+/// Cache class of a stored object (Sprint 23). Drives TTL behavior, retention
+/// and scrubber treatment. Classification happens at miss time from the
+/// matching backend's pattern metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum CacheClass {
+    /// Distro/OS packages — the pre-Sprint-23 behavior: cache indefinitely,
+    /// no TTL revalidation, no verify-on-serve.
+    Distro,
+    /// Language-ecosystem immutable artifact (npm tarball, wheel, .crate).
+    /// Never TTL-revalidated; cached "forever" subject to retention floors.
+    LangArtifact,
+    /// Language-ecosystem mutable registry metadata (npm packument, PyPI
+    /// simple-index page, cargo sparse-index entry). TTL-revalidated; serves
+    /// stale when upstream is unreachable.
+    LangMetadata,
+}
+
+impl CacheClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CacheClass::Distro => "distro",
+            CacheClass::LangArtifact => "lang_artifact",
+            CacheClass::LangMetadata => "lang_metadata",
+        }
+    }
+
+    /// Parse from its string form (DB column / dashboard JSON).
+    pub fn parse_class(s: &str) -> Option<Self> {
+        match s {
+            "distro" => Some(CacheClass::Distro),
+            "lang_artifact" => Some(CacheClass::LangArtifact),
+            "lang_metadata" => Some(CacheClass::LangMetadata),
+            _ => None,
+        }
+    }
+
+    /// True when this class is TTL-revalidated (mutable registry metadata).
+    pub fn is_ttl_metadata(&self) -> bool {
+        matches!(self, CacheClass::LangMetadata)
+    }
+
+    /// True when this class is a language-ecosystem entry at all (either
+    /// artifacts or metadata) — i.e. governed by [cache.language_artifacts].
+    pub fn is_language(&self) -> bool {
+        matches!(self, CacheClass::LangArtifact | CacheClass::LangMetadata)
+    }
+}
+
+/// Old sidecars predate the class field — they are distro entries by
+/// definition, so the serde default is `Distro`.
+impl Default for CacheClass {
+    fn default() -> Self {
+        CacheClass::Distro
+    }
+}
+
+/// `[cache.language_artifacts]` — retention + revalidation policy for the
+/// language-ecosystem cache classes. Absent section ⇒ defaults: enabled,
+/// no budget (eviction off), 300s metadata TTL, 7-day scrubber.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LanguageArtifactConfig {
+    /// Master switch for language-artifact caching. Per-PM enablement is a
+    /// separate runtime surface ([language_pms] / server_settings). When
+    /// false, language PM URLs pass through uncached regardless of per-PM
+    /// state.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Per-class byte budget for LangArtifact entries. 0 = unlimited
+    /// (eviction off — the default, matching pre-Sprint-23 behavior).
+    #[serde(default)]
+    pub budget_bytes: u64,
+    /// TTL for LangMetadata entries (seconds). Past TTL, a HIT revalidates
+    /// upstream; on upstream failure the stale body is served with
+    /// X-Cache: STALE.
+    #[serde(default = "default_metadata_ttl_secs")]
+    pub metadata_ttl_secs: u64,
+    /// Version floors (§2.2): never evict the N most recent major versions.
+    #[serde(default = "default_floor_majors")]
+    pub floor_majors: u32,
+    /// Version floors: never evict N minors within the current 0.x line.
+    #[serde(default = "default_floor_minors")]
+    pub floor_minors: u32,
+    /// Version floors: never evict N patches within the current 0.0.x line.
+    #[serde(default = "default_floor_patches")]
+    pub floor_patches: u32,
+    /// Scrubber pass interval (seconds). 0 disables the scrubber.
+    #[serde(default = "default_scrub_interval_secs")]
+    pub scrub_interval_secs: u64,
+    /// Skip blobs whose last_verified_at is more recent than this many
+    /// seconds ago (default = interval ⇒ each blob verified ~once per pass).
+    #[serde(default = "default_scrub_min_age_secs")]
+    pub scrub_min_age_secs: u64,
+}
+
+fn default_metadata_ttl_secs() -> u64 {
+    300
+}
+fn default_floor_majors() -> u32 {
+    2
+}
+fn default_floor_minors() -> u32 {
+    2
+}
+fn default_floor_patches() -> u32 {
+    3
+}
+fn default_scrub_interval_secs() -> u64 {
+    604_800
+}
+fn default_scrub_min_age_secs() -> u64 {
+    604_800
+}
+
+impl Default for LanguageArtifactConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            budget_bytes: 0,
+            metadata_ttl_secs: default_metadata_ttl_secs(),
+            floor_majors: default_floor_majors(),
+            floor_minors: default_floor_minors(),
+            floor_patches: default_floor_patches(),
+            scrub_interval_secs: default_scrub_interval_secs(),
+            scrub_min_age_secs: default_scrub_min_age_secs(),
+        }
+    }
+}
+
 fn default_max_response_bytes() -> u64 {
     4 * 1024 * 1024 * 1024 // 4 GiB — linux-firmware et al.
 }

@@ -41,10 +41,20 @@ pub struct ObjectStoreBackend {
 }
 
 /// Internal metadata stored as a sidecar object alongside data.
-#[derive(serde::Serialize, serde::Deserialize)]
+///
+/// Sprint 23 fields use `#[serde(default)]` so pre-Sprint-23 sidecars
+/// (missing the keys) deserialize as `Distro` / never-verified — backward
+/// compatible, and unverified blobs are exactly the ones the scrubber
+/// should reach first.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ObjectMeta {
     checksum_sha256: String,
     size_bytes: u64,
+    #[serde(default)]
+    cache_class: monopsony_common::config::CacheClass,
+    /// Epoch secs of the last scrubber re-hash (0 = never verified).
+    #[serde(default)]
+    last_verified_at: i64,
 }
 
 impl ObjectStoreBackend {
@@ -214,6 +224,8 @@ impl CacheStorage for ObjectStoreBackend {
         let sidecar = ObjectMeta {
             checksum_sha256: hash.clone(),
             size_bytes: data.len() as u64,
+            cache_class: monopsony_common::config::CacheClass::Distro,
+            last_verified_at: 0,
         };
         self.save_sidecar(key, &sidecar).await?;
 
@@ -224,6 +236,7 @@ impl CacheStorage for ObjectStoreBackend {
             size_bytes: data.len() as u64,
             etag: put_result.e_tag,
             storage_class: None,
+            cache_class: monopsony_common::config::CacheClass::Distro,
         })
     }
 

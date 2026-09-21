@@ -180,6 +180,7 @@ async fn run_prefetch_cycle(db: &Database, config: &PrefetchConfig) -> anyhow::R
                             .record_cache_miss(&monopsony_db::db::CacheMissConfig {
                                 url: candidate.url.clone(),
                                 cache_path,
+                                cache_class: "distro".to_string(),
                                 content_type: None,
                                 content_length: size as i64,
                                 etag: None,
