@@ -41,6 +41,7 @@ mod discovery;
 mod floor_guard;
 mod grpc_client;
 mod index_parse;
+mod lang_pm_config;
 mod ledger;
 mod oracle_update;
 mod pin_verify;
@@ -366,10 +367,14 @@ async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
 #[derive(Subcommand, Debug)]
 enum ProxyCommand {
     /// Show current proxy status for all subsystems
-    Status,
+    Status {
+        /// Show status for a specific package manager (pacman, apt, dnf, apk, winget, choco, scoop, npm, pip, cargo)
+        #[arg(long)]
+        pm: Option<String>,
+    },
     /// Enable proxying for specified subsystems
     On {
-        /// Enable specific package manager (pacman, apt, dnf, apk, winget, choco, scoop)
+        /// Enable specific package manager (pacman, apt, dnf, apk, winget, choco, scoop, npm, pip, cargo)
         #[arg(long)]
         pm: Option<String>,
         /// Enable Docker registry mirror
@@ -387,7 +392,7 @@ enum ProxyCommand {
     },
     /// Disable proxying for specified subsystems
     Off {
-        /// Disable specific package manager
+        /// Disable specific package manager (pacman, apt, dnf, apk, winget, choco, scoop, npm, pip, cargo)
         #[arg(long)]
         pm: Option<String>,
         /// Disable Docker registry mirror
@@ -992,7 +997,10 @@ async fn handle_remote_assignment(
         ) {
             Ok(()) => true,
             Err(e) => {
-                warn!("remote assignment refused: trust verification failed: {}", e);
+                warn!(
+                    "remote assignment refused: trust verification failed: {}",
+                    e
+                );
                 false
             }
         }
@@ -1429,8 +1437,8 @@ async fn run_daemon(
                 // and swallowed: the daemon must never degrade.
                 if catalog_scan_guard.ready() {
                     let result: anyhow::Result<()> = async {
-                        let known = catalog_scan::load_last_hash(&cert_dir_for_task)
-                            .unwrap_or_default();
+                        let known =
+                            catalog_scan::load_last_hash(&cert_dir_for_task).unwrap_or_default();
                         let (catalog_hash, entries) = client
                             .list_shadow_catalog(&client_id_for_task, &known)
                             .await?;
@@ -1443,10 +1451,8 @@ async fn run_daemon(
                             if local.iter().any(|p| p.name == entry.name) {
                                 continue;
                             }
-                            findings.push(catalog_scan::scan_entry(
-                                &entry.name,
-                                &entry.recipe_toml,
-                            ));
+                            findings
+                                .push(catalog_scan::scan_entry(&entry.name, &entry.recipe_toml));
                         }
                         let (accepted, message) = client
                             .report_shadow_scan(&client_id_for_task, &catalog_hash, findings)
@@ -1580,16 +1586,12 @@ async fn run_daemon(
                             .unwrap_or(0);
                         match crate::oracle_update::verify_and_merge(&pin_hex, &delta_json, now) {
                             Ok(obs) => {
-                                let mut guard =
-                                    store.write().unwrap_or_else(|e| e.into_inner());
+                                let mut guard = store.write().unwrap_or_else(|e| e.into_inner());
                                 guard.merge_delta(&obs);
                                 if let Err(e) = guard.save(&floor_path) {
                                     warn!("oracle sync: floor persist failed: {}", e);
                                 }
-                                info!(
-                                    "oracle sync: merged {} observations from delta",
-                                    obs.len()
-                                );
+                                info!("oracle sync: merged {} observations from delta", obs.len());
                             }
                             Err(e) => {
                                 // Includes Expired — the freeze-alarm path:
@@ -2078,11 +2080,18 @@ async fn run_shadow_package(
         let by_name: Vec<_> = packages.iter().filter(|p| p.name == name_or_id).collect();
         match by_name.len() {
             1 => Ok(by_name[0].id.clone()),
-            0 => anyhow::bail!("No shadow package found matching '{}' (id or name)", name_or_id),
+            0 => anyhow::bail!(
+                "No shadow package found matching '{}' (id or name)",
+                name_or_id
+            ),
             _ => anyhow::bail!(
                 "Multiple shadow packages named '{}': {} — use the package id instead",
                 name_or_id,
-                by_name.iter().map(|p| p.id.as_str()).collect::<Vec<_>>().join(", ")
+                by_name
+                    .iter()
+                    .map(|p| p.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
         }
     }
@@ -2125,10 +2134,12 @@ async fn run_shadow_package(
         // verify_recipe_trust enforces the policy (e.g. trusted_authors works
         // without the raw key, trusted_server_only fails closed without one).
         let operator_vk = load_operator_verifying_key(&trust_config);
-        trust::verify_recipe_trust(&signed, &trust_config, operator_vk.as_ref()).context(format!(
-            "trust verification failed for recipe of '{}' (key_id: {})",
-            name, signed.operator_signature.key_id
-        ))?;
+        trust::verify_recipe_trust(&signed, &trust_config, operator_vk.as_ref()).context(
+            format!(
+                "trust verification failed for recipe of '{}' (key_id: {})",
+                name, signed.operator_signature.key_id
+            ),
+        )?;
         Ok(recipe_toml)
     }
 
@@ -2182,17 +2193,17 @@ async fn run_shadow_package(
                 .register_shadow_package(
                     &client_id,
                     &pkg_name,
-                    "",          // version: server/recipe decides
+                    "", // version: server/recipe decides
                     std::env::consts::ARCH,
                     std::env::consts::OS,
-                    "",          // libc: unknown from CLI
+                    "", // libc: unknown from CLI
                     shadow_source_as_str(&source_type),
                     &source,
                     &recipe_toml,
                     &install_paths,
-                    &[],         // config_paths: not provided by CLI
-                    "",          // service_name: not provided by CLI
-                    false,       // mask_from_pm: opt-in only
+                    &[],   // config_paths: not provided by CLI
+                    "",    // service_name: not provided by CLI
+                    false, // mask_from_pm: opt-in only
                 )
                 .await?;
             println!("Registered shadow package:");
@@ -2280,7 +2291,10 @@ async fn run_shadow_package(
                 println!("All packages up to date.");
             } else {
                 for u in &updates {
-                    println!("{}: {} → {}", u.package_name, u.current_version, u.latest_version);
+                    println!(
+                        "{}: {} → {}",
+                        u.package_name, u.current_version, u.latest_version
+                    );
                     if !u.asset_url.is_empty() {
                         println!("  Asset: {}", u.asset_url);
                     }
@@ -2304,7 +2318,9 @@ async fn run_shadow_package(
             let package_id = resolve_package_id(&mut client, &client_id, &name).await?;
 
             // Latest known update info (current→latest + asset URL).
-            let updates = client.check_shadow_updates(&client_id, &[package_id.clone()]).await?;
+            let updates = client
+                .check_shadow_updates(&client_id, &[package_id.clone()])
+                .await?;
             let update = updates
                 .iter()
                 .find(|u| u.package_id == package_id)
@@ -2467,8 +2483,7 @@ async fn run_shadow_package(
                         .map(|s| s.to_string())
                 })
                 .unwrap_or_default();
-            let (install_paths, service_name) =
-                shadow_cli::extract_install_fields(&recipe_toml);
+            let (install_paths, service_name) = shadow_cli::extract_install_fields(&recipe_toml);
 
             // 2. Confirm the local install actually exists before adopting:
             //    install-path existence + detect_command version probe.
@@ -2533,8 +2548,15 @@ async fn run_shadow_package(
 }
 
 async fn run_proxy_command(cmd: ProxyCommand, cert_dir: &Path) -> anyhow::Result<()> {
+    // Sprint 23 slice 5: `--pm npm|pip|cargo` routes to the Phase B language
+    // backends (npm/pip/cargo) instead of the distro toggle path. Dispatch
+    // happens before target resolution so both `proxy on --pm npm` and
+    // `proxy status --pm npm` are covered.
+    if let Some(lang_result) = run_lang_pm_command(&cmd, cert_dir).await? {
+        return lang_result;
+    }
     match cmd {
-        ProxyCommand::Status => {
+        ProxyCommand::Status { .. } => {
             println!("Monopsony Proxy Status");
             println!("═══════════════════════════════════════════════");
 
@@ -2654,6 +2676,88 @@ async fn run_proxy_command(cmd: ProxyCommand, cert_dir: &Path) -> anyhow::Result
     }
     Ok(())
 }
+
+/// Sprint 23 slice 5: language package-manager (`npm|pip|cargo`) dispatch for
+/// `proxy on|off|status --pm <lang>`.
+///
+/// Returns `Ok(None)` when the command does not target a language PM (caller
+/// falls through to the distro toggle path), or `Ok(Some(result))` after the
+/// language-PM path has fully handled the command.
+///
+/// `status` is a read-only config-file check (regenerates the backend's
+/// config action, checks whether the file exists and contains a proxy line —
+/// writes nothing). `on`/`off` execute the backend's `ProxyConfigAction` via
+/// the shared executor in `monopsony-common`.
+///
+/// Unknown `--pm` values fall through to the distro path's existing
+/// "Unknown package manager" error so the error message stays in one place.
+async fn run_lang_pm_command(
+    cmd: &ProxyCommand,
+    cert_dir: &Path,
+) -> anyhow::Result<Option<anyhow::Result<()>>> {
+    let (pm_name, action_name, server_addr): (Option<&String>, &str, Option<String>) = match cmd {
+        ProxyCommand::Status { .. } => (None, "status", None),
+        ProxyCommand::On { pm, server, .. } => (pm.as_ref(), "on", server.clone()),
+        ProxyCommand::Off { pm, .. } => (pm.as_ref(), "off", None),
+    };
+
+    let Some(name) = pm_name else {
+        // No --pm flag at all: bare `status` prints all subsystems, leave it.
+        if matches!(cmd, ProxyCommand::Status { .. }) {
+            return Ok(None);
+        }
+        // on/off without --pm are handled by their own flags — fall through.
+        return Ok(None);
+    };
+
+    let kind = match lang_pm_config::parse_lang_pm(name) {
+        Some(k) => k,
+        None => {
+            // Not a language PM — fall through to the distro toggle path
+            // (which reports unknown distro PM names itself).
+            return Ok(None);
+        }
+    };
+
+    match action_name {
+        "status" => {
+            let (on, msg) = lang_pm_config::lang_pm_status(kind);
+            let status = if on { "ON  ✓" } else { "OFF ✗" };
+            println!("{:<16} {}  {}", kind.as_str(), status, msg);
+            Ok(Some(Ok(())))
+        }
+        "on" => {
+            let server_addr = match server_addr {
+                Some(s) => s,
+                None => resolve_server_addr(cert_dir)
+                    .await
+                    .unwrap_or_else(|_| "127.0.0.1:3128".to_string()),
+            };
+            match lang_pm_config::lang_pm_apply(kind, &server_addr, true) {
+                Ok(msg) => {
+                    println!("✓ {}: {}", kind.as_str(), msg);
+                    Ok(Some(Ok(())))
+                }
+                Err(e) => {
+                    println!("✗ {}: {}", kind.as_str(), e);
+                    Ok(Some(Err(anyhow::anyhow!("1 action failed"))))
+                }
+            }
+        }
+        "off" => match lang_pm_config::lang_pm_apply(kind, "", false) {
+            Ok(msg) => {
+                println!("✓ {}: {}", kind.as_str(), msg);
+                Ok(Some(Ok(())))
+            }
+            Err(e) => {
+                println!("✗ {}: {}", kind.as_str(), e);
+                Ok(Some(Err(anyhow::anyhow!("1 action failed"))))
+            }
+        },
+        _ => unreachable!("only status/on/off dispatched here"),
+    }
+}
+
 #[cfg(test)]
 mod remote_assignment_tests {
     use super::remote_assignment_allowed;
