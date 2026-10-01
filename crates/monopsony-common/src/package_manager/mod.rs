@@ -6,12 +6,15 @@
 mod apk;
 mod apt;
 mod bsd_privilege;
+mod cargo;
 mod choco;
 mod dnf;
 mod emerge;
 mod mport;
 mod nix;
+mod npm;
 mod pacman;
+mod pip;
 mod pkg;
 mod pkg_add;
 mod pkgin;
@@ -22,12 +25,15 @@ mod zypper;
 
 pub use apk::ApkBackend;
 pub use apt::AptBackend;
+pub use cargo::CargoBackend;
 pub use choco::ChocoBackend;
 pub use dnf::DnfBackend;
 pub use emerge::EmergeBackend;
 pub use mport::MportBackend;
 pub use nix::NixBackend;
+pub use npm::NpmBackend;
 pub use pacman::PacmanBackend;
+pub use pip::PipBackend;
 pub use pkg::PkgBackend;
 pub use pkg_add::PkgAddBackend;
 pub use pkgin::PkginBackend;
@@ -55,6 +61,9 @@ pub enum PackageManagerKind {
     Winget,
     Choco,
     Scoop,
+    Npm,
+    Pip,
+    Cargo,
     Zypper,
     Xbps,
     Emerge,
@@ -75,6 +84,9 @@ impl PackageManagerKind {
             PackageManagerKind::Winget => "winget",
             PackageManagerKind::Choco => "choco",
             PackageManagerKind::Scoop => "scoop",
+            PackageManagerKind::Npm => "npm",
+            PackageManagerKind::Pip => "pip",
+            PackageManagerKind::Cargo => "cargo",
             PackageManagerKind::Zypper => "zypper",
             PackageManagerKind::Xbps => "xbps",
             PackageManagerKind::Emerge => "emerge",
@@ -97,6 +109,9 @@ impl PackageManagerKind {
             "winget" => Some(PackageManagerKind::Winget),
             "choco" => Some(PackageManagerKind::Choco),
             "scoop" => Some(PackageManagerKind::Scoop),
+            "npm" => Some(PackageManagerKind::Npm),
+            "pip" => Some(PackageManagerKind::Pip),
+            "cargo" => Some(PackageManagerKind::Cargo),
             "zypper" => Some(PackageManagerKind::Zypper),
             "xbps" => Some(PackageManagerKind::Xbps),
             "emerge" => Some(PackageManagerKind::Emerge),
@@ -317,6 +332,9 @@ pub fn get_all_backends() -> Vec<Box<dyn PackageManagerBackend>> {
         Box::new(WingetBackend::new()),
         Box::new(ChocoBackend::new()),
         Box::new(ScoopBackend::new()),
+        Box::new(NpmBackend::new()),
+        Box::new(PipBackend::new()),
+        Box::new(CargoBackend::new()),
         Box::new(ZypperBackend::new()),
         Box::new(XbpsBackend::new()),
         Box::new(EmergeBackend::new()),
@@ -349,6 +367,9 @@ pub fn get_backend(kind: PackageManagerKind) -> Option<Box<dyn PackageManagerBac
         PackageManagerKind::Winget => Some(Box::new(WingetBackend::new())),
         PackageManagerKind::Choco => Some(Box::new(ChocoBackend::new())),
         PackageManagerKind::Scoop => Some(Box::new(ScoopBackend::new())),
+        PackageManagerKind::Npm => Some(Box::new(NpmBackend::new())),
+        PackageManagerKind::Pip => Some(Box::new(PipBackend::new())),
+        PackageManagerKind::Cargo => Some(Box::new(CargoBackend::new())),
         PackageManagerKind::Zypper => Some(Box::new(ZypperBackend::new())),
         PackageManagerKind::Xbps => Some(Box::new(XbpsBackend::new())),
         PackageManagerKind::Emerge => Some(Box::new(EmergeBackend::new())),

@@ -1,6 +1,9 @@
-//! Language artifact TTL metadata revalidation (Sprint 23 Phase A).
+//! Language artifact serving (Sprint 23 Phase A): TTL metadata revalidation
+//! + verify-on-serve.
 //!
-//! Cached tarballs/registry metadata under the `lang_artifact` class get a
+//! Cached language-PM objects get class-aware serving behavior:
+//! `lang_metadata` entries are TTL-revalidated against the origin (serve-stale
+//! when unreachable), `lang_artifact` entries are verified on serve.
 //! TTL: entries older than `metadata_ttl_secs` are revalidated against the
 //! origin (HEAD request with If-None-Match/If-Modified-Since) before the
 //! cached copy is trusted. On revalidation failure or network error the
@@ -43,6 +46,60 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+/// Per-PM enablement resolution (Sprint 23 Phase D): read the runtime
+/// `language_pms` setting and auto-enable on first use.
+///
+/// * DB-less mode → `Ok(true)` (cannot gate; same posture as every other
+///   pre-Sprint-23 code path).
+/// * PM present in the map → its `enabled` flag decides; missing keys default
+///   to disabled.
+/// * Auto-enable: the first matching request flips the PM to
+///   `{enabled: true, source: "auto"}` and writes an audit row. The read
+///   present state (or the auto-enable write) succeeding returns `Ok(true)`
+///   so the request that triggered enablement is served (and cached) normally.
+///   A failing auto-enable WRITE logs and returns `Ok(true)` too — a settings
+///   write failure must not take the proxy path down (same fail-open class as
+///   the quarantine check). Only a failing settings READ returns `Err`.
+pub async fn resolve_pm_enabled(state: &ProxyState, pm: &str) -> anyhow::Result<bool> {
+    let Some(db) = &state.db else {
+        return Ok(true);
+    };
+    let mut map = db.get_language_pms().await?;
+    match map.get(pm) {
+        Some(st) if st.enabled => Ok(true),
+        Some(_) => Ok(false),
+        None => {
+            // First contact: auto-enable (plan §2.4) + audit row.
+            info!("Language PM '{}' auto-enabling on first request", pm);
+            map.insert(
+                pm.to_string(),
+                monopsony_db::db::LanguagePmState {
+                    enabled: true,
+                    source: "auto".to_string(),
+                },
+            );
+            match db.set_language_pms(&map).await {
+                Ok(()) => {
+                    if let Err(e) = db
+                        .record_pm_enablement_audit(pm, "enabled", "auto", Some("first request"))
+                        .await
+                    {
+                        debug!("PM auto-enable audit row failed for {}: {}", pm, e);
+                    }
+                    Ok(true)
+                }
+                Err(e) => {
+                    warn!(
+                        "PM auto-enable write failed for {}: {} — serving uncached-gated",
+                        pm, e
+                    );
+                    Ok(true)
+                }
+            }
+        }
+    }
+}
+
 /// Classify an entry's freshness and refresh TTL bookkeeping on revalidation.
 ///
 /// `meta` is the sidecar metadata (`CacheEntry`) for the cache key; the
@@ -53,7 +110,10 @@ pub async fn check_freshness(state: &ProxyState, meta: &mut CacheEntry) -> Fresh
     if !cfg.enabled || cfg.metadata_ttl_secs == 0 {
         return Freshness::Fresh;
     }
-    if meta.cache_class != "lang_artifact" {
+    // TTL applies to mutable registry metadata only. Artifacts are immutable
+    // and skip revalidation entirely (plan §2.1 vs §2.2); distro entries are
+    // governed by upstream cache headers, not the language TTL.
+    if meta.cache_class != "lang_metadata" {
         return Freshness::Fresh;
     }
 
@@ -106,7 +166,10 @@ pub async fn verify_on_serve(
             return true;
         }
         Err(e) => {
-            warn!("verify-on-serve: checksum read failed for {}: {} (serve)", url, e);
+            warn!(
+                "verify-on-serve: checksum read failed for {}: {} (serve)",
+                url, e
+            );
             return true;
         }
     };
@@ -142,7 +205,10 @@ pub async fn verify_on_serve(
             }
         }
         Err(e) => {
-            warn!("verify-on-serve: blob read failed for {}: {} (serve)", url, e);
+            warn!(
+                "verify-on-serve: blob read failed for {}: {} (serve)",
+                url, e
+            );
             true
         }
     }
@@ -186,9 +252,9 @@ async fn revalidate(meta: &CacheEntry) -> RevalidateOutcome {
                     .get(reqwest::header::LAST_MODIFIED)
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
-                if origin_etag.is_some() && origin_etag != meta.etag {
-                    RevalidateOutcome::Changed
-                } else if origin_lm.is_some() && origin_lm != meta.last_modified {
+                if (origin_etag.is_some() && origin_etag != meta.etag)
+                    || (origin_lm.is_some() && origin_lm != meta.last_modified)
+                {
                     RevalidateOutcome::Changed
                 } else {
                     RevalidateOutcome::Unchanged
@@ -213,6 +279,7 @@ mod tests {
             url: "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz".to_string(),
             cache_path: "npm/left-pad/1.3.0/blob".to_string(),
             content_type: None,
+            content_encoding: None,
             content_length: 4,
             etag: None,
             last_modified: None,
@@ -254,7 +321,7 @@ mod tests {
 
     /// Disabled config or distro class → Fresh regardless of age.
     #[tokio::test]
-    async fn test_freshness_disabled_config_and_distro_class() {
+    async fn test_freshness_disabled_config_and_non_metadata_classes() {
         let (state, _t) = test_state();
         // Distro class, ancient timestamp: never TTL-gated.
         let mut entry = test_entry("distro", 1);
@@ -263,10 +330,18 @@ mod tests {
             Freshness::Fresh
         ));
 
-        // lang_artifact but TTL=0 (disabled) → Fresh.
+        // lang_artifact (immutable) past TTL: never TTL-gated either —
+        // only mutable metadata revalidates (plan §2.1 vs §2.2).
+        let mut entry = test_entry("lang_artifact", 1);
+        assert!(matches!(
+            check_freshness(&state, &mut entry).await,
+            Freshness::Fresh
+        ));
+
+        // Any class but TTL=0 (disabled) → Fresh.
         let mut state = state;
         state.language_artifacts.metadata_ttl_secs = 0;
-        let mut entry = test_entry("lang_artifact", 1);
+        let mut entry = test_entry("lang_metadata", 1);
         assert!(matches!(
             check_freshness(&state, &mut entry).await,
             Freshness::Fresh
@@ -277,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn test_freshness_within_ttl_is_fresh() {
         let (state, _t) = test_state();
-        let mut entry = test_entry("lang_artifact", now_secs() - 10);
+        let mut entry = test_entry("lang_metadata", now_secs() - 10);
         assert!(matches!(
             check_freshness(&state, &mut entry).await,
             Freshness::Fresh
@@ -289,8 +364,8 @@ mod tests {
     #[tokio::test]
     async fn test_freshness_past_ttl_origin_unreachable_serves_stale() {
         let (state, _t) = test_state();
-        let mut entry = test_entry("lang_artifact", 1);
-        entry.url = "http://127.0.0.1:1/unreachable.tgz".to_string();
+        let mut entry = test_entry("lang_metadata", 1);
+        entry.url = "http://127.0.0.1:1/unreachable".to_string();
         let original_cached_at = entry.cached_at;
         match check_freshness(&state, &mut entry).await {
             Freshness::ServeStale => {}
@@ -354,9 +429,7 @@ mod tests {
             // Fallback: first non-sidecar file for this key.
             let mut found = None;
             for entry_path in walkdir_walk(_t.path()) {
-                let is_meta = entry_path
-                    .components()
-                    .any(|c| c.as_os_str() == ".meta");
+                let is_meta = entry_path.components().any(|c| c.as_os_str() == ".meta");
                 if !is_meta {
                     found = Some(entry_path);
                     break;
