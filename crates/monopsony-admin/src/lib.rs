@@ -3,13 +3,14 @@
 //! Provides a REST API at `/api/v1/*` and serves the embedded dashboard
 //! SPA at `/dashboard/*`. Uses Tailscale-aware authentication.
 
-pub mod auth;
 pub mod assign;
+pub mod auth;
 pub mod cache;
 pub mod clients;
 pub mod features;
 pub mod health;
 pub mod help;
+pub mod language_pms;
 pub mod mirrors;
 pub mod oracle;
 pub mod pairing;
@@ -27,7 +28,7 @@ use axum::{
     extract::{Request, State},
     middleware::from_fn_with_state,
     response::Response,
-    routing::{get, post},
+    routing::{get, patch, post},
     Router,
 };
 use monopsony_control::tls::TlsManager;
@@ -175,6 +176,15 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/api/v1/config", post(settings::handle_update_config))
         .route("/api/v1/config/scan", get(settings::handle_get_scan_config))
         .route("/api/v1/config/node", get(settings::handle_get_node_config))
+        // Language-PM enablement (Sprint 23 Phase D)
+        .route(
+            "/api/v1/admin/language-pms",
+            get(language_pms::handle_get_language_pms),
+        )
+        .route(
+            "/api/v1/admin/language-pms",
+            patch(language_pms::handle_patch_language_pms),
+        )
         // Clients
         .route("/api/v1/clients", get(clients::handle_list_clients))
         .route("/api/v1/clients/:id", get(clients::handle_get_client))

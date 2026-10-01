@@ -7,6 +7,7 @@
   import AlertTriangle from 'lucide-svelte/icons/alert-triangle';
   import CheckCircle from 'lucide-svelte/icons/check-circle';
   import HelpTooltip from '$lib/components/HelpTooltip.svelte';
+  import LanguagePmPanel from '$lib/components/LanguagePmPanel.svelte';
 
   let config = $state<ConfigResponse | null>(null);
   let editedToml = $state('');
@@ -109,6 +110,9 @@
         spellcheck="false"
       ></textarea>
     </div>
+
+    <!-- Language package managers -->
+    <LanguagePmPanel />
 
     <!-- Restart warning -->
     {#if isDirty}
