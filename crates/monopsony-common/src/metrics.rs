@@ -15,6 +15,10 @@ pub mod server {
     pub const PACKAGES_CACHED: &str = "monopsony_packages_cached_current";
     pub const PACKAGES_PREFETCHED: &str = "monopsony_packages_prefetched_total";
     pub const PACKAGES_PURGED: &str = "monopsony_packages_purged_total";
+    /// Sprint 23 Phase C: language-artifact retention/scrubber counters.
+    pub const CACHE_EVICTED_TOTAL: &str = "monopsony_cache_evicted_total";
+    pub const SCRUB_VERIFIED_TOTAL: &str = "monopsony_scrub_verified_total";
+    pub const SCRUB_QUARANTINED_TOTAL: &str = "monopsony_scrub_quarantined_total";
     pub const GRPC_REQUESTS_TOTAL: &str = "monopsony_grpc_requests_total";
     pub const GRPC_REQUEST_DURATION: &str = "monopsony_grpc_request_duration_seconds";
 }
@@ -60,6 +64,20 @@ pub fn cache_bytes_served(bytes: u64) {
 /// Record bytes cached
 pub fn cache_bytes_cached(bytes: u64) {
     counter!(server::CACHE_BYTES_CACHED).increment(bytes);
+}
+
+/// Sprint 23 Phase C: record one retention eviction (blob deleted over budget).
+pub fn cache_evicted() {
+    counter!(server::CACHE_EVICTED_TOTAL).increment(1);
+}
+
+/// Sprint 23 Phase C: record scrubber verification outcome.
+pub fn scrub_verified(count: u64) {
+    counter!(server::SCRUB_VERIFIED_TOTAL).increment(count);
+}
+
+pub fn scrub_quarantined(count: u64) {
+    counter!(server::SCRUB_QUARANTINED_TOTAL).increment(count);
 }
 
 /// Record bytes relayed through HTTP CONNECT tunnels
