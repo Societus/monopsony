@@ -27,9 +27,23 @@ fn build_https_client() -> HttpClient {
         .with_native_roots()
         .expect("Failed to load native root certs")
         .https_or_http()
-        .enable_http2()
+        // Fleet-verified failure mode (2026-10-01 bench): hyper h2 against the
+        // crates CDNs (index.crates.io, static.crates.io — both CloudFront)
+        // deterministically fails with `SendRequest: broken pipe` while curl
+        // succeeds; pool_max_idle_per_host(0) did NOT fix it. For a caching
+        // proxy the h2 multiplexing win is marginal next to the correctness
+        // hit — upstream speaks HTTP/1.1.
+        .enable_http1()
         .build();
-    Client::builder(TokioExecutor::new()).build(connector)
+    Client::builder(TokioExecutor::new())
+        // Fleet-verified failure mode (2026-10-01 bench): hyper h2 against the
+        // crates CDNs (index.crates.io, static.crates.io — both CloudFront)
+        // deterministically fails with `SendRequest: broken pipe` while curl
+        // (h2 or http/1.1) succeeds; pool_max_idle_per_host(0) did NOT fix it.
+        // Upstream speaks HTTP/1.1 — for a caching proxy the h2 multiplexing
+        // win is marginal next to the correctness hit.
+        .pool_max_idle_per_host(0)
+        .build(connector)
 }
 use std::{
     collections::HashMap,
@@ -45,7 +59,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use monopsony_common::{PackageManagerBackend, PackageManagerKind};
 
-use crate::cache_storage::{ByteRange, CacheStorage, SpoolHandle};
+use crate::cache_storage::{ByteRange, ByteStream, CacheStorage, SpoolHandle};
 use crate::security::RateLimiter;
 use monopsony_db::Database;
 
@@ -55,6 +69,11 @@ pub struct CacheEntry {
     pub url: String,
     pub cache_path: String,
     pub content_type: Option<String>,
+    /// Upstream `content-encoding` (e.g. gzip). Bodies are cached byte-exact;
+    /// HIT responses must re-attach this header or clients receive gzip bytes
+    /// as identity (fleet-caught: npm packuments served undecodable).
+    #[serde(default)]
+    pub content_encoding: Option<String>,
     pub content_length: u64,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
@@ -123,8 +142,7 @@ impl ProxyState {
             connect_config: monopsony_common::config::ProxyServerConfig::default(),
             pin_key: None,
             integrity: monopsony_common::config::IntegrityConfig::default(),
-            language_artifacts:
-                monopsony_common::config::LanguageArtifactConfig::default(),
+            language_artifacts: monopsony_common::config::LanguageArtifactConfig::default(),
         }
     }
 
@@ -229,6 +247,22 @@ pub fn create_proxy_router(
 ) -> axum::Router {
     axum::Router::new()
         .route("/health", axum::routing::get(health_check))
+        // Sprint 23 Phase B+: language-registry shims (more-specific routes
+        // win over the /*path wildcard). Each shim serves plain-http requests
+        // whose real upstream is https-only — handle_request_uri rewrites
+        // origin-form to absolute-https and flows into the normal cached path.
+        .route("/npm/*path", axum::routing::any(handle_npm_shim))
+        .route("/npm", axum::routing::any(handle_npm_shim))
+        .route("/pypi/simple/*path", axum::routing::any(handle_pypi_shim))
+        .route(
+            "/pypi/packages/*path",
+            axum::routing::any(handle_pypi_files_shim),
+        )
+        .route(
+            "/cargo-index/*path",
+            axum::routing::any(handle_cargo_index_shim),
+        )
+        .route("/crates/*path", axum::routing::any(handle_crates_shim))
         .route("/*path", axum::routing::any(handle_proxy_request))
         .route("/", axum::routing::any(handle_proxy_request))
         // No `.fallback` here: CONNECT is intercepted in the hyper Service
@@ -277,10 +311,159 @@ pub async fn handle_proxy_request(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     request: Request<Body>,
 ) -> impl IntoResponse {
+    // Full URL from the request. Scheme preserved as-sent: the fetch must
+    // honor http-only mirrors. Scheme normalization happens only at
+    // DB-lookup boundaries (prefetch stores https:// URLs).
+    let url = if request.uri().scheme().is_some() {
+        request.uri().to_string()
+    } else {
+        // For proxy requests, the URI should be absolute
+        format!("http://{}", request.uri())
+    };
+    handle_request_uri(state, rate_limiter, addr, request, url).await
+}
+
+/// Registry-shim entrypoints (Sprint 23 Phase B+): plain-http origin-form
+/// requests served by clients whose real upstream is https-only. Each shim
+/// maps the path to the canonical upstream URL and re-enters the normal
+/// request pipeline (SSRF check, pattern match, cache) — the flow then
+/// behaves exactly like an origin-form proxy fetch of the https URL, so
+/// classification, TTL bookkeeping, and sidecars are identical.
+async fn handle_npm_shim(
+    State((state, rate_limiter)): State<(
+        Arc<ProxyState>,
+        Option<Arc<crate::security::RateLimiter>>,
+    )>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> impl IntoResponse {
+    let path = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_default();
+    let path = path.strip_prefix("/npm").unwrap_or(&path).to_string();
+    let upstream = format!("https://registry.npmjs.org{}", path);
+    handle_request_uri(state, rate_limiter, addr, request, upstream).await
+}
+
+async fn handle_pypi_shim(
+    State((state, rate_limiter)): State<(
+        Arc<ProxyState>,
+        Option<Arc<crate::security::RateLimiter>>,
+    )>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> impl IntoResponse {
+    let path = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_default();
+    let path = path.strip_prefix("/pypi").unwrap_or(&path).to_string();
+    let upstream = format!("https://pypi.org{}", path);
+    handle_request_uri(state, rate_limiter, addr, request, upstream).await
+}
+
+async fn handle_pypi_files_shim(
+    State((state, rate_limiter)): State<(
+        Arc<ProxyState>,
+        Option<Arc<crate::security::RateLimiter>>,
+    )>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> impl IntoResponse {
+    let path = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_default();
+    let path = path.strip_prefix("/pypi").unwrap_or(&path).to_string();
+    let upstream = format!("https://files.pythonhosted.org{}", path);
+    handle_request_uri(state, rate_limiter, addr, request, upstream).await
+}
+
+async fn handle_cargo_index_shim(
+    State((state, rate_limiter)): State<(
+        Arc<ProxyState>,
+        Option<Arc<crate::security::RateLimiter>>,
+    )>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> impl IntoResponse {
+    let path = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_default();
+    let path = path
+        .strip_prefix("/cargo-index")
+        .unwrap_or(&path)
+        .to_string();
+    // config.json IS the mirror's contract: it tells cargo where downloads
+    // live. We are the mirror — answer locally with our own /crates shim
+    // template instead of relaying upstream's (fleet note: relaying this one
+    // endpoint deterministically breaks with h2 `broken pipe`, while other
+    // index paths to the same host work; not worth the dependency).
+    if path == "/config.json" || path == "config.json" {
+        let host = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok())
+            .map(|h| h.to_string())
+            .unwrap_or_else(|| addr.to_string());
+        let body = format!(
+            "{{\n  \"dl\": \"http://{}/crates\",\n  \"api\": \"https://crates.io\"\n}}\n",
+            host
+        );
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CACHE_CONTROL, "max-age=300")
+            .body(Body::from(body))
+            .unwrap_or_else(|_| Response::new(Body::from("{}")));
+    }
+    let upstream = format!("https://index.crates.io{}", path);
+    handle_request_uri(state, rate_limiter, addr, request, upstream)
+        .await
+        .into_response()
+}
+
+async fn handle_crates_shim(
+    State((state, rate_limiter)): State<(
+        Arc<ProxyState>,
+        Option<Arc<crate::security::RateLimiter>>,
+    )>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    request: Request<Body>,
+) -> impl IntoResponse {
+    let path = request
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_default();
+    let path = path.strip_prefix("/crates").unwrap_or(&path).to_string();
+    // static.crates.io paths INCLUDE a /crates segment (e.g.
+    // /crates/libc/0.2.100/download); our route prefix coincides with it, so
+    // re-add the segment after stripping the route prefix.
+    let upstream = format!("https://static.crates.io/crates{}", path);
+    handle_request_uri(state, rate_limiter, addr, request, upstream).await
+}
+
+/// Shared request pipeline: rate limit, federation gate, SSRF check, then
+/// cache or pass-through — keyed on the caller-supplied canonical upstream
+/// `url` rather than one derived from the request URI.
+pub(crate) async fn handle_request_uri(
+    state: Arc<ProxyState>,
+    rate_limiter: Option<Arc<crate::security::RateLimiter>>,
+    addr: SocketAddr,
+    request: Request<Body>,
+    url: String,
+) -> impl IntoResponse {
     let method = request.method().clone();
     let uri = request.uri().clone();
 
-    debug!("Proxy request: {} {}", method, uri);
+    debug!("Proxy request: {} {} (upstream {})", method, uri, url);
 
     // Check rate limit if a limiter is configured
     let limiter_clone = rate_limiter.clone();
@@ -321,18 +504,8 @@ pub async fn handle_proxy_request(
 
     // Only handle GET and HEAD for caching
     if method != Method::GET && method != Method::HEAD {
-        return proxy_passthrough(&state, request).await;
+        return proxy_passthrough_to(&state, request, &url).await;
     }
-
-    // Get the full URL from the request. The scheme is preserved as-sent:
-    // the fetch must honor http-only mirrors. Scheme normalization happens
-    // only at DB-lookup boundaries (prefetch stores https:// URLs).
-    let url = if uri.scheme().is_some() {
-        uri.to_string()
-    } else {
-        // For proxy requests, the URI should be absolute
-        format!("http://{}", uri)
-    };
 
     // SSRF prevention: validate URL host doesn't resolve to private IP
     if let Ok(parsed) = url::Url::parse(&url) {
@@ -360,12 +533,53 @@ pub async fn handle_proxy_request(
     // Check if this URL matches a package manager pattern
     let is_package = state.find_backend_for_url(&url).is_some();
 
-    let response = if is_package {
+    // Sprint 23 Phase D: per-PM enablement gate. A request matching a
+    // language-PM URL pattern passes through UNCACHED while that PM is
+    // disabled in server_settings; the first matching request auto-enables
+    // the PM (source=auto + audit row). Distro PMs are unaffected. The
+    // settings read is keyed on the settings table (runtime — no restart);
+    // DB-less mode cannot gate or auto-enable, so language PMs run enabled.
+    // NOTE: no early return here — the concurrent-slot release below relies
+    // on falling through to the single response binding.
+    let mut lang_pm_bypass = false;
+    if is_package {
+        if let Some(kind) = state.find_backend_for_url(&url).map(|(k, _)| k) {
+            let pm = match kind {
+                monopsony_common::package_manager::PackageManagerKind::Npm => Some("npm"),
+                monopsony_common::package_manager::PackageManagerKind::Pip => Some("pip"),
+                monopsony_common::package_manager::PackageManagerKind::Cargo => Some("cargo"),
+                _ => None,
+            };
+            if let Some(pm) = pm {
+                match crate::language_artifacts::resolve_pm_enabled(&state, pm).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        info!(
+                            "Language PM '{}' disabled — passing through uncached: {}",
+                            pm, url
+                        );
+                        lang_pm_bypass = true;
+                    }
+                    Err(e) => {
+                        debug!("Language PM enablement check failed for {}: {}", pm, e);
+                    }
+                }
+            }
+        }
+    }
+
+    let response = if lang_pm_bypass {
+        debug!("Language PM disabled, passing through uncached: {}", url);
+        proxy_passthrough_to(&state, request, &url).await
+    } else if is_package {
         debug!("Package URL detected: {}", url);
         handle_cached_request(state.clone(), request, &url).await
     } else {
         debug!("Non-package URL, passing through: {}", url);
-        proxy_passthrough(&state, request).await
+        // Canonical `url`, never the raw request URI: shim routes receive
+        // origin-form paths (no host), e.g. cargo's config.json (a non-package
+        // URL) — rebuilding from the URI would yield an invalid http:/// URL.
+        proxy_passthrough_to(&state, request, &url).await
     };
 
     // Release the concurrent connection slot
@@ -388,7 +602,7 @@ async fn handle_cached_request(
         Some(key) => key,
         None => {
             warn!("Could not determine cache key for URL: {}", url);
-            return proxy_passthrough(&state, request).await;
+            return proxy_passthrough_to(&state, request, url).await;
         }
     };
 
@@ -440,7 +654,16 @@ async fn handle_cached_request(
             // Parse Range before the await-heavy serve path: `&Request<Body>`
             // is not Send and cannot be held across awaits.
             let range = parse_range_header(request.headers().get(header::RANGE));
-            if let Some(response) = serve_cache_hit(&state, range, &cache_key, url).await {
+            // Sprint 23 Phase B+: serve-time artifact-body rewrite context.
+            // Shim-served METADATA (pip simple pages, cargo config.json)
+            // embeds absolute upstream https links; without a rewrite the
+            // artifact downloads bypass the shims (CONNECT = opaque). The
+            // context is derived from the canonical upstream URL + the
+            // request's Host authority; None for every other path.
+            let rewrite_ctx = body_rewrite_context(request.headers(), url);
+            if let Some(response) =
+                serve_cache_hit(&state, range, &cache_key, url, rewrite_ctx.as_ref()).await
+            {
                 return response;
             }
             // read_stream failed below the DB/exists checks — treat as a
@@ -488,17 +711,65 @@ async fn quarantined(state: &ProxyState, url: &str) -> bool {
     }
 }
 
+/// Serve-time rewrite context (Sprint 23 Phase B+): identifies the shim
+/// routes whose METADATA bodies embed absolute upstream https links (pip
+/// simple pages → files.pythonhosted.org, cargo sparse index config.json →
+/// crates.io). Artifacts and npm packuments serve byte-faithful.
+#[derive(Debug, Clone)]
+struct BodyRewriteCtx {
+    shim_route: &'static str,
+    proxy_base: String,
+}
+
+/// Derive the rewrite context from the canonical upstream URL + the request's
+/// Host authority. Returns Some only for metadata-serving shim routes; every
+/// other path (artifacts, npm, non-shim) returns None — no rewrite.
+fn body_rewrite_context(headers: &header::HeaderMap, upstream_url: &str) -> Option<BodyRewriteCtx> {
+    let route = if upstream_url.starts_with("https://pypi.org/simple/") {
+        "/pypi/simple"
+    } else if upstream_url.starts_with("https://index.crates.io/") {
+        "/cargo-index"
+    } else {
+        return None;
+    };
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.trim_end_matches('/').to_string())
+        .unwrap_or_default();
+    if host.is_empty() {
+        return None;
+    }
+    Some(BodyRewriteCtx {
+        shim_route: route,
+        proxy_base: format!("http://{}", host),
+    })
+}
+
+/// Read a cached metadata stream fully for the serve-time rewrite. Only used
+/// on KB-to-MB scale documents — callers gate on size before calling.
+async fn read_stream_to_vec(mut stream: ByteStream) -> anyhow::Result<Vec<u8>> {
+    use futures::StreamExt;
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        out.extend_from_slice(&chunk?);
+    }
+    Ok(out)
+}
 /// Serve a validated cache hit as a streaming response. Returns None when the
 /// storage read fails or a security policy blocks serving — the caller then
 /// treats the request as a miss.
 ///
 /// `range` is pre-parsed (the caller extracts it from the request because
 /// `&Request<Body>` is not Send and cannot be held across awaits here).
+/// `rewrite_ctx` (Sprint 23 Phase B+) carries the serve-time body-rewrite
+/// context derived by the caller; `None` serves byte-faithful.
 async fn serve_cache_hit(
-    state: &ProxyState,
+    state: &Arc<ProxyState>,
     range: ByteRange,
     cache_key: &str,
     url: &str,
+    rewrite_ctx: Option<&BodyRewriteCtx>,
 ) -> Option<Response<Body>> {
     debug!("Cache hit for: {}", url);
     monopsony_common::metrics::cache_request_hit();
@@ -561,9 +832,7 @@ async fn serve_cache_hit(
                     .header("X-Monopsony-Quarantine", "1")
                     .body(Body::from("Cached artifact failed integrity verification"))
                     .unwrap_or_else(|_| {
-                        Response::new(Body::from(
-                            "Cached artifact failed integrity verification",
-                        ))
+                        Response::new(Body::from("Cached artifact failed integrity verification"))
                     }),
             );
         }
@@ -575,10 +844,64 @@ async fn serve_cache_hit(
     match state.storage.read_stream(cache_key, range.clone()).await {
         Ok((stream, total)) => {
             let partial = stream_requested_partial(&range, total);
-            let serve_len = if partial {
+            // Sprint 23 Phase B+: serve-time body rewrite for shim-served
+            // METADATA (pip simple pages, cargo config.json — see
+            // BodyRewriteCtx). Buffered: these documents are KB–MB scale and
+            // size-capped; artifacts and range requests never take this
+            // branch and stream byte-faithful. Cached bytes stay origin-true
+            // (sidecar checksums keep matching upstream); only the SERVED
+            // body is rewritten.
+            let mut serve_len = if partial {
                 range.end.min(total) - range.start
             } else {
                 total
+            };
+            let serve_stream: ByteStream = match rewrite_ctx {
+                Some(ctx) if !partial && total <= state.limits.max_response_bytes => {
+                    match read_stream_to_vec(stream).await {
+                        Ok(bytes) => {
+                            let body = String::from_utf8_lossy(&bytes).into_owned();
+                            match crate::body_rewrite::rewrite_if_needed(
+                                ctx.shim_route,
+                                &body,
+                                &ctx.proxy_base,
+                            ) {
+                                Some(rewritten) => {
+                                    let rewritten = rewritten.into_bytes();
+                                    serve_len = rewritten.len() as u64;
+                                    debug!(
+                                        "Body rewrite applied for {} ({} -> {} bytes)",
+                                        url,
+                                        bytes.len(),
+                                        serve_len
+                                    );
+                                    futures::stream::once(async move {
+                                        Ok::<bytes::Bytes, anyhow::Error>(bytes::Bytes::from(
+                                            rewritten,
+                                        ))
+                                    })
+                                    .boxed()
+                                }
+                                // Dispatch declined (not a rewrite target,
+                                // e.g. an index page rather than
+                                // config.json): serve the buffered ORIGINAL
+                                // bytes through the normal path below.
+                                None => futures::stream::once(async move {
+                                    Ok::<bytes::Bytes, anyhow::Error>(bytes::Bytes::from(bytes))
+                                })
+                                .boxed(),
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Rewrite-path read failed for {}: {} — treating as miss",
+                                url, e
+                            );
+                            return None;
+                        }
+                    }
+                }
+                _ => stream,
             };
 
             let mut builder = Response::builder()
@@ -590,6 +913,17 @@ async fn serve_cache_hit(
                 .header(header::CONTENT_TYPE, &content_type)
                 .header(header::CONTENT_LENGTH, serve_len)
                 .header(header::ACCEPT_RANGES, "bytes");
+
+            // Re-attach the upstream content-encoding stored in the sidecar.
+            // Bodies are cached byte-exact (possibly gzip); without this the
+            // client receives encoded bytes it doesn't know to decode.
+            if let Some(enc) = meta
+                .as_ref()
+                .and_then(|m| m.content_encoding.clone())
+                .filter(|e| !e.is_empty())
+            {
+                builder = builder.header(header::CONTENT_ENCODING, enc);
+            }
 
             if partial {
                 builder = builder.header(
@@ -682,7 +1016,7 @@ async fn serve_cache_hit(
             }
 
             monopsony_common::metrics::cache_bytes_served(serve_len);
-            let body = Body::from_stream(stream);
+            let body = Body::from_stream(serve_stream);
             return Some(
                 builder
                     .body(body)
@@ -783,6 +1117,10 @@ async fn fetch_and_stream_get(
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+    let content_encoding = headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
     let upstream_content_length = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -842,7 +1180,11 @@ async fn fetch_and_stream_get(
     let upstream_headers: Option<HashMap<String, String>> = Some(
         headers
             .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|vs| (k.as_str().to_string(), vs.to_string())))
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|vs| (k.as_str().to_string(), vs.to_string()))
+            })
             .collect(),
     );
 
@@ -858,6 +1200,7 @@ async fn fetch_and_stream_get(
         cache_path: cache_path.clone(),
         url: url.to_string(),
         content_type,
+        content_encoding,
         upstream_content_length,
         etag,
         last_modified,
@@ -965,6 +1308,7 @@ struct TeeContext {
     cache_path: Option<PathBuf>,
     url: String,
     content_type: Option<String>,
+    content_encoding: Option<String>,
     upstream_content_length: Option<u64>,
     etag: Option<String>,
     last_modified: Option<String>,
@@ -1111,6 +1455,7 @@ async fn run_tee(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|| ctx.cache_key.clone()),
         content_type: ctx.content_type.clone(),
+        content_encoding: ctx.content_encoding.clone(),
         content_length: meta.size_bytes,
         etag: ctx.etag.clone(),
         last_modified: ctx.last_modified.clone(),
@@ -1139,7 +1484,10 @@ async fn run_tee(
             origin_hash_from_sidecar(&ctx.state, &ctx.url).await
         };
         let (expected_sha256, pin_origin) = origin.unwrap_or_else(|| {
-            (meta.checksum_sha256.clone(), monopsony_common::pin_store::PinOrigin::Unverified)
+            (
+                meta.checksum_sha256.clone(),
+                monopsony_common::pin_store::PinOrigin::Unverified,
+            )
         });
 
         let now_secs = SystemTime::now()
@@ -1394,7 +1742,9 @@ async fn sweep_dir(
 /// `x-goog-hash` (only `sha256=<hex>` entries — crc32c/md5 are skipped),
 /// `x-amz-meta-sha256`, and `digest` (RFC 3230, only `sha256=<hex>`).
 /// First matching header wins; `PinOrigin::Header` on hit.
-fn origin_hash_from_header_map(headers: &HashMap<String, String>) -> Option<(String, monopsony_common::pin_store::PinOrigin)> {
+fn origin_hash_from_header_map(
+    headers: &HashMap<String, String>,
+) -> Option<(String, monopsony_common::pin_store::PinOrigin)> {
     fn valid_sha256(value: &str) -> Option<String> {
         let v = value.trim();
         if v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -1464,7 +1814,9 @@ async fn origin_hash_from_sidecar(
             None
         }
     };
-    tokio::time::timeout(Duration::from_secs(5), fut).await.ok()?
+    tokio::time::timeout(Duration::from_secs(5), fut)
+        .await
+        .ok()?
 }
 
 /// Attach pin headers to a cache-HIT response builder.
@@ -1489,7 +1841,10 @@ async fn attach_pin_header(
         return builder;
     }
 
-    let pin_path = state.cache_dir.join("pins").join(format!("{}.pin", cache_key));
+    let pin_path = state
+        .cache_dir
+        .join("pins")
+        .join(format!("{}.pin", cache_key));
     let Some(json) = tokio::fs::read_to_string(&pin_path).await.ok() else {
         return builder;
     };
@@ -1498,17 +1853,15 @@ async fn attach_pin_header(
         return builder.header("X-Monopsony-Pin-Status", "invalid");
     };
     if !att.verify(&pin_key.verifying_key()) {
-        warn!("Pin attestation FAILED verification for cache key {}", cache_key);
+        warn!(
+            "Pin attestation FAILED verification for cache key {}",
+            cache_key
+        );
         return builder.header("X-Monopsony-Pin-Status", "invalid");
     }
     // Cross-check against the storage-side recorded checksum when one
     // is present; skip the comparison otherwise (per slice spec).
-    let stored = state
-        .storage
-        .get_checksum(cache_key)
-        .await
-        .ok()
-        .flatten();
+    let stored = state.storage.get_checksum(cache_key).await.ok().flatten();
     if let Some(stored) = stored {
         if !stored.eq_ignore_ascii_case(&att.expected_sha256) {
             warn!(
@@ -1518,7 +1871,10 @@ async fn attach_pin_header(
             return builder.header("X-Monopsony-Pin-Status", "invalid");
         }
     }
-    builder.header("X-Monopsony-Pin", monopsony_common::pin_store::to_json(&att))
+    builder.header(
+        "X-Monopsony-Pin",
+        monopsony_common::pin_store::to_json(&att),
+    )
 }
 
 /// Pass through request to upstream without caching
@@ -1529,11 +1885,23 @@ async fn proxy_passthrough(state: &ProxyState, request: Request<Body>) -> Respon
     } else {
         format!("http://{}", uri)
     };
+    proxy_passthrough_to(state, request, &url).await
+}
 
-    match fetch_upstream(state, request, &url).await {
+/// Passthrough with a caller-supplied canonical upstream URL. Shim routes are
+/// received in origin-form (`/cargo-index/config.json`, no scheme/host); the
+/// canonical upstream is computed by the shim handler before the request
+/// enters `handle_request_uri`, and must survive misses/enablement-bypass —
+/// otherwise the origin-form path produces an invalid `http:///...` URL.
+async fn proxy_passthrough_to(
+    state: &ProxyState,
+    request: Request<Body>,
+    url: &str,
+) -> Response<Body> {
+    match fetch_upstream(state, request, url).await {
         Ok(response) => response,
         Err(e) => {
-            error!("Proxy passthrough failed for {}: {}", url, e);
+            error!("Proxy passthrough failed for {}: {:#}", url, e);
             Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(Body::from("Upstream request failed"))
@@ -1570,7 +1938,15 @@ async fn fetch_upstream(
         upstream_request = upstream_request.header(name, value);
     }
 
-    let upstream_request = upstream_request.body(request.into_body())?;
+    // GET/HEAD carry no body: hand the client an empty, known-length body so
+    // hyper doesn't frame the upstream request with `transfer-encoding:
+    // chunked` (index.crates.io's CDN resets chunked GETs → broken pipe).
+    // Body-carrying methods (rare on this path) keep the inbound stream.
+    let upstream_request = if request.method() == Method::GET || request.method() == Method::HEAD {
+        upstream_request.body(Body::empty())?
+    } else {
+        upstream_request.body(request.into_body())?
+    };
 
     debug!("Fetching from upstream: {}", url);
     let response = state.client.request(upstream_request).await?;
@@ -1635,62 +2011,52 @@ async fn handle_connect_request(
     let connect_cfg = state.connect_config.clone();
     let connect_limiter = rate_limiter.clone();
     let connect_addr = addr;
-    let svc = tower::util::BoxCloneService::new(tower::service_fn(
-        move |req: Request<Body>| {
-            let authority = authority.clone();
-            let connect_cfg = connect_cfg.clone();
-            let limiter = connect_limiter.clone();
-            async move {
-                // Auth passed. NOW acquire the concurrent slot (F1): before
-                // this, an auth reject leaked the slot because the guard only
-                // existed inside handle_connect.
-                let ip = connect_addr.ip();
-                if let Some(limiter) = &limiter {
-                    if !limiter.check_rate(&ip) {
-                        warn!("Rate limit exceeded for {}", ip);
-                        return Ok::<_, std::convert::Infallible>(
-                            Response::builder()
-                                .status(StatusCode::TOO_MANY_REQUESTS)
-                                .body(Body::from("Rate limit exceeded"))
-                                .unwrap_or_else(|_| {
-                                    Response::new(Body::from("Rate limit exceeded"))
-                                })
-                                .into_response(),
-                        );
-                    }
-                    if !limiter.acquire_concurrent(&ip, crate::security::DEFAULT_MAX_CONCURRENT_PER_IP)
-                    {
-                        warn!("Concurrent connection limit exceeded for {}", ip);
-                        return Ok(
-                            Response::builder()
-                                .status(StatusCode::TOO_MANY_REQUESTS)
-                                .body(Body::from("Too many concurrent connections"))
-                                .unwrap_or_else(|_| {
-                                    Response::new(Body::from(
-                                        "Too many concurrent connections",
-                                    ))
-                                })
-                                .into_response(),
-                        );
-                    }
+    let svc = tower::util::BoxCloneService::new(tower::service_fn(move |req: Request<Body>| {
+        let authority = authority.clone();
+        let connect_cfg = connect_cfg.clone();
+        let limiter = connect_limiter.clone();
+        async move {
+            // Auth passed. NOW acquire the concurrent slot (F1): before
+            // this, an auth reject leaked the slot because the guard only
+            // existed inside handle_connect.
+            let ip = connect_addr.ip();
+            if let Some(limiter) = &limiter {
+                if !limiter.check_rate(&ip) {
+                    warn!("Rate limit exceeded for {}", ip);
+                    return Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .status(StatusCode::TOO_MANY_REQUESTS)
+                            .body(Body::from("Rate limit exceeded"))
+                            .unwrap_or_else(|_| Response::new(Body::from("Rate limit exceeded")))
+                            .into_response(),
+                    );
                 }
-                // Guard created in the same scope as the acquire: every early
-                // return from here on releases the slot via Drop.
-                let slot = ConnectSlotGuard {
-                    limiter,
-                    ip,
-                    armed: true,
-                };
-                Ok(handle_connect(slot, ip, authority, connect_cfg, req)
-                    .await
-                    .into_response())
+                if !limiter.acquire_concurrent(&ip, crate::security::DEFAULT_MAX_CONCURRENT_PER_IP)
+                {
+                    warn!("Concurrent connection limit exceeded for {}", ip);
+                    return Ok(Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .body(Body::from("Too many concurrent connections"))
+                        .unwrap_or_else(|_| {
+                            Response::new(Body::from("Too many concurrent connections"))
+                        })
+                        .into_response());
+                }
             }
-        },
-    ));
-    let middleware = axum::middleware::from_fn_with_state(
-        auth_state,
-        monopsony_control::auth::auth_middleware,
-    );
+            // Guard created in the same scope as the acquire: every early
+            // return from here on releases the slot via Drop.
+            let slot = ConnectSlotGuard {
+                limiter,
+                ip,
+                armed: true,
+            };
+            Ok(handle_connect(slot, ip, authority, connect_cfg, req)
+                .await
+                .into_response())
+        }
+    }));
+    let middleware =
+        axum::middleware::from_fn_with_state(auth_state, monopsony_control::auth::auth_middleware);
     let mut authed = tower::Layer::layer(&middleware, svc);
     use tower::Service as _;
     // Error type is Infallible, so this unwrap_or_else is total.
@@ -1778,7 +2144,10 @@ async fn handle_connect(
             warn!("CONNECT DNS resolve for '{}' failed: {}", host, e);
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from(format!("CONNECT to {} failed to resolve: {}", host, e)))
+                .body(Body::from(format!(
+                    "CONNECT to {} failed to resolve: {}",
+                    host, e
+                )))
                 .unwrap_or_else(|_| Response::new(Body::from("CONNECT upstream unreachable")));
         }
     };
@@ -1790,7 +2159,10 @@ async fn handle_connect(
             .filter(|a| {
                 let private = crate::security::is_private_ip(&a.ip());
                 if private {
-                    warn!("SSRF blocked CONNECT to '{}': resolves to private IP {}", host, a);
+                    warn!(
+                        "SSRF blocked CONNECT to '{}': resolves to private IP {}",
+                        host, a
+                    );
                 }
                 !private
             })
@@ -1826,7 +2198,10 @@ async fn handle_connect(
             Err(_) => {
                 last_err = Some(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    format!("dial to {} timed out after {}s", addr, connect_cfg.connect_timeout_secs),
+                    format!(
+                        "dial to {} timed out after {}s",
+                        addr, connect_cfg.connect_timeout_secs
+                    ),
                 ));
             }
         }
@@ -1925,10 +2300,7 @@ impl hyper::service::Service<Request<hyper::body::Incoming>> for ProxyHyperServi
     type Response = axum::response::Response;
     type Error = std::convert::Infallible;
     type Future = std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<Self::Response, Self::Error>>
-                + Send,
-        >,
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
     >;
 
     fn call(&self, req: Request<hyper::body::Incoming>) -> Self::Future {
@@ -1990,13 +2362,244 @@ pub async fn serve_proxy_router(
             peer_addr: peer,
         };
         tokio::spawn(async move {
-            let _ = hyper_util::server::conn::auto::Builder::new(
-                hyper_util::rt::TokioExecutor::new(),
-            )
-            .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), svc)
-            .await;
+            let _ =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection_with_upgrades(hyper_util::rt::TokioIo::new(stream), svc)
+                    .await;
         });
     }
+}
+
+/// Sprint 23 Phase C: language-artifact maintenance — retention eviction +
+/// scrubber pass, driven from the janitor loop. Self-limiting by design:
+/// eviction only acts while the artifact class is over budget (budget 0 = off),
+/// the scrubber skips blobs verified within `scrub_min_age_secs`. Scrubber
+/// quarantines become tamper-alert rows (fail-open on DB error — availability
+/// never hinges on the alerts table; the blob is already quarantined on disk).
+async fn run_language_maintenance(state: &ProxyState) {
+    if !state.language_artifacts.enabled {
+        return;
+    }
+    let Some(root) = state.storage.base_dir() else {
+        return; // S3/in-memory: filesystem passes are local-only (staged-part
+                // sweep has the same restriction).
+    };
+
+    // --- Retention eviction ---------------------------------------------
+    if state.language_artifacts.budget_bytes > 0 {
+        if let Err(e) = run_retention_pass(state, &root).await {
+            warn!("Retention pass failed: {}", e);
+        }
+    }
+
+    // --- Scrubber pass ----------------------------------------------------
+    if state.language_artifacts.scrub_interval_secs > 0 {
+        let cfg = state.language_artifacts.clone();
+        let storage_root = root.clone();
+        let meta_root = root.join(".meta");
+        let cutoff = chrono::Utc::now().timestamp() - cfg.scrub_min_age_secs as i64;
+        let db = state.db.clone();
+        // Blocking filesystem walk + hashing: keep it off the async workers.
+        let report = tokio::task::spawn_blocking(move || {
+            crate::scrubber::scrub_pass(&storage_root, &meta_root, &cfg, cutoff)
+        })
+        .await;
+        match report {
+            Ok(report) => {
+                if report.verified_ok > 0 {
+                    monopsony_common::metrics::scrub_verified(report.verified_ok as u64);
+                }
+                if !report.quarantined.is_empty() {
+                    warn!(
+                        "Scrubber quarantined {} blob(s): {:?}",
+                        report.quarantined.len(),
+                        report
+                            .quarantined
+                            .iter()
+                            .map(|q| q.key.as_str())
+                            .collect::<Vec<_>>()
+                    );
+                    monopsony_common::metrics::scrub_quarantined(report.quarantined.len() as u64);
+                    if let Some(db) = &db {
+                        for q in &report.quarantined {
+                            // Reconstruct the canonical https URL best-effort
+                            // from the cache key so quarantine gating keys on
+                            // the same URL space as cache_entries. Key shapes:
+                            // pypi/files/..., cargo/blob/..., npm/artifact/...
+                            let url = artifact_key_to_url(&q.key);
+                            let alert = monopsony_db::db::TamperAlertInsert {
+                                url: url.unwrap_or_else(|| q.key.clone()),
+                                expected_sha256: q.expected_sha256.clone(),
+                                actual_sha256: q.actual_sha256.clone(),
+                                detail: Some("scrubber: cached blob failed re-hash".to_string()),
+                                client_id: None,
+                                observed_at: chrono::Utc::now().timestamp(),
+                            };
+                            if let Err(e) = db.record_tamper_alert(&alert).await {
+                                warn!(
+                                    "Failed to record scrubber tamper alert for {}: {}",
+                                    q.key, e
+                                );
+                            }
+                        }
+                    }
+                }
+                if !report.errors.is_empty() {
+                    warn!("Scrubber reported {} error(s)", report.errors.len());
+                }
+            }
+            Err(e) => warn!("Scrubber pass panicked or was cancelled: {}", e),
+        }
+    }
+}
+
+/// Map an artifact cache key back to its canonical https URL (best-effort, for
+/// tamper-alert rows). Reverse of the Phase B backends' `url_to_cache_path`.
+fn artifact_key_to_url(key: &str) -> Option<String> {
+    let parsed = crate::retention::parse_artifact_path(key)?;
+    match parsed.ecosystem.as_str() {
+        "npm" => {
+            // npm/artifact/<name>/-/<file>.tgz
+            let rest = key.strip_prefix("npm/artifact/")?;
+            Some(format!("https://registry.npmjs.org/{}", rest))
+        }
+        "pypi" => {
+            // pip cache keys carry the files.pythonhosted.org path under files/
+            let rest = key.strip_prefix("pip/files/")?;
+            Some(format!("https://files.pythonhosted.org/{}", rest))
+        }
+        "cargo" => {
+            // cargo/blob/<name>/<ver>/download → static.crates.io canonical
+            let rest = key.strip_prefix("cargo/blob/")?;
+            Some(format!("https://static.crates.io/crates/{}", rest))
+        }
+        _ => None,
+    }
+}
+
+/// One retention pass: collect LangArtifact candidates from the .cache-meta
+/// sidecars (class + last_accessed live there), plan the eviction, execute.
+async fn run_retention_pass(state: &ProxyState, root: &std::path::Path) -> anyhow::Result<()> {
+    let cfg = state.language_artifacts.clone();
+    // Walk .cache-meta sidecars: one JSON per cached key (created on commit).
+    let meta_root = root.join(".cache-meta");
+    let mut candidates: Vec<crate::retention::RetentionCandidate> = Vec::new();
+    let mut rd = tokio::fs::read_dir(&meta_root).await?;
+    while let Some(entry) = rd.next_entry().await? {
+        if entry.file_type().await?.is_dir() {
+            // Nested keys create subdirectories — descend via the recursive
+            // helper (slashed cache keys are the norm).
+            let full = entry.path();
+            let child_rel = full
+                .strip_prefix(&meta_root)
+                .unwrap_or(full.as_path())
+                .to_string_lossy()
+                .to_string();
+            collect_cache_meta_candidates(state, &full, &child_rel, &mut candidates).await?;
+            continue;
+        }
+        add_cache_meta_candidate(state, entry.path(), &mut candidates).await?;
+    }
+
+    let to_evict = crate::retention::plan_eviction(&candidates, &cfg);
+    if to_evict.is_empty() {
+        return Ok(());
+    }
+    info!(
+        "Retention: evicting {} lang-artifact blob(s) over budget ({} bytes)",
+        to_evict.len(),
+        cfg.budget_bytes
+    );
+    for key in to_evict {
+        if let Err(e) = state.storage.delete(&key).await {
+            warn!("Retention: failed to delete {}: {}", key, e);
+            continue;
+        }
+        // Remove the sidecars + DB row so the entry is fully gone.
+        let meta_path = meta_root.join(&key);
+        let _ = tokio::fs::remove_file(&meta_path).await;
+        let obj_meta_path = root.join(".meta").join(&key);
+        let _ = tokio::fs::remove_file(&obj_meta_path).await;
+        if let Some(db) = &state.db {
+            if let Some(url) = artifact_key_to_url(&key) {
+                let lookup_url = normalize_url_scheme(&url);
+                if let Err(e) = sqlx::query("DELETE FROM cache_entries WHERE url = $1")
+                    .bind(&lookup_url)
+                    .execute(db.pool())
+                    .await
+                {
+                    warn!("Retention: DB row delete failed for {}: {}", url, e);
+                }
+            }
+        }
+        monopsony_common::metrics::cache_evicted();
+    }
+    Ok(())
+}
+
+/// Recursively walk a sidecar directory subtree, adding candidate entries.
+fn collect_cache_meta_candidates<'a>(
+    state: &'a ProxyState,
+    dir: &'a std::path::Path,
+    rel: &'a str,
+    out: &'a mut Vec<crate::retention::RetentionCandidate>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let mut rd = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = rd.next_entry().await? {
+            let path = entry.path();
+            let child_rel = if rel.is_empty() {
+                entry.file_name().to_string_lossy().to_string()
+            } else {
+                format!("{}/{}", rel, entry.file_name().to_string_lossy())
+            };
+            if entry.file_type().await?.is_dir() {
+                collect_cache_meta_candidates(state, &path, &child_rel, out).await?;
+            } else {
+                add_cache_meta_candidate(state, path, out).await?;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Parse one .cache-meta sidecar into a retention candidate (artifact-class
+/// entries only; metadata entries and unparseable paths are skipped).
+async fn add_cache_meta_candidate(
+    state: &ProxyState,
+    sidecar_path: std::path::PathBuf,
+    out: &mut Vec<crate::retention::RetentionCandidate>,
+) -> anyhow::Result<()> {
+    let Some(rel_key) = sidecar_path
+        .strip_prefix(state.cache_dir.join(".cache-meta"))
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
+    else {
+        return Ok(());
+    };
+    // The storage key is the sidecar path relative to .cache-meta.
+    let key = rel_key;
+    let Ok(content) = tokio::fs::read(&sidecar_path).await else {
+        return Ok(()); // sidecar vanished mid-walk — skip
+    };
+    let Ok(entry) = serde_json::from_slice::<CacheEntry>(&content) else {
+        return Ok(());
+    };
+    if entry.cache_class != "lang_artifact" {
+        return Ok(()); // metadata/distro entries are never eviction candidates
+    }
+    let Some(parsed) = crate::retention::parse_artifact_path(&key) else {
+        return Ok(());
+    };
+    out.push(crate::retention::RetentionCandidate {
+        key,
+        ecosystem: parsed.ecosystem,
+        name: parsed.name,
+        version: parsed.version,
+        size_bytes: entry.content_length,
+        last_accessed: entry.last_accessed as i64,
+    });
+    Ok(())
 }
 
 /// Start the HTTP proxy server
@@ -2046,8 +2649,7 @@ pub async fn run_proxy(
     // Wire integrity pinning (Sprint 20 Phase 3): signing key + [integrity]
     // section. Pin attestations are only produced when both are present.
     {
-        let mut st = Arc::get_mut(&mut state)
-            .expect("state should be uniquely owned at this point");
+        let st = Arc::get_mut(&mut state).expect("state should be uniquely owned at this point");
         st.pin_key = pin_key;
         st.integrity = integrity;
     }
@@ -2060,7 +2662,12 @@ pub async fn run_proxy(
     }
 
     // Spawn the staged-part janitor: sweeps orphaned `#N` multipart staging
-    // files left behind by crashed uploads.
+    // files left behind by crashed uploads. Sprint 23 Phase C: the same loop
+    // drives the language-artifact maintenance passes — retention eviction
+    // (budget-gated, self-limits to evicting only over-budget bytes) and the
+    // scrubber (min-age-gated, so blobs verify roughly once per period). Both
+    // passes are no-ops when budget is 0 / everything is fresh, so running
+    // them on the janitor cadence costs nothing in the default config.
     let janitor_state = state.clone();
     tokio::spawn(async move {
         let sweep_secs = janitor_state.limits.stale_part_sweep_secs.max(60);
@@ -2072,6 +2679,7 @@ pub async fn run_proxy(
             if let Err(e) = sweep_staged_parts(&janitor_state, ttl).await {
                 warn!("Staged-part janitor sweep failed: {}", e);
             }
+            run_language_maintenance(&janitor_state).await;
         }
     });
 
@@ -2153,10 +2761,7 @@ mod tests {
             "AABBCCDD".repeat(8).to_lowercase(),
         );
         // Later-precedence headers must be ignored when x-checksum-sha256 wins.
-        headers.insert(
-            "digest".to_string(),
-            format!("sha256={}", "ee".repeat(32)),
-        );
+        headers.insert("digest".to_string(), format!("sha256={}", "ee".repeat(32)));
 
         let (hex, origin) = origin_hash_from_header_map(&headers).expect("should find a hash");
         assert_eq!(hex, "aabbccdd".repeat(8));
@@ -2231,7 +2836,9 @@ mod tests {
         let resp = builder.body(()).expect("build");
         assert!(resp.headers().get("X-Monopsony-Pin").is_none());
         assert_eq!(
-            resp.headers().get("X-Monopsony-Pin-Status").expect("status header"),
+            resp.headers()
+                .get("X-Monopsony-Pin-Status")
+                .expect("status header"),
             "invalid"
         );
     }
