@@ -347,10 +347,7 @@ async fn prefetch_url(
                 bytes_seen += chunk.len() as u64;
                 if bytes_seen > crate::security::MAX_RESPONSE_BODY_SIZE {
                     spool.abort().await;
-                    return Err(format!(
-                        "Response body exceeds max: {} bytes",
-                        bytes_seen
-                    ));
+                    return Err(format!("Response body exceeds max: {} bytes", bytes_seen));
                 }
                 spool.write(chunk);
             }

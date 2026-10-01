@@ -311,10 +311,7 @@ async fn read_response_head(stream: &mut tokio::net::TcpStream) -> (String, Vec<
             .expect("read response head");
         assert!(n > 0, "connection closed before a response head arrived");
         buf.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = buf
-            .windows(4)
-            .position(|w| w == b"\r\n\r\n")
-        {
+        if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
             let head = String::from_utf8_lossy(&buf[..pos]).to_string();
             let rest = buf[pos + 4..].to_vec();
             return (head, rest);
@@ -327,10 +324,7 @@ async fn read_response_head(stream: &mut tokio::net::TcpStream) -> (String, Vec<
 async fn send_connect(proxy: SocketAddr, authority: &str) -> (tokio::net::TcpStream, String) {
     use tokio::io::AsyncWriteExt;
     let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
-    let req = format!(
-        "CONNECT {a} HTTP/1.1\r\nHost: {a}\r\n\r\n",
-        a = authority
-    );
+    let req = format!("CONNECT {a} HTTP/1.1\r\nHost: {a}\r\n\r\n", a = authority);
     stream.write_all(req.as_bytes()).await.unwrap();
     stream.flush().await.unwrap();
     let (head, _rest) = read_response_head(&mut stream).await;
@@ -369,7 +363,10 @@ async fn spawn_echo_upstream() -> SocketAddr {
 }
 
 /// ProxyState with the given CONNECT configuration.
-fn make_connect_state(cache_dir: &std::path::Path, cfg: monopsony_common::config::ProxyServerConfig) -> Arc<ProxyState> {
+fn make_connect_state(
+    cache_dir: &std::path::Path,
+    cfg: monopsony_common::config::ProxyServerConfig,
+) -> Arc<ProxyState> {
     // ProxyState::new() builds an HTTPS client which needs the ring
     // CryptoProvider installed process-wide (same as make_state above;
     // install_default is a no-op once another test has installed it).
@@ -427,9 +424,9 @@ async fn test_connect_private_target_blocked() {
     )
     .await
     {
-        Ok(Ok(0)) | Err(_) => {}                       // closed / quiet: correct
+        Ok(Ok(0)) | Err(_) => {} // closed / quiet: correct
         Ok(Ok(n)) => leftover.extend_from_slice(&[0u8; 128][..n]),
-        Ok(Err(e)) => {}                               // reset also fine
+        Ok(Err(e)) => {} // reset also fine
     }
     assert!(
         leftover.is_empty(),
@@ -501,8 +498,7 @@ async fn test_connect_refused_upstream_502() {
     let closed_port = closed.local_addr().unwrap().port();
     drop(closed);
 
-    let (_stream, head) =
-        send_connect(proxy_addr, &format!("127.0.0.1:{}", closed_port)).await;
+    let (_stream, head) = send_connect(proxy_addr, &format!("127.0.0.1:{}", closed_port)).await;
     assert!(
         head.starts_with("HTTP/1.1 502"),
         "expected 502 for dead upstream, got: {}",
@@ -560,7 +556,17 @@ async fn test_connect_chain_client_to_server() {
     };
     tokio::spawn(async move {
         let addr: SocketAddr = format!("127.0.0.1:{}", client_port).parse().unwrap();
-        if let Err(e) = run_proxy(addr, client_config, pin_state, None, "warn".to_string(), 0, None).await {
+        if let Err(e) = run_proxy(
+            addr,
+            client_config,
+            pin_state,
+            None,
+            "warn".to_string(),
+            0,
+            None,
+        )
+        .await
+        {
             tracing::warn!("client proxy exited: {}", e);
         }
     });
@@ -684,10 +690,7 @@ fn pin_e2e_key(seed: u8) -> ed25519_dalek::SigningKey {
 
 /// ProxyState with pin capture provisioned: real signing key, pinning on,
 /// private loopback upstreams allowed (test upstreams live on 127.0.0.1).
-fn make_pin_state(
-    cache_dir: &std::path::Path,
-    key: ed25519_dalek::SigningKey,
-) -> Arc<ProxyState> {
+fn make_pin_state(cache_dir: &std::path::Path, key: ed25519_dalek::SigningKey) -> Arc<ProxyState> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let storage: Arc<dyn CacheStorage> =
         Arc::new(ObjectStoreBackend::local(cache_dir.to_path_buf(), 0).unwrap());

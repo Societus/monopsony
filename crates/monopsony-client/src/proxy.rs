@@ -547,7 +547,9 @@ fn wrap_with_pin_check(
             return Response::builder()
                 .status(StatusCode::CONFLICT)
                 .body(Body::from(body.to_string()))
-                .unwrap_or_else(|_| Response::new(Body::from("{\"error\":\"below_oracle_floor\"}")));
+                .unwrap_or_else(|_| {
+                    Response::new(Body::from("{\"error\":\"below_oracle_floor\"}"))
+                });
         }
     }
 
@@ -1053,9 +1055,7 @@ pub async fn run_proxy(
     ledger: Option<std::sync::Arc<crate::ledger::Ledger>>,
     ledger_policy: String,
     ledger_max_index_age_secs: u64,
-    floor_store: Option<
-        std::sync::Arc<std::sync::RwLock<crate::floor_guard::FloorStore>>,
-    >,
+    floor_store: Option<std::sync::Arc<std::sync::RwLock<crate::floor_guard::FloorStore>>>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     run_proxy_with_listener(

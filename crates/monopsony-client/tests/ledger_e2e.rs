@@ -228,7 +228,9 @@ struct RawResponse {
 
 impl RawResponse {
     fn header(&self, name: &str) -> Option<&str> {
-        self.headers.get(&name.to_ascii_lowercase()).map(|s| s.as_str())
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(|s| s.as_str())
     }
 }
 
@@ -281,7 +283,14 @@ async fn fetch_via_proxy(proxy: SocketAddr, url: &str) -> RawResponse {
 #[tokio::test]
 async fn index_downgrade_reject_503s() {
     let ledger = Arc::new(Ledger::open(&leaked_ledger_path("reject")).unwrap());
-    let h = setup("reject", Some(ledger), "reject", 0, pacman_db_bytes("5.2.37-1")).await;
+    let h = setup(
+        "reject",
+        Some(ledger),
+        "reject",
+        0,
+        pacman_db_bytes("5.2.37-1"),
+    )
+    .await;
     let url = h.index_url();
 
     // FIRST fetch: 200 — first contact just records the high-water.
@@ -293,7 +302,10 @@ async fn index_downgrade_reject_503s() {
     let second = fetch_via_proxy(h.proxy_addr, &url).await;
     assert_eq!(second.status, 503, "downgraded index must be rejected");
     let body = String::from_utf8_lossy(&second.body).to_lowercase();
-    assert!(body.contains("rewound"), "reject body must say rewound: {body}");
+    assert!(
+        body.contains("rewound"),
+        "reject body must say rewound: {body}"
+    );
 
     // The tamper spool gained a `downgrade:` event.
     let events = std::fs::read_to_string(&h.events_path).expect("events file exists");
@@ -317,7 +329,10 @@ async fn index_downgrade_warn_headers() {
 
     h.swap_body(pacman_db_bytes("5.2.36-1"));
     let second = fetch_via_proxy(h.proxy_addr, &url).await;
-    assert_eq!(second.status, 200, "warn policy must pass the index through");
+    assert_eq!(
+        second.status, 200,
+        "warn policy must pass the index through"
+    );
     let dg = second
         .header("X-Monopsony-Downgrade")
         .expect("warn policy sets X-Monopsony-Downgrade")
@@ -339,14 +354,7 @@ async fn index_downgrade_warn_headers() {
 #[tokio::test]
 async fn garbage_index_reject() {
     let ledger = Arc::new(Ledger::open(&leaked_ledger_path("garbage")).unwrap());
-    let h = setup(
-        "garbage",
-        Some(ledger),
-        "reject",
-        0,
-        garbage_index_bytes(),
-    )
-    .await;
+    let h = setup("garbage", Some(ledger), "reject", 0, garbage_index_bytes()).await;
     let url = h.index_url();
 
     let resp = fetch_via_proxy(h.proxy_addr, &url).await;
@@ -367,14 +375,7 @@ async fn garbage_index_reject() {
 /// no events file is created, no ledger headers appear.
 #[tokio::test]
 async fn disabled_ledger_inert() {
-    let h = setup(
-        "inert",
-        None,
-        "warn",
-        0,
-        garbage_index_bytes(),
-    )
-    .await;
+    let h = setup("inert", None, "warn", 0, garbage_index_bytes()).await;
     let url = h.index_url();
 
     let resp = fetch_via_proxy(h.proxy_addr, &url).await;
@@ -401,7 +402,14 @@ async fn disabled_ledger_inert() {
 async fn stale_index_header_only() {
     let ledger = Arc::new(Ledger::open(&leaked_ledger_path("stale")).unwrap());
     let now = chrono::Utc::now().timestamp();
-    let h = setup("stale", Some(ledger.clone()), "warn", 1, pacman_db_bytes("5.2.37-1")).await;
+    let h = setup(
+        "stale",
+        Some(ledger.clone()),
+        "warn",
+        1,
+        pacman_db_bytes("5.2.37-1"),
+    )
+    .await;
 
     // Seed last_seen the same way the proxy computes it: canonical https
     // index URL → repo_key_from_url.
@@ -435,7 +443,11 @@ async fn payload_downgrade_warn_header() {
         "seed",
         now,
     );
-    assert_eq!(verdict.unwrap(), CheckVerdict::Ok, "seed records first contact");
+    assert_eq!(
+        verdict.unwrap(),
+        CheckVerdict::Ok,
+        "seed records first contact"
+    );
 
     let h = setup("payload", Some(ledger), "warn", 0, vec![0xAB; 512]).await;
     let payload_url = format!(

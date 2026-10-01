@@ -990,8 +990,15 @@ mod tests {
         fs::create_dir_all(&src).await.unwrap();
 
         let steps = vec!["exit 1".to_string()];
-        let result = execute_build(&steps, &src, "/tmp", "1.0.0", "x86_64", NetworkPolicy::Allowed)
-            .await;
+        let result = execute_build(
+            &steps,
+            &src,
+            "/tmp",
+            "1.0.0",
+            "x86_64",
+            NetworkPolicy::Allowed,
+        )
+        .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("step 1"));
     }
@@ -1012,8 +1019,8 @@ mod tests {
 
     #[tokio::test]
     async fn execute_script_fails() {
-        let result = execute_script("exit 42", "1.0", "x86_64", "linux", NetworkPolicy::Allowed)
-            .await;
+        let result =
+            execute_script("exit 42", "1.0", "x86_64", "linux", NetworkPolicy::Allowed).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("42"));
     }

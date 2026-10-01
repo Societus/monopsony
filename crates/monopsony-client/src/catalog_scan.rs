@@ -69,7 +69,9 @@ pub fn scan_entry(entry_name: &str, recipe_toml: &str) -> ScanFinding {
 
 fn scan_entry_inner(entry_name: &str, recipe_toml: &str) -> Result<ScanFinding, String> {
     let doc: toml::Value = toml::from_str(recipe_toml).map_err(|e| e.to_string())?;
-    let table = doc.as_table().ok_or_else(|| "recipe is not a table".to_string())?;
+    let table = doc
+        .as_table()
+        .ok_or_else(|| "recipe is not a table".to_string())?;
 
     // install_paths lives under [install]; tolerate a top-level key too.
     let mut paths: Vec<String> = table
@@ -94,7 +96,11 @@ fn scan_entry_inner(entry_name: &str, recipe_toml: &str) -> Result<ScanFinding, 
             .and_then(|i| i.get("target_dir"))
             .and_then(|c| c.as_str())
         {
-            paths.push(format!("{}/{}", target_dir.trim_end_matches('/'), entry_name));
+            paths.push(format!(
+                "{}/{}",
+                target_dir.trim_end_matches('/'),
+                entry_name
+            ));
         }
     }
 
@@ -271,7 +277,10 @@ mod tests {
     #[test]
     fn entry_hash_mismatch_on_different_toml() {
         let a = entry_hash(GOLDEN_NAME, GOLDEN_TOML);
-        let b = entry_hash(GOLDEN_NAME, "[package]\nname = \"ripgrep\"\nversion = \"14.1.0\"\n");
+        let b = entry_hash(
+            GOLDEN_NAME,
+            "[package]\nname = \"ripgrep\"\nversion = \"14.1.0\"\n",
+        );
         assert_ne!(a, b);
     }
 
@@ -283,7 +292,13 @@ mod tests {
         let ba = catalog_hash(&[hash_b, hash_a]);
         assert_eq!(ab, ba);
         // determinism across calls
-        assert_eq!(ab, catalog_hash(&[entry_hash(GOLDEN_NAME, GOLDEN_TOML), entry_hash("fzf", "[package]\nname = \"fzf\"\n")]));
+        assert_eq!(
+            ab,
+            catalog_hash(&[
+                entry_hash(GOLDEN_NAME, GOLDEN_TOML),
+                entry_hash("fzf", "[package]\nname = \"fzf\"\n")
+            ])
+        );
     }
 
     #[test]

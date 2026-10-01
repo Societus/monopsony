@@ -152,10 +152,7 @@ mod tests {
     }
 
     fn weights(pairs: &[(&str, u64)]) -> std::collections::HashMap<String, u64> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), *v))
-            .collect()
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
     }
 
     // Worklist dedupes by package_key and takes max weight.

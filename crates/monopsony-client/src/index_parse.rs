@@ -26,10 +26,16 @@ pub struct IndexEntry {
 /// The parsed index, tagged by detected repository format.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParsedIndex {
-    Pacman { entries: Vec<IndexEntry> },
-    Apk { entries: Vec<IndexEntry> },
+    Pacman {
+        entries: Vec<IndexEntry>,
+    },
+    Apk {
+        entries: Vec<IndexEntry>,
+    },
     /// dnf/rocky `primary.xml(.gz)` (slice 5).
-    Dnf { entries: Vec<IndexEntry> },
+    Dnf {
+        entries: Vec<IndexEntry>,
+    },
     /// apt `InRelease` / `Release` (slice 5). `valid_until` is the UTC
     /// epoch of the `Valid-Until:` field when parseable.
     Apt {
@@ -975,16 +981,10 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "bash");
         assert_eq!(entries[0].version, "1.2-3");
-        assert_eq!(
-            entries[0].sha256.as_deref(),
-            Some("a".repeat(64).as_str())
-        );
+        assert_eq!(entries[0].sha256.as_deref(), Some("a".repeat(64).as_str()));
         assert_eq!(entries[1].name, "kernel");
         assert_eq!(entries[1].version, "2:9.15-1");
-        assert_eq!(
-            entries[1].sha256.as_deref(),
-            Some("b".repeat(64).as_str())
-        );
+        assert_eq!(entries[1].sha256.as_deref(), Some("b".repeat(64).as_str()));
     }
 
     #[test]
@@ -1070,10 +1070,7 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "bash");
         assert_eq!(entries[0].version, "5.2-1");
-        assert_eq!(
-            entries[0].sha256.as_deref(),
-            Some("1".repeat(64).as_str())
-        );
+        assert_eq!(entries[0].sha256.as_deref(), Some("1".repeat(64).as_str()));
         assert_eq!(entries[1].name, "util-linux");
         assert_eq!(entries[1].version, "2.38-2");
         assert!(valid_until.is_some());
@@ -1121,7 +1118,9 @@ mod tests {
             panic!("expected apt variant");
         };
         assert_eq!(entries.len(), 2);
-        let expected = chrono::DateTime::parse_from_rfc2822(vu).unwrap().timestamp();
+        let expected = chrono::DateTime::parse_from_rfc2822(vu)
+            .unwrap()
+            .timestamp();
         assert_eq!(valid_until, Some(expected));
     }
 
@@ -1139,7 +1138,9 @@ mod tests {
         assert!(looks_like_index(
             "/rocky/9/BaseOS/x86_64/os/repodata/primary.xml.gz"
         ));
-        assert!(looks_like_index("/rocky/9/BaseOS/x86_64/os/repodata/primary.xml"));
+        assert!(looks_like_index(
+            "/rocky/9/BaseOS/x86_64/os/repodata/primary.xml"
+        ));
         assert!(looks_like_index("/debian/dists/bookworm/InRelease"));
         assert!(looks_like_index("/debian/dists/bookworm/Release"));
         // Signature and non-primary gzip stay out.

@@ -68,7 +68,10 @@ pub fn router(state: MirrorState) -> axum::Router {
         .route("/", axum::routing::get(information))
         .route("/information", axum::routing::get(information))
         .route("/manifestSearch", axum::routing::post(manifest_search))
-        .route("/packageManifests/:package_id", axum::routing::get(package_manifest))
+        .route(
+            "/packageManifests/:package_id",
+            axum::routing::get(package_manifest),
+        )
         .with_state(state)
 }
 
@@ -105,7 +108,10 @@ fn search_request(body: &Value) -> Option<(String, String)> {
     }
     body.get("Query").and_then(|q| {
         let kw = q.get("Key").and_then(|v| v.as_str())?;
-        let mt = q.get("MatchType").and_then(|v| v.as_str()).unwrap_or("Exact");
+        let mt = q
+            .get("MatchType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Exact");
         Some((kw.to_string(), mt.to_string()))
     })
 }
@@ -147,7 +153,10 @@ async fn manifest_search(State(state): State<MirrorState>, body: Option<Json<Val
             continue;
         };
         let Ok(doc) = serde_json::from_str::<Value>(&text) else {
-            warn!("winget shim: skipping non-JSON index file {}", path.display());
+            warn!(
+                "winget shim: skipping non-JSON index file {}",
+                path.display()
+            );
             continue;
         };
         if let Some(pid) = doc.get("PackageIdentifier").and_then(|v| v.as_str()) {
@@ -206,7 +215,11 @@ async fn package_manifest(
                 .into_response()
         }
         Err(e) => {
-            warn!("winget shim: failed reading {}: {}", canonical_file.display(), e);
+            warn!(
+                "winget shim: failed reading {}: {}",
+                canonical_file.display(),
+                e
+            );
             (StatusCode::INTERNAL_SERVER_ERROR, "Read failed").into_response()
         }
     }
@@ -324,7 +337,12 @@ fn parse_block(lines: &[(usize, String)], i: &mut usize, indent: usize) -> Value
         let mut arr: Vec<Value> = Vec::new();
         while *i < lines.len() && lines[*i].0 == indent && is_item(&lines[*i].1) {
             let item_indent = indent + 2;
-            let rest = lines[*i].1.strip_prefix("- ").unwrap_or("").trim().to_string();
+            let rest = lines[*i]
+                .1
+                .strip_prefix("- ")
+                .unwrap_or("")
+                .trim()
+                .to_string();
             *i += 1;
             if rest.is_empty() {
                 arr.push(parse_block(lines, i, item_indent));
@@ -382,7 +400,11 @@ fn valid_package_id(pid: &str) -> bool {
 
 /// Sync manifests for a configured package list from the default community
 /// repo (microsoft/winget-pkgs), rewriting installer URLs through `proxy_base`.
-pub async fn sync(state: &MirrorState, package_ids: &[String], proxy_base: &str) -> anyhow::Result<()> {
+pub async fn sync(
+    state: &MirrorState,
+    package_ids: &[String],
+    proxy_base: &str,
+) -> anyhow::Result<()> {
     sync_from(state, package_ids, DEFAULT_UPSTREAM_REPO, proxy_base).await
 }
 
@@ -452,23 +474,37 @@ pub async fn sync_from(
         let resp = match client.get(&list_url).send().await {
             Ok(r) => r,
             Err(e) => {
-                warn!("winget shim sync: {}: fetch error {} — skipping {}", list_url, e, pid);
+                warn!(
+                    "winget shim sync: {}: fetch error {} — skipping {}",
+                    list_url, e, pid
+                );
                 continue;
             }
         };
         if !resp.status().is_success() {
-            warn!("winget shim sync: {} {} — skipping {}", resp.status(), list_url, pid);
+            warn!(
+                "winget shim sync: {} {} — skipping {}",
+                resp.status(),
+                list_url,
+                pid
+            );
             continue;
         }
         let listing: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
-                warn!("winget shim sync: {}: bad JSON ({}) — skipping {}", list_url, e, pid);
+                warn!(
+                    "winget shim sync: {}: bad JSON ({}) — skipping {}",
+                    list_url, e, pid
+                );
                 continue;
             }
         };
         let Some(entries) = listing.as_array() else {
-            warn!("winget shim sync: {} returned no array — skipping {}", list_url, pid);
+            warn!(
+                "winget shim sync: {} returned no array — skipping {}",
+                list_url, pid
+            );
             continue;
         };
 
@@ -497,7 +533,11 @@ pub async fn sync_from(
                         }
                     };
                     if !sub_resp.status().is_success() {
-                        warn!("winget shim sync: {} {} — skipping dir", sub_resp.status(), sub_url);
+                        warn!(
+                            "winget shim sync: {} {} — skipping dir",
+                            sub_resp.status(),
+                            sub_url
+                        );
                         continue;
                     }
                     if let Ok(Value::Array(files)) = sub_resp.json::<Value>().await {
@@ -529,7 +569,11 @@ pub async fn sync_from(
                 }
             };
             if !resp.status().is_success() {
-                warn!("winget shim sync: {} {} — skipping file", resp.status(), path);
+                warn!(
+                    "winget shim sync: {} {} — skipping file",
+                    resp.status(),
+                    path
+                );
                 continue;
             }
             let text = match resp.text().await {
@@ -540,7 +584,10 @@ pub async fn sync_from(
                 }
             };
             let Some(mut frag) = yaml_to_rest(&text, proxy_base) else {
-                warn!("winget shim sync: {} has no installer manifest fields — skipping", path);
+                warn!(
+                    "winget shim sync: {} has no installer manifest fields — skipping",
+                    path
+                );
                 continue;
             };
             if ident.is_none() {
@@ -672,7 +719,10 @@ ManifestVersion: 1.6.0
         // A locale manifest has no Installers but does have id+version → ok but empty
         let locale = "PackageIdentifier: Test.App\nPackageVersion: 1.0\nPackageLocale: en-US\n";
         let rest = yaml_to_rest(locale, "http://p:3128").unwrap();
-        assert_eq!(rest["Versions"][0]["Installers"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            rest["Versions"][0]["Installers"].as_array().unwrap().len(),
+            0
+        );
         // No PackageVersion → None
         let bad = "PackageIdentifier: Test.App\nPackageName: App\n";
         assert!(yaml_to_rest(bad, "http://p:3128").is_none());
@@ -680,8 +730,14 @@ ManifestVersion: 1.6.0
 
     #[test]
     fn test_rewrite_installer_url_non_http_untouched() {
-        assert_eq!(rewrite_installer_url("ftp://x/y.exe", "http://p:3128"), "ftp://x/y.exe");
-        assert_eq!(rewrite_installer_url("relative.exe", "http://p:3128"), "relative.exe");
+        assert_eq!(
+            rewrite_installer_url("ftp://x/y.exe", "http://p:3128"),
+            "ftp://x/y.exe"
+        );
+        assert_eq!(
+            rewrite_installer_url("relative.exe", "http://p:3128"),
+            "relative.exe"
+        );
         assert_eq!(
             rewrite_installer_url("https://a/b.exe", "http://p:3128/"),
             "http://p:3128/https://a/b.exe"
@@ -690,10 +746,26 @@ ManifestVersion: 1.6.0
 
     #[test]
     fn test_id_matches_match_types() {
-        assert!(id_matches("Microsoft.PowerShell", "microsoft.powershell", "Exact"));
-        assert!(!id_matches("Microsoft.PowerShell", "microsoft.powershell", "CaseSensitive"));
-        assert!(id_matches("Microsoft.PowerShell", "Microsoft.PowerShell", "CaseSensitive"));
-        assert!(id_matches("Microsoft.PowerShell", "powershell", "Substring"));
+        assert!(id_matches(
+            "Microsoft.PowerShell",
+            "microsoft.powershell",
+            "Exact"
+        ));
+        assert!(!id_matches(
+            "Microsoft.PowerShell",
+            "microsoft.powershell",
+            "CaseSensitive"
+        ));
+        assert!(id_matches(
+            "Microsoft.PowerShell",
+            "Microsoft.PowerShell",
+            "CaseSensitive"
+        ));
+        assert!(id_matches(
+            "Microsoft.PowerShell",
+            "powershell",
+            "Substring"
+        ));
         assert!(!id_matches("Microsoft.PowerShell", "vim", "Substring"));
         // Unknown match type falls back to case-insensitive exact
         assert!(id_matches("Git.Git", "git.git", "Something"));
@@ -707,7 +779,10 @@ ManifestVersion: 1.6.0
                  "RequestMatch":{"KeyWord":"Git.Git","MatchType":"Exact"}}]}"#,
         )
         .unwrap();
-        assert_eq!(search_request(&body), Some(("Git.Git".into(), "Exact".into())));
+        assert_eq!(
+            search_request(&body),
+            Some(("Git.Git".into(), "Exact".into()))
+        );
         let query_only: Value =
             serde_json::from_str(r#"{"Query":{"Key":"git","MatchType":"Substring"}}"#).unwrap();
         assert_eq!(
@@ -882,7 +957,9 @@ ManifestVersion: 1.6.0
         let (state, dir) = test_state();
         write_fixture(dir.path()).await;
         let secret = dir.path().join("secret.json");
-        tokio::fs::write(&secret, "{\"secret\":true}").await.unwrap();
+        tokio::fs::write(&secret, "{\"secret\":true}")
+            .await
+            .unwrap();
 
         let app = router(state);
         // Encoded traversal: %2F decodes to '/', caught by the sanitizer

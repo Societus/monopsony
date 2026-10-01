@@ -117,7 +117,11 @@ async fn serve_from_bucket(state: &MirrorState, bucket: &str, file_path: &str) -
                 .unwrap()
         }
         Err(e) => {
-            warn!("scoop shim: failed reading {}: {}", canonical_file.display(), e);
+            warn!(
+                "scoop shim: failed reading {}: {}",
+                canonical_file.display(),
+                e
+            );
             (StatusCode::INTERNAL_SERVER_ERROR, "Read failed").into_response()
         }
     }
@@ -209,9 +213,15 @@ pub async fn sync(
         anyhow::bail!("GitHub tree API {}: {}", tree_resp.status(), api_url);
     }
     let tree: Value = tree_resp.json().await?;
-    let truncated = tree.get("truncated").and_then(|v| v.as_bool()).unwrap_or(false);
+    let truncated = tree
+        .get("truncated")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if truncated {
-        warn!("scoop shim sync: GitHub tree listing truncated for {}/{}", owner, repo);
+        warn!(
+            "scoop shim sync: GitHub tree listing truncated for {}/{}",
+            owner, repo
+        );
     }
 
     let root = bucket_root(&state.mirror_dir, bucket);
@@ -349,12 +359,14 @@ mod tests {
 
     #[test]
     fn test_rewrite_skips_non_http_and_non_string() {
-        let mut manifest: Value = serde_json::from_str(r#"{
+        let mut manifest: Value = serde_json::from_str(
+            r#"{
             "url": "ftp://example.com/x.exe",
             "url.x86": 42,
             "url.extra": "not-a-url",
             "myurl": "https://example.com/should-not-rewrite.exe"
-        }"#)
+        }"#,
+        )
         .unwrap();
         let rewritten = rewrite_manifest_urls(&mut manifest, "http://p:3128");
         assert_eq!(rewritten, 0);
@@ -494,8 +506,7 @@ mod tests {
             parse_github_repo(&url),
             Some(("ScoopInstaller".to_string(), "Main".to_string()))
         );
-        let url =
-            url::Url::parse("https://github.com/ScoopInstaller/Main/tree/master").unwrap();
+        let url = url::Url::parse("https://github.com/ScoopInstaller/Main/tree/master").unwrap();
         assert_eq!(
             parse_github_repo(&url),
             Some(("ScoopInstaller".to_string(), "Main".to_string()))

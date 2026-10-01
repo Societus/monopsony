@@ -21,8 +21,7 @@ use monopsony_common::proto::monopsony::{
     ListShadowCatalogRequest, ListShadowPackagesRequest, RegisterRequest, RegisterResponse,
     RegisterShadowPackageRequest, RollbackShadowUpdateRequest, ServerMessage, ShadowAssetChunk,
     ShadowCatalog, ShadowCatalogEntry, ShadowPackageInfo, ShadowPackageList, ShadowScanAck,
-    ShadowScanReport,
-    ShadowUpdateList, ShadowUpdateResult, SignedShadowRecipe, SyncRequest,
+    ShadowScanReport, ShadowUpdateList, ShadowUpdateResult, SignedShadowRecipe, SyncRequest,
     UnregisterShadowPackageRequest, UnregisterShadowPackageResponse,
 };
 
@@ -30,8 +29,8 @@ use crate::tls::TlsManager;
 use monopsony_db::db::TamperAlertInsert;
 use monopsony_db::Database;
 use monopsony_mirror::MirrorManager;
-use monopsony_shadow::ShadowPackageManager;
 use monopsony_shadow::catalog_hash::{catalog_hash, entry_hash, sign_entry};
+use monopsony_shadow::ShadowPackageManager;
 
 pub struct MonopsonyGrpc {
     db: Arc<Database>,
@@ -404,10 +403,7 @@ impl MonopsonyGrpc {
     /// 'pending' until the client reports applied/refused) and returns
     /// ServerMessage{ Command(UPDATE_CONFIG, shadow_assign params) } per the
     /// pinned contract. Recipe fields come from the shadow_recipes catalog.
-    async fn take_pending_assignment_command(
-        &self,
-        client_id_str: &str,
-    ) -> Option<ServerMessage> {
+    async fn take_pending_assignment_command(&self, client_id_str: &str) -> Option<ServerMessage> {
         let client_id = match monopsony_common::models::ClientId::parse(client_id_str) {
             Ok(id) => id.0,
             Err(e) => {
@@ -453,8 +449,7 @@ impl MonopsonyGrpc {
                 // Parse the stored TOML so the SignedRecipe carries a real
                 // recipe struct (Default is not implemented for ShadowRecipe).
                 let parsed =
-                    monopsony_shadow::shadow_recipe::parse_recipe_str(&recipe.recipe_toml)
-                        .ok()?;
+                    monopsony_shadow::shadow_recipe::parse_recipe_str(&recipe.recipe_toml).ok()?;
                 let signed = sign_recipe(&recipe.recipe_toml, parsed, sk);
                 (
                     signed.operator_signature.signature,
@@ -709,11 +704,8 @@ impl MonopsonyControl for MonopsonyGrpc {
         // would poison the catalog for every other client (adoption parses
         // before serving). Reject early instead of storing garbage.
         if !req.recipe_toml.trim().is_empty() {
-            monopsony_shadow::shadow_recipe::parse_recipe_str(&req.recipe_toml).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "recipe TOML is invalid: {e}"
-                ))
-            })?;
+            monopsony_shadow::shadow_recipe::parse_recipe_str(&req.recipe_toml)
+                .map_err(|e| Status::invalid_argument(format!("recipe TOML is invalid: {e}")))?;
         }
 
         let install_paths = serde_json::json!(req.install_paths);
@@ -1117,7 +1109,10 @@ impl MonopsonyControl for MonopsonyGrpc {
             .map_err(|e| Status::internal(format!("DB error listing shadow catalog: {e}")))?;
 
         let whole_hash = catalog_hash(
-            &rows.iter().map(|r| r.catalog_hash.clone()).collect::<Vec<_>>(),
+            &rows
+                .iter()
+                .map(|r| r.catalog_hash.clone())
+                .collect::<Vec<_>>(),
         );
 
         // Change-detection short-circuit: client already has this version.

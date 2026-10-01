@@ -125,8 +125,7 @@ async fn token_mode_missing_key_returns_401() {
     // it must never be reached; auth rejects first.
     let status = raw_proxy_get(proxy, "http://127.0.0.1:1/never-reached.pkg", None).await;
     assert_eq!(
-        status,
-        401,
+        status, 401,
         "Token mode must reject keyless requests with 401 (got {status})"
     );
 }
@@ -146,8 +145,7 @@ async fn token_mode_garbage_key_returns_401() {
     )
     .await;
     assert_eq!(
-        status,
-        401,
+        status, 401,
         "Token mode must reject unknown keys with 401 (got {status})"
     );
 }

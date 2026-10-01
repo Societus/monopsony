@@ -1,5 +1,5 @@
-pub mod preloaded;
 pub mod catalog_hash;
+pub mod preloaded;
 pub mod shadow;
 pub mod shadow_cache;
 pub mod shadow_conflict;

@@ -43,7 +43,10 @@ pub fn gate_decision(
         ));
     }
     if !in_catalog {
-        return Err((StatusCode::NOT_FOUND, "recipe not found in catalog".to_string()));
+        return Err((
+            StatusCode::NOT_FOUND,
+            "recipe not found in catalog".to_string(),
+        ));
     }
     Ok(())
 }
@@ -137,12 +140,16 @@ pub async fn handle_shadow_context(
 
     (
         StatusCode::OK,
-        Json(serde_json::to_value(ShadowContextResponse {
-            inventory,
-            scan_findings,
-            catalog,
-        })
-        .unwrap_or_else(|_| serde_json::json!({"inventory":[],"scan_findings":[],"catalog":[]}))),
+        Json(
+            serde_json::to_value(ShadowContextResponse {
+                inventory,
+                scan_findings,
+                catalog,
+            })
+            .unwrap_or_else(
+                |_| serde_json::json!({"inventory":[],"scan_findings":[],"catalog":[]}),
+            ),
+        ),
     )
 }
 
@@ -224,9 +231,7 @@ pub async fn handle_assign_recipe(
     }
 
     // Final assertion — the enable gate from 22-F must agree with the flag.
-    if let Err(gate_err) =
-        crate::features::check_remote_assignment_enable(flag_enabled, true)
-    {
+    if let Err(gate_err) = crate::features::check_remote_assignment_enable(flag_enabled, true) {
         warn!(gate_err = %gate_err, "assign-recipe: final gate assertion failed");
         return (
             StatusCode::FORBIDDEN,
@@ -242,10 +247,7 @@ pub async fn handle_assign_recipe(
             {
                 warn!(error = %e, "assign-recipe: audit write failed");
             }
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({"accepted": true})),
-            )
+            (StatusCode::OK, Json(serde_json::json!({"accepted": true})))
         }
         Err(e) => {
             warn!(error = %e, "assign-recipe: pending assignment insert failed");

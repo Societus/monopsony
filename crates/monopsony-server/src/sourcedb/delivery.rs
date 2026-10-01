@@ -121,8 +121,7 @@ pub fn verify_delta(
     delta: &SignedDelta,
     now: i64,
 ) -> Result<(), DeltaError> {
-    let payload = canonical_payload(&delta.snapshot)
-        .map_err(|_| DeltaError::BadSignature)?;
+    let payload = canonical_payload(&delta.snapshot).map_err(|_| DeltaError::BadSignature)?;
     let sig_bytes: [u8; 64] = hex::decode(&delta.sig_hex)
         .ok()
         .and_then(|v| <[u8; 64]>::try_from(v).ok())
@@ -148,8 +147,7 @@ mod tests {
     // + negative control. Hardcoded EXACTLY; never recompute.
     const GOLDEN_PRIV_HEX: &str =
         "7d69ba2215aad50abd7898d87b1ac6588177fd82ab70c8762fb82b1efec7f9f2";
-    const GOLDEN_PUB_HEX: &str =
-        "2d997aa483a5ab4c033534d2f17df6fe6434c3d0663324d482ece053f79e8dd9";
+    const GOLDEN_PUB_HEX: &str = "2d997aa483a5ab4c033534d2f17df6fe6434c3d0663324d482ece053f79e8dd9";
     const GOLDEN_PAYLOAD: &str = r#"{"expires_at":4102444800,"generated_at":1726000000,"observations":[{"observed_at":1726000000,"observed_by":"seed","package_key":"pacman||ripgrep|x86_64","scheme":"default","source":"aur","version":"14.1.0","version_ord":"0000000000000000:14.1.0:000000"},{"observed_at":1726000001,"observed_by":"seed","package_key":"pacman||ripgrep|x86_64","scheme":"default","source":"github:BurntSushi/ripgrep","version":"14.1.1","version_ord":"0000000000000000:14.1.1:000000"}],"scheme_tables":[],"version":3}"#;
     const GOLDEN_SIG_HEX: &str = "f210c07830a48319709b5f915d70692f412aa68568aad1b8c4df582bc335bbf1df266a814e9ce6d0d1d8f58cf63160bcb98dbbb64e022a6f7d94b83166fa5d09";
 
@@ -248,7 +246,10 @@ mod tests {
         let pub_key = VerifyingKey::from_bytes(&golden_pub()).unwrap();
         let mut delta = golden_delta();
         delta.snapshot.observations[1].version = "14.1.9".to_string();
-        assert_eq!(verify_delta(&pub_key, &delta, 1_726_000_100), Err(DeltaError::BadSignature));
+        assert_eq!(
+            verify_delta(&pub_key, &delta, 1_726_000_100),
+            Err(DeltaError::BadSignature)
+        );
     }
 
     // Tampered sig_hex -> BadSignature.
@@ -257,7 +258,10 @@ mod tests {
         let pub_key = VerifyingKey::from_bytes(&golden_pub()).unwrap();
         let mut delta = golden_delta();
         delta.sig_hex = "00".to_string() + &GOLDEN_SIG_HEX[2..];
-        assert_eq!(verify_delta(&pub_key, &delta, 1_726_000_100), Err(DeltaError::BadSignature));
+        assert_eq!(
+            verify_delta(&pub_key, &delta, 1_726_000_100),
+            Err(DeltaError::BadSignature)
+        );
     }
 
     // load_or_generate roundtrip: first call creates the key file, second
@@ -270,9 +274,6 @@ mod tests {
         let kp1 = load_or_generate(&path).unwrap();
         assert!(path.exists());
         let kp2 = load_or_generate(&path).unwrap();
-        assert_eq!(
-            kp1.verifying.as_bytes(),
-            kp2.verifying.as_bytes()
-        );
+        assert_eq!(kp1.verifying.as_bytes(), kp2.verifying.as_bytes());
     }
 }

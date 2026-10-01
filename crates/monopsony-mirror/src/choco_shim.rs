@@ -139,8 +139,17 @@ fn entry_xml(meta: &NuspecMeta, base: &str, is_latest: bool) -> String {
     let esc_id = xml_escape(&meta.id);
     let esc_ver = xml_escape(&meta.version);
     let esc_title = xml_escape(&meta.title);
-    let esc_url = meta.project_url.as_deref().map(xml_escape).unwrap_or_default();
-    let content_src = format!("{}/api/v2/package/{}/{}", base.trim_end_matches('/'), esc_id, esc_ver);
+    let esc_url = meta
+        .project_url
+        .as_deref()
+        .map(xml_escape)
+        .unwrap_or_default();
+    let content_src = format!(
+        "{}/api/v2/package/{}/{}",
+        base.trim_end_matches('/'),
+        esc_id,
+        esc_ver
+    );
     format!(
         concat!(
             "<entry>",
@@ -183,14 +192,22 @@ fn feed_xml(title: &str, self_href: &str, base: &str, metas: &[NuspecMeta]) -> S
     // explicit package lists operators configure).
     let mut latest_by_id: HashMap<&str, &str> = HashMap::new();
     for m in metas {
-        let e = latest_by_id.entry(m.id.as_str()).or_insert(m.version.as_str());
+        let e = latest_by_id
+            .entry(m.id.as_str())
+            .or_insert(m.version.as_str());
         if m.version.as_str() > *e {
             *e = m.version.as_str();
         }
     }
     let entries: String = metas
         .iter()
-        .map(|m| entry_xml(m, base, latest_by_id.get(m.id.as_str()).copied() == Some(m.version.as_str())))
+        .map(|m| {
+            entry_xml(
+                m,
+                base,
+                latest_by_id.get(m.id.as_str()).copied() == Some(m.version.as_str()),
+            )
+        })
         .collect();
     format!(
         concat!(
@@ -269,10 +286,19 @@ pub fn router(state: MirrorState) -> axum::Router {
     axum::Router::new()
         .route("/api/v2/Packages()", axum::routing::get(packages_feed))
         .route("/api/v2/packages()", axum::routing::get(packages_feed))
-        .route("/api/v2/FindPackagesById()", axum::routing::get(find_packages_by_id))
-        .route("/api/v2/findPackagesById()", axum::routing::get(find_packages_by_id))
+        .route(
+            "/api/v2/FindPackagesById()",
+            axum::routing::get(find_packages_by_id),
+        )
+        .route(
+            "/api/v2/findPackagesById()",
+            axum::routing::get(find_packages_by_id),
+        )
         .route("/api/v2/$metadata", axum::routing::get(metadata))
-        .route("/api/v2/package/:id/:version", axum::routing::get(download_package))
+        .route(
+            "/api/v2/package/:id/:version",
+            axum::routing::get(download_package),
+        )
         .route("/api/v2/package/:id", axum::routing::get(download_latest))
         .with_state(state)
 }
@@ -307,7 +333,12 @@ async fn packages_feed(
         None => metas,
     };
     let base = request_base(&headers);
-    xml_response(feed_xml("Packages", &format!("{}/api/v2/Packages()", base), &base, &metas))
+    xml_response(feed_xml(
+        "Packages",
+        &format!("{}/api/v2/Packages()", base),
+        &base,
+        &metas,
+    ))
 }
 
 /// GET /api/v2/FindPackagesById()?id=<pkg> — per-package versions feed.
@@ -326,11 +357,7 @@ async fn find_packages_by_id(
         .filter(|m| m.id.to_ascii_lowercase() == lower)
         .collect();
     let base = request_base(&headers);
-    let href = format!(
-        "{}/api/v2/FindPackagesById()?id={}",
-        base,
-        xml_escape(id)
-    );
+    let href = format!("{}/api/v2/FindPackagesById()?id={}", base, xml_escape(id));
     xml_response(feed_xml(id, &href, &base, &metas))
 }
 
@@ -403,7 +430,11 @@ async fn serve_nupkg(state: &MirrorState, id: &str, version: &str) -> Response {
             .body(axum::body::Body::from(data))
             .unwrap(),
         Err(e) => {
-            warn!("choco shim: failed reading {}: {}", canonical_file.display(), e);
+            warn!(
+                "choco shim: failed reading {}: {}",
+                canonical_file.display(),
+                e
+            );
             (StatusCode::INTERNAL_SERVER_ERROR, "Read failed").into_response()
         }
     }
@@ -460,13 +491,21 @@ pub async fn sync(
             }
         };
         if !resp.status().is_success() {
-            warn!("choco shim sync: {} {}: upstream {}", id, version, resp.status());
+            warn!(
+                "choco shim sync: {} {}: upstream {}",
+                id,
+                version,
+                resp.status()
+            );
             continue;
         }
         let bytes = match resp.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                warn!("choco shim sync: {} {}: body read failed ({})", id, version, e);
+                warn!(
+                    "choco shim sync: {} {}: body read failed ({})",
+                    id, version, e
+                );
                 continue;
             }
         };
@@ -497,7 +536,12 @@ pub async fn sync(
             anyhow::bail!("write {}: {}", sidecar.display(), e);
         }
         synced += 1;
-        debug!("choco shim sync: {} {} ({} bytes) stored", id, version, bytes.len());
+        debug!(
+            "choco shim sync: {} {} ({} bytes) stored",
+            id,
+            version,
+            bytes.len()
+        );
     }
 
     info!(
@@ -526,9 +570,12 @@ mod tests {
     async fn seed(state: &MirrorState, id: &str, version: &str) {
         let dir = feed_root(&state.mirror_dir).join(id).join(version);
         tokio::fs::create_dir_all(&dir).await.unwrap();
-        tokio::fs::write(dir.join(format!("{}.{}.nupkg", id, version)), b"PK-fake-zip")
-            .await
-            .unwrap();
+        tokio::fs::write(
+            dir.join(format!("{}.{}.nupkg", id, version)),
+            b"PK-fake-zip",
+        )
+        .await
+        .unwrap();
         let meta = NuspecMeta {
             id: id.to_string(),
             version: version.to_string(),
@@ -578,12 +625,35 @@ mod tests {
     #[test]
     fn test_feed_latest_flag_and_filter_parse() {
         let metas = vec![
-            NuspecMeta { id: "git".into(), version: "2.40.0".into(), title: "git".into(), project_url: None, sha256: "h1".into(), nupkg_size: 1, synced_at: "2026-09-14T00:00:00Z".into() },
-            NuspecMeta { id: "git".into(), version: "2.45.1".into(), title: "git".into(), project_url: None, sha256: "h2".into(), nupkg_size: 2, synced_at: "2026-09-14T00:00:00Z".into() },
+            NuspecMeta {
+                id: "git".into(),
+                version: "2.40.0".into(),
+                title: "git".into(),
+                project_url: None,
+                sha256: "h1".into(),
+                nupkg_size: 1,
+                synced_at: "2026-09-14T00:00:00Z".into(),
+            },
+            NuspecMeta {
+                id: "git".into(),
+                version: "2.45.1".into(),
+                title: "git".into(),
+                project_url: None,
+                sha256: "h2".into(),
+                nupkg_size: 2,
+                synced_at: "2026-09-14T00:00:00Z".into(),
+            },
         ];
-        let xml = feed_xml("Packages", "http://h/choco/api/v2/Packages()", "http://h/choco", &metas);
+        let xml = feed_xml(
+            "Packages",
+            "http://h/choco/api/v2/Packages()",
+            "http://h/choco",
+            &metas,
+        );
         // exactly one latest=true (2.45.1)
-        let latest_count = xml.matches("<d:IsLatestVersion m:type=\"Edm.Boolean\">true<").count();
+        let latest_count = xml
+            .matches("<d:IsLatestVersion m:type=\"Edm.Boolean\">true<")
+            .count();
         assert_eq!(latest_count, 1);
         assert!(xml.contains("<d:Version>2.45.1</d:Version>"));
 
@@ -678,7 +748,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(resp.headers().get("content-type").unwrap(), "application/zip");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/zip"
+        );
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(&body[..], b"PK-fake-zip");
     }

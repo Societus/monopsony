@@ -342,7 +342,9 @@ impl SignedException {
         let Ok(sig) = ed25519_dalek::Signature::from_slice(&sig_arr) else {
             return false;
         };
-        verifying.verify(self.canonical_json().as_bytes(), &sig).is_ok()
+        verifying
+            .verify(self.canonical_json().as_bytes(), &sig)
+            .is_ok()
     }
 }
 
@@ -359,11 +361,7 @@ impl SignedException {
 /// That is why verification lives HERE and not in the callers: both the
 /// downgrade branch of check_and_update and the public active_exception get
 /// it automatically.
-fn active_exception_on(
-    conn: &rusqlite::Connection,
-    package_key: &str,
-    now: i64,
-) -> Option<String> {
+fn active_exception_on(conn: &rusqlite::Connection, package_key: &str, now: i64) -> Option<String> {
     let mut stmt = conn
         .prepare(
             "SELECT id, package_key, to_version, reason, created_at, expires_at, signature, signing_key
@@ -388,9 +386,7 @@ fn active_exception_on(
 }
 
 /// Project one exceptions row onto a [`SignedException`].
-fn row_to_signed_exception(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<SignedException> {
+fn row_to_signed_exception(row: &rusqlite::Row<'_>) -> rusqlite::Result<SignedException> {
     Ok(SignedException {
         id: row.get(0)?,
         package_key: row.get(1)?,
@@ -590,7 +586,13 @@ mod tests {
         SigningKey::from_bytes(&bytes)
     }
 
-    fn signed_rec(key: &SigningKey, package: &str, to: &str, now: i64, ttl: i64) -> super::SignedException {
+    fn signed_rec(
+        key: &SigningKey,
+        package: &str,
+        to: &str,
+        now: i64,
+        ttl: i64,
+    ) -> super::SignedException {
         let mut rec = super::SignedException {
             id: 0,
             package_key: package.to_string(),

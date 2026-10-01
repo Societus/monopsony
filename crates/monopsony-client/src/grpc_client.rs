@@ -4,9 +4,9 @@ use monopsony_common::proto::monopsony::{
     client_message, ApplyShadowUpdateRequest, CheckShadowUpdatesRequest,
     DownloadShadowAssetRequest, GetShadowRecipeRequest, HeartbeatRequest, InventoryReport,
     ListShadowCatalogRequest, ListShadowPackagesRequest, PackageEntry, PairRequest, PairResponse,
-    RegisterRequest, RegisterShadowPackageRequest, RollbackShadowUpdateRequest,
-    ShadowCatalogEntry, ShadowPackageInfo, ShadowScanFinding, ShadowScanReport, ShadowUpdateInfo,
-    TamperAlert, UnregisterShadowPackageRequest,
+    RegisterRequest, RegisterShadowPackageRequest, RollbackShadowUpdateRequest, ShadowCatalogEntry,
+    ShadowPackageInfo, ShadowScanFinding, ShadowScanReport, ShadowUpdateInfo, TamperAlert,
+    UnregisterShadowPackageRequest,
 };
 use std::path::Path;
 use tonic::transport::Channel;
@@ -658,7 +658,11 @@ impl MonopsonyGrpcClient {
             service_name: service_name.to_string(),
             mask_from_pm,
         };
-        info!(client_id = client_id, name = name, "Registering shadow package");
+        info!(
+            client_id = client_id,
+            name = name,
+            "Registering shadow package"
+        );
         let resp = self.client.register_shadow_package(req).await?;
         Ok(resp.into_inner())
     }
@@ -727,7 +731,12 @@ impl MonopsonyGrpcClient {
         );
         let resp = self.client.get_shadow_recipe(req).await?;
         let resp = resp.into_inner();
-        Ok((resp.recipe_toml, resp.key_id, resp.signature, resp.signed_at))
+        Ok((
+            resp.recipe_toml,
+            resp.key_id,
+            resp.signature,
+            resp.signed_at,
+        ))
     }
 
     /// Ask the server to apply an update to a shadow package.
@@ -756,7 +765,12 @@ impl MonopsonyGrpcClient {
         );
         let resp = self.client.apply_shadow_update(req).await?;
         let resp = resp.into_inner();
-        Ok((resp.success, resp.message, resp.new_version, resp.backup_path))
+        Ok((
+            resp.success,
+            resp.message,
+            resp.new_version,
+            resp.backup_path,
+        ))
     }
 
     /// Ask the server to roll back a shadow package to its previous version.
@@ -778,7 +792,12 @@ impl MonopsonyGrpcClient {
         );
         let resp = self.client.rollback_shadow_update(req).await?;
         let resp = resp.into_inner();
-        Ok((resp.success, resp.message, resp.new_version, resp.backup_path))
+        Ok((
+            resp.success,
+            resp.message,
+            resp.new_version,
+            resp.backup_path,
+        ))
     }
 
     /// Download a shadow package asset via server-side streaming.
@@ -869,7 +888,11 @@ impl MonopsonyGrpcClient {
             client_id: client_id.to_string(),
             catalog_hash: known_hash.to_string(),
         };
-        debug!(client_id = client_id, known_hash = known_hash, "Listing shadow catalog");
+        debug!(
+            client_id = client_id,
+            known_hash = known_hash,
+            "Listing shadow catalog"
+        );
         let resp = self.client.list_shadow_catalog(req).await?;
         let resp = resp.into_inner();
         debug!(

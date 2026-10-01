@@ -109,11 +109,7 @@ impl PackageManagerBackend for ChocoBackend {
             },
             ProxyConfigAction::RunCommand {
                 program: "powershell".to_string(),
-                args: vec![
-                    "-NoProfile".to_string(),
-                    "-Command".to_string(),
-                    add_script,
-                ],
+                args: vec!["-NoProfile".to_string(), "-Command".to_string(), add_script],
             },
         ])
     }

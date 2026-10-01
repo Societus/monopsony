@@ -36,21 +36,23 @@ use monopsony_client::proxy::{run_proxy_with_listener, ProxyConfig};
 // ---- pin/url helpers ----
 
 fn tmp_events_path(tag: &str) -> std::path::PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "pin-e2e-{}-{}.jsonl",
-        tag,
-        std::process::id()
-    ));
+    let p = std::env::temp_dir().join(format!("pin-e2e-{}-{}.jsonl", tag, std::process::id()));
     let _ = std::fs::remove_file(&p);
     p
 }
 
 fn pkg_url(port: u16) -> String {
-    format!("http://127.0.0.1:{port}/extra/os/x86_64/pkg-1.0-1-x86_64.pkg.tar.zst", port = port)
+    format!(
+        "http://127.0.0.1:{port}/extra/os/x86_64/pkg-1.0-1-x86_64.pkg.tar.zst",
+        port = port
+    )
 }
 
 fn canonical_pkg_url(port: u16) -> String {
-    format!("https://127.0.0.1:{port}/extra/os/x86_64/pkg-1.0-1-x86_64.pkg.tar.zst", port = port)
+    format!(
+        "https://127.0.0.1:{port}/extra/os/x86_64/pkg-1.0-1-x86_64.pkg.tar.zst",
+        port = port
+    )
 }
 
 fn signed_pin_for(url: &str, sha: &str) -> (String, [u8; 32]) {
@@ -64,7 +66,10 @@ fn signed_pin_for(url: &str, sha: &str) -> (String, [u8; 32]) {
         signature: String::new(),
     };
     att.sign(&key);
-    (monopsony_common::pin_store::to_json(&att), key.verifying_key().to_bytes())
+    (
+        monopsony_common::pin_store::to_json(&att),
+        key.verifying_key().to_bytes(),
+    )
 }
 
 #[derive(Debug)]
@@ -87,9 +92,7 @@ async fn fetch_via_proxy_deadline(proxy: SocketAddr, url: &str) -> RawResponse {
         .and_then(|rest| rest.find('/').map(|i| &rest[..i]))
         .expect("http url with authority");
     let mut sock = tokio::net::TcpStream::connect(proxy).await.unwrap();
-    let request = format!(
-        "GET {url} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: pin-e2e\r\n\r\n"
-    );
+    let request = format!("GET {url} HTTP/1.1\r\nHost: {authority}\r\nUser-Agent: pin-e2e\r\n\r\n");
     sock.write_all(request.as_bytes()).await.unwrap();
     let mut raw = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -110,9 +113,7 @@ async fn fetch_via_proxy_deadline(proxy: SocketAddr, url: &str) -> RawResponse {
     })
     .await;
     let _ = read;
-    let head_end = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n");
+    let head_end = raw.windows(4).position(|w| w == b"\r\n\r\n");
     let (head, body) = match head_end {
         Some(i) => (
             String::from_utf8_lossy(&raw[..i]).to_string(),
@@ -143,11 +144,7 @@ async fn fetch_via_proxy_deadline(proxy: SocketAddr, url: &str) -> RawResponse {
         .get("transfer-encoding")
         .map(|v| v.to_ascii_lowercase().contains("chunked"))
         .unwrap_or(false);
-    let body = if chunked {
-        decode_chunked(&body)
-    } else {
-        body
-    };
+    let body = if chunked { decode_chunked(&body) } else { body };
     let aborted = match declared {
         Some(n) => body.len() < n, // short read before clean end = abort
         None => false,             // chunked: complete terminator unknown here
@@ -253,7 +250,10 @@ async fn tampered_body_aborts_under_content_length_framing() {
     let events = pin.drain_events();
     assert_eq!(events.len(), 1, "exactly one tamper event: {events:?}");
     assert_eq!(events[0].expected_sha256, clean_sha);
-    assert_eq!(events[0].actual_sha256, hex::encode(Sha256::digest(tampered_of(&clean))));
+    assert_eq!(
+        events[0].actual_sha256,
+        hex::encode(Sha256::digest(tampered_of(&clean)))
+    );
     assert!(events[0].url.contains("pkg-1.0"));
 }
 

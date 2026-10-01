@@ -125,7 +125,8 @@ mod tests {
     #[test]
     fn test_parse_empty_url_is_none() {
         let src = AurSource::new();
-        let body = "{\"resultcount\":1,\"results\":[{\"Name\":\"foo\",\"Version\":\"1.0\",\"URL\":\"\"}]}";
+        let body =
+            "{\"resultcount\":1,\"results\":[{\"Name\":\"foo\",\"Version\":\"1.0\",\"URL\":\"\"}]}";
         let mappings = src.parse_rpc_response(body).unwrap();
         assert_eq!(mappings.len(), 1);
         assert_eq!(mappings[0].homepage, None);

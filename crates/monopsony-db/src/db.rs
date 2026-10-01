@@ -1850,9 +1850,10 @@ impl Database {
         if let Some(v) = self.get_setting(LANGUAGE_PMS_KEY).await? {
             if let Some(obj) = v.as_object() {
                 for (pm, state) in obj {
-                    if let (Some(enabled), Some(source)) =
-                        (state.get("enabled").and_then(|e| e.as_bool()), state.get("source").and_then(|s| s.as_str()))
-                    {
+                    if let (Some(enabled), Some(source)) = (
+                        state.get("enabled").and_then(|e| e.as_bool()),
+                        state.get("source").and_then(|s| s.as_str()),
+                    ) {
                         out.insert(
                             pm.clone(),
                             LanguagePmState {
@@ -1909,11 +1910,7 @@ impl Database {
     }
 
     /// Set the cache class on one cache entry (Sprint 23 classification).
-    pub async fn update_cache_class(
-        &self,
-        url: &str,
-        cache_class: &str,
-    ) -> Result<()> {
+    pub async fn update_cache_class(&self, url: &str, cache_class: &str) -> Result<()> {
         sqlx::query("UPDATE cache_entries SET cache_class = $1 WHERE url = $2")
             .bind(cache_class)
             .bind(url)
@@ -2029,10 +2026,9 @@ impl Database {
     /// MAX(resolved_at) from package_map — freshest oracle resolution time
     /// (unix ms), for the dashboard stat + delta metadata. None when empty.
     pub async fn oracle_last_resolved(&self) -> Result<Option<i64>> {
-        let row: (Option<i64>,) =
-            sqlx::query_as("SELECT MAX(resolved_at) FROM package_map")
-                .fetch_one(&self.pool)
-                .await?;
+        let row: (Option<i64>,) = sqlx::query_as("SELECT MAX(resolved_at) FROM package_map")
+            .fetch_one(&self.pool)
+            .await?;
         Ok(row.0)
     }
 
@@ -2141,7 +2137,9 @@ impl Database {
                 signature: r.get("signature"),
                 key_id: r.get("key_id"),
                 catalog_hash: r.get("catalog_hash"),
-                published_at: r.get::<chrono::DateTime<Utc>, _>("published_at").timestamp(),
+                published_at: r
+                    .get::<chrono::DateTime<Utc>, _>("published_at")
+                    .timestamp(),
                 provenance_client_id: r.get("provenance_client_id"),
             })
             .collect())
