@@ -5,6 +5,7 @@
 
 mod apk;
 mod apt;
+mod brew;
 mod bsd_privilege;
 mod cargo;
 mod choco;
@@ -25,6 +26,7 @@ mod zypper;
 
 pub use apk::ApkBackend;
 pub use apt::AptBackend;
+pub use brew::HomebrewBackend;
 pub use cargo::CargoBackend;
 pub use choco::ChocoBackend;
 pub use dnf::DnfBackend;
@@ -68,6 +70,7 @@ pub enum PackageManagerKind {
     Xbps,
     Emerge,
     Nix,
+    Homebrew,
 }
 
 impl PackageManagerKind {
@@ -91,6 +94,7 @@ impl PackageManagerKind {
             PackageManagerKind::Xbps => "xbps",
             PackageManagerKind::Emerge => "emerge",
             PackageManagerKind::Nix => "nix",
+            PackageManagerKind::Homebrew => "brew",
         }
     }
 
@@ -116,6 +120,7 @@ impl PackageManagerKind {
             "xbps" => Some(PackageManagerKind::Xbps),
             "emerge" => Some(PackageManagerKind::Emerge),
             "nix" => Some(PackageManagerKind::Nix),
+            "brew" => Some(PackageManagerKind::Homebrew),
             _ => None,
         }
     }
@@ -339,6 +344,7 @@ pub fn get_all_backends() -> Vec<Box<dyn PackageManagerBackend>> {
         Box::new(XbpsBackend::new()),
         Box::new(EmergeBackend::new()),
         Box::new(NixBackend::new()),
+        Box::new(HomebrewBackend::new()),
     ]
 }
 
@@ -374,6 +380,7 @@ pub fn get_backend(kind: PackageManagerKind) -> Option<Box<dyn PackageManagerBac
         PackageManagerKind::Xbps => Some(Box::new(XbpsBackend::new())),
         PackageManagerKind::Emerge => Some(Box::new(EmergeBackend::new())),
         PackageManagerKind::Nix => Some(Box::new(NixBackend::new())),
+        PackageManagerKind::Homebrew => Some(Box::new(HomebrewBackend::new())),
     }
 }
 

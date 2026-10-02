@@ -263,6 +263,20 @@ pub fn create_proxy_router(
             axum::routing::any(handle_cargo_index_shim),
         )
         .route("/crates/*path", axum::routing::any(handle_crates_shim))
+        // Sprint 26 Phase 1: Homebrew shims — /brew/api/* rides the normal
+        // cached LangMetadata path (formulae.brew.sh); /brew/bottles/* serves
+        // ghcr manifests (token-injected cached path) + bottle blobs
+        // (bespoke reqwest handler — ghcr blob GETs 307 to a signed CDN the
+        // hyper client cannot follow). On 404 brew silently falls back to
+        // origin (mirror-list semantics).
+        .route(
+            "/brew/api/*path",
+            axum::routing::any(crate::brew_shim::handle_brew_api_shim),
+        )
+        .route(
+            "/brew/bottles/*path",
+            axum::routing::any(crate::brew_shim::handle_brew_bottles_shim),
+        )
         .route("/*path", axum::routing::any(handle_proxy_request))
         .route("/", axum::routing::any(handle_proxy_request))
         // No `.fallback` here: CONNECT is intercepted in the hyper Service
@@ -548,6 +562,7 @@ pub(crate) async fn handle_request_uri(
                 monopsony_common::package_manager::PackageManagerKind::Npm => Some("npm"),
                 monopsony_common::package_manager::PackageManagerKind::Pip => Some("pip"),
                 monopsony_common::package_manager::PackageManagerKind::Cargo => Some("cargo"),
+                monopsony_common::package_manager::PackageManagerKind::Homebrew => Some("brew"),
                 _ => None,
             };
             if let Some(pm) = pm {

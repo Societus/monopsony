@@ -1,4 +1,5 @@
 pub mod body_rewrite;
+pub mod brew_shim;
 pub mod cache_storage;
 pub mod docker;
 pub mod language_artifacts;
