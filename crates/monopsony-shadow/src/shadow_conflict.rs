@@ -237,11 +237,8 @@ mod tests {
     #[test]
     fn detect_active_pms() {
         let pms = detect_active_package_managers();
-        // On this Arch system, pacman should be detected
-        assert!(
-            !pms.is_empty() || true,
-            "no PMs detected (OK in containers)"
-        );
+        // On this Arch system, pacman should be detected; the guard is OK when no PM is present.
+        assert!(!pms.is_empty(), "no PMs detected (OK in containers)");
     }
 
     #[test]
