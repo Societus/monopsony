@@ -3,7 +3,7 @@
 The marketing website (monopsony.dev) lists these backends as "planned."
 Track implementation status here.
 
-## Currently Implemented (15 backends)
+## Currently Implemented (16 backends)
 
 | Backend  | Platform           | File                              | Status |
 |----------|--------------------|-----------------------------------|--------|
@@ -22,6 +22,7 @@ Track implementation status here.
 | xbps     | Void Linux         | package_manager/xbps.rs           | ✅ Implemented, unit-tested |
 | emerge   | Gentoo             | package_manager/emerge.rs         | ✅ Implemented, unit-tested |
 | nix      | NixOS              | package_manager/nix.rs            | ✅ Implemented, unit-tested |
+| brew     | macOS (Homebrew)   | package_manager/brew.rs           | ✅ Implemented, unit-tested (Sprint 26 Phase 1) |
 
 ## All Planned Backends Implemented
 

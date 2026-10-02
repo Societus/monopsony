@@ -186,6 +186,8 @@ pub fn infer_ecosystem(path: &std::path::Path) -> &'static str {
         "Debian"
     } else if path_str.contains("dnf") || path_str.ends_with(".rpm") {
         "Fedora"
+    } else if path_str.contains("brew") {
+        "Homebrew"
     } else {
         "" // OSV requires ecosystem — empty means skip lookup
     }
@@ -278,6 +280,16 @@ mod tests {
         assert_eq!(
             infer_ecosystem(std::path::Path::new("/cache/random/file.bin")),
             ""
+        );
+    }
+
+    #[test]
+    fn test_infer_ecosystem_brew() {
+        assert_eq!(
+            infer_ecosystem(std::path::Path::new(
+                "/cache/brew/bottles/jq/1.8.2/jq-1.8.2.arm64_tahoe.bottle.1.tar.gz"
+            )),
+            "Homebrew"
         );
     }
 

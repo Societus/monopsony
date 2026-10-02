@@ -2,13 +2,13 @@
   import { onMount } from 'svelte';
   import Package from 'lucide-svelte/icons/package';
 
-  type PmName = 'npm' | 'pip' | 'cargo';
+  type PmName = 'npm' | 'pip' | 'cargo' | 'brew';
   type PmSource = 'default' | 'auto' | 'manual';
   type PmState = { enabled: boolean; source: PmSource };
   type LanguagePms = Record<PmName, PmState>;
 
   const BASE: string = import.meta.env.VITE_API_BASE || '/api/v1';
-  const PMS: readonly PmName[] = ['npm', 'pip', 'cargo'];
+  const PMS: readonly PmName[] = ['npm', 'pip', 'cargo', 'brew'];
 
   let states = $state<LanguagePms | null>(null);
   let loading = $state(true);
@@ -74,7 +74,7 @@
     <h2 class="text-sm font-semibold">Language package managers</h2>
   </div>
   <p class="text-xs" style="color: var(--color-text-muted);">
-    Enable caching of language-ecosystem packages (npm registry, PyPI, crates.io). Changes apply immediately — no restart required.
+    Enable caching of language-ecosystem packages (npm registry, PyPI, crates.io) and Homebrew bottles + API metadata. Changes apply immediately — no restart required.
   </p>
 
   {#if error}

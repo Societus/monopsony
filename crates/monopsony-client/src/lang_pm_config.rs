@@ -18,6 +18,7 @@ pub fn parse_lang_pm(s: &str) -> Option<PackageManagerKind> {
         "npm" => Some(PackageManagerKind::Npm),
         "pip" => Some(PackageManagerKind::Pip),
         "cargo" => Some(PackageManagerKind::Cargo),
+        "brew" => Some(PackageManagerKind::Homebrew),
         _ => None,
     }
 }
@@ -192,6 +193,8 @@ mod tests {
         assert_eq!(parse_lang_pm("pip"), Some(PackageManagerKind::Pip));
         assert_eq!(parse_lang_pm("cargo"), Some(PackageManagerKind::Cargo));
         assert_eq!(parse_lang_pm("NPM"), Some(PackageManagerKind::Npm));
+        assert_eq!(parse_lang_pm("brew"), Some(PackageManagerKind::Homebrew));
+        assert_eq!(parse_lang_pm("BREW"), Some(PackageManagerKind::Homebrew));
         assert_eq!(parse_lang_pm("pacman"), None);
         assert_eq!(parse_lang_pm(""), None);
     }

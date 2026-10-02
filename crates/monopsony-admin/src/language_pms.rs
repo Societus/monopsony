@@ -25,7 +25,7 @@ use crate::AdminState;
 
 /// The language PMs exposed on the admin surface. Order is the pinned
 /// dashboard display order.
-pub const SUPPORTED_LANGUAGE_PMS: [&str; 3] = ["npm", "pip", "cargo"];
+pub const SUPPORTED_LANGUAGE_PMS: [&str; 4] = ["npm", "pip", "cargo", "brew"];
 
 /// `source` value for a state explicitly set via this API.
 const SOURCE_MANUAL: &str = "manual";
@@ -207,9 +207,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_map_has_all_three_pms_disabled_by_default() {
+    fn default_map_has_all_supported_pms_disabled_by_default() {
         let map = default_language_pms_map();
-        assert_eq!(map.len(), 3);
+        assert_eq!(map.len(), SUPPORTED_LANGUAGE_PMS.len());
         for pm in SUPPORTED_LANGUAGE_PMS {
             let state = map.get(pm).unwrap();
             assert!(!state.enabled, "{pm} should default to disabled");
@@ -226,6 +226,7 @@ mod tests {
                 "npm":   {"enabled": false, "source": "default"},
                 "pip":   {"enabled": false, "source": "default"},
                 "cargo": {"enabled": false, "source": "default"},
+                "brew":  {"enabled": false, "source": "default"},
             })
         );
     }
@@ -266,7 +267,7 @@ mod tests {
             },
         );
         let map = apply_patch(stored, "npm", true);
-        assert_eq!(map.len(), 3);
+        assert_eq!(map.len(), SUPPORTED_LANGUAGE_PMS.len());
         assert_eq!(
             map.get("npm").unwrap(),
             &LanguagePmStateDto {

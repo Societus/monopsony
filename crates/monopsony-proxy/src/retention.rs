@@ -76,6 +76,7 @@ pub fn parse_artifact_path(path: &str) -> Option<ParsedArtifactPath> {
         "npm" => parse_npm_path(&segments),
         "pip" => parse_pip_path(&segments),
         "cargo" => parse_cargo_path(&segments),
+        "brew" => parse_brew_path(&segments),
         _ => None,
     }
     .map(|(name, version)| ParsedArtifactPath {
@@ -149,6 +150,16 @@ fn parse_cargo_path(segments: &[&str]) -> Option<(String, String)> {
     let name = segments.get(crates_pos + 1)?.to_string();
     let version = segments.get(crates_pos + 2)?.to_string();
     Some((name, version))
+}
+
+/// brew bottles: `["bottles", <name>, <version>, "<file>.tar.gz"]` (the
+/// `brew/` ecosystem prefix is already split off by the caller).
+/// The api/ and v2/ shapes are metadata, not candidates → `None`.
+fn parse_brew_path(segments: &[&str]) -> Option<(String, String)> {
+    if segments.len() < 4 || segments[0] != "bottles" {
+        return None; // api/, v2/ shapes = metadata, not candidates
+    }
+    Some((segments[1].to_string(), segments[2].to_string()))
 }
 
 /// Semver-family tuple passed into the floor logic.
@@ -450,6 +461,28 @@ mod tests {
     #[test]
     fn cargo_index_is_not_a_candidate() {
         assert_eq!(parse_artifact_path("cargo/index/ca/rg/cargo"), None);
+    }
+
+    #[test]
+    fn brew_bottle_path_parses() {
+        let p = parse_artifact_path("brew/bottles/jq/1.8.2/jq-1.8.2.arm64_tahoe.bottle.1.tar.gz")
+            .unwrap();
+        assert_eq!(p.ecosystem, "brew");
+        assert_eq!(p.name, "jq");
+        assert_eq!(p.version, "1.8.2");
+    }
+
+    #[test]
+    fn brew_api_metadata_is_not_a_candidate() {
+        assert_eq!(parse_artifact_path("brew/api/formula/jq.json"), None);
+    }
+
+    #[test]
+    fn brew_manifest_is_not_a_candidate() {
+        assert_eq!(
+            parse_artifact_path("brew/v2/homebrew/core/jq/manifests/1.8.2-1"),
+            None
+        );
     }
 
     // --- version floors ----------------------------------------------------
