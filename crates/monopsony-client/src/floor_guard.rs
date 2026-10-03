@@ -64,6 +64,7 @@ pub fn load(path: &Path) -> std::io::Result<FloorStore> {
 }
 
 impl FloorStore {
+    #[allow(dead_code)] // test-construction helper; kept for parity with load()
     pub fn empty() -> Self {
         Self::default()
     }
@@ -178,9 +179,9 @@ pub enum FloorVerdict {
     },
 }
 
-/// Repo class from key segment 2 (splitn '|' → [manager, repo, name, arch]).
+/// Repo class from key segment 2 (split '|' → [manager, repo, name, arch]).
 pub fn repo_class_of(package_key: &str) -> String {
-    match package_key.splitn(4, '|').nth(1) {
+    match package_key.split('|').nth(1) {
         Some("core") => "core".to_string(),
         Some("extra") => "extra".to_string(),
         Some("aur") => "aur".to_string(),
@@ -190,7 +191,7 @@ pub fn repo_class_of(package_key: &str) -> String {
 
 /// Name segment (index 2) of a package_key.
 fn key_name(package_key: &str) -> Option<String> {
-    package_key.splitn(4, '|').nth(2).map(|s| s.to_string())
+    package_key.split('|').nth(2).map(|s| s.to_string())
 }
 
 /// Common archive/signature suffixes, longest first so compound

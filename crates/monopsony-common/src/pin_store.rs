@@ -11,12 +11,12 @@
 //! Origin classes (Phase 3 scope — plan §5):
 //! - `index`         — hash declared by the PM's signed index for this URL
 //! - `sidecar`       — sibling checksum file fetched from the same origin
-//!                     (`.sha256` / `.sha512`)
+//!   (`.sha256` / `.sha512`)
 //! - `header`        — origin checksum header (`x-checksum-sha256` et al.)
 //! - `shim`          — shim-declared checksum (winget InstallerSha256, scoop
-//!                     bucket hash, choco nuspec checksum) passed at sync time
+//!   bucket hash, choco nuspec checksum) passed at sync time
 //! - `unverified`    — no origin integrity source found; pin records the
-//!                     commit-time hash as an observation only (policy-gated)
+//!   commit-time hash as an observation only (policy-gated)
 //!
 //! Trust note (plan §9): a compromised server can sign lies with its own pin
 //! key. The pin store defends the CACHE path (bit rot, cache poisoning,

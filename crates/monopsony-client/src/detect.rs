@@ -83,11 +83,13 @@ pub struct ElfInfo {
 #[serde(rename_all = "snake_case")]
 pub enum ConfigSource {
     UnitEnv,
+    #[allow(dead_code)] // kept for config-source reporting parity
     UnitArg,
     Conventional,
 }
 
 impl ConfigSource {
+    #[allow(dead_code)] // config-source reporting parity; not yet surfaced in CLI output
     pub fn as_str(&self) -> &'static str {
         match self {
             ConfigSource::UnitEnv => "unit-env",
@@ -121,6 +123,7 @@ pub struct ServiceMatch {
 
 /// Version-probe outcome.
 #[derive(Debug, Clone, Serialize)]
+#[allow(dead_code)] // version probe report struct; fields serialized only in some paths
 pub struct VersionProbe {
     pub version: Option<String>,
     pub detect_command: Option<String>,
@@ -188,7 +191,7 @@ pub fn parse_elf_header(first20: &[u8]) -> Option<ElfInfo> {
 pub fn extract_version(text: &str) -> Option<String> {
     let re = Regex::new(r"(?i)\bv?[0-9]+\.[0-9]+(\.[0-9]+)?([-+][0-9A-Za-z.]+)?").ok()?;
     re.find(text)
-        .map(|m| m.as_str().trim_start_matches(|c| c == 'v' || c == 'V'))
+        .map(|m| m.as_str().trim_start_matches(['v', 'V']))
         .filter(|s| s.as_bytes().first().is_some_and(|c| c.is_ascii_digit()))
         .map(|s| s.to_string())
 }
@@ -276,6 +279,7 @@ fn extract_unit_paths(contents: &str) -> Vec<String> {
 }
 
 /// Extract argv tokens (beyond argv[0]) from an ExecStart= line.
+#[allow(dead_code)] // unit-file ExecStart parser; used when unit-arg config sources are enabled
 fn extract_execstart_args(contents: &str) -> Vec<String> {
     for line in contents.lines() {
         let line = line.trim();
@@ -334,7 +338,7 @@ pub async fn match_service(
                 };
                 let mut confidence = None;
                 if let Some(res) = resolved {
-                    if rest.contains(&res.to_string_lossy().as_ref()) {
+                    if rest.contains(res.to_string_lossy().as_ref()) {
                         confidence = Some(Confidence::High);
                     }
                 }
@@ -415,7 +419,7 @@ pub async fn match_service(
             };
             let hit = contents.lines().any(|l| {
                 (resolved
-                    .map(|r| l.contains(&r.to_string_lossy().as_ref()))
+                    .map(|r| l.contains(r.to_string_lossy().as_ref()))
                     .unwrap_or(false))
                     || (!basename.is_empty()
                         && l.split_whitespace()
@@ -460,7 +464,7 @@ fn cgroup_unit(proc_entry: &Path) -> Option<String> {
 pub async fn discover_configs(
     name: &str,
     service: Option<&ServiceMatch>,
-    scan: &ScanPaths,
+    _scan: &ScanPaths,
 ) -> Result<Vec<ConfigFinding>> {
     let mut findings: Vec<ConfigFinding> = Vec::new();
     let mut seen = std::collections::HashSet::new();

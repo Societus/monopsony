@@ -187,10 +187,10 @@ impl hyper::rt::Write for WsTransport {
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         match self.tx.poll_flush_unpin(cx) {
             Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("WebSocket flush error: {}", e),
-            ))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::other(format!(
+                "WebSocket flush error: {}",
+                e
+            )))),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -201,10 +201,10 @@ impl hyper::rt::Write for WsTransport {
                 self.closed = true;
                 Poll::Ready(Ok(()))
             }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("WebSocket close error: {}", e),
-            ))),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(std::io::Error::other(format!(
+                "WebSocket close error: {}",
+                e
+            )))),
             Poll::Pending => Poll::Pending,
         }
     }

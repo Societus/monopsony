@@ -213,11 +213,10 @@ pub async fn handle_assign_recipe(
     };
 
     if let Err((status, reason)) = gate_decision(flag_enabled, exposed, in_catalog) {
-        let outcome = if status == StatusCode::NOT_FOUND {
-            "refused"
-        } else {
-            "refused"
-        };
+        // Both refusal classes audit as "refused"; the status only shapes the
+        // HTTP response, not the audit outcome. (Single-arm by design.)
+        let _ = status;
+        let outcome = "refused";
         if let Err(e) = db
             .record_shadow_assignment_audit(client_uuid, &recipe_name, outcome, Some(&reason))
             .await

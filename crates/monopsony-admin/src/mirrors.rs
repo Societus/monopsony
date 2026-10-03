@@ -6,7 +6,6 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
-use sqlx::Row;
 use tracing::{info, warn};
 
 use crate::AdminState;

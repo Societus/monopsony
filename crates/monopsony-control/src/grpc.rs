@@ -1188,6 +1188,9 @@ impl MonopsonyControl for MonopsonyGrpc {
     }
 }
 
+// Thin orchestrator entrypoint — args mirror the wired subsystems (db, tls,
+// mirror, tracker); a params struct would just relocate the arity.
+#[allow(clippy::too_many_arguments)]
 pub async fn start(
     addr: SocketAddr,
     db: Arc<Database>,

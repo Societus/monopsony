@@ -26,10 +26,7 @@ pub async fn handle_health(State(state): State<AdminState>) -> impl IntoResponse
 
     // Database
     let db_healthy = if let Some(ref db) = state.db {
-        match db.ping().await {
-            Ok(true) => true,
-            _ => false,
-        }
+        matches!(db.ping().await, Ok(true))
     } else {
         false
     };

@@ -273,6 +273,9 @@ pub async fn handle_pair_cancel(State(state): State<AdminState>) -> impl IntoRes
 ///
 /// Uses `tokio::time::timeout` (not `select!` + `sleep_until`) to avoid the
 /// instant-timeout bug that affected the old CLI pairing command.
+// Listener wiring mirrors the subsystem surface it hands off to; a params
+// struct would just relocate the arity.
+#[allow(clippy::too_many_arguments)]
 async fn run_pairing_listener(
     pairing_code: String,
     tls_manager: std::sync::Arc<monopsony_control::tls::TlsManager>,

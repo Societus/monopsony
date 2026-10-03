@@ -790,7 +790,7 @@ impl MirrorManager {
                 config.upstream_url.trim_end_matches('/'),
                 index_path
             );
-            let dest = local_path.join(index_path.split('/').last().unwrap_or("index"));
+            let dest = local_path.join(index_path.split('/').next_back().unwrap_or("index"));
             if let Ok(size) =
                 sync_single_file(&build_https_client(), &url, &dest, None, "fail-open").await
             {

@@ -124,6 +124,7 @@ impl ClientProxyState {
     }
 
     /// Read-only access to the effective proxy configuration.
+    #[allow(dead_code)] // introspection API for status output; callers pending
     pub fn config(&self) -> &ProxyConfig {
         &self.config
     }
@@ -310,7 +311,7 @@ fn find_head_end(buf: &[u8]) -> Option<usize> {
 /// Reads the (small) error body to match the server proxy's markers.
 pub async fn is_transient_failure(response: &mut Response<Body>) -> bool {
     let status = response.status();
-    if !matches!(status.as_u16(), 502 | 503 | 504) {
+    if !matches!(status.as_u16(), 502..=504) {
         return false;
     }
     // The server's transient errors are short marker strings. Only inspect

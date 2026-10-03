@@ -27,7 +27,7 @@ const SESSION_COOKIE_NAME: &str = "monopsony_session";
 // ─── Tailscale Detection ──────────────────────────────────────────────
 
 /// Detected Tailscale environment state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TailscaleState {
     /// Is Tailscale installed and running on this host?
     pub available: bool,
@@ -41,19 +41,6 @@ pub struct TailscaleState {
     pub self_ip: Option<String>,
     /// This node's hostname on the tailnet
     pub hostname: Option<String>,
-}
-
-impl Default for TailscaleState {
-    fn default() -> Self {
-        Self {
-            available: false,
-            serve_mode: false,
-            funnel_mode: false,
-            tailnet_name: None,
-            self_ip: None,
-            hostname: None,
-        }
-    }
 }
 
 /// Detector that caches Tailscale state and refreshes periodically.
@@ -288,7 +275,9 @@ pub struct SessionStore {
 }
 
 struct Session {
+    #[allow(dead_code)] // reserved for audit fields in session responses
     username: String,
+    #[allow(dead_code)] // reserved: expiry cleanup pass reads this
     created_at: Instant,
     expires_at: Instant,
 }

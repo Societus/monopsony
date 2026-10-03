@@ -9,7 +9,7 @@ use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 // Crate imports
-use monopsony_admin::{AdminState, DashboardConfig};
+use monopsony_admin::DashboardConfig;
 use monopsony_control::{announce, discovery, grpc, metrics};
 use monopsony_db::Database;
 use monopsony_mirror::mirror;

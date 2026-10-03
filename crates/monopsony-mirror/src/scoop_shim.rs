@@ -87,7 +87,7 @@ async fn serve_from_bucket(state: &MirrorState, bucket: &str, file_path: &str) -
     let local_file = if file_path.is_empty() {
         root.join("bucket.json")
     } else {
-        root.join(&file_path)
+        root.join(file_path)
     };
 
     let canonical_file = match local_file.canonicalize() {

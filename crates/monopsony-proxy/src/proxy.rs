@@ -9,7 +9,6 @@ use axum::{
     http::{header, Method, Request, Response, StatusCode},
     response::IntoResponse,
 };
-use http_body_util::BodyExt;
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
@@ -157,7 +156,7 @@ impl ProxyState {
                 if pattern.matches(url) {
                     // Highest-priority matching pattern wins (same tie-break
                     // direction as find_backend_for_url's first-match scan).
-                    if best.map_or(true, |(p, _)| pattern.priority > p) {
+                    if best.is_none_or(|(p, _)| pattern.priority > p) {
                         best = Some((pattern.priority, pattern.cache_class));
                     }
                 }
@@ -308,11 +307,7 @@ async fn health_check() -> &'static str {
 /// matches a prefetched `https://` entry, causing duplicate fetches and cache
 /// misses.
 fn normalize_url_scheme(url: &str) -> String {
-    if url.starts_with("http://") {
-        format!("https://{}", &url[7..])
-    } else {
-        url.to_string()
-    }
+    url.replacen("http://", "https://", 1)
 }
 
 /// Handle HTTP proxy requests
@@ -990,7 +985,7 @@ async fn serve_cache_hit(
 
             // Scan policy enforcement: query DB for scan status on HIT
             if let Some(db) = &state.db {
-                if let Ok(Some(scan_row)) = db.get_latest_scan_result(&cache_key).await {
+                if let Ok(Some(scan_row)) = db.get_latest_scan_result(cache_key).await {
                     builder = builder.header("X-Scan-Status", &scan_row.scan_status);
 
                     if let Some(ref scan_cfg) = state.scan_config {
@@ -1056,11 +1051,11 @@ async fn serve_cache_hit(
 
             monopsony_common::metrics::cache_bytes_served(serve_len);
             let body = Body::from_stream(serve_stream);
-            return Some(
+            Some(
                 builder
                     .body(body)
                     .unwrap_or_else(|_| Response::new(Body::from("Failed to build response"))),
-            );
+            )
         }
         Err(e) => {
             warn!("Failed to open cached object {}: {}", cache_key, e);
@@ -1348,6 +1343,7 @@ struct TeeContext {
     url: String,
     content_type: Option<String>,
     content_encoding: Option<String>,
+    #[allow(dead_code)] // recorded for parity with sidecar shape; consumed only by debug output
     upstream_content_length: Option<u64>,
     etag: Option<String>,
     last_modified: Option<String>,
@@ -1524,13 +1520,13 @@ async fn run_tee(
 
     // Pin capture (Sprint 20 Phase 3): record the origin-declared hash as a
     // signed attestation when pinning is provisioned and enabled.
-    if ctx.state.integrity.pinning_enabled && ctx.state.pin_key.is_some() {
+    if ctx.state.integrity.pinning_enabled {
         // Origin precedence: response headers first, then `<url>.sha256`
         // sidecar, then the commit-time hash as an Unverified observation.
         let origin = ctx
             .upstream_headers
             .as_ref()
-            .and_then(|h| origin_hash_from_header_map(h));
+            .and_then(origin_hash_from_header_map);
         let origin = if origin.is_some() {
             origin
         } else {
@@ -1555,26 +1551,28 @@ async fn run_tee(
             observed_at: now_secs,
             signature: String::new(),
         };
-        att.sign(ctx.state.pin_key.as_ref().unwrap());
+        if let Some(key) = ctx.state.pin_key.as_ref() {
+            att.sign(key);
 
-        // Sidecar pin file next to the cache metadata. Cache keys carry
-        // slashes (host/path), so create the FULL parent chain of the pin
-        // path, not just the pins/ root.
-        let pin_path = ctx
-            .state
-            .cache_dir
-            .join("pins")
-            .join(format!("{}.pin", ctx.cache_key));
-        if let Some(parent) = pin_path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                warn!("Failed to create pins dir {}: {}", parent.display(), e);
+            // Sidecar pin file next to the cache metadata. Cache keys carry
+            // slashes (host/path), so create the FULL parent chain of the pin
+            // path, not just the pins/ root.
+            let pin_path = ctx
+                .state
+                .cache_dir
+                .join("pins")
+                .join(format!("{}.pin", ctx.cache_key));
+            if let Some(parent) = pin_path.parent() {
+                if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                    warn!("Failed to create pins dir {}: {}", parent.display(), e);
+                }
             }
-        }
-        let pin_json = monopsony_common::pin_store::to_json(&att);
-        if let Err(e) = tokio::fs::write(&pin_path, pin_json).await {
-            warn!("Failed to write pin file {}: {}", pin_path.display(), e);
-        } else {
-            debug!("Pinned {} (origin {})", ctx.url, pin_origin.as_str());
+            let pin_json = monopsony_common::pin_store::to_json(&att);
+            if let Err(e) = tokio::fs::write(&pin_path, pin_json).await {
+                warn!("Failed to write pin file {}: {}", pin_path.display(), e);
+            } else {
+                debug!("Pinned {} (origin {})", ctx.url, pin_origin.as_str());
+            }
         }
         // DB upsert: slice-2 wires db.record_pin()
     }
@@ -1931,6 +1929,9 @@ async fn attach_pin_header(
 }
 
 /// Pass through request to upstream without caching
+// Direct (non-CONNECT) passthrough entrypoint; all live call sites resolve a
+// URL first and use proxy_passthrough_to. Kept for symmetry with CONNECT path.
+#[allow(dead_code)]
 async fn proxy_passthrough(state: &ProxyState, request: Request<Body>) -> Response<Body> {
     let uri = request.uri().clone();
     let url = if uri.scheme().is_some() {
@@ -2262,9 +2263,8 @@ async fn handle_connect(
     let mut upstream = match upstream {
         Some(s) => s,
         None => {
-            let e = last_err.unwrap_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::Other, "no validated addresses to dial")
-            });
+            let e =
+                last_err.unwrap_or_else(|| std::io::Error::other("no validated addresses to dial"));
             warn!("CONNECT upstream dial {}:{} failed: {}", host, port, e);
             return Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
@@ -2656,6 +2656,9 @@ async fn add_cache_meta_candidate(
 }
 
 /// Start the HTTP proxy server
+// Orchestrator entrypoint — args mirror the configured subsystems; a params
+// struct would just relocate the arity (same pattern as control::start()).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_proxy(
     addr: SocketAddr,
     storage: Arc<dyn CacheStorage>,

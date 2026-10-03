@@ -292,9 +292,7 @@ pub fn ip_in_cidr(ip: std::net::IpAddr, cidr: &str) -> bool {
         None => (cidr, None),
     };
     if prefix_len.is_none() {
-        return network
-            .parse::<std::net::IpAddr>()
-            .map_or(false, |addr| addr == ip);
+        return network.parse::<std::net::IpAddr>() == Ok(ip);
     }
     let prefix_len = prefix_len.unwrap();
     match ip {

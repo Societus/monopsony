@@ -117,7 +117,7 @@ pub async fn check_freshness(state: &ProxyState, meta: &mut CacheEntry) -> Fresh
         return Freshness::Fresh;
     }
 
-    let ttl = cfg.metadata_ttl_secs as u64;
+    let ttl = cfg.metadata_ttl_secs;
     let age = now_secs().saturating_sub(meta.cached_at);
     if age < ttl {
         return Freshness::Fresh;

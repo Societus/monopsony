@@ -116,7 +116,7 @@ impl PinState {
                 .create(true)
                 .append(true)
                 .open(&self.events_path)
-                .and_then(|mut f| writeln!(f, "{}", line).map_err(|e| e.into()))
+                .and_then(|mut f| writeln!(f, "{}", line))
             {
                 Ok(()) => {}
                 Err(e) => tracing::error!(

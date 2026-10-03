@@ -279,7 +279,7 @@ impl CacheStorage for ObjectStoreBackend {
         let sidecar = ObjectMeta {
             checksum_sha256: meta.checksum_sha256.clone(),
             size_bytes: meta.size_bytes,
-            cache_class: meta.cache_class.clone(),
+            cache_class: meta.cache_class,
             last_verified_at: 0,
         };
         self.save_sidecar(key, &sidecar).await

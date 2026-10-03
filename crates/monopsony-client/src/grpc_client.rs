@@ -5,7 +5,7 @@ use monopsony_common::proto::monopsony::{
     DownloadShadowAssetRequest, GetShadowRecipeRequest, HeartbeatRequest, InventoryReport,
     ListShadowCatalogRequest, ListShadowPackagesRequest, PackageEntry, PairRequest, PairResponse,
     RegisterRequest, RegisterShadowPackageRequest, RollbackShadowUpdateRequest, ShadowCatalogEntry,
-    ShadowPackageInfo, ShadowScanFinding, ShadowScanReport, ShadowUpdateInfo, TamperAlert,
+    ShadowPackageInfo, ShadowScanFinding, ShadowScanReport, ShadowUpdateInfo,
     UnregisterShadowPackageRequest,
 };
 use std::path::Path;
@@ -830,9 +830,7 @@ impl MonopsonyGrpcClient {
         let mut blob: Vec<u8> = Vec::new();
         let mut expected_total: i64 = 0;
         while let Some(chunk) = inbound.next().await {
-            let chunk = chunk.map_err(|e| {
-                anyhow::anyhow!("shadow asset stream failed: {}", tonic::Status::from(e))
-            })?;
+            let chunk = chunk.map_err(|e| anyhow::anyhow!("shadow asset stream failed: {}", e))?;
 
             if !chunk.blob_hash.is_empty() {
                 let mut hasher = Sha256::new();

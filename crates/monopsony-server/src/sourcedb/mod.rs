@@ -6,6 +6,11 @@
 //! later `observed_at`. `version_ord` is a lexicographically sortable canonical
 //! key produced by `monopsony_common::version_ord::order_key` — comparisons
 //! here are plain string compares, never version parsing.
+//!
+// Only `refresh` and `delivery` are wired into the server today; the store,
+// freeze, resolve, and sources submodules are staged API (tested, unwired).
+// Remove this allow as each piece gains a live caller.
+#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 
@@ -87,7 +92,6 @@ pub fn floor_for(package_key: &str, obs: &[ObservedVersion]) -> Option<ObservedV
 /// dpkg-style weights, release as fixed-width string. Never parses raw
 /// version strings.
 pub fn cmp_version_ord(a: &str, b: &str) -> std::cmp::Ordering {
-    use std::cmp::Ordering::*;
     let (ae, ab, ar) = split_ord_key(a);
     let (be, bb, br) = split_ord_key(b);
     ae.cmp(be)

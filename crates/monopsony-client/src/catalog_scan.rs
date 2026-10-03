@@ -8,6 +8,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// SHA-256 of `data`, lowercase hex.
+// Shared hashing helper — used by tests and upcoming catalog sync paths.
+#[allow(dead_code)]
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -21,6 +23,7 @@ fn sha256_hex(data: &[u8]) -> String {
 
 /// Stable hash for a single catalog entry: sha256 over canonical JSON
 /// `{"name":...,"recipe_toml":...}` (serde_json Value sorts map keys, no spaces).
+#[allow(dead_code)] // catalog-sync API (Sprint 22); bin wiring pending
 pub fn entry_hash(name: &str, recipe_toml: &str) -> String {
     let mut map = serde_json::Map::new();
     map.insert(
@@ -37,6 +40,7 @@ pub fn entry_hash(name: &str, recipe_toml: &str) -> String {
 
 /// Stable hash for a whole catalog: sha256 over canonical JSON of the
 /// sorted vector of entry hashes (order-independent).
+#[allow(dead_code)] // catalog-sync API (Sprint 22); bin wiring pending
 pub fn catalog_hash(entry_hashes: &[String]) -> String {
     let mut sorted: Vec<String> = entry_hashes.to_vec();
     sorted.sort();

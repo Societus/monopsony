@@ -12,9 +12,11 @@
 //!      1/2/3 protects 3.x and 2.x; 1.x is evictable),
 //!    - within the `0.x` line, the `floor_minors` most recent minors,
 //!    - within the `0.0.x` line, the `floor_patches` most recent patches.
+//!
 //!    The `0.x` line is deliberately NOT ranked among the major lines: it is
 //!    governed by the finer-grained minor/patch floors instead (otherwise a
 //!    lone `0.x` package would be entirely un-evictable).
+//!
 //! 2. **LRU** among non-floor-protected entries, oldest `last_accessed` first.
 //!    Unparseable versions rank below everything (evicted before any parseable
 //!    entry, regardless of access time) and are never floor-protected.
@@ -283,7 +285,7 @@ impl FloorSets {
 
 /// Full-version ordering for eviction tie-breaks: semver rule first (release
 /// > its pre-releases, `~`/`-` bodies order via vercmp), falling back to
-/// `version_ord::vercmp` — never `order_key` string sorts (tilde misranks).
+/// > `version_ord::vercmp` — never `order_key` string sorts (tilde misranks).
 fn cmp_versions(a: &SemVer, b: &SemVer) -> Ordering {
     a.major
         .cmp(&b.major)

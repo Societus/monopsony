@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use reqwest::Client;
 use serde::Deserialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 // ─── Managed Update Pipeline Types ─────────────────────────────────
@@ -614,8 +614,8 @@ fn select_asset_for_platform(
 
 /// Download and apply update with atomic swap (raw, no safety pipeline)
 pub async fn apply_update(
-    current_path: &PathBuf,
-    target_dir: &PathBuf,
+    current_path: &Path,
+    target_dir: &Path,
     asset_url: &str,
     version: &str,
 ) -> Result<()> {

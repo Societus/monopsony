@@ -209,6 +209,7 @@ impl Ledger {
 
     /// Record a signed-exception request: downgrades of `package_key` are
     /// permitted until `now + ttl_secs`.
+    #[allow(dead_code)] // ledger exception API (Sprint 23); bin wiring pending
     pub fn add_exception(
         &self,
         package_key: &str,
@@ -268,6 +269,7 @@ impl Ledger {
     /// Most recent unexpired exception for `package_key` (its to_version),
     /// or None. Record-scoped: a live exception waives ANY downgrade of the
     /// package (the wave-2 override command refines per-version matching).
+    #[allow(dead_code)] // exception query API (Sprint 23); bin wiring pending
     pub fn active_exception(&self, package_key: &str, now: i64) -> Option<String> {
         let conn = self.conn.lock().expect("ledger lock poisoned");
         active_exception_on(&conn, package_key, now)

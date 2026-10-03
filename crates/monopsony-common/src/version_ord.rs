@@ -240,7 +240,7 @@ fn ver_cmp(a: &str, b: &str, cfg: &SchemeConfig) -> std::cmp::Ordering {
         // --- digit phase: compare numeric runs (overflow-proof) ---
         let a_digits = digit_run(a, &mut i);
         let b_digits = digit_run(b, &mut j);
-        match compare_numeric_runs(&a_digits, &b_digits) {
+        match compare_numeric_runs(a_digits, b_digits) {
             Equal => {}
             other => return other,
         }

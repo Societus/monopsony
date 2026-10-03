@@ -1947,6 +1947,9 @@ impl Database {
     /// Append one observation to the sourcedb observation log. The log is
     /// append-only: duplicates by (package_key, source, version) are resolved
     /// at read time via floor_for_package / merge, never mutated here.
+    // 8 scalar fields mirror the observations table columns 1:1 — a params
+    // struct would just move the arity, not reduce it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn append_observation(
         &self,
         package_key: &str,

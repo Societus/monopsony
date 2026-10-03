@@ -84,6 +84,7 @@ fn validate_pin(key_hex: &str) -> Result<[u8; 32], ()> {
 }
 
 /// Store the oracle verify pin (64 lowercase hex chars) to cert_dir/oracle-verify.key.
+#[allow(dead_code)] // pairing flow (Sprint 22); bin wiring pending
 pub fn store_pin(cert_dir: &Path, key_hex: &str) -> std::io::Result<()> {
     if validate_pin(key_hex).is_err() {
         return Err(std::io::Error::new(

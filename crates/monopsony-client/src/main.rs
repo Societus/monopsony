@@ -1281,7 +1281,7 @@ async fn run_daemon(
         .as_ref()
         .map(|c| c.shadow_trust.clone())
         .unwrap_or_default();
-    let accept_remote = trust_config.accept_remote_assignment;
+    let _accept_remote = trust_config.accept_remote_assignment;
     let mirror_key_for_task = load_mirror_verify_key(&cert_dir);
 
     // Spawn background task for heartbeat and inventory sync
@@ -2256,10 +2256,7 @@ async fn run_shadow_package(
             if packages.is_empty() {
                 println!("No shadow packages registered.");
             } else {
-                println!(
-                    "{:<28} {:<14} {:<24} {}",
-                    "NAME", "VERSION", "SERVICE", "ID"
-                );
+                println!("{:<28} {:<14} {:<24} ID", "NAME", "VERSION", "SERVICE");
                 for p in &packages {
                     println!(
                         "{:<28} {:<14} {:<24} {}",
@@ -2329,7 +2326,7 @@ async fn run_shadow_package(
 
             // Latest known update info (current→latest + asset URL).
             let updates = client
-                .check_shadow_updates(&client_id, &[package_id.clone()])
+                .check_shadow_updates(&client_id, std::slice::from_ref(&package_id))
                 .await?;
             let update = updates
                 .iter()
@@ -2363,12 +2360,11 @@ async fn run_shadow_package(
                 Err(e) => {
                     eprintln!("WARNING: recipe trust could not be verified: {}", e);
                     eprintln!("Recipe NOT executed. Recipe content:");
-                    match client.get_shadow_recipe(&client_id, &name).await {
-                        Ok((toml, key_id, _, _)) => {
-                            println!("{}", toml);
-                            println!("(signed by key: {})", key_id);
-                        }
-                        Err(_) => {}
+                    if let Ok((toml, key_id, _, _)) =
+                        client.get_shadow_recipe(&client_id, &name).await
+                    {
+                        println!("{}", toml);
+                        println!("(signed by key: {})", key_id);
                     }
                     println!("Update aborted (trust-UNVERIFIED).");
                     return Ok(());

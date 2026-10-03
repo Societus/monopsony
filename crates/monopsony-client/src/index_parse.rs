@@ -95,7 +95,7 @@ fn decode_container(bytes: &[u8]) -> Result<Vec<u8>, IndexError> {
         // APKINDEX.tar.gz (signature entries in the first member, the index
         // in later ones). Plain GzDecoder stops after member 1 — seen live
         // on the bench as a truncated-tar parse error on real archives.
-        let mut decoder = flate2::read::MultiGzDecoder::new(bytes);
+        let decoder = flate2::read::MultiGzDecoder::new(bytes);
         read_limited(decoder, &mut out, MAX_DECOMPRESSED_BYTES, "gzip")?;
         return Ok(out);
     }

@@ -32,11 +32,11 @@ pub fn parse_pacman_db(db_bytes: &[u8]) -> Vec<UpstreamPackage> {
     let mut packages = Vec::new();
     let mut archive = tar::Archive::new(&decompressed[..]);
 
-    let Ok(mut entries) = archive.entries() else {
+    let Ok(entries) = archive.entries() else {
         return packages;
     };
 
-    while let Some(entry_result) = entries.next() {
+    for entry_result in entries {
         let mut entry = match entry_result {
             Ok(e) => e,
             Err(_) => continue,
