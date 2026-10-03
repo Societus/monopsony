@@ -392,9 +392,25 @@ async fn handle_pypi_files_shim(
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_default();
-    let path = path.strip_prefix("/pypi").unwrap_or(&path).to_string();
+    let path = strip_pypi_files_route(&path).to_string();
     let upstream = format!("https://files.pythonhosted.org{}", path);
     handle_request_uri(state, rate_limiter, addr, request, upstream).await
+}
+
+/// Map a `/pypi/packages/...` route path to the files.pythonhosted.org
+/// upstream path: strip the FULL route prefix so exactly one `packages`
+/// segment remains. Also accepts legacy `/pypi/packages`-less shapes routed
+/// here (defensive `or_else`).
+///
+/// Twin-site contract (fleet-caught 2026-10-02): `body_rewrite::rewrite_pypi_simple`
+/// emits links as `<proxy_base>/pypi/packages` + the FULL origin path
+/// (`packages/<h1>/<h2>/<hash>/<file>`) — this strip must consume exactly the
+/// `/pypi/packages` prefix, never more, never less, or upstream sees a
+/// doubled/missing `packages` segment and 404s (pip artifacts unreachable).
+fn strip_pypi_files_route(path: &str) -> &str {
+    path.strip_prefix("/pypi/packages")
+        .or_else(|| path.strip_prefix("/pypi"))
+        .unwrap_or(path)
 }
 
 async fn handle_cargo_index_shim(
@@ -871,19 +887,27 @@ async fn serve_cache_hit(
             } else {
                 total
             };
+            // The content-encoding the SERVED body will carry: the sidecar's
+            // stored upstream encoding by default; the rewrite path may
+            // change it (decoded rewrite clears it; gzip→gzip re-encode
+            // keeps it).
+            let mut serve_encoding: Option<String> = meta
+                .as_ref()
+                .and_then(|m| m.content_encoding.clone())
+                .filter(|e| !e.is_empty());
             let serve_stream: ByteStream = match rewrite_ctx {
                 Some(ctx) if !partial && total <= state.limits.max_response_bytes => {
                     match read_stream_to_vec(stream).await {
                         Ok(bytes) => {
-                            let body = String::from_utf8_lossy(&bytes).into_owned();
-                            match crate::body_rewrite::rewrite_if_needed(
+                            match crate::body_rewrite::rewrite_metadata_body(
+                                serve_encoding.as_deref(),
+                                &bytes,
                                 ctx.shim_route,
-                                &body,
                                 &ctx.proxy_base,
                             ) {
-                                Some(rewritten) => {
-                                    let rewritten = rewritten.into_bytes();
+                                Some((rewritten, enc)) => {
                                     serve_len = rewritten.len() as u64;
+                                    serve_encoding = if enc.is_empty() { None } else { Some(enc) };
                                     debug!(
                                         "Body rewrite applied for {} ({} -> {} bytes)",
                                         url,
@@ -897,10 +921,11 @@ async fn serve_cache_hit(
                                     })
                                     .boxed()
                                 }
-                                // Dispatch declined (not a rewrite target,
-                                // e.g. an index page rather than
-                                // config.json): serve the buffered ORIGINAL
-                                // bytes through the normal path below.
+                                // Not a rewrite target (wrong route/body
+                                // shape, non-UTF-8, or an encoding we must
+                                // not touch): serve the buffered ORIGINAL
+                                // bytes through the normal path below —
+                                // byte-faithful, original encoding kept.
                                 None => futures::stream::once(async move {
                                     Ok::<bytes::Bytes, anyhow::Error>(bytes::Bytes::from(bytes))
                                 })
@@ -929,14 +954,13 @@ async fn serve_cache_hit(
                 .header(header::CONTENT_LENGTH, serve_len)
                 .header(header::ACCEPT_RANGES, "bytes");
 
-            // Re-attach the upstream content-encoding stored in the sidecar.
-            // Bodies are cached byte-exact (possibly gzip); without this the
-            // client receives encoded bytes it doesn't know to decode.
-            if let Some(enc) = meta
-                .as_ref()
-                .and_then(|m| m.content_encoding.clone())
-                .filter(|e| !e.is_empty())
-            {
+            // Attach the SERVED body's content-encoding. Bodies are cached
+            // byte-exact (possibly gzip) and the rewrite path may have
+            // decoded/re-encoded them — serve_encoding is the single source
+            // of truth for what the bytes actually are. Without this header
+            // an encoded body reaches clients that won't decode it; with the
+            // wrong one (the 2026-10-02 pip regression) decode fails too.
+            if let Some(enc) = serve_encoding.filter(|e| !e.is_empty()) {
                 builder = builder.header(header::CONTENT_ENCODING, enc);
             }
 
@@ -1447,6 +1471,20 @@ async fn run_tee(
             return;
         }
     };
+    // Scrub/verify sidecar for streamed blobs (fleet-caught 2026-10-02:
+    // streamed commits never wrote it, so the scrubber skipped these blobs
+    // and verify-on-serve failed open on corruption).
+    if let Err(e) = ctx
+        .state
+        .storage
+        .record_spool_meta(&ctx.cache_key, &meta)
+        .await
+    {
+        warn!(
+            "Spool scrub-sidecar write failed for {}: {}",
+            ctx.cache_key, e
+        );
+    }
 
     info!(
         "Cached: {} -> {} ({} bytes, sha256 {})",
@@ -2754,6 +2792,40 @@ mod tests {
     }
 
     // ---- Sprint 20 Phase 3 slice 5: quarantine gate ----
+
+    #[test]
+    fn pypi_files_strip_is_inverse_of_rewrite() {
+        // Twin-site contract (fleet-caught 2026-10-02): the serve-time
+        // rewrite emits `<base>/pypi/packages` + the FULL origin path; this
+        // strip must return exactly that origin path. Asserted through BOTH
+        // real functions on a real-shaped wheel URL.
+        let origin_path = "/packages/ab/cd/3f2d8a1c9b4e7f60a5d8c2b1e4f7a0c3d6e9b2a5c8f1d4e7a0b3c6d9e/example-1.0-py3-none-any.whl";
+        let page = format!(
+            r#"<a href="https://files.pythonhosted.org{}#sha256=deadbeef">example</a>"#,
+            origin_path
+        );
+        let rewritten = crate::body_rewrite::rewrite_pypi_simple(&page, "http://10.0.0.5:3128");
+        let href = rewritten
+            .split("href=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("rewritten href");
+        let path = href
+            .strip_prefix("http://10.0.0.5:3128")
+            .expect("rewritten link carries the proxy base")
+            .split('#')
+            .next()
+            .expect("pip strips the #sha256= fragment before fetching");
+        assert_eq!(strip_pypi_files_route(path), origin_path);
+        // PEP 658 metadata sibling follows the same shape.
+        assert_eq!(
+            strip_pypi_files_route(&format!("/pypi/packages{}.metadata", origin_path)),
+            format!("{}.metadata", origin_path)
+        );
+        // Defensive legacy shapes keep working.
+        assert_eq!(strip_pypi_files_route("/pypi/foo"), "/foo");
+        assert_eq!(strip_pypi_files_route("/unrelated"), "/unrelated");
+    }
 
     #[tokio::test]
     async fn test_quarantined_db_none_returns_false() {

@@ -535,9 +535,33 @@ async fn handle_blob_request(
     };
     info!("Brew cached bottle {} ({} bytes)", key, meta.size_bytes);
 
-    // Content-type sidecar (same pattern as docker.rs).
+    // Scrub/verify sidecar for streamed blobs (fleet-caught 2026-10-02:
+    // without it the scrubber skipped brew bottles entirely and
+    // verify-on-serve failed open — a corrupted bottle kept serving).
+    if let Err(e) = state.storage.record_spool_meta(&key, &meta).await {
+        warn!("Brew scrub-sidecar write failed for {}: {}", key, e);
+    }
+
+    // Content-type sidecar — FULL CacheEntry-compatible shape (fleet-caught
+    // 2026-10-02: a thin content_type-only sidecar made brew blobs invisible
+    // to the retention collector, which parses CacheEntry). Fields that don't
+    // apply to the bespoke path are None; class/size/access are real.
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
     let sidecar = BottleCacheMeta {
         content_type: Some(BOTTLE_CONTENT_TYPE.to_string()),
+        url: Some(format!("https://ghcr.io/v2/homebrew/core/{}", key)),
+        cache_path: Some(key.clone()),
+        content_encoding: None,
+        content_length: Some(meta.size_bytes),
+        etag: None,
+        last_modified: None,
+        cached_at: Some(now_secs),
+        last_accessed: Some(now_secs),
+        hit_count: Some(1),
+        cache_class: Some("lang_artifact".to_string()),
     };
     if let Ok(raw) = serde_json::to_vec(&sidecar) {
         let _ = state.storage.save_meta_json(&key, &raw).await;
@@ -616,6 +640,27 @@ struct BottleFileInfo {
     digest_ref: String,
 }
 
+/// Decode a cached formula-JSON body that may be gzip-encoded. Fleet-caught
+/// 2026-10-02: brew clients send `Accept-Encoding: gzip`, the proxy caches
+/// the encoded body byte-exact (with the sidecar recording the encoding),
+/// and these server-side readers must PARSE the JSON — sniff by magic bytes
+/// (`1f 8b`), not by sidecar lookup (works regardless of caller context;
+/// multi-member-safe via MultiGzDecoder). Non-gzip bytes pass through.
+fn decode_cached_json(bytes: Vec<u8>) -> Vec<u8> {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        use flate2::read::MultiGzDecoder;
+        use std::io::Read;
+        let mut out = Vec::new();
+        if MultiGzDecoder::new(&bytes[..])
+            .read_to_end(&mut out)
+            .is_ok()
+        {
+            return out;
+        }
+    }
+    bytes
+}
+
 /// Load the cached formula JSON for `name` and find the bottle file entry
 /// whose reconstructed filename matches. Returns the expected sha256 +
 /// digest reference.
@@ -635,7 +680,10 @@ async fn load_bottle_info(
 ) -> Option<BottleFileInfo> {
     let key = format!("brew/api/formula/{}.json", name);
     let value: serde_json::Value = match storage.read(&key).await {
-        Ok(body) => serde_json::from_slice(&body).ok()?,
+        Ok(body) => match serde_json::from_slice(&decode_cached_json(body)) {
+            Ok(v) => v,
+            Err(_) => return None,
+        },
         Err(_) => {
             // Cache miss: self-fetch the formula from origin (ephemeral).
             let url = format!("{}/api/formula/{}.json", brew.formulae_base, name);
@@ -686,7 +734,8 @@ async fn scan_formulas_for_filename(
         let Ok(body) = storage.read(key).await else {
             continue;
         };
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&decode_cached_json(body))
+        else {
             continue;
         };
         if let Some((version, sha)) = formula_matches_filename(&value, name, filename) {
@@ -875,11 +924,37 @@ fn bad_gateway_response(msg: &'static str) -> Response<Body> {
         .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
-/// Metadata stored alongside cached bottle blobs (content-type sidecar,
-/// same pattern as docker.rs's DockerCacheMeta).
-#[derive(serde::Serialize, serde::Deserialize)]
+/// Metadata stored alongside cached bottle blobs.
+///
+/// Fleet-caught 2026-10-02: this was `{"content_type": ...}` only, but the
+/// retention collector parses `.cache-meta` sidecars as `CacheEntry` — brew
+/// (and docker) blobs were silently never eviction candidates and carried no
+/// class. The full field set is now written at commit; `#[serde(default)]`
+/// keeps pre-existing thin sidecars parseable (their blobs stay retention-
+/// invisible until re-cached — accepted degradation, noted in the gate).
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 struct BottleCacheMeta {
     content_type: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    cache_path: Option<String>,
+    #[serde(default)]
+    content_encoding: Option<String>,
+    #[serde(default)]
+    content_length: Option<u64>,
+    #[serde(default)]
+    etag: Option<String>,
+    #[serde(default)]
+    last_modified: Option<String>,
+    #[serde(default)]
+    cached_at: Option<i64>,
+    #[serde(default)]
+    last_accessed: Option<i64>,
+    #[serde(default)]
+    hit_count: Option<u64>,
+    #[serde(default)]
+    cache_class: Option<String>,
 }
 
 async fn stored_content_type(storage: &dyn CacheStorage, key: &str) -> String {

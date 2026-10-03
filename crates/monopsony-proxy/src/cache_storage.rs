@@ -167,6 +167,19 @@ pub trait CacheStorage: Send + Sync {
     /// Get stored SHA256 checksum for tamper verification.
     async fn get_checksum(&self, key: &str) -> anyhow::Result<Option<String>>;
 
+    /// Persist the commit-time checksum/size/class of a STREAMING spool
+    /// commit as the backend's scrub sidecar. The buffered `write` path
+    /// records this itself; spool commits historically did not, which left
+    /// streamed blobs (brew bottles, npm/pip/cargo artifacts) invisible to
+    /// the scrubber AND to verify-on-serve (both read this sidecar — a
+    /// missing sidecar meant skip/fail-open, fleet-caught 2026-10-02 when a
+    /// corrupted brew bottle kept serving). Call once right after a
+    /// successful [`SpoolHandle::commit`].
+    async fn record_spool_meta(&self, key: &str, meta: &StorageMeta) -> anyhow::Result<()> {
+        let _ = (key, meta);
+        Ok(())
+    }
+
     /// Set immutability retention on a key until the given time.
     /// No-op on filesystem backend.
     async fn set_retention(&self, key: &str, until: SystemTime) -> anyhow::Result<()>;

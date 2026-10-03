@@ -2028,6 +2028,7 @@ dependencies = [
  "chrono",
  "clamav-client",
  "ed25519-dalek",
+ "flate2",
  "futures",
  "hex",
  "http-body-util",

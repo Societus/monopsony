@@ -273,6 +273,18 @@ impl CacheStorage for ObjectStoreBackend {
         Ok(meta.map(|m| m.checksum_sha256))
     }
 
+    async fn record_spool_meta(&self, key: &str, meta: &StorageMeta) -> anyhow::Result<()> {
+        // Overwrite semantics match `write`: new bytes = never verified
+        // (last_verified_at resets so the scrubber reaches them first).
+        let sidecar = ObjectMeta {
+            checksum_sha256: meta.checksum_sha256.clone(),
+            size_bytes: meta.size_bytes,
+            cache_class: meta.cache_class.clone(),
+            last_verified_at: 0,
+        };
+        self.save_sidecar(key, &sidecar).await
+    }
+
     async fn set_retention(&self, key: &str, until: SystemTime) -> anyhow::Result<()> {
         // Object Lock retention is set via S3 API extension.
         // The object_store crate doesn't directly support PutObjectRetention.

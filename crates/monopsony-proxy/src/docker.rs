@@ -254,6 +254,11 @@ async fn cache_and_respond(
     };
     info!("Docker cached: {} ({} bytes)", key, meta.size_bytes);
 
+    // Scrub/verify sidecar for streamed blobs (fleet-caught 2026-10-02).
+    if let Err(e) = state.storage.record_spool_meta(&key, &meta).await {
+        warn!("Docker scrub-sidecar write failed for {}: {}", key, e);
+    }
+
     // Save content-type metadata sidecar
     if let Some(ref ct) = content_type {
         let sidecar = DockerCacheMeta {

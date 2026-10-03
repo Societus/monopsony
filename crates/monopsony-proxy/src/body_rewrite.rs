@@ -61,6 +61,79 @@ pub fn rewrite_cargo_config(body: &str, proxy_base: &str) -> String {
     }
 }
 
+/// Serve-path entry point for METADATA bodies on shim routes. `encoding` is
+/// the sidecar's stored upstream content-encoding (e.g. `"gzip"`); `bytes`
+/// is the byte-exact cached body.
+///
+/// pip simple pages arrive gzip-encoded when the spool fetched them from
+/// origin with `Accept-Encoding: gzip` — the rewrites above operate on TEXT,
+/// so an encoded body must be decoded before rewriting and re-encoded after
+/// (serving decoded bytes under a `content-encoding: gzip` header, or
+/// lossily UTF-8-converting encoded bytes, both break clients; the latter is
+/// the fleet-caught 2026-10-02 pip regression).
+///
+/// Returns `Some((body, encoding))` — the bytes to serve plus the
+/// content-encoding header value to attach (`""` = attach none) — or `None`
+/// when the route/body is not a rewrite target (caller serves the original
+/// bytes byte-faithful with the ORIGINAL encoding). Any decode/encode
+/// surprise also yields `None`: stored bytes are never mangled to force a
+/// rewrite through.
+pub fn rewrite_metadata_body(
+    encoding: Option<&str>,
+    bytes: &[u8],
+    shim_route: &str,
+    proxy_base: &str,
+) -> Option<(Vec<u8>, String)> {
+    // Normalize the encoding tag. Only gzip is decode-able here; anything
+    // else non-identity stays byte-faithful.
+    let normalized = encoding
+        .map(|e| e.trim().to_ascii_lowercase())
+        .filter(|e| !e.is_empty() && e != "identity");
+    let (plain, was_gzip) = match normalized.as_deref() {
+        Some("gzip") => match gunzip(bytes) {
+            Ok(decoded) => (decoded, true),
+            // Sidecar says gzip but the bytes aren't (or are corrupt):
+            // serve byte-faithful rather than guessing.
+            Err(_) => return None,
+        },
+        Some(_) => return None,
+        None => (bytes.to_vec(), false),
+    };
+    // Strict UTF-8: a non-text body is not a rewrite target (the serve path
+    // then streams the original bytes unchanged).
+    let text = String::from_utf8(plain).ok()?;
+    let rewritten = rewrite_if_needed(shim_route, &text, proxy_base)?;
+    let out = rewritten.into_bytes();
+    if was_gzip {
+        match gzip(&out) {
+            Ok(reencoded) => Some((reencoded, "gzip".to_string())),
+            // Re-encode failed: serve the DECODED rewrite without an
+            // encoding header — still a faithful representation of the doc.
+            Err(_) => Some((out, String::new())),
+        }
+    } else {
+        Some((out, String::new()))
+    }
+}
+
+/// Multi-member gzip decode (`MultiGzDecoder` — externally-sourced gzip can
+/// be multi-member; single-member `GzDecoder` silently truncates).
+fn gunzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::read::MultiGzDecoder;
+    use std::io::Read;
+    let mut out = Vec::new();
+    MultiGzDecoder::new(bytes).read_to_end(&mut out)?;
+    Ok(out)
+}
+
+fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    use flate2::{write::GzEncoder, Compression};
+    use std::io::Write;
+    let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+    enc.write_all(bytes)?;
+    enc.finish()
+}
+
 /// Dispatch: `Some(rewritten)` when the (shim_route, body) pair warrants a
 /// rewrite, `None` otherwise.
 ///
@@ -300,6 +373,81 @@ mod tests {
         let once = rewrite_cargo_config(&body, PROXY);
         let twice = rewrite_cargo_config(&once, PROXY);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn metadata_body_gzip_roundtrip_preserves_bytes_and_encoding() {
+        // The 2026-10-02 fleet regression: pip simple pages are cached
+        // gzip-encoded; the old call site UTF-8-lossy'd the ENCODED bytes
+        // and served mush. The entry point must decode, rewrite, re-encode.
+        let page = simple_page(&[wheel_link(HASH_59, "example", "1.0")]);
+        let encoded = gzip(page.as_bytes()).expect("gzip fixture");
+        let (body, enc) = rewrite_metadata_body(Some("gzip"), &encoded, "/pypi/simple", PROXY)
+            .expect("gzip pip page is a rewrite target");
+        assert_eq!(enc, "gzip");
+        // Round-trips to the rewritten plain text:
+        let decoded = gunzip(&body).expect("re-encoded body is valid gzip");
+        let decoded = String::from_utf8(decoded).expect("utf8");
+        assert!(decoded.contains(&format!("{}{}", PROXY, PYPI_PACKAGES_ROUTE)));
+        assert!(!decoded.contains("files.pythonhosted.org"));
+        // And is NOT the lossy-mangled encoding of the gzip bytes:
+        assert_ne!(body, encoded);
+    }
+
+    #[test]
+    fn metadata_body_identity_gzip_decodes_and_clears_encoding() {
+        // Plain (identity) cached body: rewritten, encoding header cleared.
+        let page = simple_page(&[wheel_link(HASH_59, "example", "1.0")]);
+        let (body, enc) = rewrite_metadata_body(None, page.as_bytes(), "/pypi/simple", PROXY)
+            .expect("plain pip page rewrites");
+        assert_eq!(enc, "");
+        assert!(String::from_utf8_lossy(&body).contains(PYPI_PACKAGES_ROUTE));
+        // "identity" is normalized to no-encoding, same path:
+        let (body2, enc2) =
+            rewrite_metadata_body(Some("identity"), page.as_bytes(), "/pypi/simple", PROXY)
+                .expect("identity is treated as plain");
+        assert_eq!(enc2, "");
+        assert_eq!(body, body2);
+    }
+
+    #[test]
+    fn metadata_body_unknown_encoding_stays_byte_faithful() {
+        // br (brotli) or anything non-gzip must NOT be touched: None →
+        // caller serves original bytes + original header.
+        let body = b"\xce\xba\xe1\xbd\xb9\xcf\x83\xce\xbc\xce\xb5 compressed-ish";
+        assert!(rewrite_metadata_body(Some("br"), body, "/pypi/simple", PROXY).is_none());
+    }
+
+    #[test]
+    fn metadata_body_gzip_labeled_non_gzip_bytes_stay_faithful() {
+        // Sidecar says gzip but bytes are not gzip (corrupt/mislabeled):
+        // never guess, never mangle.
+        let junk: &[u8] = b"\x1f\x8b NOT ACTUALLY GZIP \xff\xfe";
+        assert!(
+            rewrite_metadata_body(Some("gzip"), junk, "/pypi/simple", PROXY).is_none(),
+            "corrupt gzip must fall back to byte-faithful serve"
+        );
+    }
+
+    #[test]
+    fn metadata_body_non_utf8_is_not_a_rewrite_target() {
+        // Binary (non-UTF-8) body on a pip route: None → byte-faithful.
+        let binary: &[u8] = &[0x00, 0xff, 0xfe, 0x80, 0x01];
+        assert!(rewrite_metadata_body(None, binary, "/pypi/simple", PROXY).is_none());
+    }
+
+    #[test]
+    fn metadata_body_cargo_route_gzip_roundtrip() {
+        let cfg = format!(
+            "{{\"dl\":\"{}\",\"api\":\"https://crates.io\"}}",
+            CARGO_DL_UPSTREAM
+        );
+        let encoded = gzip(cfg.as_bytes()).expect("gzip fixture");
+        let (body, enc) = rewrite_metadata_body(Some("gzip"), &encoded, "/cargo-index", PROXY)
+            .expect("gzip cargo config rewrites");
+        assert_eq!(enc, "gzip");
+        let decoded = String::from_utf8(gunzip(&body).expect("gzip")).expect("utf8");
+        assert!(decoded.contains(&format!("\"dl\":\"{}/crates\"", PROXY)));
     }
 
     #[test]
