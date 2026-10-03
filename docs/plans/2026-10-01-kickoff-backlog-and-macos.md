@@ -91,6 +91,19 @@ Phase 0 spike proved the CatalogURL/Reposado path dead on macOS 26.3.1 (EV host 
 
 ### Phase 3 — App forwarding (B2) — tiered by what Apple allows
 
+> **Tier-2 spike RESULT (2026-10-03, m2mini, brew 7.0.7 / macOS 26.3.1): cask
+> caching via `HOMEBREW_ARTIFACT_DOMAIN` is NO-GO.** Method: localhost 200-
+> serving listener + `NO_FALLBACK=1` differential. With identical env, the
+> bottle fetch routed through the listener (`GET /v2/homebrew/core/jq/…`,
+> errored on stub bytes as expected) while the cask fetch (`hiddenbar`)
+> succeeded straight from origin — ARTIFACT_DOMAIN was **never contacted for
+> casks**. Source corroboration: ARTIFACT_DOMAIN is consumed only by the
+> bottle path (`bottle.rb` semantics: bottle URLs get their DOMAIN replaced,
+> not prefixed; cask URLs would need prefix semantics the cask download path
+> does not implement). **Phase 3 ships Tier 1 only.** If cask caching ever
+> matters, the supported path is a future brew-side change — do not
+> re-spike on the same macOS/brew pair.
+
 - **Tier 1 (always):** system-proxy CONNECT pass-through — App Store + all GUI-app HTTPS traffic *routes* through Monopsony (forwarding; no cache). Client action wraps `networksetup -setwebproxy/-setsecurewebproxy` (scoped per network service) + clean removal. Honest labeling in docs/UI: "forwarded, not cached."
 - **Tier 2 (if Phase 0 proves it):** Homebrew cask caching for direct-download `.app` installs (the common "app install" path outside the App Store).
 - **Ruled out:** MITM of App Store sessions. If Phase 0 shows App Store update checks break under plain CONNECT (they shouldn't — no pinning violation in tunnel mode), document as known limitation rather than escalate to interception.
