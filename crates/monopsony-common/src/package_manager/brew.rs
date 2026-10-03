@@ -146,9 +146,11 @@ impl PackageManagerBackend for HomebrewBackend {
 
     fn proxy_config(&self, proxy_addr: &str) -> ProxyConfigAction {
         // brew's native env file: plain KEY=value lines, no export, no shell
-        // expansion. Only API+BOTTLE domains (ARTIFACT_DOMAIN cask prefixing
-        // is unverified — deliberately out of scope). Plain http on purpose:
-        // the proxy's plain-http shim is the whole point.
+        // expansion. Only API+BOTTLE domains — HOMEBREW_ARTIFACT_DOMAIN is
+        // verified NO-GO for casks (bench 2026-10-03, brew 7.0.7: cask
+        // downloads never contact ARTIFACT_DOMAIN; bottles get domain
+        // replacement). Plain http on purpose: the proxy's plain-http shim
+        // is the whole point.
         let config_content = format!(
             "HOMEBREW_API_DOMAIN=http://{}/brew/api\nHOMEBREW_BOTTLE_DOMAIN=http://{}/brew/bottles\n",
             proxy_addr, proxy_addr

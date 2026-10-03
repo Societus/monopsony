@@ -3,6 +3,7 @@
 mod proxy_toggle;
 mod shadow;
 mod shadow_cli;
+mod system_proxy;
 mod ws_transport;
 
 use anyhow::Context;
@@ -368,13 +369,16 @@ async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
 enum ProxyCommand {
     /// Show current proxy status for all subsystems
     Status {
-        /// Show status for a specific package manager (pacman, apt, dnf, apk, winget, choco, scoop, npm, pip, cargo)
+        /// Show status for a specific package manager (pacman, apt, dnf, apk, winget, choco, scoop, npm, pip, cargo, brew)
         #[arg(long)]
         pm: Option<String>,
+        /// Show macOS system-proxy forwarding status
+        #[arg(long)]
+        system: bool,
     },
     /// Enable proxying for specified subsystems
     On {
-        /// Enable specific package manager (pacman, apt, dnf, apk, winget, choco, scoop, npm, pip, cargo)
+        /// Enable specific package manager (pacman, apt, dnf, apk, winget, choco, scoop, npm, pip, cargo, brew)
         #[arg(long)]
         pm: Option<String>,
         /// Enable Docker registry mirror
@@ -383,6 +387,9 @@ enum ProxyCommand {
         /// Enable shadow package trust
         #[arg(long)]
         shadow: bool,
+        /// Enable macOS system-proxy forwarding (forwarded, NOT cached)
+        #[arg(long)]
+        system: bool,
         /// Enable all detected subsystems
         #[arg(long)]
         all: bool,
@@ -392,7 +399,7 @@ enum ProxyCommand {
     },
     /// Disable proxying for specified subsystems
     Off {
-        /// Disable specific package manager (pacman, apt, dnf, apk, winget, choco, scoop, npm, pip, cargo)
+        /// Disable specific package manager (pacman, apt, dnf, apk, winget, choco, scoop, npm, pip, cargo, brew)
         #[arg(long)]
         pm: Option<String>,
         /// Disable Docker registry mirror
@@ -401,6 +408,9 @@ enum ProxyCommand {
         /// Disable shadow package trust
         #[arg(long)]
         shadow: bool,
+        /// Disable macOS system-proxy forwarding
+        #[arg(long)]
+        system: bool,
         /// Disable all subsystems
         #[arg(long)]
         all: bool,
@@ -2555,6 +2565,11 @@ async fn run_proxy_command(cmd: ProxyCommand, cert_dir: &Path) -> anyhow::Result
     if let Some(lang_result) = run_lang_pm_command(&cmd, cert_dir).await? {
         return lang_result;
     }
+    // Sprint 26 Phase 3 Tier 1: `--system` routes to the macOS system-proxy
+    // forwarding module (networksetup; forwarded, NOT cached).
+    if let Some(system_result) = run_system_proxy_command(&cmd)? {
+        return system_result;
+    }
     match cmd {
         ProxyCommand::Status { .. } => {
             println!("Monopsony Proxy Status");
@@ -2599,6 +2614,7 @@ async fn run_proxy_command(cmd: ProxyCommand, cert_dir: &Path) -> anyhow::Result
             shadow,
             all,
             server,
+            ..
         } => {
             let target = if all {
                 proxy_toggle::ToggleTarget::All
@@ -2643,6 +2659,7 @@ async fn run_proxy_command(cmd: ProxyCommand, cert_dir: &Path) -> anyhow::Result
             docker,
             shadow,
             all,
+            ..
         } => {
             let target = if all {
                 proxy_toggle::ToggleTarget::All
@@ -2755,6 +2772,97 @@ async fn run_lang_pm_command(
             }
         },
         _ => unreachable!("only status/on/off dispatched here"),
+    }
+}
+
+/// Sprint 26 Phase 3 Tier 1: macOS system-proxy forwarding via networksetup.
+///
+/// Returns `Ok(Some(result))` when the `--system` flag claims the command
+/// (status/on/off), `Ok(None)` to fall through to the other toggle paths.
+/// Non-macOS hosts get an explicit unsupported message rather than a
+/// silent no-op. The toggle runs `networksetup` via the shared
+/// `ProxyConfigAction` executor and needs an admin-privileged caller
+/// (networksetup prompts for credentials itself when the service is
+/// admin-secured — no sudo needed for standard services).
+fn run_system_proxy_command(cmd: &ProxyCommand) -> anyhow::Result<Option<anyhow::Result<()>>> {
+    let (system_flag, action_name) = match cmd {
+        ProxyCommand::Status { system, .. } => (*system, "status"),
+        ProxyCommand::On { system, .. } => (*system, "on"),
+        ProxyCommand::Off { system, .. } => (*system, "off"),
+    };
+    if !system_flag {
+        return Ok(None);
+    }
+    if !system_proxy::is_supported() {
+        println!("✗ system-proxy: only supported on macOS (networksetup not found)");
+        return Ok(Some(Err(anyhow::anyhow!("unsupported platform"))));
+    }
+    match action_name {
+        "status" => {
+            println!("System proxy (macOS) — forwarded via monopsony client proxy, NOT cached:");
+            match system_proxy::status() {
+                Ok(rows) if rows.is_empty() => {
+                    println!("  no configurable network services found");
+                }
+                Ok(rows) => {
+                    for (svc, on, detail) in rows {
+                        let status = if on { "ON  ✓" } else { "OFF ✗" };
+                        println!("  {:<20} {}  {}", svc, status, detail);
+                    }
+                }
+                Err(e) => {
+                    println!("✗ system-proxy status: {}", e);
+                    return Ok(Some(Err(anyhow::anyhow!("status failed"))));
+                }
+            }
+            Ok(Some(Ok(())))
+        }
+        "on" => {
+            if !system_proxy::status()
+                .map(|r| r.iter().any(|(_, on, _)| *on))
+                .unwrap_or(false)
+            {
+                // Not yet on: make sure the LOCAL client proxy is reachable
+                // before pointing the whole system at it.
+                match std::net::TcpStream::connect(system_proxy::listen_addr()) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        println!(
+                            "✗ system-proxy: local client proxy not reachable at {} ({}). \
+                             Start it with `monopsony-client daemon` or `proxy on --pm <pm>` first.",
+                            system_proxy::listen_addr(),
+                            e
+                        );
+                        return Ok(Some(Err(anyhow::anyhow!("local proxy not running"))));
+                    }
+                }
+            }
+            let rows = system_proxy::apply(true);
+            report_system_proxy_rows(rows)
+        }
+        "off" => report_system_proxy_rows(system_proxy::apply(false)),
+        _ => unreachable!("only status/on/off dispatched here"),
+    }
+}
+
+fn report_system_proxy_rows(
+    rows: Vec<(String, bool, String)>,
+) -> anyhow::Result<Option<anyhow::Result<()>>> {
+    let mut any_fail = false;
+    for (svc, ok, msg) in &rows {
+        if !ok {
+            any_fail = true;
+        }
+        let mark = if *ok { "✓" } else { "✗" };
+        println!("{} system-proxy [{}]: {}", mark, svc, msg);
+    }
+    if rows.is_empty() {
+        println!("system-proxy: no network services to configure");
+    }
+    if any_fail {
+        Ok(Some(Err(anyhow::anyhow!("one or more services failed"))))
+    } else {
+        Ok(Some(Ok(())))
     }
 }
 
