@@ -37,6 +37,7 @@ fn default_cert_dir() -> String {
 
 mod auto_update;
 mod catalog_scan;
+mod content_cache;
 mod detect;
 mod discovery;
 mod floor_guard;
@@ -174,6 +175,27 @@ enum Commands {
     Override {
         #[command(subcommand)]
         mode: OverrideMode,
+    },
+    /// One-shot platform setup tasks (macOS Content Caching, etc.)
+    Setup {
+        #[command(subcommand)]
+        cmd: SetupMode,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SetupMode {
+    /// macOS: activate Apple Content Caching (shared content only — no
+    /// iCloud personal-blob caching). One sudo prompt; needs an admin user
+    /// (rc=77 without root). Serves OS updates + App Store content to OTHER
+    /// Apple devices on the LAN.
+    Mac {
+        /// Show Content Caching status without changing anything
+        #[arg(long)]
+        status: bool,
+        /// Deactivate Content Caching (cached content stays on disk)
+        #[arg(long)]
+        disable: bool,
     },
 }
 
@@ -505,6 +527,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Override { mode }) => {
             run_override(mode, &cert_dir).await?;
+        }
+        Some(Commands::Setup { cmd }) => {
+            run_setup(cmd)?;
         }
         None => {
             info!("No command specified. Use --help for usage.");
@@ -2859,6 +2884,76 @@ fn report_system_proxy_rows(
         Ok(Some(Err(anyhow::anyhow!("one or more services failed"))))
     } else {
         Ok(Some(Ok(())))
+    }
+}
+
+/// Sprint 26 Phase 3.5: one-shot platform setup. Currently the macOS Content
+/// Caching lane. Sync like the system-proxy lane — blocking process spawns
+/// only; never touches the async network stack.
+fn run_setup(cmd: SetupMode) -> anyhow::Result<()> {
+    let SetupMode::Mac {
+        status: status_flag,
+        disable,
+    } = cmd;
+    if !content_cache::is_supported() {
+        println!("✗ setup mac: only supported on macOS (/usr/bin/AssetCacheManagerUtil not found)");
+        anyhow::bail!("unsupported platform");
+    }
+    if status_flag {
+        return run_setup_status();
+    }
+    if disable {
+        println!("Deactivating Apple Content Caching (cached content stays on disk)...");
+        println!("You may be prompted for your password (one sudo prompt):");
+        let results = content_cache::disable_action().execute();
+        if let Some(e) = results.iter().find_map(|r| r.as_ref().err()) {
+            println!("✗ setup mac: {}", e);
+            anyhow::bail!("deactivation failed");
+        }
+        println!("✓ Content Caching deactivated");
+        return run_setup_status();
+    }
+    // Enable path: probe capability unprivileged first (rc=77 diagnosis
+    // happens here — an unprivileged run fails BEFORE the sudo prompt).
+    match content_cache::can_activate() {
+        Ok(true) => {}
+        Ok(false) => {
+            println!("✗ setup mac: this Mac cannot host a Content Cache (canActivate reported no)");
+            anyhow::bail!("cannot activate");
+        }
+        Err(e) => {
+            println!("✗ setup mac: capability probe failed: {}", e);
+            anyhow::bail!("probe failed");
+        }
+    }
+    println!(
+        "Activating Apple Content Caching — shared content only (no iCloud personal caching)."
+    );
+    println!("You may be prompted for your password (one sudo prompt):");
+    let results = content_cache::enable_action().execute();
+    if let Some(e) = results.iter().find_map(|r| r.as_ref().err()) {
+        println!("✗ setup mac: {}", e);
+        anyhow::bail!("activation failed");
+    }
+    println!("✓ Content Caching activated — verifying status:");
+    run_setup_status()
+}
+
+/// Unprivileged status render for the setup lane. ON = activated AND scoped
+/// to shared content; the detail line always tells the truth either way.
+fn run_setup_status() -> anyhow::Result<()> {
+    match content_cache::status() {
+        Ok(st) => {
+            println!("Apple Content Caching (this Mac):");
+            let (on, detail) = content_cache::enabled_and_private(&st);
+            let verdict = if on { "ON  ✓" } else { "OFF ✗" };
+            println!("  {:<12} {}  {}", "cache", verdict, detail);
+            Ok(())
+        }
+        Err(e) => {
+            println!("✗ setup mac status: {}", e);
+            anyhow::bail!("status failed");
+        }
     }
 }
 
