@@ -221,3 +221,23 @@ jobs:
             See [CHANGELOG.md](CHANGELOG.md) for details.
             Built with rustc stable, --locked, musl static (Alpine).
             SHA256SUMS signed with GPG. Verify: `gpg --verify SHA256SUMS.sig SHA256SUMS`
+
+  build-darwin:
+    name: Check (macOS arm64, best-effort)
+    runs-on: macos-arm64
+    continue-on-error: true
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure dashboard/build exists (rust-embed needs the dir at compile time)
+        run: mkdir -p dashboard/build
+      - name: Ensure Rust toolchain (rustup + clippy)
+        run: |
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          rustup component add clippy
+      - run: cargo check --workspace --locked
+      - run: cargo clippy --workspace --locked -- -D warnings
+      - run: cargo test --workspace --locked -- --test-threads=1
