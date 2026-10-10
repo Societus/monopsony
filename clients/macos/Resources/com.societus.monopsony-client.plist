@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for the monopsony-client daemon (B4 GUI skeleton).
+
+  AppState.installAgentPlist() copies this file to
+  ~/Library/LaunchAgents/com.societus.monopsony-client.plist, substituting
+  __CLIENT_BINARY__ with the real binary path, then runs:
+      launchctl bootstrap gui/$UID <plist path>
+  Stop with:
+      launchctl bootout gui/$UID/com.societus.monopsony-client
+
+  KNOWN LIMITATION: the binary path must exist. bootstrap fails (and the
+  menu shows the error) if __CLIENT_BINARY__ was substituted with a
+  non-existent path — build monopsony-client first and install it to
+  ~/.local/bin/monopsony-client (or edit the substituted path).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.societus.monopsony-client</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__CLIENT_BINARY__</string>
+        <string>daemon</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/monopsony-client.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/monopsony-client.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
