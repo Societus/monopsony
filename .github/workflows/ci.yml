@@ -241,3 +241,27 @@ jobs:
       - run: cargo check --workspace --locked
       - run: cargo clippy --workspace --locked -- -D warnings
       - run: cargo test --workspace --locked -- --test-threads=1
+
+  swift-selftest:
+    name: Swift selftest (macOS arm64, best-effort)
+    runs-on: macos-arm64
+    continue-on-error: true
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build menu-bar app (CLT-only, zero deps)
+        run: |
+          cd clients/macos
+          swift build
+      - name: Pure-logic selftest (CLT has no XCTest)
+        run: |
+          cd clients/macos
+          ./.build/debug/MonopsonyMenuBar --selftest
+      - name: Client crate still compiles on macOS
+        run: |
+          mkdir -p dashboard/build
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          cargo check -p monopsony-client --locked

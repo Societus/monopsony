@@ -14,7 +14,9 @@ clients/macos/
 │   └── com.societus.monopsony-client.plist        # LaunchAgent template (placeholder binary path)
 └── Sources/MonopsonyMenuBar/
     ├── MonopsonyMenuBarApp.swift                  # @main, MenuBarExtra + menu items
-    └── AppState.swift                             # ObservableObject: CLI shell-out + launchctl
+    ├── AppState.swift                             # ObservableObject: CLI shell-out + launchctl
+    ├── Core.swift                                 # pure logic: server.json parse, row/ratio parsers, icon map
+    └── SelfTest.swift                             # --selftest suite (CLT has no XCTest)
 ```
 
 ## Build & run (Command Line Tools only — no Xcode needed)
@@ -61,19 +63,44 @@ sed "s|__CLIENT_BINARY__|$HOME/.local/bin/monopsony-client|" \
 launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.societus.monopsony-client.plist
 ```
 
-## What the menu does today (skeleton scope)
+## What the menu does today (Wave A — implemented, bench-verified)
 
-* Status line: server, connected clients, cache HIT ratio — parsed
-  **defensively** from `monopsony-client status` plain-text output; raw CLI
-  lines are shown verbatim when nothing parseable comes back.
+* Status line: server + cache HIT ratio from `monopsony-client status --quiet`
+  (tracing-suppressed `key: value` output; raw CLI lines shown verbatim when
+  nothing parseable comes back).
+* Per-service proxy rows (slice 4) — parsed from `proxy status` subsystem
+  rows, rendered with ✓/✗ state.
+* Cache HIT ratio (slice 5) — counts the server's `X-Cache` decisions at the
+  client proxy, persisted by the daemon to
+  `~/.local/state/monopsony/hit-counts.json`; "n/a" before any traffic.
+* Server host (slice 3) — resolved from `~/.config/monopsony/server.json`
+  (`ws_url` → `grpc_addr`, same chain as the daemon); dashboard URL and
+  status line both use it. No more constant.
+* Menu icon (slice 6) — bolt.fill (green) when connected, bolt.slash when
+  disconnected, warning triangle on errors.
+* Content Caching status (slice 1, status half) — from `setup mac --status`,
+  unprivileged. The enable/disable *action* needs GUI sudo elevation and is
+  pending bench verification (review spec §11).
+* Trigger Update Scan (slice 2, reframed) — `monopsony-client update-scan`
+  wraps `softwareupdate --background` (the only live SUS scan verb on
+  current macOS; `--clear-catalog` is gone on 26.3.1).
 * Connect / Disconnect — LaunchAgent bootstrap/bootout (above).
 * System proxy toggle — shells out to `monopsony-client proxy system on|off`
   (existing Sprint 26 Tier 1 CLI surface).
-* Homebrew env caching / Catalog refresh — **stubs, disabled, marked
-  TODO(b4-followup)** until the CLI contract is wired.
-* Open Dashboard — `NSWorkspace.open` on `http://<server>:3130`
-  (server host is currently a constant in `AppState.MonopsonyConfig`;
-  TODO: read from the client's saved config).
+* Open Dashboard — `NSWorkspace.open` on `http://<host>:3130` from pairing state.
+
+## Testing (no XCTest — CLT-only toolchain)
+
+`swift test` cannot work: the CLT toolchain ships **no XCTest module**
+(bench-verified on macOS 26.3.1). The pure-logic suite runs instead via:
+
+```sh
+swift build
+.build/debug/MonopsonyMenuBar --selftest   # SELFTEST PASS, exit 0/1
+```
+
+CI (Forgejo, macos-arm64 runner) gates on this — see the `swift-selftest`
+job in `.github/workflows/ci.yml`.
 
 ## Polling strategy
 
@@ -84,8 +111,9 @@ background work at all.
 ## Known limitations
 
 * Daemon binary path must exist (see above) — no bundled binary yet.
-* `serverHost` for the dashboard URL is a placeholder constant.
+* Content Caching enable/disable is status-only in the menu; the action needs
+  a GUI sudo elevation path (osascript prototype pending — review spec §11).
 * Status parsing tracks today's CLI output shape; new fields are picked up
   best-effort, unknown output falls back to raw lines.
-* HIT-ratio parsing assumes the CLI prints `Cache HIT ratio: NN%` — not yet
-  emitted by the Rust client; parse hardening is follow-up work.
+* Update-scan traffic routing through Monopsony is a bench experiment, not a
+  code guarantee (review spec §11, item 6).

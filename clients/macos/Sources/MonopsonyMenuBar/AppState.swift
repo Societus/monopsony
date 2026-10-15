@@ -1,10 +1,14 @@
 // AppState.swift — ObservableObject bridging the menu bar UI to the Rust daemon.
 //
 // Thin shell, no new protocol work: everything goes through
-//   * `monopsony-client` CLI (status output, system-proxy subcommands)
+//   * `monopsony-client` CLI (status --quiet, proxy status, setup mac --status,
+//     update-scan; system-proxy subcommands)
 //   * `launchctl bootstrap/bootout gui/$UID` (modern syntax, macOS 10.11+;
 //     m2mini bench is 26.3.1 so no legacy load/unload fallback is needed)
 // using the LaunchAgent template in Resources/com.societus.monopsony-client.plist.
+//
+// Pure parsing/formatting logic lives in Core.swift (unit-tested); this file
+// owns process spawning, timers, and published state only.
 import Foundation
 import AppKit
 import Combine
@@ -17,11 +21,11 @@ enum MonopsonyConfig {
     /// Client binary location on the bench (target/release build). The
     /// LaunchAgent template carries a placeholder; real installs replace it.
     static let clientBinary = NSString(string: "~/.local/bin/monopsony-client").expandingTildeInPath
-    /// Dashboard URL (server control plane).
-    static var dashboardURL: URL { URL(string: "http://\(serverHost):3130")! }
-    /// Server host. TODO(b4-followup): read from the client's saved config
-    /// (cert dir / pairing state) instead of this constant.
-    static let serverHost = "192.168.1.10"
+    /// Client cert/state dir — matches the Rust client's default_cert_dir.
+    /// server.json (written at pairing) is the source of truth for the
+    /// server host (slice 3).
+    static let certDir = NSString(string: "~/.config/monopsony").expandingTildeInPath
+    static var serverJSONPath: String { certDir + "/server.json" }
     static let launchAgentsDir = NSString(string: "~/Library/LaunchAgents").expandingTildeInPath
     static var agentPlistPath: String { launchAgentsDir + "/\(agentLabel).plist" }
 }
@@ -29,7 +33,8 @@ enum MonopsonyConfig {
 struct ClientStatus {
     var server: String?
     var connectedClients: Int?
-    var hitRatio: Double?
+    /// Structured HIT-ratio state (slice 5) — nil ratio = daemon has no data.
+    var hitRatio: HitRatioDisplay = HitRatioDisplay(ratio: nil, hits: 0, total: 0)
     /// Verbatim CLI output — shown if structured parsing fails.
     var rawLines: [String] = []
     var parseFailed = false
@@ -41,6 +46,13 @@ final class AppState: ObservableObject {
     @Published var isAgentRunning = false
     @Published var systemProxyEnabled = false
     @Published var lastError: String?
+    /// Server identity resolved from pairing state (slice 3).
+    @Published var serverIdentity: ServerIdentity?
+    /// Per-service proxy rows parsed from `proxy status` (slice 4).
+    @Published var proxyRows: [ProxyServiceRow] = []
+    /// Apple Content Caching state from `setup mac --status` (slice 1 status).
+    @Published var contentCacheOn = false
+    @Published var contentCacheDetail = ""
 
     private var pollTimer: Timer?
 
@@ -65,17 +77,37 @@ final class AppState: ObservableObject {
     // MARK: - Status
 
     func refresh() {
-        let output = runClient(["status"])
+        // Slice 3: server identity from the pairing file (no process spawn).
+        if let data = FileManager.default.contents(atPath: MonopsonyConfig.serverJSONPath) {
+            serverIdentity = ServerIdentity.parse(serverJSON: data)
+        } else {
+            serverIdentity = nil
+        }
+
+        // Slice 5 contract: `status --quiet` prints only key: value lines
+        // (tracing suppressed CLI-side). Parse defensively regardless.
+        let output = runClient(["status", "--quiet"])
         status = Self.parseStatus(output)
+
+        // Slice 4: per-service rows from `proxy status`.
+        let proxyOutput = runClient(["proxy", "status"])
+        let report = ProxyStatusParser.parse(proxyOutput)
+        proxyRows = report.rows
+
+        // Slice 1 (status half): Content Caching on/off, unprivileged probe.
+        let ccOutput = runClient(["setup", "mac", "--status"])
+        (contentCacheOn, contentCacheDetail) = Self.parseContentCacheStatus(ccOutput)
+
         isAgentRunning = Self.agentIsRunning()
         systemProxyEnabled = refreshSystemProxy()
     }
 
-    /// Defensive parse of `monopsony-client status` plain-text output.
-    /// The CLI today prints "Certificates: ..." / "Package managers detected: N"
-    /// lines; richer fields (server, connected clients, HIT ratio) arrive as the
-    /// daemon grows them. Anything unparseable keeps the raw lines on screen.
-    static func parseStatus(_ output: String) -> ClientStatus {
+    /// Defensive parse of `monopsony-client status --quiet` output.
+    /// Expected lines: `Server: ...`, `Cache HIT ratio: NN.N%`.
+    /// Anything unparseable keeps the raw lines on screen.
+    /// nonisolated: pure function, no shared state — callable from the
+    /// self-test runner and any actor context.
+    nonisolated static func parseStatus(_ output: String) -> ClientStatus {
         var result = ClientStatus()
         let lines = output.split(separator: "\n").map(String.init)
         result.rawLines = lines
@@ -84,10 +116,6 @@ final class AppState: ObservableObject {
             return result
         }
         for line in lines {
-            // Expected shapes (best effort, case-insensitive label match):
-            //   Server: 192.168.1.10
-            //   Connected clients: 3
-            //   Cache HIT ratio: 87.4%
             let parts = line.split(separator: ":", maxSplits: 1)
             guard parts.count == 2 else { continue }
             let key = parts[0].trimmingCharacters(in: .whitespaces).lowercased()
@@ -98,20 +126,37 @@ final class AppState: ObservableObject {
             case "connected clients":
                 result.connectedClients = Int(value)
             case "cache hit ratio":
-                if value.hasSuffix("%") {
-                    result.hitRatio = Double(value.dropLast())
-                } else {
-                    result.hitRatio = Double(value)
-                }
+                result.hitRatio = HitRatioDisplay.from(statusOutput: line)
             default:
                 break
             }
         }
-        // If nothing structured was recognized, surface the raw output instead.
-        if result.server == nil && result.connectedClients == nil && result.hitRatio == nil {
+        if result.server == nil && result.connectedClients == nil
+            && result.hitRatio.ratio == nil {
             result.parseFailed = true
         }
         return result
+    }
+
+    /// Parse `setup mac --status` output. Row shape (main.rs):
+    /// `  cache         ON  ✓  active — shared content only ...`.
+    /// nonisolated: pure function (see parseStatus).
+    nonisolated static func parseContentCacheStatus(_ output: String) -> (Bool, String) {
+        for rawLine in output.split(separator: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("cache") {
+                if line.contains("ON") {
+                    let afterMark = line.drop(while: { $0 != "✓" && $0 != "✗" })
+                    let detail = afterMark.dropFirst()
+                        .trimmingCharacters(in: .whitespaces)
+                    return (true, detail.isEmpty ? "on" : detail)
+                }
+                if line.contains("OFF") {
+                    return (false, "off")
+                }
+            }
+        }
+        return (false, "status unavailable")
     }
 
     var statusHeadline: String {
@@ -119,7 +164,7 @@ final class AppState: ObservableObject {
             return "Error: \(err)"
         }
         if isAgentRunning {
-            return "Connected — \(status.server ?? "unknown server")"
+            return "Connected — \(status.server ?? serverIdentity?.host ?? "unknown server")"
         }
         return "Disconnected"
     }
@@ -133,10 +178,14 @@ final class AppState: ObservableObject {
         if let clients = status.connectedClients {
             lines.append("Connected clients: \(clients)")
         }
-        if let ratio = status.hitRatio {
-            lines.append(String(format: "Cache HIT ratio: %.1f%%", ratio))
-        }
+        lines.append("Cache HIT ratio: \(status.hitRatio.label)")
         return lines
+    }
+
+    /// Slice 6: icon state for the menu bar label.
+    var iconState: MenuIcon {
+        if lastError != nil { return .error }
+        return isAgentRunning ? .connected : .disconnected
     }
 
     // MARK: - Connect / Disconnect via LaunchAgent
@@ -212,8 +261,6 @@ final class AppState: ObservableObject {
         lastError = nil
         let verb = on ? "on" : "off"
         let output = runClient(["proxy", "system", verb])
-        // TODO(b4-followup): parse the per-service rows the CLI prints and
-        // surface partial failures per network service.
         if output.isEmpty {
             lastError = "proxy system \(verb): no output from client"
         }
@@ -222,15 +269,28 @@ final class AppState: ObservableObject {
 
     private func refreshSystemProxy() -> Bool {
         // Skeleton-honest probe: ask the CLI for status and look for a
-        // positive marker. TODO(b4-followup): structured subcommand output.
+        // positive marker. Structured per-service rows come from `proxy status`
+        // (slice 4); this probes the system-proxy lane specifically.
         let output = runClient(["proxy", "system", "status"])
         return output.lowercased().contains("forwarded") && !output.lowercased().contains("disabled")
     }
 
     // MARK: - Dashboard
 
+    /// Open the server dashboard (slice 3: host from pairing state, not a
+    /// constant). Refuses silently-with-error when unpaired or the URL is
+    /// not constructable — no force-unwrap crash path.
     func openDashboard() {
-        NSWorkspace.shared.open(MonopsonyConfig.dashboardURL)
+        lastError = nil
+        guard let identity = serverIdentity else {
+            lastError = "Not paired — no server.json at \(MonopsonyConfig.serverJSONPath)"
+            return
+        }
+        guard let url = identity.dashboardURL else {
+            lastError = "Cannot build dashboard URL from \(identity.host)"
+            return
+        }
+        NSWorkspace.shared.open(url)
     }
 
     // MARK: - Process helpers
@@ -253,7 +313,8 @@ final class AppState: ObservableObject {
     }
 
     /// Shell out to the monopsony-client binary; returns combined stdout.
-    private func runClient(_ args: [String]) -> String {
+    /// Internal: views call this directly for one-shot actions (update-scan).
+    func runClient(_ args: [String]) -> String {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: MonopsonyConfig.clientBinary)
         proc.arguments = args
