@@ -42,6 +42,7 @@ mod detect;
 mod discovery;
 mod floor_guard;
 mod grpc_client;
+mod hit_counter;
 mod index_parse;
 mod lang_pm_config;
 mod ledger;
@@ -119,7 +120,12 @@ enum Commands {
         distro: String,
     },
     /// Show client status (certificates, detected package managers)
-    Status,
+    Status {
+        /// Machine-quiet output: suppress the tracing log prefix so stdout
+        /// carries only the key: value lines the menu bar app parses.
+        #[arg(long)]
+        quiet: bool,
+    },
     /// Configure local package managers to use the Monopsony proxy
     Configure {
         /// Server address used to derive proxy settings
@@ -181,6 +187,10 @@ enum Commands {
         #[command(subcommand)]
         cmd: SetupMode,
     },
+    /// Trigger a macOS softwareupdate background scan (the only live SUS
+    /// verb on current macOS; whether the scan's traffic routes through
+    /// Monopsony depends on system-proxy / Content Caching state)
+    UpdateScan,
 }
 
 #[derive(Subcommand, Debug)]
@@ -448,13 +458,19 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let log_level = if args.debug {
-        Level::DEBUG
-    } else {
-        Level::INFO
-    };
-    let subscriber = FmtSubscriber::builder().with_max_level(log_level).finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    // `status --quiet` is a machine contract: stdout carries ONLY the key:
+    // value lines the menu bar app parses. Skip subscriber installation
+    // entirely — info!/warn! macros become no-ops instead of prefixing lines.
+    let quiet_status = matches!(args.command, Some(Commands::Status { quiet: true }));
+    if !quiet_status {
+        let log_level = if args.debug {
+            Level::DEBUG
+        } else {
+            Level::INFO
+        };
+        let subscriber = FmtSubscriber::builder().with_max_level(log_level).finish();
+        tracing::subscriber::set_global_default(subscriber)?;
+    }
 
     // Resolve cert_dir — platform-aware defaults. Windows uses APPDATA; Linux uses ~/.config/monopsony.
     let cert_dir_raw = args.cert_dir.clone().unwrap_or_else(default_cert_dir);
@@ -497,8 +513,12 @@ async fn main() -> anyhow::Result<()> {
         }) => {
             run_discover(timeout_secs, tracker_url, peer_url, &distro).await?;
         }
-        Some(Commands::Status) => {
-            run_status(&cert_dir).await?;
+        Some(Commands::Status { quiet }) => {
+            if quiet {
+                run_status_quiet(&cert_dir);
+            } else {
+                run_status(&cert_dir).await?;
+            }
         }
         Some(Commands::Configure { server }) => {
             run_configure(&server).await?;
@@ -530,6 +550,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Setup { cmd }) => {
             run_setup(cmd)?;
+        }
+        Some(Commands::UpdateScan) => {
+            run_update_scan()?;
         }
         None => {
             info!("No command specified. Use --help for usage.");
@@ -1674,6 +1697,26 @@ async fn run_daemon(
         _ => (None, "warn".to_string(), 0),
     };
 
+    // HIT/MISS/STALE accounting (Sprint 26 Phase 4 slice 5): persist under
+    // the client state dir so `status --quiet` (a separate process) reads
+    // the daemon's snapshot. Flush on an interval; a crash loses at most
+    // one interval. Counting failure never blocks forwarding (fail-open).
+    let hit_counter_path = hit_counter_state_path(&cert_dir);
+    if let Some(parent) = hit_counter_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let hit_counter = hit_counter::HitCounter::load(hit_counter_path.clone());
+    {
+        let counter = hit_counter.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                tick.tick().await;
+                counter.persist();
+            }
+        });
+    }
+
     proxy::run_proxy(
         listen_addr,
         proxy_config,
@@ -1682,6 +1725,7 @@ async fn run_daemon(
         ledger_policy,
         ledger_max_age,
         Some(floor_store),
+        Some(hit_counter),
     )
     .await?;
 
@@ -1802,6 +1846,61 @@ async fn run_status(cert_dir: &Path) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Machine-readable status (Sprint 26 Phase 4, B4 slices 3/5). stdout carries
+/// ONLY `key: value` lines — the tracing subscriber is not installed for this
+/// verb, so no log prefixes ever interleave. Parse contract (case-insensitive
+/// keys, matched by the menu bar app):
+///   Server: <host[:port] | not paired | unavailable>
+///   Connected clients: <N>
+///   Cache HIT ratio: <NN.N%>
+/// Exit code 0 always — absence of data is expressed by omitting the line.
+fn run_status_quiet(cert_dir: &Path) {
+    // Server identity: same fallback chain as the daemon (ws_url, then
+    // grpc_addr, from cert_dir/server.json written at pairing time).
+    let server_json_path = cert_dir.join("server.json");
+    if let Ok(content) = std::fs::read_to_string(&server_json_path) {
+        if let Ok(info) = serde_json::from_str::<serde_json::Value>(&content) {
+            let addr = info
+                .get("ws_url")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .or_else(|| {
+                    info.get("grpc_addr")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                });
+            if let Some(addr) = addr {
+                println!("Server: {}", addr);
+            }
+        }
+    }
+
+    // Cache HIT ratio from the daemon's persisted X-Cache counters. The
+    // daemon (not this process) owns the live counters; this reads its
+    // last flushed snapshot, so a never-run daemon simply omits the line.
+    let counter_path = hit_counter_state_path(cert_dir);
+    if let Ok(content) = std::fs::read_to_string(&counter_path) {
+        if let Ok(counters) = serde_json::from_str::<hit_counter::PersistedSnapshot>(&content) {
+            let total = counters.hits + counters.misses + counters.stale;
+            if total > 0 {
+                let served = counters.hits + counters.stale;
+                let ratio = (served as f64 / total as f64) * 100.0;
+                println!("Cache HIT ratio: {:.1}%", ratio);
+            }
+        }
+    }
+}
+
+/// Persist path for the daemon's X-Cache counters: the client state dir,
+/// matching the tamper-event spool / ledger convention.
+fn hit_counter_state_path(_cert_dir: &Path) -> PathBuf {
+    std::env::var("HOME")
+        .map(|h| PathBuf::from(h).join(".local/state/monopsony/hit-counts.json"))
+        .unwrap_or_else(|_| PathBuf::from("/tmp/monopsony/hit-counts.json"))
 }
 
 async fn run_configure(server: &str) -> anyhow::Result<()> {
@@ -2937,6 +3036,34 @@ fn run_setup(cmd: SetupMode) -> anyhow::Result<()> {
     }
     println!("✓ Content Caching activated — verifying status:");
     run_setup_status()
+}
+
+/// Sprint 26 Phase 4 (B4 slice 2): trigger a macOS softwareupdate background
+/// scan. `--clear-catalog` no longer exists on current macOS (verified on the
+/// 26.3.1 bench — absent from `softwareupdate --help`), so this is the only
+/// live scan verb. Meaningfulness (does scan traffic route through Monopsony?)
+/// depends on system-proxy / Content Caching state and is verified on the
+/// bench, not here. The scan daemonizes: exit code reflects the trigger, not
+/// the scan result.
+fn run_update_scan() -> anyhow::Result<()> {
+    if !cfg!(target_os = "macos") {
+        anyhow::bail!("update-scan: only supported on macOS");
+    }
+    let out = std::process::Command::new("/usr/sbin/softwareupdate")
+        .arg("--background")
+        .output()
+        .map_err(|e| anyhow::anyhow!("update-scan: failed to spawn softwareupdate: {}", e))?;
+    if out.status.success() {
+        println!("✓ softwareupdate background scan triggered");
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "update-scan: softwareupdate exited {} ({})",
+            out.status.code().unwrap_or(-1),
+            stderr.trim()
+        )
+    }
 }
 
 /// Unprivileged status render for the setup lane. ON = activated AND scoped

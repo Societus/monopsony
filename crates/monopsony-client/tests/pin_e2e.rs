@@ -205,6 +205,7 @@ async fn tampered_body_aborts_under_content_length_framing() {
         "warn".to_string(),
         0,
         None,
+        None,
     ));
 
     // Bug 1 flow: key provisioned AFTER serving starts (register path).
@@ -293,6 +294,7 @@ async fn clean_body_serves_clean_under_framing() {
         "warn".to_string(),
         0,
         None,
+        None,
     ));
     pin.set_key(verify);
 
@@ -338,6 +340,7 @@ async fn unprovisioned_client_is_inert() {
         None,
         "warn".to_string(),
         0,
+        None,
         None,
     ));
     // Deliberately NOT provisioning the key.

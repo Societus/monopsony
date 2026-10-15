@@ -210,6 +210,7 @@ async fn setup(
         policy.to_string(),
         max_index_age_secs,
         None,
+        None,
     ));
     Harness {
         proxy_addr,

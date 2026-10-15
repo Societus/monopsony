@@ -4,6 +4,7 @@
 
 pub mod catalog_scan;
 pub mod floor_guard;
+pub mod hit_counter;
 pub mod index_parse;
 pub mod ledger;
 pub mod oracle_update;

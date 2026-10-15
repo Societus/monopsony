@@ -89,6 +89,9 @@ pub struct ClientProxyState {
     /// Oracle floor enforcement (Sprint 21 slice 21-5b).
     /// None = disabled (feature off; enforcement inert).
     pub floor_store: Option<std::sync::Arc<std::sync::RwLock<crate::floor_guard::FloorStore>>>,
+    /// HIT/MISS/STALE accounting (Sprint 26 Phase 4 slice 5).
+    /// None = counting off (e.g. tests that don't care).
+    pub hit_counter: Option<std::sync::Arc<crate::hit_counter::HitCounter>>,
 }
 
 impl ClientProxyState {
@@ -101,6 +104,7 @@ impl ClientProxyState {
             ledger_policy: "warn".to_string(),
             ledger_max_index_age_secs: 0,
             floor_store: None,
+            hit_counter: None,
         }
     }
 
@@ -424,6 +428,18 @@ async fn proxy_handler(
                     response
                         .headers_mut()
                         .insert("X-Monopsony", "forwarded".parse().unwrap());
+                    // HIT/MISS/STALE accounting (Sprint 26 Phase 4 slice 5):
+                    // the server stamps X-Cache on cache-served traffic; count
+                    // its decision here, before body transforms below.
+                    if let Some(counter) = state.hit_counter.as_ref() {
+                        if let Some(v) = response
+                            .headers()
+                            .get("x-cache")
+                            .and_then(|v| v.to_str().ok())
+                        {
+                            counter.observe(v);
+                        }
+                    }
                     // Pin verification (Sprint 20 Phase 3): wrap 200 payload
                     // bodies that carry a signed pin. HEAD (no body) and
                     // 206 partial responses are skipped — a partial body's
@@ -1049,6 +1065,7 @@ async fn handle_connect(state: Arc<ClientProxyState>, request: Request<Body>) ->
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_proxy(
     listen_addr: SocketAddr,
     config: ProxyConfig,
@@ -1057,6 +1074,7 @@ pub async fn run_proxy(
     ledger_policy: String,
     ledger_max_index_age_secs: u64,
     floor_store: Option<std::sync::Arc<std::sync::RwLock<crate::floor_guard::FloorStore>>>,
+    hit_counter: Option<std::sync::Arc<crate::hit_counter::HitCounter>>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(listen_addr).await?;
     run_proxy_with_listener(
@@ -1067,6 +1085,7 @@ pub async fn run_proxy(
         ledger_policy,
         ledger_max_index_age_secs,
         floor_store,
+        hit_counter,
     )
     .await
 }
@@ -1083,12 +1102,14 @@ pub async fn run_proxy_with_listener(
     ledger_policy: String,
     ledger_max_index_age_secs: u64,
     floor_store: Option<std::sync::Arc<std::sync::RwLock<crate::floor_guard::FloorStore>>>,
+    hit_counter: Option<std::sync::Arc<crate::hit_counter::HitCounter>>,
 ) -> anyhow::Result<()> {
     let mut state = ClientProxyState::new(config).with_pin(pin);
     if let Some(ledger) = ledger {
         state = state.with_ledger(ledger, ledger_policy, ledger_max_index_age_secs);
     }
     state.floor_store = floor_store;
+    state.hit_counter = hit_counter;
     let state = Arc::new(state);
 
     let app = axum::Router::new()
