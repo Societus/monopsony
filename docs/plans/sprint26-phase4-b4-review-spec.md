@@ -253,4 +253,49 @@ The skeleton's core design principle is "thin shell over Rust daemon" — **no n
 
 ---
 
+## 10. Wave A results (2026-10-12 — implemented, bench-verified)
+
+Wave A = all slices not requiring sudo/console (per user direction, sudo items banked to §11).
+
+| Slice | Status | Evidence |
+|-------|--------|----------|
+| 3 config-driven host | DONE | `ServerIdentity` parses `~/.config/monopsony/server.json` (ws_url → grpc_addr, same chain as daemon); 4 unit checks |
+| 4 per-service rows | DONE | `ProxyStatusParser` over `proxy status`; rows render in menu; 3 unit checks |
+| 5 HIT ratio | DONE | Rust: `hit_counter.rs` counts `X-Cache` at client-proxy forwarding point, persists `~/.local/state/monopsony/hit-counts.json` (30s flush); CLI: `status --quiet` prints `Server:` + `Cache HIT ratio: NN.N%` with tracing suppressed; Swift: `HitRatioDisplay`, "n/a" when no data; 7 unit checks total |
+| 6 icon swap | DONE | bolt.fill (connected, green) / bolt.slash / warning-triangle (error) |
+| 2 scan trigger (reframed) | DONE (CLI) | `--clear-catalog` does not exist on 26.3.1 (bench-verified via `softwareupdate --help`); `monopsony-client update-scan` wraps the live `--background` verb; menu button wired |
+| 1 Homebrew/CC toggle | STATUS-ONLY in UI | `setup mac --status` row parses + renders unprivileged; the enable/disable ACTION needs GUI sudo elevation — banked (§11) |
+| 7 Swift CI lane | DONE (repo half) | `swift-selftest` job in ci.yml (macos-arm64, continue-on-error): swift build + `--selftest` + cargo check client |
+
+**Key bench fact (answers spec §6.7):** the CLT-only toolchain has **no XCTest module** — `swift test` cannot work without full Xcode. Testing is an in-binary `--selftest` mode (18 checks, `SELFTEST PASS`, exit 0) run by CI.
+
+**Verification state:** cargo test 355+ green incl. 4 new hit_counter tests; clippy `-D warnings` clean; workspace check clean; on m2mini (macOS 26.3.1): `swift build` green + `--selftest` pass.
+
+---
+
+## 11. Wave B — banked for in-person bench run (sudo/console required)
+
+Wave B files are committed; everything below needs martin at the m2mini console.
+
+1. **Deploy client binary (bench-build — dev host is Linux, cannot produce a macOS binary):**
+   ```sh
+   # from the dev host (repo root): sync source (gate-blocked for agent — user-run)
+   rsync -a --exclude target/ --exclude .git/ --exclude dashboard/ --exclude clients/ --exclude docs/ --exclude dist/ \
+     ./ m2mini:/tmp/monopsony-build/
+   ssh m2mini 'mkdir -p /tmp/monopsony-build/dashboard/build'
+   # on the bench: build with the same env the forgejo-runner LaunchAgent uses
+   ssh m2mini 'export PATH="/Users/martin-ci/.rustup/toolchains/1.94.1-aarch64-apple-darwin/bin:/Users/martin/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+     export PROTOC=/Users/martin-ci/.local/bin/protoc
+     cd /tmp/monopsony-build && cargo build --release -p monopsony-client \
+     && cp target/release/monopsony-client ~/.local/bin/monopsony-client'
+   # then (console or martin shell): restart the daemon agent if running
+   ```
+2. **`status --quiet` live check:** run `~/.local/bin/monopsony-client status --quiet` as martin; expect `Server: <grpc_addr-or-ws_url>` from the real pairing file and `Cache HIT ratio:` after traffic.
+3. **HIT-ratio meaning experiment (slice 5 gate):** run a brew/apt fetch cold through the daemon → ratio drops; refetch → climbs. If the ratio never moves, slice 5's data source is wrong in the field — record the verdict here.
+4. **Menu app connect (GUI):** launch the built app at the console; verify icon states, per-service rows, dashboard open, scan button (`softwareupdate --background` fires without prompting).
+5. **sudo elevation prototype (slice 1 action half):** try `osascript -e 'do shell script ... with administrator privileges'` wrapping `setup mac --enable`. If reliable → wire the menu button; if not → slice 1 stays status-only with a "run in Terminal" hint. Record the verdict here.
+6. **Scan-traffic experiment (slice 2 gate):** with system-proxy ON (or Content Caching active), trigger update-scan and check whether SUS traffic is observable through Monopsony (server logs / cache growth / Activity). No observable routing → cut the button as cosmetic, per the keep/cut rule.
+
+---
+
 **End of review spec.**
