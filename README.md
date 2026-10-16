@@ -36,7 +36,9 @@ The installer detects your distro and configures the package manager proxy:
 curl -fsSL https://monopsony.dev/install.sh | bash -s -- --server
 ```
 
-Sets up PostgreSQL, TLS, systemd/OpenRC service, health check.
+Sets up PostgreSQL, TLS, and a system service for the detected init system
+(systemd, OpenRC, runit, s6, SysV init.d; launchd on macOS). Detection is
+capability-based — see `dist/init/README.md`.
 
 ## Supported Platforms
 
@@ -153,6 +155,17 @@ cargo clippy
 ```
 
 238 tests, 0 failures, 4 crates.
+
+## Contributing
+
+Monopsony is open source (MIT). We welcome contributions from anyone — bug reports, documentation, new package managers, or infrastructure work are all valuable.
+
+**We're actively looking for two kinds of contributors:**
+
+- **A macOS contributor.** Monopsony runs on Darwin today: it builds and operates as a BSD/Darwin application rather than a true native Mac app (no App Store packaging, no native menu bar). We deliberately avoid leaning heavily on third-party AI tools for Swift and Ruby so the code stays readable, maintainable, and genuinely ours. A contributor comfortable writing idiomatic Swift and Shell is wanted to push it toward a proper macOS application.
+- **A Windows contributor.** The project creator does not run Windows 11, so Windows backends (winget, choco, scoop) can't be developed or verified end-to-end by the core team. We need someone on Windows to implement and test these backends against real systems.
+
+See `clients/macos/README.md` for how to build and test on macOS, and open an issue if you'd like to help with either effort.
 
 ## License
 

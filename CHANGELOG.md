@@ -89,8 +89,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Server shadow modules compile but are not yet wired to gRPC handlers
 - V4V schema exists but logic is not built (post-v1.0)
 - Metrics crate types defined but never called from production code
-- Windows backends (winget, choco, scoop) untested on actual Windows
-- sqlx 0.8.6+ upgrade blocked by libsqlite3-sys link conflict with rusqlite 0.31
+- Windows backends (winget, choco, scoop) untested on actual Windows — **actively seeking a Windows contributor** for end-to-end implementation and verification
+- macOS builds as a BSD/Darwin app, not a native Mac application; **seeking a Swift/Shell contributor** to move toward a proper macOS app
 
 ---
 

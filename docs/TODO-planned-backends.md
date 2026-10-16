@@ -74,3 +74,11 @@ When a backend is implemented:
 4. Update the website platform strip from "Planned" to active
 5. Update test count in AGENTS.md and on the website
 6. Write integration test with a real or mock repository
+
+## Contributing
+
+Monopsony is MIT open source and welcomes contributions of any kind — bug reports, documentation, new package managers, or infrastructure work. Two areas need hands-on help right now:
+
+- **macOS contributor** — Monopsony runs on Darwin as a BSD/Darwin app rather than a true native Mac app (no App Store packaging, no native menu bar). We deliberately avoid leaning heavily on third-party AI tools for Swift and Ruby so the code stays readable and genuinely ours. A contributor comfortable with idiomatic Swift and Shell is wanted to push it toward a proper macOS application.
+- **Windows contributor** — The project creator does not run Windows 11, so the Windows backends (winget, choco, scoop) can't be developed or verified end-to-end by the core team. We need someone on Windows to implement and test these against real systems.
+
