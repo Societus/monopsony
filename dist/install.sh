@@ -8,12 +8,18 @@
 #   curl -fsSL https://monopsony.dev/install.sh | bash -s -- --uninstall
 #   curl -fsSL https://monopsony.dev/install.sh | bash -s -- --upgrade
 #   curl -fsSL https://monopsony.dev/install.sh | bash -s -- --reconfigure
+#   bash install.sh --detect-init          # print detected init system + evidence
+#   bash install.sh --check-templates      # verify embedded templates match dist/init/
+#   bash install.sh --emit-templates DIR   # regenerate dist/init/ from embedded copies
+#
+# Init systems (auto-detected): systemd, OpenRC, runit, s6, SysV init.d, launchd (macOS).
+# Pin explicitly with MONOPSONY_INIT_SYSTEM=<name> for testing or unusual setups.
 #
 # Supported OSes: Arch, Debian 12+, Ubuntu 22.04+, Rocky/Alma/RHEL 9+, Alpine 3.x,
 #                 openSUSE (Tumbleweed/Leap), Void Linux, Gentoo, Clear Linux, Solus,
-#                 NixOS (client only)
-# Graceful bail:  FreeBSD (not Linux)
-# Supported arches: x86_64, aarch64
+#                 NixOS (client only), macOS (server via launchd)
+# Graceful bail:  FreeBSD (not Linux/macOS)
+# Supported arches: x86_64, aarch64 (Linux), x86_64/arm64 (macOS)
 # ============================================================================
 
 set -euo pipefail
@@ -24,7 +30,8 @@ set -euo pipefail
 readonly VERSION="0.1.0"
 readonly DOWNLOAD_BASE="https://base.societus.club/societus/monopsony/releases/download"
 readonly BINARY_NAME="monopsony-server"
-readonly INSTALL_DIR="/usr/bin"
+# Mutable: macOS re-points to /usr/local/bin in set_platform_paths()
+INSTALL_DIR="/usr/bin"
 readonly CONFIG_DIR="/etc/monopsony"
 readonly CACHE_DIR="/var/cache/monopsony"
 readonly LIB_DIR="/var/lib/monopsony"
@@ -68,6 +75,13 @@ run_as_postgres() {
 # OS detection
 # ---------------------------------------------------------------------------
 detect_os() {
+    # macOS has no /etc/os-release — check uname first
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        local mac_ver
+        mac_ver="$(sw_vers -productVersion 2>/dev/null || echo "unknown")"
+        echo "macos:${mac_ver}"
+        return 0
+    fi
     if [[ -f /etc/os-release ]]; then
         local _id _version_id
         _id=$(grep "^ID=" /etc/os-release | cut -d= -f2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
@@ -97,6 +111,15 @@ detect_arch() {
             exit 1
             ;;
     esac
+}
+
+# ---------------------------------------------------------------------------
+# Platform paths
+# ---------------------------------------------------------------------------
+set_platform_paths() {
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        INSTALL_DIR="/usr/local/bin"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -184,6 +207,10 @@ check_prereqs() {
                 # NixOS handles packages declaratively; no extra packages needed for client setup.
                 info "NixOS detected — skipping package prerequisites."
                 ;;
+            macos)
+                # macOS ships curl + openssl (LibreSSL) with the base system
+                info "macOS detected — skipping package prerequisites."
+                ;;
             *)
                 error "Cannot auto-install prerequisites on this OS. Install curl and openssl manually."
                 exit 1
@@ -215,17 +242,20 @@ download_binary() {
     arch="$(detect_arch)"
     os_ver="$(detect_os | cut -d: -f1)"
 
-    # Map OS to release asset name
-    local asset_name
-    case "${os_ver}" in
-        arch)  asset_name="monopsony-server-v${VERSION}-linux-x86_64.tar.gz" ;;
-        debian|ubuntu) asset_name="monopsony-server-v${VERSION}-linux-x86_64.tar.gz" ;;
-        *)     asset_name="monopsony-server-v${VERSION}-linux-x86_64.tar.gz" ;;
-    esac
-
-    # If aarch64, use that asset
-    if [[ "${arch}" == "aarch64" ]]; then
-        asset_name="monopsony-server-v${VERSION}-linux-aarch64.tar.gz"
+    # Map OS/arch to release asset name
+    local asset_name os_type
+    os_type="$(uname -s)"
+    if [[ "${os_type}" == "Darwin" ]]; then
+        if [[ "${arch}" == "aarch64" ]]; then
+            asset_name="monopsony-server-v${VERSION}-darwin-arm64.tar.gz"
+        else
+            asset_name="monopsony-server-v${VERSION}-darwin-x86_64.tar.gz"
+        fi
+    else
+        asset_name="monopsony-server-v${VERSION}-linux-x86_64.tar.gz"
+        if [[ "${arch}" == "aarch64" ]]; then
+            asset_name="monopsony-server-v${VERSION}-linux-aarch64.tar.gz"
+        fi
     fi
 
     local url="${DOWNLOAD_BASE}/v${VERSION}/${asset_name}"
@@ -287,10 +317,62 @@ download_binary() {
     # Extract and install
     info "Extracting and installing..."
     tar xzf "${tmpdir}/${asset_name}" -C "${tmpdir}/"
+    # /usr/local/bin does not exist by default on Apple Silicon — create it
+    mkdir -p "${INSTALL_DIR}"
     mv "${tmpdir}/monopsony-server" "${INSTALL_DIR}/${BINARY_NAME}"
     chmod 755 "${INSTALL_DIR}/${BINARY_NAME}"
     rm -rf "${tmpdir}"
     ok "Binary installed to ${INSTALL_DIR}/${BINARY_NAME}"
+}
+
+# ---------------------------------------------------------------------------
+# Create user, groups, directories — macOS (dscl)
+# ---------------------------------------------------------------------------
+next_free_dscl_id() {
+    # $1 = /Users or /Groups, $2 = UniqueID or PrimaryGroupID; scans 300-399
+    local node="$1" key="$2" id
+    for id in $(seq 300 399); do
+        if [[ -z "$(dscl . -search "${node}" "${key}" "${id}" 2>/dev/null || true)" ]]; then
+            echo "${id}"
+            return 0
+        fi
+    done
+    echo ""
+}
+
+setup_user_and_dirs_macos() {
+    if ! dscl . -read /Groups/monopsony >/dev/null 2>&1; then
+        local gid
+        gid="$(next_free_dscl_id /Groups PrimaryGroupID)"
+        if [[ -z "${gid}" ]]; then
+            error "No free GID in 300-399 range."
+            exit 1
+        fi
+        dscl . -create /Groups/monopsony PrimaryGroupID "${gid}"
+        dscl . -create /Groups/monopsony RealName "Monopsony"
+        ok "Created group monopsony (gid ${gid})"
+    fi
+    if ! dscl . -read /Users/monopsony >/dev/null 2>&1; then
+        local uid gid
+        uid="$(next_free_dscl_id /Users UniqueID)"
+        gid="$(dscl . -read /Groups/monopsony PrimaryGroupID 2>/dev/null | awk '{print $2}')"
+        if [[ -z "${uid}" ]]; then
+            error "No free UID in 300-399 range."
+            exit 1
+        fi
+        dscl . -create /Users/monopsony UniqueID "${uid}"
+        dscl . -create /Users/monopsony PrimaryGroupID "${gid}"
+        dscl . -create /Users/monopsony RealName "Monopsony Server"
+        dscl . -create /Users/monopsony UserShell /usr/bin/false
+        dscl . -create /Users/monopsony NFSHomeDirectory /var/lib/monopsony
+        ok "Created user monopsony (uid ${uid})"
+    fi
+
+    for dir in "${CONFIG_DIR}" "${CACHE_DIR}" "${LIB_DIR}" "${LOG_DIR}"; do
+        mkdir -p "${dir}"
+        chown monopsony:monopsony "${dir}" 2>/dev/null || true
+        chmod 750 "${dir}" 2>/dev/null || true
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -299,6 +381,11 @@ download_binary() {
 setup_user_and_dirs() {
     local os_ver
     os_ver="$(detect_os | cut -d: -f1)"
+
+    if [[ "${os_ver}" == "macos" ]]; then
+        setup_user_and_dirs_macos
+        return 0
+    fi
 
     # Create group if it doesn't exist
     if ! getent group "${GROUP_NAME}" &>/dev/null; then
@@ -401,10 +488,57 @@ TOML
 }
 
 # ---------------------------------------------------------------------------
+# PostgreSQL setup — local, macOS (Homebrew)
+# ---------------------------------------------------------------------------
+setup_local_postgres_macos() {
+    info "Setting up local PostgreSQL via Homebrew..."
+
+    local brew
+    brew="$(command -v brew 2>/dev/null || true)"
+    if [[ -z "${brew}" && -x /opt/homebrew/bin/brew ]]; then brew=/opt/homebrew/bin/brew; fi
+    if [[ -z "${brew}" && -x /usr/local/bin/brew ]]; then brew=/usr/local/bin/brew; fi
+    if [[ -z "${brew}" ]]; then
+        error "Homebrew not found."
+        error "Install Homebrew (https://brew.sh), then: brew install postgresql@16"
+        error "Re-run this installer with --reconfigure afterwards."
+        return 1
+    fi
+
+    if ! "${brew}" list --versions postgresql@16 >/dev/null 2>&1; then
+        info "Installing postgresql@16 via brew..."
+        "${brew}" install postgresql@16 || { error "brew install postgresql@16 failed."; return 1; }
+    fi
+
+    "${brew}" services start postgresql@16 2>/dev/null || { error "brew services start postgresql@16 failed."; return 1; }
+
+    local pgbin
+    pgbin="$("${brew}" --prefix postgresql@16)/bin"
+
+    # Homebrew's PostgreSQL trusts the local admin user — no run_as_postgres needed
+    if ! "${pgbin}/psql" -d postgres -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DB_USER}'" 2>/dev/null | grep -q 1; then
+        info "Creating role '${DB_USER}' and database '${DB_NAME}'..."
+        local password
+        password="$(openssl rand -base64 24)"
+        "${pgbin}/psql" -d postgres -c "CREATE USER ${DB_USER} WITH PASSWORD '${password}';" || return 1
+        "${pgbin}/psql" -d postgres -c "CREATE DATABASE ${DB_NAME} OWNER ${DB_USER};" || return 1
+        "${pgbin}/psql" -d "${DB_NAME}" -c "GRANT ALL ON SCHEMA public TO ${DB_USER};" 2>/dev/null || true
+        update_config_db_url "${password}"
+        ok "PostgreSQL role + database created."
+    else
+        info "Role '${DB_USER}' already exists. Skipping."
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # PostgreSQL setup — local
 # ---------------------------------------------------------------------------
 setup_local_postgres() {
     info "Setting up local PostgreSQL..."
+
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+        setup_local_postgres_macos
+        return 0
+    fi
 
     # Check if postgres is installed
     if ! command -v psql &>/dev/null; then
@@ -862,60 +996,123 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Service setup
+# Init system detection
 # ---------------------------------------------------------------------------
-setup_service() {
-    local cf_mode="${1:-false}"
-    local os_ver
-    os_ver="$(detect_os | cut -d: -f1)"
-
-    case "${os_ver}" in
-        alpine)
-            setup_service_openrc "${cf_mode}"
-            ;;
-        void)
-            setup_service_runit "${cf_mode}"
-            ;;
-        gentoo)
-            # Gentoo can use either systemd or OpenRC
-            if command -v systemctl >/dev/null 2>&1; then
-                setup_service_systemd "${cf_mode}"
-            else
-                setup_service_openrc "${cf_mode}"
-            fi
-            ;;
-        *)
-            setup_service_systemd "${cf_mode}"
-            ;;
-    esac
-}
-
-setup_service_systemd() {
-    local cf_mode="${1:-false}"
-    info "Setting up systemd service..."
-
-    local service_file="${CONFIG_DIR}/monopsony-server.service"
-
-    # Build ExecStart — in CF Tunnel mode, bind all ports to localhost
-    # so they're not exposed to the network. Only cloudflared's outbound
-    # connection reaches them.
-    local exec_start="/usr/bin/monopsony-server --config /etc/monopsony/server.toml"
-    if [[ "${cf_mode}" == "true" ]]; then
-        exec_start="${exec_start} --http-addr 127.0.0.1:3128 --grpc-addr 127.0.0.1:50051 --dashboard-addr 127.0.0.1:3130 --metrics-addr 127.0.0.1:9090 --mirror-addr 127.0.0.1:3129"
-        info "CF Tunnel mode: binding all ports to localhost"
+# Prints one of: launchd systemd openrc runit s6 sysvinit container unknown
+# Detection is capability-based (PID 1 identity, marker files, command probes),
+# NOT keyed on distro name. Pin explicitly with MONOPSONY_INIT_SYSTEM=<name>
+# for testing or unusual setups.
+detect_init() {
+    if [[ -n "${MONOPSONY_INIT_SYSTEM:-}" ]]; then
+        echo "${MONOPSONY_INIT_SYSTEM}"
+        return 0
     fi
 
-    # Copy service file
-    if [[ -f "/usr/lib/systemd/system/monopsony-server.service" ]]; then
-        info "Service file already installed."
-    else
-        # Find the service file in dist/ or use installed one
-        local dist_service="/usr/share/monopsony/dist/monopsony-server.service"
-        if [[ -f "${dist_service}" ]]; then
-            cp "${dist_service}" "/etc/systemd/system/monopsony-server.service"
-        else
-            # Generate inline
-            cat > "/etc/systemd/system/monopsony-server.service" <<SERVICE
+    local uname_s pid1
+    uname_s="$(uname -s)"
+    pid1=""
+    if [[ -r /proc/1/comm ]]; then
+        pid1="$(tr -d '[:space:]' < /proc/1/comm 2>/dev/null || true)"
+    fi
+
+    # macOS — launchd is the only option
+    if [[ "${uname_s}" == "Darwin" ]]; then
+        echo "launchd"
+        return 0
+    fi
+
+    # systemd — strongest signals first
+    if [[ -d /run/systemd/system ]] || [[ "${pid1}" == "systemd" ]]; then
+        echo "systemd"
+        return 0
+    fi
+
+    # s6 — STRONG signals first: s6-svscan as PID 1, or a live s6-rc
+    # database. Must outrank OpenRC's weakest heuristic (rc-service
+    # installed + classic init as PID 1): a Gentoo box converted to s6
+    # supervision keeps OpenRC's early-boot scripts around.
+    if [[ "${pid1}" == "s6-svscan" ]] || [[ -d /run/s6-rc ]]; then
+        echo "s6"
+        return 0
+    fi
+
+    # OpenRC — running softlevel marker, openrc-init as PID 1,
+    # or rc-service present with a classic init PID 1
+    if [[ -f /run/openrc/softlevel ]] || [[ "${pid1}" == "openrc-init" ]] \
+       || { command -v rc-service >/dev/null 2>&1 && [[ "${pid1}" == "init" ]]; }; then
+        echo "openrc"
+        return 0
+    fi
+
+    # runit — Void/Artix run runit (or runsvdir) as PID 1
+    if [[ "${pid1}" == "runit" ]] || [[ "${pid1}" == "runsvdir" ]] \
+       || { command -v sv >/dev/null 2>&1 && { [[ -d /var/service ]] || [[ -d /service ]]; }; }; then
+        echo "runit"
+        return 0
+    fi
+
+    # s6 — weak signal: toolkit installed but not confirmed running
+    if command -v s6-sv >/dev/null 2>&1; then
+        echo "s6"
+        return 0
+    fi
+
+    # Container without an init system (Docker/Podman)
+    if [[ -f /.dockerenv ]] || [[ -f /run/.containerenv ]]; then
+        echo "container"
+        return 0
+    fi
+
+    # Legacy SysV init.d fallback
+    if [[ -d /etc/init.d ]]; then
+        echo "sysvinit"
+        return 0
+    fi
+
+    echo "unknown"
+}
+
+# ---------------------------------------------------------------------------
+# Service templates
+# ---------------------------------------------------------------------------
+# Canonical copies live in dist/init/ next to this script; the embedded copies
+# below keep the curl|bash one-liner self-contained. They MUST stay in sync:
+#   bash dist/install.sh --check-templates     (also enforced in CI)
+#   bash dist/install.sh --emit-templates DIR  (regenerate dist/init from here)
+# ---------------------------------------------------------------------------
+TEMPLATE_FILES=(
+    monopsony-server.service
+    monopsony-client.service
+    monopsony-server.openrc
+    monopsony-server.runit
+    monopsony-server.runit-log
+    monopsony-server.s6
+    monopsony-server.sysv
+    com.monopsony.server.plist
+)
+
+template_dir() {
+    # Prefer templates shipped next to this script (repo checkout), then the
+    # system-installed copy. Empty string means: use embedded copies.
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    if [[ -f "${script_dir}/init/monopsony-server.service" ]]; then
+        echo "${script_dir}/init"
+        return 0
+    fi
+    if [[ -f /usr/share/monopsony/dist/init/monopsony-server.service ]]; then
+        echo "/usr/share/monopsony/dist/init"
+        return 0
+    fi
+    echo ""
+}
+
+template_embedded() {
+    # $1 = template name; prints the embedded fallback copy on stdout.
+    # MUST match dist/init/<name> byte-for-byte (verified by --check-templates).
+    case "$1" in
+        monopsony-server.service)
+            cat <<'TEMPLATE_EOF'
 [Unit]
 Description=Monopsony Caching Proxy Server
 Documentation=https://base.societus.club/societus/monopsony
@@ -924,11 +1121,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${exec_start}
-ExecReload=/bin/kill -HUP \$MAINPID
+ExecStart=@INSTALL_DIR@/monopsony-server --config /etc/monopsony/server.toml @EXTRA_ARGS@
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 
+# Security hardening
 LimitNOFILE=65536
 ReadWritePaths=/var/cache/monopsony /var/lib/monopsony
 NoNewPrivileges=true
@@ -936,94 +1134,510 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 
+# User/group
 User=monopsony
 Group=monopsony
 
+# Environment
 Environment=RUST_LOG=info
 Environment=RUST_BACKTRACE=1
 
 [Install]
 WantedBy=multi-user.target
-SERVICE
-        fi
-    fi
+TEMPLATE_EOF
+            ;;
+        monopsony-client.service)
+            cat <<'TEMPLATE_EOF'
+[Unit]
+Description=Monopsony Client Daemon
+Documentation=https://base.societus.club/societus/monopsony
+After=network-online.target
+Wants=network-online.target
 
-    # Reload systemd
-    systemctl daemon-reload 2>/dev/null || warn "systemd daemon-reload failed (may not be running in container)."
+[Service]
+Type=simple
+ExecStart=/usr/bin/monopsony-client daemon --config /etc/monopsony/client.toml
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
 
-    # Enable and start
-    systemctl enable monopsony-server 2>/dev/null || warn "Failed to enable service."
-    systemctl start monopsony-server 2>/dev/null || warn "Failed to start service. Check logs: journalctl -u monopsony-server"
+# Security hardening
+LimitNOFILE=8192
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
 
-    ok "Service configured. Status: $(systemctl is-active monopsony-server 2>/dev/null || echo 'unknown')"
-}
+# User — must have read access to cert dir (~/.config/monopsony)
+User=root
+Group=root
 
-setup_service_openrc() {
-    local cf_mode="${1:-false}"
-    info "Setting up OpenRC service..."
+# Environment
+Environment=RUST_LOG=info
 
-    local command_args="--config /etc/monopsony/server.toml"
-    if [[ "${cf_mode}" == "true" ]]; then
-        command_args="${command_args} --http-addr 127.0.0.1:3128 --grpc-addr 127.0.0.1:50051 --dashboard-addr 127.0.0.1:3130 --metrics-addr 127.0.0.1:9090 --mirror-addr 127.0.0.1:3129"
-    fi
-
-    cat > "/etc/init.d/monopsony-server" <<OPENRC
+[Install]
+WantedBy=multi-user.target
+TEMPLATE_EOF
+            ;;
+        monopsony-server.openrc)
+            cat <<'TEMPLATE_EOF'
 #!/sbin/openrc-run
+# Monopsony Caching Proxy Server — OpenRC init script
+# For Alpine, Artix, and Gentoo systems without systemd
 
-name="monopsony-server"
-description="Monopsony Caching Proxy Server"
-command="/usr/bin/monopsony-server"
-command_args="${command_args}"
+description="Monopsony caching proxy server"
+command="@INSTALL_DIR@/monopsony-server"
+command_args="--config /etc/monopsony/server.toml @EXTRA_ARGS@"
 command_user="monopsony:monopsony"
-pidfile="/run/\${RC_SVCNAME}.pid"
-command_background="yes"
+
+pidfile="/run/${RC_SVCNAME}.pid"
+command_background=true
 start_stop_daemon_args="--make-pidfile"
+
+output_log="/var/log/monopsony/server.log"
+error_log="/var/log/monopsony/server-error.log"
 
 depend() {
     need net
     after postgresql
+    use dns logger
 }
 
-OPENRC
-    chmod 755 "/etc/init.d/monopsony-server"
+start_pre() {
+    checkpath --directory --owner monopsony:monopsony --mode 0755 \
+        /var/cache/monopsony /var/lib/monopsony /var/log/monopsony
+}
+TEMPLATE_EOF
+            ;;
+        monopsony-server.runit)
+            cat <<'TEMPLATE_EOF'
+#!/bin/sh
+# Monopsony Caching Proxy Server — runit service (run script)
+# Install to: /etc/sv/monopsony-server/run  (enable: ln -s /etc/sv/monopsony-server /var/service/)
+exec chpst -u monopsony:monopsony \
+    @INSTALL_DIR@/monopsony-server --config /etc/monopsony/server.toml @EXTRA_ARGS@ 2>&1
+TEMPLATE_EOF
+            ;;
+        monopsony-server.runit-log)
+            cat <<'TEMPLATE_EOF'
+#!/bin/sh
+# Monopsony Caching Proxy Server — runit log service
+# Install to: /etc/sv/monopsony-server/log/run
+exec chpst -u monopsony:monopsony svlogd -tt /var/log/monopsony
+TEMPLATE_EOF
+            ;;
+        monopsony-server.s6)
+            cat <<'TEMPLATE_EOF'
+#!/bin/sh
+# Monopsony Caching Proxy Server — s6 longrun service
+# Install to: /etc/s6/sv/monopsony-server/run  (requires a sibling `type` file containing "longrun")
+exec s6-setuidgid monopsony \
+    @INSTALL_DIR@/monopsony-server --config /etc/monopsony/server.toml @EXTRA_ARGS@ 2>&1
+TEMPLATE_EOF
+            ;;
+        monopsony-server.sysv)
+            cat <<'TEMPLATE_EOF'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          monopsony-server
+# Required-Start:    $network $remote_fs postgresql
+# Required-Stop:     $network $remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Monopsony caching proxy server
+# Description:       Centralized package caching proxy for LAN environments.
+### END INIT INFO
 
-    rc-update add monopsony-server default 2>/dev/null || warn "Failed to enable service."
-    rc-service monopsony-server start 2>/dev/null || warn "Failed to start service."
+NAME="monopsony-server"
+DAEMON="@INSTALL_DIR@/monopsony-server"
+DAEMON_ARGS="--config /etc/monopsony/server.toml @EXTRA_ARGS@"
+DAEMON_USER="monopsony"
+DAEMON_GROUP="monopsony"
+PIDFILE="/run/${NAME}.pid"
+LOGDIR="/var/log/monopsony"
 
-    ok "Service configured. Status: $(rc-service monopsony-server status 2>/dev/null || echo 'unknown')"
+SSD="/usr/sbin/start-stop-daemon"
+[ -x "${SSD}" ] || SSD="start-stop-daemon"
+
+is_running() {
+    [ -f "${PIDFILE}" ] && kill -0 "$(cat "${PIDFILE}" 2>/dev/null)" 2>/dev/null
 }
 
-setup_service_runit() {
+do_start() {
+    if is_running; then
+        echo "${NAME} already running."
+        return 0
+    fi
+    mkdir -p "${LOGDIR}" /var/cache/monopsony /var/lib/monopsony 2>/dev/null || true
+    chown "${DAEMON_USER}:${DAEMON_GROUP}" "${LOGDIR}" /var/cache/monopsony /var/lib/monopsony 2>/dev/null || true
+    "${SSD}" --start --background --make-pidfile --pidfile "${PIDFILE}" \
+        --chuid "${DAEMON_USER}:${DAEMON_GROUP}" \
+        --exec /bin/sh -- -c "exec ${DAEMON} ${DAEMON_ARGS} >> ${LOGDIR}/server.log 2>&1"
+    echo "${NAME} started."
+}
+
+do_stop() {
+    if ! is_running; then
+        echo "${NAME} not running."
+        return 0
+    fi
+    "${SSD}" --stop --pidfile "${PIDFILE}" --retry TERM/10/KILL/5 --remove-pidfile
+    echo "${NAME} stopped."
+}
+
+case "$1" in
+    start)   do_start ;;
+    stop)    do_stop ;;
+    restart) do_stop; sleep 1; do_start ;;
+    status)
+        if is_running; then
+            echo "${NAME} running (pid $(cat "${PIDFILE}" 2>/dev/null))"
+        else
+            echo "${NAME} not running."
+            exit 3
+        fi
+        ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
+TEMPLATE_EOF
+            ;;
+        com.monopsony.server.plist)
+            cat <<'TEMPLATE_EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.monopsony.server</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@INSTALL_DIR@/monopsony-server</string>
+        <string>--config</string>
+        <string>/etc/monopsony/server.toml</string>
+@PLIST_EXTRA_ARGS@
+    </array>
+
+    <key>UserName</key>
+    <string>monopsony</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+
+    <key>WorkingDirectory</key>
+    <string>/var/lib/monopsony</string>
+
+    <key>StandardOutPath</key>
+    <string>/var/log/monopsony/server.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/monopsony/server-error.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RUST_LOG</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>
+TEMPLATE_EOF
+            ;;
+        *)
+            error "Unknown template: $1"
+            return 1
+            ;;
+    esac
+}
+
+render_template() {
+    # $1 = template name, $2 = destination path, $3 = cf_mode ("true"/"false")
+    local name="$1" dest="$2" cf_mode="${3:-false}"
+    local dir src blockfile extra repl tok
+
+    dir="$(template_dir)"
+    src="$(mktemp)"
+    blockfile="$(mktemp)"
+
+    if [[ -n "${dir}" && -f "${dir}/${name}" ]]; then
+        cat "${dir}/${name}" > "${src}"
+    else
+        template_embedded "${name}" > "${src}"
+    fi
+
+    # Extra CLI args — Cloudflare Tunnel mode binds every port to localhost
+    extra=""
+    if [[ "${cf_mode}" == "true" ]]; then
+        extra="--http-addr 127.0.0.1:3128 --grpc-addr 127.0.0.1:50051 --dashboard-addr 127.0.0.1:3130 --metrics-addr 127.0.0.1:9090 --mirror-addr 127.0.0.1:3129"
+    fi
+    repl=""
+    if [[ -n "${extra}" ]]; then
+        repl=" ${extra}"
+    fi
+
+    # plist extras become one <string> element per arg on the token line
+    if grep -q '@PLIST_EXTRA_ARGS@' "${src}"; then
+        for tok in ${extra}; do
+            printf '        <string>%s</string>\n' "${tok}" >> "${blockfile}"
+        done
+    fi
+
+    mkdir -p "$(dirname "${dest}")"
+    # POSIX-safe sed (no -i): stream edit into place
+    sed -e "/@PLIST_EXTRA_ARGS@/r ${blockfile}" \
+        -e "/@PLIST_EXTRA_ARGS@/d" \
+        -e "s|@INSTALL_DIR@|${INSTALL_DIR}|g" \
+        -e "s| @EXTRA_ARGS@|${repl}|g" \
+        "${src}" > "${dest}"
+    rm -f "${src}" "${blockfile}"
+}
+
+# ---------------------------------------------------------------------------
+# Service installers (one per init system)
+# ---------------------------------------------------------------------------
+install_service_systemd() {
+    local cf_mode="${1:-false}"
+    info "Setting up systemd service..."
+
+    local dest
+    dest="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}/monopsony-server.service"
+    render_template monopsony-server.service "${dest}" "${cf_mode}"
+    chmod 644 "${dest}"
+
+    systemctl daemon-reload 2>/dev/null || warn "systemctl daemon-reload failed (no systemd?)"
+    systemctl enable monopsony-server 2>/dev/null || warn "Failed to enable monopsony-server."
+    systemctl restart monopsony-server 2>/dev/null || warn "Failed to start monopsony-server. Check: journalctl -u monopsony-server"
+    ok "systemd service installed. Status: $(systemctl is-active monopsony-server 2>/dev/null || echo 'unknown')"
+}
+
+install_service_openrc() {
+    local cf_mode="${1:-false}"
+    info "Setting up OpenRC service..."
+
+    local dest
+    dest="${OPENRC_INIT_DIR:-/etc/init.d}/monopsony-server"
+    render_template monopsony-server.openrc "${dest}" "${cf_mode}"
+    chmod 755 "${dest}"
+
+    rc-update add monopsony-server default 2>/dev/null || warn "rc-update add failed."
+    rc-service monopsony-server restart 2>/dev/null || warn "rc-service start failed."
+    ok "OpenRC service installed. Status: $(rc-service monopsony-server status 2>/dev/null || echo 'unknown')"
+}
+
+install_service_runit() {
     local cf_mode="${1:-false}"
     info "Setting up runit service..."
 
-    local exec_cmd="/usr/bin/monopsony-server --config /etc/monopsony/server.toml"
-    if [[ "${cf_mode}" == "true" ]]; then
-        exec_cmd="${exec_cmd} --http-addr 127.0.0.1:3128 --grpc-addr 127.0.0.1:50051 --dashboard-addr 127.0.0.1:3130 --metrics-addr 127.0.0.1:9090 --mirror-addr 127.0.0.1:3129"
+    local svdir servicedir
+    svdir="${RUNIT_SV_DIR:-/etc/sv}/monopsony-server"
+    servicedir="${RUNIT_SERVICE_DIR:-/var/service}"
+
+    mkdir -p "${svdir}/log"
+    render_template monopsony-server.runit "${svdir}/run" "${cf_mode}"
+    chmod 755 "${svdir}/run"
+    render_template monopsony-server.runit-log "${svdir}/log/run" "${cf_mode}"
+    chmod 755 "${svdir}/log/run"
+
+    if [[ -d "${servicedir}" ]]; then
+        ln -sf "${svdir}" "${servicedir}/monopsony-server"
+        # give runsv a moment to create supervise/ before issuing sv commands
+        # (racing it produces "unable to open supervise/ok" warnings)
+        sleep 2
+        sv restart monopsony-server 2>/dev/null || true
+        ok "runit service installed and linked into ${servicedir}."
+    else
+        ok "runit service installed at ${svdir}."
+        warn "No ${servicedir} scan dir — enable with: ln -s ${svdir} ${servicedir}/monopsony-server"
+    fi
+}
+
+s6_refresh_db() {
+    # Refresh the compiled s6-rc database from /etc/s6/sv sources and
+    # live-update it. Prefers Artix's `s6-rc-bundle update default`; upstream
+    # s6-rc (Gentoo/Void) has no source-recompile verb, so compile a new db
+    # and s6-rc-update directly. NEVER prune old compiled dbs — s6-rc-update
+    # is asynchronous and deleting the db it is migrating from corrupts
+    # /run/s6-rc/state.
+    if command -v s6-rc-bundle >/dev/null 2>&1 && s6-rc-bundle update default 2>/dev/null; then
+        return 0
+    fi
+    if command -v s6-rc-compile >/dev/null 2>&1 && command -v s6-rc-update >/dev/null 2>&1; then
+        local newdb="/etc/s6/rc.dbs/compiled/monopsony-$$-$(date +%s%N 2>/dev/null || date +%s)"
+        mkdir -p /etc/s6/rc.dbs/compiled
+        if s6-rc-compile "${newdb}" /etc/s6/sv 2>/dev/null && s6-rc-update "${newdb}" 2>/dev/null; then
+            if [[ -L /etc/s6/current ]]; then
+                ln -sfn "${newdb}" /etc/s6/current
+            fi
+            return 0
+        fi
+    fi
+    return 1
+}
+
+install_service_s6() {
+    local cf_mode="${1:-false}"
+    info "Setting up s6 service..."
+
+    local svdir
+    svdir="${S6_SV_DIR:-/etc/s6/sv}/monopsony-server"
+    mkdir -p "${svdir}"
+    echo "longrun" > "${svdir}/type"
+    render_template monopsony-server.s6 "${svdir}/run" "${cf_mode}"
+    chmod 755 "${svdir}/run"
+
+    local contents="/etc/s6/sv/bundle/contents.d"
+    if [[ -d "${contents}" ]]; then
+        touch "${contents}/monopsony-server"
+        if s6_refresh_db; then
+            ok "s6 longrun service installed at ${svdir} and registered in the boot bundle."
+        else
+            ok "s6 longrun service installed at ${svdir} and added to the bundle sources."
+            warn "s6-rc database refresh failed — recompile your s6-rc database to activate."
+        fi
+    else
+        ok "s6 longrun service installed at ${svdir}."
+        warn "No s6-rc bundle dir found — register ${svdir} with your s6-rc database manually."
     fi
 
-    mkdir -p /etc/sv/monopsony-server
+    # s6-rc-update swaps the db definition but does NOT start newly added
+    # services — bring it up explicitly (newer s6-rc uses "start", older "up")
+    s6-rc -b start monopsony-server 2>/dev/null \
+        || s6-rc -b up monopsony-server 2>/dev/null \
+        || warn "Failed to start service — run: s6-rc -b start monopsony-server"
+}
 
-    cat > "/etc/sv/monopsony-server/run" <<RUNIT
-#!/bin/sh
-exec chpst -u monopsony:monopsony ${exec_cmd} 2>&1
-RUNIT
-    chmod 755 "/etc/sv/monopsony-server/run"
+install_service_sysv() {
+    local cf_mode="${1:-false}"
+    info "Setting up SysV init service..."
 
-    # Create log service
-    mkdir -p /etc/sv/monopsony-server/log
-    cat > "/etc/sv/monopsony-server/log/run" <<'RUNIT_LOG'
-#!/bin/sh
-exec chpst -u monopsony:monopsony svlogd -tt /var/log/monopsony
-RUNIT_LOG
-    chmod 755 "/etc/sv/monopsony-server/log/run"
+    local dest
+    dest="${SYSV_INIT_DIR:-/etc/init.d}/monopsony-server"
+    render_template monopsony-server.sysv "${dest}" "${cf_mode}"
+    chmod 755 "${dest}"
 
-    # Enable service
-    ln -sf /etc/sv/monopsony-server /var/service/ 2>/dev/null || warn "Failed to enable service."
+    if command -v update-rc.d >/dev/null 2>&1; then
+        update-rc.d monopsony-server defaults
+    elif command -v chkconfig >/dev/null 2>&1; then
+        chkconfig --add monopsony-server 2>/dev/null || warn "chkconfig --add failed."
+    else
+        warn "Neither update-rc.d nor chkconfig found — create runlevel links manually."
+    fi
 
-    sv start monopsony-server 2>/dev/null || warn "Failed to start service."
+    "${dest}" start || warn "Service start failed — check /var/log/monopsony/server.log"
+    ok "SysV init script installed at ${dest}."
+}
 
-    ok "Service configured. Status: $(sv status monopsony-server 2>/dev/null || echo 'unknown')"
+install_service_launchd() {
+    local cf_mode="${1:-false}"
+    info "Setting up launchd daemon (macOS)..."
+
+    local dest
+    dest="${LAUNCHD_DIR:-/Library/LaunchDaemons}/com.monopsony.server.plist"
+    render_template com.monopsony.server.plist "${dest}" "${cf_mode}"
+    chown root:wheel "${dest}" 2>/dev/null || true
+    chmod 644 "${dest}"
+
+    # Modern launchctl first, legacy fallback for older macOS
+    if launchctl bootstrap system "${dest}" 2>/dev/null; then
+        launchctl enable system/com.monopsony.server 2>/dev/null || true
+        launchctl kickstart -k system/com.monopsony.server 2>/dev/null || true
+        ok "launchd daemon bootstrapped: ${dest}"
+    elif launchctl load -w "${dest}" 2>/dev/null; then
+        ok "launchd daemon loaded (legacy): ${dest}"
+    else
+        warn "launchctl failed — load manually: launchctl bootstrap system ${dest}"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Service setup — dispatch on detected init system
+# ---------------------------------------------------------------------------
+setup_service() {
+    local cf_mode="${1:-false}"
+    local init_sys
+    init_sys="$(detect_init)"
+    info "Detected init system: ${init_sys}"
+
+    case "${init_sys}" in
+        systemd)  install_service_systemd "${cf_mode}" ;;
+        openrc)   install_service_openrc "${cf_mode}" ;;
+        runit)    install_service_runit "${cf_mode}" ;;
+        s6)       install_service_s6 "${cf_mode}" ;;
+        sysvinit) install_service_sysv "${cf_mode}" ;;
+        launchd)  install_service_launchd "${cf_mode}" ;;
+        container)
+            warn "Running inside a container with no init system — skipping service setup."
+            warn "Start manually: ${INSTALL_DIR}/${BINARY_NAME} --config ${CONFIG_DIR}/server.toml"
+            ;;
+        *)
+            error "Unknown init system — cannot install a service automatically."
+            echo ""
+            echo "Init templates ship in dist/init/ of the repository:"
+            echo "  systemd:  monopsony-server.service"
+            echo "  openrc:   monopsony-server.openrc"
+            echo "  runit:    monopsony-server.runit / monopsony-server.runit-log"
+            echo "  s6:       monopsony-server.s6"
+            echo "  sysv:     monopsony-server.sysv"
+            echo "  macOS:    com.monopsony.server.plist"
+            echo ""
+            echo "Or pin your init system explicitly and re-run:"
+            echo "  MONOPSONY_INIT_SYSTEM=systemd bash install.sh --server"
+            echo ""
+            return 1
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Service lifecycle helpers (stop/restart across all init systems)
+# ---------------------------------------------------------------------------
+service_stop_and_disable() {
+    case "$(detect_init)" in
+        systemd)
+            systemctl stop monopsony-server 2>/dev/null || true
+            systemctl disable monopsony-server 2>/dev/null || true
+            ;;
+        openrc)
+            rc-service monopsony-server stop 2>/dev/null || true
+            rc-update del monopsony-server default 2>/dev/null || true
+            ;;
+        runit)
+            sv down monopsony-server 2>/dev/null || true
+            rm -f "${RUNIT_SERVICE_DIR:-/var/service}/monopsony-server" 2>/dev/null || true
+            ;;
+        s6)
+            # tell s6-rc the service is down (newer s6-rc uses "stop", older "down")
+            s6-rc -b stop monopsony-server 2>/dev/null || s6-rc -b down monopsony-server 2>/dev/null || true
+            s6-svc -d /run/s6-rc/servicedirs/monopsony-server 2>/dev/null || true
+            rm -f /etc/s6/sv/bundle/contents.d/monopsony-server 2>/dev/null || true
+            s6_refresh_db || true
+            ;;
+        sysvinit)
+            /etc/init.d/monopsony-server stop 2>/dev/null || true
+            update-rc.d -f monopsony-server remove 2>/dev/null || chkconfig --del monopsony-server 2>/dev/null || true
+            ;;
+        launchd)
+            launchctl bootout system/com.monopsony.server 2>/dev/null \
+                || launchctl unload -w "${LAUNCHD_DIR:-/Library/LaunchDaemons}/com.monopsony.server.plist" 2>/dev/null || true
+            ;;
+    esac
+}
+
+service_restart() {
+    case "$(detect_init)" in
+        systemd)  systemctl restart monopsony-server 2>/dev/null || warn "Service restart failed." ;;
+        openrc)   rc-service monopsony-server restart 2>/dev/null || warn "Service restart failed." ;;
+        runit)    sv restart monopsony-server 2>/dev/null || warn "Service restart failed." ;;
+        s6)       s6-svc -r /run/s6-rc/servicedirs/monopsony-server 2>/dev/null || warn "Service restart failed." ;;
+        sysvinit) /etc/init.d/monopsony-server restart 2>/dev/null || warn "Service restart failed." ;;
+        launchd)  launchctl kickstart -k system/com.monopsony.server 2>/dev/null || warn "Service restart failed." ;;
+        *)        warn "No init system detected — restart ${BINARY_NAME} manually." ;;
+    esac
 }
 
 # ---------------------------------------------------------------------------
@@ -1207,7 +1821,10 @@ wait_for_health() {
     done
 
     warn "Health check timed out after ${max_wait}s."
-    warn "Check logs: journalctl -u monopsony-server --since '5 minutes ago'"
+    case "$(detect_init)" in
+        systemd) warn "Check logs: journalctl -u monopsony-server --since '5 minutes ago'" ;;
+        *)       warn "Check logs: /var/log/monopsony/" ;;
+    esac
     return 1
 }
 
@@ -1223,21 +1840,26 @@ print_info() {
     echo "  Version:    ${VERSION}"
     echo "  Config:     ${CONFIG_DIR}/server.toml"
     echo "  Binary:     ${INSTALL_DIR}/${BINARY_NAME}"
-    local os_ver
-    os_ver="$(detect_os | cut -d: -f1)"
-    case "${os_ver}" in
-        alpine|gentoo)
-            if ! command -v systemctl >/dev/null 2>&1; then
-                echo "  Service:    rc-service monopsony-server status"
-                echo "  Logs:       cat /var/log/monopsony/*.log"
-            else
-                echo "  Service:    systemctl status monopsony-server"
-                echo "  Logs:       journalctl -u monopsony-server -f"
-            fi
+    case "$(detect_init)" in
+        openrc)
+            echo "  Service:    rc-service monopsony-server status"
+            echo "  Logs:       /var/log/monopsony/"
             ;;
-        void)
+        runit)
             echo "  Service:    sv status monopsony-server"
-            echo "  Logs:       svlogd tail /var/log/monopsony"
+            echo "  Logs:       /var/log/monopsony/ (svlogd)"
+            ;;
+        s6)
+            echo "  Service:    s6-svstat /run/s6-rc/servicedirs/monopsony-server"
+            echo "  Logs:       /var/log/monopsony/"
+            ;;
+        sysvinit)
+            echo "  Service:    /etc/init.d/monopsony-server status"
+            echo "  Logs:       /var/log/monopsony/server.log"
+            ;;
+        launchd)
+            echo "  Service:    launchctl print system/com.monopsony.server"
+            echo "  Logs:       /var/log/monopsony/"
             ;;
         *)
             echo "  Service:    systemctl status monopsony-server"
@@ -1265,19 +1887,37 @@ do_uninstall() {
 
     local fully_removed=0
 
-    # Stop service
-    if systemctl is-active --quiet monopsony-server 2>/dev/null; then
-        systemctl stop monopsony-server
-        systemctl disable monopsony-server
-        ok "Service stopped and disabled."
-    fi
+    # Stop and disable the service (any init system)
+    service_stop_and_disable
+    ok "Service stopped and disabled."
 
-    # Remove systemd unit
-    if [[ -f "/etc/systemd/system/monopsony-server.service" ]]; then
-        rm -f "/etc/systemd/system/monopsony-server.service"
-        systemctl daemon-reload 2>/dev/null || true
-        ok "Removed systemd unit."
-    fi
+    # Remove service unit/script per detected init system
+    local init_sys
+    init_sys="$(detect_init)"
+    case "${init_sys}" in
+        systemd)
+            rm -f "/etc/systemd/system/monopsony-server.service" "/usr/lib/systemd/system/monopsony-server.service"
+            systemctl daemon-reload 2>/dev/null || true
+            ok "Removed systemd unit."
+            ;;
+        openrc|sysvinit)
+            rm -f "/etc/init.d/monopsony-server"
+            ok "Removed init script."
+            ;;
+        runit)
+            rm -rf "/etc/sv/monopsony-server"
+            ok "Removed runit service dir."
+            ;;
+        s6)
+            rm -rf "/etc/s6/sv/monopsony-server"
+            rm -f "/etc/s6/sv/bundle/contents.d/monopsony-server" 2>/dev/null || true
+            ok "Removed s6 service dir."
+            ;;
+        launchd)
+            rm -f "${LAUNCHD_DIR:-/Library/LaunchDaemons}/com.monopsony.server.plist"
+            ok "Removed launchd plist."
+            ;;
+    esac
 
     # Remove binary
     if [[ -f "${INSTALL_DIR}/${BINARY_NAME}" ]]; then
@@ -1322,7 +1962,16 @@ do_uninstall() {
     if id "${USER_NAME}" &>/dev/null; then
         read -r -p "Remove user ${USER_NAME}? [y/N]: " confirm
         if [[ "${confirm,,}" == "y" ]]; then
-            userdel "${USER_NAME}" 2>/dev/null || true
+            if [[ "$(uname -s)" == "Darwin" ]]; then
+                dscl . -delete "/Users/${USER_NAME}" 2>/dev/null || true
+                dscl . -delete "/Groups/${GROUP_NAME}" 2>/dev/null || true
+            elif [[ "$(detect_os | cut -d: -f1)" == "alpine" ]]; then
+                # BusyBox: deluser/delgroup, not userdel
+                deluser "${USER_NAME}" 2>/dev/null || true
+                delgroup "${GROUP_NAME}" 2>/dev/null || true
+            else
+                userdel "${USER_NAME}" 2>/dev/null || true
+            fi
             ok "Removed user."
         else
             warn "Kept user."
@@ -1369,7 +2018,7 @@ do_upgrade() {
     download_binary
 
     # Restart service
-    systemctl restart monopsony-server 2>/dev/null || warn "Service restart failed."
+    service_restart
 
     # Wait for health
     wait_for_health
@@ -1413,7 +2062,7 @@ do_reconfigure() {
     setup_cloudflare_tunnel || true
 
     # Restart service
-    systemctl restart monopsony-server 2>/dev/null || warn "Service restart failed."
+    service_restart
 
     ok "Reconfiguration complete."
 }
@@ -1685,9 +2334,63 @@ install_cloudflared_binary() {
 }
 
 # ---------------------------------------------------------------------------
+# Installer maintenance / diagnostics
+# ---------------------------------------------------------------------------
+do_detect_init() {
+    local init_sys
+    init_sys="$(detect_init)"
+    echo "init system: ${init_sys}"
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        local pid1=""
+        if [[ -r /proc/1/comm ]]; then
+            pid1="$(tr -d '[:space:]' < /proc/1/comm 2>/dev/null || true)"
+        fi
+        local m_systemd="no" m_openrc="no" m_runit="no" m_s6="no" m_container="no"
+        if [[ -d /run/systemd/system ]]; then m_systemd="yes"; fi
+        if [[ -f /run/openrc/softlevel ]]; then m_openrc="yes"; fi
+        if [[ -d /var/service || -d /service ]]; then m_runit="yes"; fi
+        if command -v s6-sv >/dev/null 2>&1; then m_s6="yes"; fi
+        if [[ -f /.dockerenv || -f /run/.containerenv ]]; then m_container="yes"; fi
+        echo "  pid 1:     ${pid1:-unknown}"
+        echo "  markers:   systemd=${m_systemd} | openrc=${m_openrc} | runit-sv=${m_runit} | s6=${m_s6} | container=${m_container}"
+    fi
+}
+
+do_check_templates() {
+    local dir failures=0 name
+    dir="$(template_dir)"
+    if [[ -z "${dir}" ]]; then
+        error "No dist/init/ directory found next to install.sh — nothing to check."
+        exit 1
+    fi
+    for name in "${TEMPLATE_FILES[@]}"; do
+        if ! template_embedded "${name}" | diff -q - "${dir}/${name}" >/dev/null 2>&1; then
+            error "Template out of sync: ${name} (embedded copy != ${dir}/${name})"
+            failures=$((failures + 1))
+        fi
+    done
+    if [[ ${failures} -gt 0 ]]; then
+        error "${failures} template(s) out of sync. Regenerate with: bash install.sh --emit-templates <dir>"
+        exit 1
+    fi
+    ok "All ${#TEMPLATE_FILES[@]} templates in sync with ${dir}/"
+}
+
+do_emit_templates() {
+    local dir="$1" name
+    mkdir -p "${dir}"
+    for name in "${TEMPLATE_FILES[@]}"; do
+        template_embedded "${name}" > "${dir}/${name}"
+    done
+    ok "Emitted ${#TEMPLATE_FILES[@]} templates to ${dir}/"
+}
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 main() {
+    set_platform_paths
+    EMIT_TEMPLATES_DIR=""
     local action="client"
 
     # Parse arguments
@@ -1698,8 +2401,20 @@ main() {
             --uninstall)     action="uninstall" ;;
             --upgrade)       action="upgrade" ;;
             --reconfigure)   action="reconfigure" ;;
+            --detect-init)   action="detect-init" ;;
+            --check-templates) action="check-templates" ;;
+            --emit-templates)
+                action="emit-templates"
+                shift
+                if [[ -z "${1:-}" ]]; then
+                    error "--emit-templates requires a directory argument."
+                    exit 1
+                fi
+                EMIT_TEMPLATES_DIR="$1"
+                ;;
             --help|-h)
                 echo "Usage: $0 [--server|--client|--uninstall|--upgrade|--reconfigure]"
+                echo "       $0 --detect-init | --check-templates | --emit-templates DIR"
                 echo ""
                 echo "  (no args)       Configure this machine as a client (proxy setup)"
                 echo "  --client        Same as default — client proxy setup"
@@ -1719,6 +2434,15 @@ main() {
     done
 
     case "${action}" in
+        detect-init)
+            do_detect_init
+            ;;
+        check-templates)
+            do_check_templates
+            ;;
+        emit-templates)
+            do_emit_templates "${EMIT_TEMPLATES_DIR}"
+            ;;
         uninstall)
             require_root
             do_uninstall
@@ -1775,4 +2499,7 @@ main() {
     esac
 }
 
-main "$@"
+# Allow sourcing for tests: only dispatch when executed directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

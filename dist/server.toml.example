@@ -212,6 +212,14 @@ server_key_path = "/var/lib/monopsony/server.key"
 # Type: string
 # path = "/metrics"
 
+# Sprint 27: a client is "stale" when its last heartbeat is older than this
+# many seconds (default 900 = 15x the 60s heartbeat interval). Drives the
+# monopsony_clients_stale_current gauge / per-client age gauges exposed on
+# /metrics for monitor (e.g. CheckMK) alerting.
+# Default: 900
+# Type: integer (seconds)
+# stale_threshold_secs = 900
+
 # ============================================================================
 # Logging
 # ============================================================================

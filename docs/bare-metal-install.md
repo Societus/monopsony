@@ -30,7 +30,7 @@ The installer is interactive — it will ask for:
 4. Sets up PostgreSQL database and user
 5. Generates `/etc/monopsony/server.toml` with your settings
 6. Bootstraps a TLS CA (generates CA + server certificates)
-7. Installs and enables a systemd service (or OpenRC/runit on Alpine)
+7. Installs and enables a service for the detected init system (systemd, OpenRC, runit, s6, SysV init.d — launchd on macOS)
 8. Runs a health check to verify the server started
 
 The dashboard is embedded in the binary — no separate install step needed.

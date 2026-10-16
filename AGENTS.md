@@ -62,10 +62,11 @@ monopsony/
 ├── dist/
 │   ├── container/
 │   │   └── entrypoint.sh          # Container entrypoint (Docker/Podman/rootless detect)
-│   ├── install.sh                  # curl|bash installer (client default, --server for server)
-│   ├── monopsony-server.service    # systemd unit
-│   ├── monopsony-server.openrc     # OpenRC init script
-│   ├── monopsony-client.service    # systemd unit
+│   ├── install.sh                  # curl|bash installer (client default, --server for server); init-system detection incl. launchd
+│   ├── init/                       # Canonical init templates (systemd x2, OpenRC, runit run+log, s6, SysV, launchd plist)
+│   │   ├── monopsony-server.service    # systemd unit (server)
+│   │   ├── monopsony-server.openrc     # OpenRC init script
+│   │   └── monopsony-client.service    # systemd unit (client daemon)
 │   ├── monopsony-tmpfiles.conf     # tmpfiles.d entry
 │   ├── monopsony-sysusers.conf     # sysusers.d entry
 │   ├── server.toml.example         # Fully commented server config

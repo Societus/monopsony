@@ -1,0 +1,5 @@
+#!/bin/sh
+# Monopsony Caching Proxy Server — runit service (run script)
+# Install to: /etc/sv/monopsony-server/run  (enable: ln -s /etc/sv/monopsony-server /var/service/)
+exec chpst -u monopsony:monopsony \
+    @INSTALL_DIR@/monopsony-server --config /etc/monopsony/server.toml @EXTRA_ARGS@ 2>&1

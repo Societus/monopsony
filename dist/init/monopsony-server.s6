@@ -1,0 +1,5 @@
+#!/bin/sh
+# Monopsony Caching Proxy Server — s6 longrun service
+# Install to: /etc/s6/sv/monopsony-server/run  (requires a sibling `type` file containing "longrun")
+exec s6-setuidgid monopsony \
+    @INSTALL_DIR@/monopsony-server --config /etc/monopsony/server.toml @EXTRA_ARGS@ 2>&1

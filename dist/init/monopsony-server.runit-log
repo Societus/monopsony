@@ -1,0 +1,4 @@
+#!/bin/sh
+# Monopsony Caching Proxy Server — runit log service
+# Install to: /etc/sv/monopsony-server/log/run
+exec chpst -u monopsony:monopsony svlogd -tt /var/log/monopsony

@@ -1,0 +1,62 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          monopsony-server
+# Required-Start:    $network $remote_fs postgresql
+# Required-Stop:     $network $remote_fs
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Monopsony caching proxy server
+# Description:       Centralized package caching proxy for LAN environments.
+### END INIT INFO
+
+NAME="monopsony-server"
+DAEMON="@INSTALL_DIR@/monopsony-server"
+DAEMON_ARGS="--config /etc/monopsony/server.toml @EXTRA_ARGS@"
+DAEMON_USER="monopsony"
+DAEMON_GROUP="monopsony"
+PIDFILE="/run/${NAME}.pid"
+LOGDIR="/var/log/monopsony"
+
+SSD="/usr/sbin/start-stop-daemon"
+[ -x "${SSD}" ] || SSD="start-stop-daemon"
+
+is_running() {
+    [ -f "${PIDFILE}" ] && kill -0 "$(cat "${PIDFILE}" 2>/dev/null)" 2>/dev/null
+}
+
+do_start() {
+    if is_running; then
+        echo "${NAME} already running."
+        return 0
+    fi
+    mkdir -p "${LOGDIR}" /var/cache/monopsony /var/lib/monopsony 2>/dev/null || true
+    chown "${DAEMON_USER}:${DAEMON_GROUP}" "${LOGDIR}" /var/cache/monopsony /var/lib/monopsony 2>/dev/null || true
+    "${SSD}" --start --background --make-pidfile --pidfile "${PIDFILE}" \
+        --chuid "${DAEMON_USER}:${DAEMON_GROUP}" \
+        --exec /bin/sh -- -c "exec ${DAEMON} ${DAEMON_ARGS} >> ${LOGDIR}/server.log 2>&1"
+    echo "${NAME} started."
+}
+
+do_stop() {
+    if ! is_running; then
+        echo "${NAME} not running."
+        return 0
+    fi
+    "${SSD}" --stop --pidfile "${PIDFILE}" --retry TERM/10/KILL/5 --remove-pidfile
+    echo "${NAME} stopped."
+}
+
+case "$1" in
+    start)   do_start ;;
+    stop)    do_stop ;;
+    restart) do_stop; sleep 1; do_start ;;
+    status)
+        if is_running; then
+            echo "${NAME} running (pid $(cat "${PIDFILE}" 2>/dev/null))"
+        else
+            echo "${NAME} not running."
+            exit 3
+        fi
+        ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
