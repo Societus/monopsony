@@ -209,18 +209,6 @@ async fn which_yara() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::ExitStatus;
-
-    /// Helper to create a fake ExitStatus from a code.
-    fn exit_code(code: i32) -> std::process::ExitStatus {
-        // ExitStatus can't be constructed directly in stable Rust,
-        // so we use the output of a real process.
-        // For tests we use a trick: run `true` or `false` and grab status.
-        // But that's async and complex. Instead, we test parse_yara_output
-        // with real Command outputs from the integration test suite.
-        // For unit tests, we use the actual `echo` command.
-        unreachable!("use real process output for tests")
-    }
 
     #[test]
     fn parse_yara_output_clean() {

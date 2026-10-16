@@ -243,7 +243,7 @@ async fn tampered_body_aborts_under_content_length_framing() {
     // Zero-byte response with non-200/zero status = connection reset by the
     // enforcement abort — also a failed download. Either way we must land here.
     assert!(
-        resp.status != 200 || resp.aborted || resp.headers.get("content-length").is_none(),
+        resp.status != 200 || resp.aborted || !resp.headers.contains_key("content-length"),
         "status 200 with intact content-length and no abort — framing fix regressed"
     );
 

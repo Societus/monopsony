@@ -180,11 +180,10 @@ fn test_tracker_announce_and_discover() {
         .get("mirrors")
         .expect("response should have 'mirrors' field");
     assert!(
-        mirrors
+        !mirrors
             .as_array()
             .expect("mirrors should be an array")
-            .len()
-            >= 1,
+            .is_empty(),
         "discover should return at least 1 mirror, got: {}",
         mirrors
     );
@@ -222,7 +221,7 @@ fn test_tracker_graceful_shutdown() {
 
     // Port should no longer be in use
     assert!(
-        !TcpStream::connect(format!("127.0.0.1:{}", tracker.port)).is_ok(),
+        TcpStream::connect(format!("127.0.0.1:{}", tracker.port)).is_err(),
         "Tracker port should be released after shutdown"
     );
 }

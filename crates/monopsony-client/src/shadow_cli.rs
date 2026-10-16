@@ -248,7 +248,6 @@ pub fn format_variant(index: usize, v: &RecipeVariant) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
 
     #[test]
     fn package_command_clap_parse() {

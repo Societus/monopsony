@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_wrong_key() {
-        let signer = test_key(3);
+        let _signer = test_key(3);
         let other = test_key(4);
         let att = att_for("https://example.com/p.bin", &"ab".repeat(32));
         let pin = PinState::new(

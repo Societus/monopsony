@@ -196,7 +196,7 @@ mod tests {
             mapping: None,
         };
         debug_assert!(
-            matches!(unmapped.mapping, None),
+            unmapped.mapping.is_none(),
             "None mapping must be representable without error"
         );
         let mapped = Resolution {

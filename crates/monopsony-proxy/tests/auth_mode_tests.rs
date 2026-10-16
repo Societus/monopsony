@@ -13,7 +13,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::body::Body;
 use monopsony_common::config::AuthMode;
 use monopsony_proxy::cache_storage::CacheStorage;
 use monopsony_proxy::object_store_backend::ObjectStoreBackend;

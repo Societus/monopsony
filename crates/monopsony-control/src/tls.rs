@@ -335,7 +335,7 @@ impl TlsManager {
 
     /// Detect the LAN IP address for certificate SAN inclusion.
     /// Returns the first non-loopback, non-link-local IPv4 address.
-    #[cfg_attr(not(test), allow(dead_code))] // fallback path; primary discovery is gRPC-reported
+    #[allow(dead_code)] // fallback path; primary discovery is gRPC-reported (dead in lib-test builds)
     fn detect_lan_ip() -> anyhow::Result<std::net::IpAddr> {
         for iface in pnet::datalink::interfaces() {
             for ip in iface.ips {

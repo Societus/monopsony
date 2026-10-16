@@ -49,7 +49,7 @@ impl PackageManagerBackend for TestBackend {
     }
     fn url_to_cache_path(&self, url: &str) -> Option<String> {
         let parsed = url::Url::parse(url).ok()?;
-        let name = parsed.path_segments()?.last()?.to_string();
+        let name = parsed.path_segments()?.next_back()?.to_string();
         Some(format!("test/{}", name))
     }
     fn proxy_config(&self, _proxy_addr: &str) -> ProxyConfigAction {
@@ -337,26 +337,21 @@ async fn spawn_echo_upstream() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((mut sock, _)) => {
-                    tokio::spawn(async move {
-                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                        let mut buf = [0u8; 4096];
-                        loop {
-                            match sock.read(&mut buf).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(n) => {
-                                    if sock.write_all(&buf[..n]).await.is_err() {
-                                        break;
-                                    }
-                                }
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buf = [0u8; 4096];
+                loop {
+                    match sock.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if sock.write_all(&buf[..n]).await.is_err() {
+                                break;
                             }
                         }
-                    });
+                    }
                 }
-                Err(_) => break,
-            }
+            });
         }
     });
     addr
@@ -426,7 +421,7 @@ async fn test_connect_private_target_blocked() {
     {
         Ok(Ok(0)) | Err(_) => {} // closed / quiet: correct
         Ok(Ok(n)) => leftover.extend_from_slice(&[0u8; 128][..n]),
-        Ok(Err(e)) => {} // reset also fine
+        Ok(Err(_)) => {} // reset also fine
     }
     assert!(
         leftover.is_empty(),
@@ -564,6 +559,7 @@ async fn test_connect_chain_client_to_server() {
             "warn".to_string(),
             0,
             None,
+            None,
         )
         .await
         {
@@ -574,7 +570,10 @@ async fn test_connect_chain_client_to_server() {
     // Wait for the client proxy to come up (poll-connect, bounded).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        if let Ok(_) = tokio::net::TcpStream::connect(("127.0.0.1", client_port)).await {
+        if tokio::net::TcpStream::connect(("127.0.0.1", client_port))
+            .await
+            .is_ok()
+        {
             break;
         }
         assert!(

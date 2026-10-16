@@ -14,7 +14,7 @@ use axum::body::Body;
 use http_body_util::BodyExt;
 use hyper::http::{Request, StatusCode};
 
-use monopsony_client::proxy::{run_proxy, ClientProxyState, ProxyConfig};
+use monopsony_client::proxy::{ClientProxyState, ProxyConfig};
 
 /// Mock server proxy: first `transient_before_success` GETs return
 /// 503 with the Monopsony transient marker; after that, 200 with a body.
@@ -79,20 +79,17 @@ async fn drive_retry(state: Arc<ClientProxyState>, url: &str) -> RetryOutcome {
     loop {
         let request = original.take().unwrap_or_else(|| build_request(url));
         let result = tokio::time::timeout(per_attempt, state.forward_to_server(request)).await;
-        match result {
-            Ok(Ok(mut response)) => {
-                if !monopsony_client::proxy::is_transient_failure(&mut response).await {
-                    let status = response.status();
-                    let body = response.into_body().collect().await.unwrap().to_bytes();
-                    return RetryOutcome {
-                        status,
-                        body_len: body.len(),
-                        attempts: (attempt + 1) as usize,
-                    };
-                }
-                debug_assert!(response.status() == StatusCode::SERVICE_UNAVAILABLE);
+        if let Ok(Ok(mut response)) = result {
+            if !monopsony_client::proxy::is_transient_failure(&mut response).await {
+                let status = response.status();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                return RetryOutcome {
+                    status,
+                    body_len: body.len(),
+                    attempts: (attempt + 1) as usize,
+                };
             }
-            _ => {}
+            debug_assert!(response.status() == StatusCode::SERVICE_UNAVAILABLE);
         }
         let step = Duration::from_millis(50); // fast backoff for tests
         if std::time::Instant::now() + step >= deadline {
@@ -133,7 +130,7 @@ async fn test_retry_succeeds_after_transient_503s() {
         "127.0.0.1:{}",
         server.port()
     ))));
-    let url = format!("http://mirror.example.com/pkg/file.pkg");
+    let url = "http://mirror.example.com/pkg/file.pkg".to_string();
 
     let outcome = drive_retry(state, &url).await;
     assert_eq!(outcome.status, StatusCode::OK);
@@ -151,7 +148,7 @@ async fn test_deadline_exhaustion_returns_503() {
     let mut cfg = test_config(format!("127.0.0.1:{}", server.port()));
     cfg.retry_deadline_ms = 500; // short deadline for test speed
     let state = Arc::new(ClientProxyState::new(cfg));
-    let url = format!("http://mirror.example.com/pkg/file.pkg");
+    let url = "http://mirror.example.com/pkg/file.pkg".to_string();
 
     let start = std::time::Instant::now();
     let outcome = drive_retry(state, &url).await;

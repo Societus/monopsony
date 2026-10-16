@@ -2,7 +2,6 @@
 /// Tests that the client CLI starts, responds to --help, and handles
 /// missing-server / unpaired states gracefully (no panics).
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 /// Run a client subcommand and return (status, stdout, stderr).
 fn run_client(args: &[&str]) -> (i32, String, String) {
