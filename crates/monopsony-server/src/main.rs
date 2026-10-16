@@ -631,6 +631,33 @@ async fn main() -> anyhow::Result<()> {
         let shadow_for_grpc = shared_shadow_manager.clone();
         let tls_for_grpc = tls_manager.clone();
 
+        // Sprint 27 Part A: read staleness threshold from [metrics] config and
+        // start the client-health sweep. The shared tracker lets heartbeat
+        // receipt (both gRPC paths) close a stale episode immediately.
+        let stale_threshold_secs = {
+            match std::fs::read_to_string(&args.config) {
+                Ok(content) => {
+                    #[derive(serde::Deserialize, Default)]
+                    struct MetricsWrapper {
+                        #[serde(default)]
+                        metrics: monopsony_common::config::MetricsConfig,
+                    }
+                    toml::from_str::<MetricsWrapper>(&content)
+                        .map(|w| w.metrics.stale_threshold_secs)
+                        .unwrap_or(900)
+                }
+                Err(_) => 900,
+            }
+        };
+        let stale_tracker = {
+            let monitor =
+                monopsony_control::client_health::ClientHealthMonitor::new(stale_threshold_secs);
+            let tracker = monitor.tracker();
+            monitor.start(db.clone());
+            tracker
+        };
+        info!(stale_threshold_secs, "Client staleness monitoring enabled");
+
         // Read TLS SANs and access control from config file
         let (tls_sans, access_control) = match std::fs::read_to_string(&args.config) {
             Ok(content) => {
@@ -673,6 +700,7 @@ async fn main() -> anyhow::Result<()> {
                 mirror_verify_key,
                 &tls_sans,
                 access_control,
+                Some(stale_tracker),
             )
             .await
             {

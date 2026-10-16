@@ -680,6 +680,26 @@ pub struct MetricsConfig {
     /// Path for metrics endpoint
     #[serde(default = "default_metrics_path")]
     pub path: String,
+    /// Sprint 27 Part A: a client is "stale" when its last heartbeat is older
+    /// than this many seconds. Default 900 = 15× the 60s heartbeat interval.
+    /// Exposed as monopsony_clients_stale_current / per-client age gauges.
+    #[serde(default = "default_stale_threshold_secs")]
+    pub stale_threshold_secs: u64,
+}
+
+fn default_stale_threshold_secs() -> u64 {
+    900
+}
+
+impl Default for MetricsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind: default_metrics_bind(),
+            path: default_metrics_path(),
+            stale_threshold_secs: default_stale_threshold_secs(),
+        }
+    }
 }
 
 fn default_metrics_bind() -> String {
@@ -1326,6 +1346,7 @@ mod tests {
                 enabled: true,
                 bind: "0.0.0.0:9090".to_string(),
                 path: "/metrics".to_string(),
+                stale_threshold_secs: 900,
             },
             logging: LoggingConfig {
                 level: "info".to_string(),

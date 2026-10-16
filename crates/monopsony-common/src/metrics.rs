@@ -21,6 +21,13 @@ pub mod server {
     pub const SCRUB_QUARANTINED_TOTAL: &str = "monopsony_scrub_quarantined_total";
     pub const GRPC_REQUESTS_TOTAL: &str = "monopsony_grpc_requests_total";
     pub const GRPC_REQUEST_DURATION: &str = "monopsony_grpc_request_duration_seconds";
+    /// Sprint 27 Part A: seconds since a client's last heartbeat (per client).
+    pub const CLIENT_HEARTBEAT_AGE: &str = "monopsony_client_last_heartbeat_age_seconds";
+    /// Sprint 27 Part A: episodes where a client crossed the staleness
+    /// threshold (bumped once per fresh→stale transition, not per sweep).
+    pub const CLIENTS_STALE_TOTAL: &str = "monopsony_clients_stale_total";
+    /// Sprint 27 Part A: how many clients are currently past the threshold.
+    pub const CLIENTS_STALE_CURRENT: &str = "monopsony_clients_stale_current";
 }
 
 /// Metric names for mirror subsystem
@@ -98,6 +105,21 @@ pub fn set_clients_connected(count: u64) {
 /// Increment registered clients
 pub fn client_registered() {
     counter!(server::CLIENTS_REGISTERED).increment(1);
+}
+
+/// Sprint 27 Part A: set per-client heartbeat age gauge (seconds since last_seen).
+pub fn set_client_heartbeat_age(client_id: &str, age_secs: u64) {
+    gauge!(server::CLIENT_HEARTBEAT_AGE, "client_id" => client_id.to_string()).set(age_secs as f64);
+}
+
+/// Sprint 27 Part A: record one fresh→stale transition episode.
+pub fn client_stale_episode() {
+    counter!(server::CLIENTS_STALE_TOTAL).increment(1);
+}
+
+/// Sprint 27 Part A: set current count of clients past the staleness threshold.
+pub fn set_clients_stale(count: u64) {
+    gauge!(server::CLIENTS_STALE_CURRENT).set(count as f64);
 }
 
 /// Set cached packages count

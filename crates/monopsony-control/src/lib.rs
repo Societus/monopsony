@@ -1,5 +1,6 @@
 pub mod announce;
 pub mod auth;
+pub mod client_health;
 pub mod discovery;
 pub mod grpc;
 pub mod metrics;

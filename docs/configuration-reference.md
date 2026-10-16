@@ -70,6 +70,7 @@ Loaded by: `monopsony-server --config /etc/monopsony/server.toml`
 | `enabled` | bool | `true` | Enable Prometheus metrics endpoint. |
 | `bind` | string | `"0.0.0.0:9090"` | Bind address for metrics HTTP endpoint. |
 | `path` | string | `"/metrics"` | URL path for Prometheus scrape endpoint. |
+| `stale_threshold_secs` | u64 | `900` | Sprint 27: heartbeat staleness threshold. A client whose last heartbeat is older than this is marked stale (`monopsony_clients_stale_current` gauge, per-client `monopsony_client_last_heartbeat_age_seconds` gauges). |
 
 ### `[logging]` — Log Configuration
 

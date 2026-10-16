@@ -25,6 +25,7 @@ use monopsony_common::proto::monopsony::{
     UnregisterShadowPackageRequest, UnregisterShadowPackageResponse,
 };
 
+use crate::client_health;
 use crate::tls::TlsManager;
 use monopsony_db::db::TamperAlertInsert;
 use monopsony_db::Database;
@@ -41,6 +42,9 @@ pub struct MonopsonyGrpc {
     /// Ed25519 verifying key for pin attestations, delivered to clients on
     /// register. Zeroed ([0u8; 32]) = pinning not provisioned (inert).
     mirror_verify_key: [u8; 32],
+    /// Sprint 27 Part A: shared staleness episode state (also owned by the
+    /// client-health sweep task). None = monitor not started (no DB).
+    stale_tracker: Option<client_health::SharedStaleTracker>,
 }
 
 impl MonopsonyGrpc {
@@ -56,6 +60,7 @@ impl MonopsonyGrpc {
             mirror_manager: None,
             telemetry_enabled: true,
             mirror_verify_key: [0u8; 32],
+            stale_tracker: None,
         }
     }
 
@@ -74,6 +79,16 @@ impl MonopsonyGrpc {
     /// Set telemetry enabled flag from server config.
     pub fn with_telemetry(mut self, enabled: bool) -> Self {
         self.telemetry_enabled = enabled;
+        self
+    }
+
+    /// Sprint 27 Part A: share staleness episode state with the sweep task so
+    /// a received heartbeat closes an open stale episode immediately.
+    pub fn with_stale_tracker(
+        mut self,
+        tracker: Option<client_health::SharedStaleTracker>,
+    ) -> Self {
+        self.stale_tracker = tracker;
         self
     }
 
@@ -141,6 +156,11 @@ impl MonopsonyGrpc {
             ClientId::parse(&req.client_id).context("Invalid client ID in heartbeat request")?;
 
         self.db.heartbeat(&client_id).await?;
+
+        // Sprint 27 Part A: heartbeat received → client is live. Pin the age
+        // gauge to 0 and close any open stale episode immediately, so a
+        // recovering client clears its alert without waiting for the sweep.
+        client_health::note_heartbeat_for(&self.stale_tracker, &client_id).await;
 
         monopsony_common::metrics::grpc_request_duration(
             "heartbeat",
@@ -530,6 +550,7 @@ impl MonopsonyControl for MonopsonyGrpc {
         let shadow_manager = self.shadow_manager.clone();
         let mirror_manager = self.mirror_manager.clone();
         let mirror_verify_key = self.mirror_verify_key;
+        let stale_tracker = self.stale_tracker.clone();
         let mut stream = request.into_inner();
 
         let output = async_stream::stream! {
@@ -538,7 +559,8 @@ impl MonopsonyControl for MonopsonyGrpc {
                     Ok(client_msg) => {
                         let grpc = MonopsonyGrpc::new(db.clone(), tls_manager.clone(), shadow_manager.clone())
                             .with_mirror_manager(mirror_manager.clone())
-                            .with_mirror_verify_key(mirror_verify_key);
+                            .with_mirror_verify_key(mirror_verify_key)
+                            .with_stale_tracker(stale_tracker.clone());
                         yield grpc.dispatch_client_message(client_msg).await;
                     }
                     Err(status) => {
@@ -1201,13 +1223,15 @@ pub async fn start(
     mirror_verify_key: [u8; 32],
     additional_tls_sans: &[String],
     access_control: Option<monopsony_common::config::AccessControlConfig>,
+    stale_tracker: Option<client_health::SharedStaleTracker>,
 ) -> Result<()> {
     info!(addr = %addr, "gRPC server starting (mTLS required)");
 
     let grpc = MonopsonyGrpc::new(db.clone(), tls_manager.clone(), shadow_manager)
         .with_mirror_manager(mirror_manager.clone())
         .with_telemetry(telemetry_enabled)
-        .with_mirror_verify_key(mirror_verify_key);
+        .with_mirror_verify_key(mirror_verify_key)
+        .with_stale_tracker(stale_tracker);
 
     let tls_config =
         tls_manager.tonic_server_tls_config_with_sans(Some(addr.ip()), additional_tls_sans)?;
