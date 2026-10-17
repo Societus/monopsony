@@ -1,7 +1,8 @@
 # Sprint 27 — Client health & CheckMK integration (planned)
 
-**Status:** Part A LANDED (server-only staleness detection + metrics + config knob, 995 tests
-green, clippy clean). Part B still awaiting transport decision (see §6).
+**Status:** Part A LANDED (server-only staleness detection + metrics + config knob; 996 tests
+green on the 2026-10-16 tree, clippy clean). Part B APPROVED 2026-10-16 — Option A transport,
+counts-only v1; CheckMK wiring decided (§6). Implementation in flight.
 
 **Part A as landed:**
 - `monopsony-control/src/client_health.rs` — pure drift decision (`is_stale`, boundary:
@@ -126,11 +127,72 @@ Consequences:
 - Part B update-failure counts are operational only (not sensitive). If exposed, keep client label
   hashed/derived rather than raw hostname.
 
-## 6. Open question for user
+## 6. Decisions (kickoff 2026-10-16 — all resolved)
 
-Part A is approved. Part B transport (A extend-existing vs B new-RPC) needs a call — see table in §4.
+1. **Part B transport: Option A** — extend `HeartbeatRequest` /
+   `ClientMessage.heartbeat` with windowed counters (proto fields 3-5:
+   `failed_updates_window`, `last_update_attempt_ts`, `window_start_ts`).
+   No new RPC surface; both unary and control-stream paths funnel into the
+   same `handle_heartbeat`.
+2. **Counts-only v1:** Sprint 24's `privacy_level` is not in the tree yet
+   (verified 2026-10-16, zero grep hits), so Part B v1 carries counts only —
+   no package names anywhere, any deployment class. The names-only tier is
+   added when Sprint 24's privacy level lands (§4a shape unchanged).
+3. **v1 carries no DB persistence:** the client re-reports the windowed count
+   every 60 s, so the Prometheus gauges self-heal after a server restart
+   within one heartbeat interval. Persistence (clients-row columns or the
+   `client_update_failures` table from §4's cost note) is deferred to
+   Sprint 28's fleet dashboard if it needs history. Blast radius: proto +
+   client tracker + server handler + metrics.
+4. **Failure semantics v1:** an *operational* failure = an update-pipeline
+   action was attempted and errored (v1 producer: remote shadow-assignment
+   registration failure). Policy outcomes — trust refusals, client opt-out,
+   not-installed — are the system working as configured and are NOT counted,
+   so a healthy strict-policy fleet never alerts. The auto-update scheduler
+   hooks the same tracker when it is wired (currently a TODO stub at
+   client main.rs ~1560; the CLI `self-update apply` path cannot report —
+   the process exits before any heartbeat follows).
+5. **CheckMK edition: Raw/CRE** — new site on the ingest hypervisor
+   (personal use + demoing the setup; no existing monitor).
+6. **Ingestion mechanics: active checks + spool-dir script.** Verified
+   against docs.checkmk.com (rev 2026-06): the Prometheus special agent
+   targets a Prometheus *server* query API, not a bare exporter endpoint,
+   so it would require a Prometheus middleman; dynamic host management
+   (per-client auto-hosts) is commercial-only. Raw-native path: active HTTP
+   checks on `/metrics` + `/health` for liveness, plus
+   `monitoring/checkmk/monopsony_spool.py` on the CheckMK host curling
+   `/metrics` and emitting one service per client into the spool directory
+   (native graphs, no extra infra).
+7. **Host aggregation: one CheckMK host** (the monopsony server), per-client
+   services from `client_id` labels — forced by Raw's commercial-only
+   dynamic host management anyway (§3.5).
 
 ## 7. Landing / gating
 
 - Workspace suite must stay green + clippy `-D warnings` clean; target ~950 tests maintained.
-- CheckMK edition check before choosing OVS-push vs active-check ingestion.
+- CheckMK edition check before choosing OVS-push vs active-check ingestion. ✓ resolved 2026-10-16 (§6).
+
+## 8. Part B implementation record (2026-10-16, in flight)
+
+- `proto/monopsony.proto` — `HeartbeatRequest` fields 3-5 (windowed counters,
+  counts-only). Backward compatible: legacy clients send zeros and
+  `window_start_ts == 0` marks "no data" server-side.
+- `crates/monopsony-client/src/update_health.rs` — `UpdateHealthTracker`
+  (Mutex<VecDeque> rolling 24 h window, prune-on-snapshot, failure implies
+  attempt) + `UpdateHealthSnapshot`; 5 unit tests.
+- Client wiring: tracker created in `run_daemon`, cloned into the heartbeat
+  task; unary `heartbeat()` and the control-stream `poll_pending_commands()`
+  heartbeat both carry the snapshot; `handle_remote_assignment` records
+  attempt (post-policy-gate) and failure (registration Err).
+- Server: `grpc.rs::handle_heartbeat` sets
+  `monopsony_client_failed_updates{client_id}` and
+  `monopsony_client_last_update_attempt_age_seconds{client_id}` gauges
+  (helpers in `monopsony-common/src/metrics.rs`).
+- CheckMK bridge: `monitoring/checkmk/monopsony_spool.py` (spool-dir local
+  checks, fleet stale aggregate + per-client age/failed service) and
+  `monitoring/checkmk/README.md` (CRE site setup, host + active checks, cron).
+
+Remaining: fleet bench verification on .58/.20 per
+`references/fleet-bench-verification.md` rules (deploy new client binary,
+force a registration failure, observe gauge + CheckMK line; delete bench
+seeds after).
