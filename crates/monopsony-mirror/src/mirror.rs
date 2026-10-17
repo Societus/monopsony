@@ -1806,10 +1806,8 @@ mod tests {
     /// wrapper in `monopsony-admin`'s pairing listener.
     #[tokio::test]
     async fn ensure_mirrors_stalls_while_config_lock_held() {
-        let dir = std::env::temp_dir().join(format!(
-            "monopsony-mirror-lock-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("monopsony-mirror-lock-test-{}", std::process::id()));
         let mgr = MirrorManager::new(dir, None);
 
         // Hold the write lock, as a wedged sync task would.

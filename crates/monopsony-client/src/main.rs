@@ -1431,7 +1431,10 @@ async fn run_daemon(
                 // update-failure snapshot — counts-only, no package identity)
                 let health_snapshot =
                     update_health_for_task.snapshot(chrono::Utc::now().timestamp());
-                match client.heartbeat(&client_id_for_task, &health_snapshot).await {
+                match client
+                    .heartbeat(&client_id_for_task, &health_snapshot)
+                    .await
+                {
                     Ok(_) => {
                         info!("Heartbeat sent");
                         // Poll server-pushed commands (Sprint 22 slice 22-E2b):

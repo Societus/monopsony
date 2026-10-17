@@ -423,9 +423,7 @@ impl MonopsonyGrpcClient {
         )
         .await
         .map_err(|_| anyhow::anyhow!("Timed out connecting to pairing port {}", pair_addr))?
-        .map_err(|e| {
-            anyhow::anyhow!("Failed to connect to pairing port {}: {}", pair_addr, e)
-        })?;
+        .map_err(|e| anyhow::anyhow!("Failed to connect to pairing port {}: {}", pair_addr, e))?;
 
         let req = PairRequest {
             code: code.to_string(),
@@ -439,16 +437,16 @@ impl MonopsonyGrpcClient {
         stream.write_all(&len.to_le_bytes()).await?;
         stream.write_all(&req_bytes).await?;
 
-        let resp_buf =
-            tokio::time::timeout(PAIR_RESPONSE_TIMEOUT, read_pair_response(&mut stream))
-                .await
-                .map_err(|_| {
-                    anyhow::anyhow!(
-                        "Timed out after {:?} waiting for the pairing response from {} \
+        let resp_buf = tokio::time::timeout(PAIR_RESPONSE_TIMEOUT, read_pair_response(&mut stream))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Timed out after {:?} waiting for the pairing response from {} \
                          — the server accepted the connection but never completed the exchange",
-                        PAIR_RESPONSE_TIMEOUT, pair_addr
-                    )
-                })??;
+                    PAIR_RESPONSE_TIMEOUT,
+                    pair_addr
+                )
+            })??;
 
         let resp = PairResponse::decode(resp_buf.as_slice())
             .map_err(|e| anyhow::anyhow!("Failed to decode pair response: {}", e))?;

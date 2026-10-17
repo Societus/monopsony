@@ -327,17 +327,15 @@ async fn run_pairing_listener(
             // Read length-prefixed PairRequest, bounded so a silent
             // connection (port probe, wedged client) can't hold the
             // single-accept session open forever.
-            let req_buf = tokio::time::timeout(
-                PAIRING_IO_TIMEOUT,
-                read_pair_request(&mut socket),
-            )
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Timed out after {:?} reading pairing request from {} — connection silent",
-                    PAIRING_IO_TIMEOUT, addr
-                )
-            })??;
+            let req_buf = tokio::time::timeout(PAIRING_IO_TIMEOUT, read_pair_request(&mut socket))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Timed out after {:?} reading pairing request from {} — connection silent",
+                        PAIRING_IO_TIMEOUT,
+                        addr
+                    )
+                })??;
 
             let req = monopsony_common::proto::monopsony::PairRequest::decode(req_buf.as_slice())
                 .map_err(|e| anyhow::anyhow!("Failed to decode pair request: {}", e))?;
