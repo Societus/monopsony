@@ -51,6 +51,7 @@ mod pin_verify;
 mod proxy;
 mod self_update;
 mod trust;
+mod update_health;
 
 #[derive(Parser, Debug)]
 #[command(name = "monopsony-client", version)]
@@ -949,6 +950,7 @@ async fn handle_remote_assignment(
     accept_remote: bool,
     trust_config: &monopsony_common::config::ShadowPackageTrustConfig,
     mirror_verify_key: Option<[u8; 32]>,
+    update_health: &update_health::UpdateHealthTracker,
 ) {
     // (a) Client opt-in gate — refuse before touching the payload.
     if !accept_remote {
@@ -1092,6 +1094,9 @@ async fn handle_remote_assignment(
         .unwrap_or("")
         .to_string();
     let (install_paths, service_name) = shadow_cli::extract_install_fields(&recipe_toml);
+    // Sprint 27 Part B: an assignment that passed every policy gate and is
+    // being registered counts as one update-pipeline attempt.
+    update_health.record_attempt(chrono::Utc::now().timestamp());
     match client
         .register_shadow_package(
             client_id,
@@ -1116,7 +1121,11 @@ async fn handle_remote_assignment(
             version = %detected_version,
             "Remote shadow assignment recorded"
         ),
-        Err(e) => warn!("remote assignment registration failed (ignored): {}", e),
+        Err(e) => {
+            // Sprint 27 Part B: operational failure → windowed telemetry.
+            update_health.record_failure(chrono::Utc::now().timestamp());
+            warn!("remote assignment registration failed (ignored): {}", e);
+        }
     }
 }
 
@@ -1131,6 +1140,7 @@ async fn handle_heartbeat_command(
     accept_remote: bool,
     trust_config: &monopsony_common::config::ShadowPackageTrustConfig,
     mirror_verify_key: Option<[u8; 32]>,
+    update_health: &update_health::UpdateHealthTracker,
 ) {
     use monopsony_common::proto::monopsony::command::CommandType;
 
@@ -1155,6 +1165,7 @@ async fn handle_heartbeat_command(
         accept_remote,
         trust_config,
         mirror_verify_key,
+        update_health,
     )
     .await;
 }
@@ -1332,11 +1343,18 @@ async fn run_daemon(
     let _accept_remote = trust_config.accept_remote_assignment;
     let mirror_key_for_task = load_mirror_verify_key(&cert_dir);
 
+    // Sprint 27 Part B: windowed update-failure telemetry (counts-only).
+    // Producers record here; the heartbeat task snapshots it every beat.
+    let update_health = std::sync::Arc::new(update_health::UpdateHealthTracker::new(
+        update_health::DEFAULT_WINDOW_SECS,
+    ));
+
     // Spawn background task for heartbeat and inventory sync
     let client_id_for_task = client_id.clone();
     let cert_dir_for_task = cert_dir.clone();
     let server_addr_for_task = server_addr.clone();
     let pin_for_heartbeat = pin_state.clone();
+    let update_health_for_task = update_health.clone();
     let mut catalog_scan_guard = catalog_scan::ScanGuard::new(Duration::from_secs(600));
     let trust_config_for_task = trust_config.clone();
     let heartbeat_handle = tokio::spawn(async move {
@@ -1409,8 +1427,11 @@ async fn run_daemon(
             loop {
                 interval.tick().await;
 
-                // Send heartbeat
-                match client.heartbeat(&client_id_for_task).await {
+                // Send heartbeat (Sprint 27 Part B: carries the windowed
+                // update-failure snapshot — counts-only, no package identity)
+                let health_snapshot =
+                    update_health_for_task.snapshot(chrono::Utc::now().timestamp());
+                match client.heartbeat(&client_id_for_task, &health_snapshot).await {
                     Ok(_) => {
                         info!("Heartbeat sent");
                         // Poll server-pushed commands (Sprint 22 slice 22-E2b):
@@ -1418,7 +1439,10 @@ async fn run_daemon(
                         // the ControlStream when an assignment is pending.
                         // Failures are logged and swallowed so the heartbeat
                         // loop never degrades.
-                        match client.poll_pending_commands(&client_id_for_task).await {
+                        match client
+                            .poll_pending_commands(&client_id_for_task, &health_snapshot)
+                            .await
+                        {
                             Ok(Some(command)) => {
                                 handle_heartbeat_command(
                                     &mut client,
@@ -1427,6 +1451,7 @@ async fn run_daemon(
                                     trust_config_for_task.accept_remote_assignment,
                                     &trust_config_for_task,
                                     mirror_key_for_task,
+                                    &update_health_for_task,
                                 )
                                 .await;
                             }

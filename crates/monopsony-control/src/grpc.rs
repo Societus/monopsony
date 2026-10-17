@@ -162,6 +162,22 @@ impl MonopsonyGrpc {
         // recovering client clears its alert without waiting for the sweep.
         client_health::note_heartbeat_for(&self.stale_tracker, &client_id).await;
 
+        // Sprint 27 Part B: windowed update-failure telemetry (counts-only).
+        // window_start_ts == 0 marks a pre-Part-B client with no data.
+        if req.window_start_ts > 0 {
+            monopsony_common::metrics::set_client_failed_updates(
+                &client_id.to_string(),
+                req.failed_updates_window,
+            );
+            if req.last_update_attempt_ts > 0 {
+                let age = (chrono::Utc::now().timestamp() - req.last_update_attempt_ts).max(0);
+                monopsony_common::metrics::set_client_update_attempt_age(
+                    &client_id.to_string(),
+                    age as u64,
+                );
+            }
+        }
+
         monopsony_common::metrics::grpc_request_duration(
             "heartbeat",
             start.elapsed().as_secs_f64(),

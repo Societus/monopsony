@@ -75,6 +75,11 @@ message TamperAlert {
 message HeartbeatRequest {
     string client_id = 1;
     int64 timestamp = 2;
+    // Sprint 27 Part B: windowed update-failure telemetry (counts-only — no
+    // package identity ever crosses the wire in v1; see plan §4a/§6).
+    uint32 failed_updates_window = 3; // failures within [window_start_ts, now]
+    int64 last_update_attempt_ts = 4; // unix seconds; 0 = no attempt recorded
+    int64 window_start_ts = 5;        // unix seconds; 0 = legacy client, no data
 }
 
 message HeartbeatResponse {

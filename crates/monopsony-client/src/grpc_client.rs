@@ -212,10 +212,18 @@ impl MonopsonyGrpcClient {
         Ok((resp.client_id, certs, resp.mirror_verify_key))
     }
 
-    pub async fn heartbeat(&mut self, client_id: &str) -> anyhow::Result<i64> {
+    pub async fn heartbeat(
+        &mut self,
+        client_id: &str,
+        health: &crate::update_health::UpdateHealthSnapshot,
+    ) -> anyhow::Result<i64> {
         let req = HeartbeatRequest {
             client_id: client_id.to_string(),
             timestamp: chrono::Utc::now().timestamp(),
+            // Sprint 27 Part B: windowed update-failure snapshot (counts-only).
+            failed_updates_window: health.failed_updates_window,
+            last_update_attempt_ts: health.last_update_attempt_ts,
+            window_start_ts: health.window_start_ts,
         };
 
         debug!(client_id = client_id, "Sending heartbeat");
@@ -280,6 +288,7 @@ impl MonopsonyGrpcClient {
     pub async fn poll_pending_commands(
         &mut self,
         client_id: &str,
+        health: &crate::update_health::UpdateHealthSnapshot,
     ) -> anyhow::Result<Option<monopsony_common::proto::monopsony::Command>> {
         use futures_util::StreamExt;
         use monopsony_common::proto::monopsony::{client_message, server_message, ClientMessage};
@@ -288,6 +297,11 @@ impl MonopsonyGrpcClient {
             msg: Some(client_message::Msg::Heartbeat(HeartbeatRequest {
                 client_id: client_id.to_string(),
                 timestamp: chrono::Utc::now().timestamp(),
+                // Sprint 27 Part B: same windowed snapshot as the unary
+                // heartbeat — this stream heartbeat hits the same handler.
+                failed_updates_window: health.failed_updates_window,
+                last_update_attempt_ts: health.last_update_attempt_ts,
+                window_start_ts: health.window_start_ts,
             })),
         };
         let outbound = futures_util::stream::iter(vec![message]);

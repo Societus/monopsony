@@ -28,6 +28,10 @@ pub mod server {
     pub const CLIENTS_STALE_TOTAL: &str = "monopsony_clients_stale_total";
     /// Sprint 27 Part A: how many clients are currently past the threshold.
     pub const CLIENTS_STALE_CURRENT: &str = "monopsony_clients_stale_current";
+    /// Sprint 27 Part B: windowed update-failure count per client (counts-only).
+    pub const CLIENT_FAILED_UPDATES: &str = "monopsony_client_failed_updates";
+    /// Sprint 27 Part B: seconds since the client's last update attempt.
+    pub const CLIENT_UPDATE_ATTEMPT_AGE: &str = "monopsony_client_last_update_attempt_age_seconds";
 }
 
 /// Metric names for mirror subsystem
@@ -105,6 +109,18 @@ pub fn set_clients_connected(count: u64) {
 /// Increment registered clients
 pub fn client_registered() {
     counter!(server::CLIENTS_REGISTERED).increment(1);
+}
+
+/// Sprint 27 Part B: set per-client windowed update-failure count (gauge).
+pub fn set_client_failed_updates(client_id: &str, count: u32) {
+    gauge!(server::CLIENT_FAILED_UPDATES, "client_id" => client_id.to_string()).set(count as f64);
+}
+
+/// Sprint 27 Part B: set seconds since a client's last update attempt.
+/// Callers must skip this when the client reported no attempt (ts == 0).
+pub fn set_client_update_attempt_age(client_id: &str, age_secs: u64) {
+    gauge!(server::CLIENT_UPDATE_ATTEMPT_AGE, "client_id" => client_id.to_string())
+        .set(age_secs as f64);
 }
 
 /// Sprint 27 Part A: set per-client heartbeat age gauge (seconds since last_seen).
