@@ -1,0 +1,122 @@
+# Monopsony Client PKGBUILD — Arch Linux package
+# Build: makepkg -srci   Install: pacman -U monopsony-client-*.pkg.tar.zst
+
+pkgname=monopsony-client
+pkgver=1.0.0_rc2
+pkgrel=1
+pkgdesc="Monopsony client daemon — local HTTP proxy and package manager integration for the Monopsony caching proxy"
+arch=('x86_64' 'aarch64')
+url="https://base.societus.club/societus/monopsony"
+license=('MIT')
+depends=()
+makedepends=()
+source=("monopsony-client-${pkgver}::file://${pkgname}-${pkgver}")
+sha256sums=('SKIP')
+
+package() {
+    # Binary
+    install -Dm755 "${srcdir}/monopsony-client-${pkgver}" "${pkgdir}/usr/bin/monopsony-client"
+
+    # Example config
+    install -Dm644 /dev/null "${pkgdir}/etc/monopsony/client.toml.example"
+    cat > "${pkgdir}/etc/monopsony/client.toml.example" <<'EOF'
+# Monopsony Client Configuration — example
+# Copy to /etc/monopsony/client.toml and edit.
+
+[server]
+# Address of the Monopsony server (host:port). If unset, the client
+# discovers the server via mDNS.
+# address = "10.10.2.122"
+# grpc_port = 50051
+
+# Directory for paired client certificates and trust state.
+cert_dir = "~/.config/monopsony"
+
+[client]
+# Report package install telemetry to the server.
+report_install_telemetry = true
+
+[shadow_trust]
+# Policy for remote shadow recipe assignments: trusted_server_only, paranoid, permissive
+policy = "trusted_server_only"
+accept_remote_assignment = false
+
+[ledger]
+enabled = true
+policy = "warn"
+max_index_age_secs = 604800
+
+[logging]
+level = "info"
+format = "json"
+EOF
+
+    # systemd service unit
+    install -Dm644 /dev/null "${pkgdir}/etc/systemd/system/monopsony-client.service"
+    cat > "${pkgdir}/etc/systemd/system/monopsony-client.service" <<'EOF'
+[Unit]
+Description=Monopsony Client Daemon
+Documentation=https://base.societus.club/societus/monopsony
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/monopsony-client daemon --config /etc/monopsony/client.toml
+Restart=on-failure
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+LimitNOFILE=8192
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+User=root
+Group=root
+
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # tmpfiles.d config
+    install -Dm644 /dev/null "${pkgdir}/usr/lib/tmpfiles.d/monopsony-client.conf"
+    cat > "${pkgdir}/usr/lib/tmpfiles.d/monopsony-client.conf" <<'EOF'
+d /run/monopsony 0755 root root -
+EOF
+
+    # sysusers.d config
+    install -Dm644 /dev/null "${pkgdir}/usr/lib/sysusers.d/monopsony-client.conf"
+    cat > "${pkgdir}/usr/lib/sysusers.d/monopsony-client.conf" <<'EOF'
+# Monopsony client user (optional; daemon runs as root by default)
+#u monopsony - "Monopsony client" /var/lib/monopsony /usr/sbin/nologin
+EOF
+
+    # License
+    install -Dm644 /dev/null "${pkgdir}/usr/share/licenses/monopsony-client/LICENSE"
+    cat > "${pkgdir}/usr/share/licenses/monopsony-client/LICENSE" <<'EOF'
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+EOF
+}

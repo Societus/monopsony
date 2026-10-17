@@ -1,0 +1,19 @@
+Monopsony client 1.0.0-rc2 has been installed.
+
+To get started:
+
+1. Copy the example config:
+   cp /usr/local/etc/monopsony/client.toml.example /usr/local/etc/monopsony/client.toml
+   # Edit client.toml with your server address
+
+2. Pair with your Monopsony server:
+   monopsony-client pair --server <host> --code <code>
+
+3. Enable and start the service:
+   sysrc monopsony_client_enable="YES"
+   service monopsony-client start
+
+4. Configure your package managers to use the local proxy:
+   monopsony-client configure --server <host>
+
+The local HTTP proxy listens on 127.0.0.1:3129 by default.

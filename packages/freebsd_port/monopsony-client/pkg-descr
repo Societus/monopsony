@@ -1,0 +1,18 @@
+Monopsony client daemon - local HTTP proxy and package manager integration
+
+Monopsony is a centralized package caching proxy system. The client runs a
+local HTTP proxy (127.0.0.1:3129) that redirects package manager traffic
+(apt, pacman, dnf, apk, xbps, emerge, zypper, winget, choco, scoop, brew,
+npm, pip, cargo) through a central Monopsony server cache. It also handles
+server pairing (mTLS), shadow package management, and distribution mirror
+configuration.
+
+WWW: https://base.societus.club/societus/monopsony
+
+After installation:
+
+1. Pair with a server: monopsony-client pair --server <host> --code <code>
+2. Start the daemon: service monopsony-client start
+3. Configure package managers: monopsony-client configure --server <host>
+
+The rc.d script monopsony-client is installed for service management.
