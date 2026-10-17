@@ -1799,6 +1799,35 @@ mod tests {
         assert!(!config.public);
     }
 
+    /// Regression documentation for the 2026-10-17 pairing hang: while the
+    /// `configs` lock is held (e.g. by a wedged sync task),
+    /// `ensure_mirrors_for_package_managers` stalls indefinitely. Callers on
+    /// the pairing path must bound their wait — see the MIRROR_ENSURE_TIMEOUT
+    /// wrapper in `monopsony-admin`'s pairing listener.
+    #[tokio::test]
+    async fn ensure_mirrors_stalls_while_config_lock_held() {
+        let dir = std::env::temp_dir().join(format!(
+            "monopsony-mirror-lock-test-{}",
+            std::process::id()
+        ));
+        let mgr = MirrorManager::new(dir, None);
+
+        // Hold the write lock, as a wedged sync task would.
+        let _guard = mgr.configs.write().await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            mgr.ensure_mirrors_for_package_managers(&["apt".to_string()]),
+        )
+        .await;
+
+        // Still waiting on the lock when the deadline hit.
+        assert!(
+            result.is_err(),
+            "ensure_mirrors should stall while the config lock is held"
+        );
+    }
+
     #[test]
     fn test_mirror_config_deserialize() {
         let toml = r#"

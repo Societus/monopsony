@@ -14,6 +14,16 @@ use tracing::{debug, info};
 
 use crate::ws_transport::WsTransport;
 
+/// Pairing client deadlines. A server that accepts the TCP connection but
+/// never completes the protobuf exchange must surface an error, not an
+/// infinite hang — observed 2026-10-17 when a server-side mirror-lock
+/// deadlock froze the pairing response after client registration.
+const PAIR_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const PAIR_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Cap on the pairing response length prefix — parity with the server's
+/// request cap and the WebSocket pairing path's sanity check.
+const PAIR_RESPONSE_MAX: usize = 65536;
+
 pub struct MonopsonyGrpcClient {
     client: MonopsonyControlClient<Channel>,
     client_id: Option<String>,
@@ -400,18 +410,22 @@ impl MonopsonyGrpcClient {
         package_managers: &[String],
     ) -> anyhow::Result<(String, ClientCerts, String, Option<String>, Vec<u8>)> {
         use prost::Message;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let pair_addr = if server_addr.ends_with(":50052") {
             server_addr.to_string()
         } else {
             format!("{}:50052", server_addr.trim_end_matches(":50051"))
         };
-        let mut stream = tokio::net::TcpStream::connect(&pair_addr)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!("Failed to connect to pairing port {}: {}", pair_addr, e)
-            })?;
+        let mut stream = tokio::time::timeout(
+            PAIR_CONNECT_TIMEOUT,
+            tokio::net::TcpStream::connect(&pair_addr),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out connecting to pairing port {}", pair_addr))?
+        .map_err(|e| {
+            anyhow::anyhow!("Failed to connect to pairing port {}: {}", pair_addr, e)
+        })?;
 
         let req = PairRequest {
             code: code.to_string(),
@@ -425,11 +439,16 @@ impl MonopsonyGrpcClient {
         stream.write_all(&len.to_le_bytes()).await?;
         stream.write_all(&req_bytes).await?;
 
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await?;
-        let resp_len = u32::from_le_bytes(len_buf) as usize;
-        let mut resp_buf = vec![0u8; resp_len];
-        stream.read_exact(&mut resp_buf).await?;
+        let resp_buf =
+            tokio::time::timeout(PAIR_RESPONSE_TIMEOUT, read_pair_response(&mut stream))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Timed out after {:?} waiting for the pairing response from {} \
+                         — the server accepted the connection but never completed the exchange",
+                        PAIR_RESPONSE_TIMEOUT, pair_addr
+                    )
+                })??;
 
         let resp = PairResponse::decode(resp_buf.as_slice())
             .map_err(|e| anyhow::anyhow!("Failed to decode pair response: {}", e))?;
@@ -942,5 +961,68 @@ impl MonopsonyGrpcClient {
         let resp = resp.into_inner();
         debug!(accepted = resp.accepted, message = %resp.message, "Shadow scan ack");
         Ok((resp.accepted, resp.message))
+    }
+}
+
+/// Read one `[u32 LE length][protobuf bytes]` PairResponse frame from
+/// `stream`, enforcing the 64 KiB cap (parity with the server's request cap
+/// and the WebSocket pairing path).
+async fn read_pair_response<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+) -> anyhow::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;
+    let resp_len = u32::from_le_bytes(len_buf) as usize;
+    if resp_len > PAIR_RESPONSE_MAX {
+        anyhow::bail!("Pairing response too large: {} bytes", resp_len);
+    }
+    let mut resp_buf = vec![0u8; resp_len];
+    stream.read_exact(&mut resp_buf).await?;
+    Ok(resp_buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn read_pair_response_decodes_valid_frame() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let payload = b"resp-frame".to_vec();
+        client
+            .write_all(&(payload.len() as u32).to_le_bytes())
+            .await
+            .unwrap();
+        client.write_all(&payload).await.unwrap();
+
+        let buf = read_pair_response(&mut server).await.unwrap();
+        assert_eq!(buf, payload);
+    }
+
+    #[tokio::test]
+    async fn read_pair_response_rejects_oversized_length() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&1_000_000u32.to_le_bytes()).await.unwrap();
+
+        let err = read_pair_response(&mut server).await.unwrap_err();
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn read_pair_response_errors_on_truncated_frame() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&16u32.to_le_bytes()).await.unwrap();
+        client.write_all(b"short").await.unwrap();
+        drop(client); // EOF mid-frame
+
+        assert!(read_pair_response(&mut server).await.is_err());
     }
 }

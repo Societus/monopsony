@@ -22,6 +22,17 @@ const PAIRING_TIMEOUT_SECS: u64 = 300; // 5 minutes
 /// Port for the plaintext pairing listener (same as the old CLI command).
 const PAIRING_PORT: u16 = 50052;
 
+/// How long the pairing exchange waits for socket reads/writes before giving
+/// up. A silent or wedged peer must fail the session, not hold the
+/// single-accept listener open forever.
+const PAIRING_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Upper bound for pairing's best-effort mirror auto-creation. Pairing is
+/// control-plane critical; mirror config creation is not — if the mirror
+/// subsystem's config lock is contended or stuck, pairing proceeds without it
+/// (2026-10-17: a wedged sync task froze pairing mid-handshake exactly here).
+const MIRROR_ENSURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// In-memory state for a single active pairing session.
 #[derive(Debug, Clone, Serialize)]
 pub struct PairingSession {
@@ -288,7 +299,7 @@ async fn run_pairing_listener(
     pairing_manager: std::sync::Arc<tokio::sync::Mutex<Option<PairingSession>>>,
 ) -> anyhow::Result<()> {
     use prost::Message;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::AsyncWriteExt;
 
     let pair_addr: SocketAddr = format!("0.0.0.0:{}", PAIRING_PORT).parse()?;
     let pair_listener = tokio::net::TcpListener::bind(pair_addr)
@@ -313,24 +324,20 @@ async fn run_pairing_listener(
         Ok(Ok((mut socket, addr))) => {
             info!("Pairing client connected from {}", addr);
 
-            // Read length-prefixed PairRequest
-            let mut len_buf = [0u8; 4];
-            socket
-                .read_exact(&mut len_buf)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to read pairing request length: {}", e))?;
-            let req_len = u32::from_le_bytes(len_buf) as usize;
-
-            // Sanity-check the length to prevent allocation bombs
-            if req_len > 65536 {
-                anyhow::bail!("Pairing request too large: {} bytes", req_len);
-            }
-
-            let mut req_buf = vec![0u8; req_len];
-            socket
-                .read_exact(&mut req_buf)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to read pairing request body: {}", e))?;
+            // Read length-prefixed PairRequest, bounded so a silent
+            // connection (port probe, wedged client) can't hold the
+            // single-accept session open forever.
+            let req_buf = tokio::time::timeout(
+                PAIRING_IO_TIMEOUT,
+                read_pair_request(&mut socket),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Timed out after {:?} reading pairing request from {} — connection silent",
+                    PAIRING_IO_TIMEOUT, addr
+                )
+            })??;
 
             let req = monopsony_common::proto::monopsony::PairRequest::decode(req_buf.as_slice())
                 .map_err(|e| anyhow::anyhow!("Failed to decode pair request: {}", e))?;
@@ -369,13 +376,28 @@ async fn run_pairing_listener(
                 db.record_pairing(&registered, chrono::Utc::now()).await?;
                 info!("Client registered and paired in DB: {}", registered.0);
 
-                // Auto-create mirror configs for the client's package managers
+                // Auto-create mirror configs for the client's package
+                // managers. Bounded: the mirror manager's config lock can be
+                // held indefinitely by a stuck sync task (2026-10-17 tailnet
+                // pairing hang), and pairing must never wedge on it.
                 if let Some(ref mirror_mgr) = mirror_manager {
-                    let created = mirror_mgr
-                        .ensure_mirrors_for_package_managers(&req.package_managers)
-                        .await;
-                    if created > 0 {
-                        info!(client = %req.hostname, created = created, "Auto-created mirror configs from pairing");
+                    match tokio::time::timeout(
+                        MIRROR_ENSURE_TIMEOUT,
+                        mirror_mgr.ensure_mirrors_for_package_managers(&req.package_managers),
+                    )
+                    .await
+                    {
+                        Ok(created) if created > 0 => {
+                            info!(client = %req.hostname, created = created, "Auto-created mirror configs from pairing");
+                        }
+                        Ok(_) => {}
+                        Err(_) => {
+                            warn!(
+                                client = %req.hostname,
+                                "Mirror auto-creation timed out after {:?} (mirror subsystem busy) — continuing pairing without it",
+                                MIRROR_ENSURE_TIMEOUT
+                            );
+                        }
                     }
                 }
 
@@ -427,8 +449,12 @@ async fn run_pairing_listener(
             };
             let resp_bytes = resp.encode_to_vec();
             let resp_len = resp_bytes.len() as u32;
-            socket.write_all(&resp_len.to_le_bytes()).await?;
-            socket.write_all(&resp_bytes).await?;
+            tokio::time::timeout(PAIRING_IO_TIMEOUT, async {
+                socket.write_all(&resp_len.to_le_bytes()).await?;
+                socket.write_all(&resp_bytes).await
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out sending pairing response to {}", addr))??;
 
             info!(
                 "Pairing certificates sent to {} (client_id={})",
@@ -470,6 +496,33 @@ async fn run_pairing_listener(
     }
 
     Ok(())
+}
+
+/// Read one `[u32 LE length][protobuf bytes]` frame from `stream`, enforcing
+/// the 64 KiB cap shared with the client's response reader.
+async fn read_pair_request<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+) -> anyhow::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read pairing request length: {}", e))?;
+    let req_len = u32::from_le_bytes(len_buf) as usize;
+
+    // Sanity-check the length to prevent allocation bombs
+    if req_len > 65536 {
+        anyhow::bail!("Pairing request too large: {} bytes", req_len);
+    }
+
+    let mut req_buf = vec![0u8; req_len];
+    stream
+        .read_exact(&mut req_buf)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read pairing request body: {}", e))?;
+    Ok(req_buf)
 }
 
 /// Helper: update the pairing session inside the mutex.
@@ -537,5 +590,44 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"active\":false"));
         assert!(!json.contains("code"));
+    }
+
+    #[tokio::test]
+    async fn read_pair_request_decodes_valid_frame() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let payload = b"pair-frame".to_vec();
+        client
+            .write_all(&(payload.len() as u32).to_le_bytes())
+            .await
+            .unwrap();
+        client.write_all(&payload).await.unwrap();
+
+        let buf = read_pair_request(&mut server).await.unwrap();
+        assert_eq!(buf, payload);
+    }
+
+    #[tokio::test]
+    async fn read_pair_request_rejects_oversized_length() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&1_000_000u32.to_le_bytes()).await.unwrap();
+
+        let err = read_pair_request(&mut server).await.unwrap_err();
+        assert!(err.to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn read_pair_request_errors_on_truncated_frame() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&16u32.to_le_bytes()).await.unwrap();
+        client.write_all(b"short").await.unwrap();
+        drop(client); // EOF mid-frame
+
+        assert!(read_pair_request(&mut server).await.is_err());
     }
 }
