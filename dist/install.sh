@@ -27,8 +27,13 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Globals
 # ---------------------------------------------------------------------------
-readonly VERSION="0.1.0"
-readonly DOWNLOAD_BASE="https://base.societus.club/societus/monopsony/releases/download"
+# Pinned fallback when the latest-release lookup fails (no network / API down).
+# Must match the newest tagged release: bump when cutting releases.
+readonly VERSION_FALLBACK="1.0.0-rc2"
+# Release artifacts are hosted on the PUBLIC GitHub mirror — the Forgejo
+# instance is internal (forward-auth gated) and cannot serve curl|bash.
+readonly DOWNLOAD_BASE="https://github.com/Societus/monopsony/releases/download"
+readonly RELEASES_API="https://api.github.com/repos/Societus/monopsony/releases/latest"
 readonly BINARY_NAME="monopsony-server"
 # Mutable: macOS re-points to /usr/local/bin in set_platform_paths()
 INSTALL_DIR="/usr/bin"
@@ -235,9 +240,33 @@ get_installed_version() {
 }
 
 # ---------------------------------------------------------------------------
-# Download binary
+# Version resolution (pairing-v2 Phase 0)
 # ---------------------------------------------------------------------------
+# Resolution order: MONOPSONY_VERSION env (also set by --version) >
+# latest release tag from the GitHub API > VERSION_FALLBACK.
+# Proven failure mode this fixes: a hardcoded VERSION fetches a nonexistent
+# release on re-run (v0.1.0 404).
+resolve_version() {
+    if [[ -n "${MONOPSONY_VERSION:-}" ]]; then
+        echo "${MONOPSONY_VERSION#v}"
+        return 0
+    fi
+
+    local tag=""
+    tag="$(curl -fsSL --retry 2 --max-time 15 "${RELEASES_API}" 2>/dev/null \
+        | grep -o '"tag_name"[^,]*' | head -1 \
+        | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')" || true
+    if [[ -n "${tag}" ]]; then
+        echo "${tag#v}"
+        return 0
+    fi
+
+    warn "Could not resolve the latest release; falling back to v${VERSION_FALLBACK}."
+    echo "${VERSION_FALLBACK}"
+}
+
 download_binary() {
+    local kind="${1:-server}"   # server | client
     local arch os_ver
     arch="$(detect_arch)"
     os_ver="$(detect_os | cut -d: -f1)"
@@ -247,14 +276,14 @@ download_binary() {
     os_type="$(uname -s)"
     if [[ "${os_type}" == "Darwin" ]]; then
         if [[ "${arch}" == "aarch64" ]]; then
-            asset_name="monopsony-server-v${VERSION}-darwin-arm64.tar.gz"
+            asset_name="monopsony-${kind}-v${VERSION}-darwin-arm64.tar.gz"
         else
-            asset_name="monopsony-server-v${VERSION}-darwin-x86_64.tar.gz"
+            asset_name="monopsony-${kind}-v${VERSION}-darwin-x86_64.tar.gz"
         fi
     else
-        asset_name="monopsony-server-v${VERSION}-linux-x86_64.tar.gz"
+        asset_name="monopsony-${kind}-v${VERSION}-linux-x86_64.tar.gz"
         if [[ "${arch}" == "aarch64" ]]; then
-            asset_name="monopsony-server-v${VERSION}-linux-aarch64.tar.gz"
+            asset_name="monopsony-${kind}-v${VERSION}-linux-aarch64.tar.gz"
         fi
     fi
 
@@ -317,12 +346,13 @@ download_binary() {
     # Extract and install
     info "Extracting and installing..."
     tar xzf "${tmpdir}/${asset_name}" -C "${tmpdir}/"
+    local bin_name="monopsony-${kind}"
     # /usr/local/bin does not exist by default on Apple Silicon — create it
     mkdir -p "${INSTALL_DIR}"
-    mv "${tmpdir}/monopsony-server" "${INSTALL_DIR}/${BINARY_NAME}"
-    chmod 755 "${INSTALL_DIR}/${BINARY_NAME}"
+    mv "${tmpdir}/${bin_name}" "${INSTALL_DIR}/${bin_name}"
+    chmod 755 "${INSTALL_DIR}/${bin_name}"
     rm -rf "${tmpdir}"
-    ok "Binary installed to ${INSTALL_DIR}/${BINARY_NAME}"
+    ok "Binary installed to ${INSTALL_DIR}/${bin_name}"
 }
 
 # ---------------------------------------------------------------------------
@@ -2392,17 +2422,28 @@ main() {
     set_platform_paths
     EMIT_TEMPLATES_DIR=""
     local action="client"
+    local version_pinned=false
+    local client_explicit=false
 
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --server)        action="server" ;;
-            --client)        action="client" ;;
+            --client)        action="client"; client_explicit=true ;;
             --uninstall)     action="uninstall" ;;
             --upgrade)       action="upgrade" ;;
             --reconfigure)   action="reconfigure" ;;
             --detect-init)   action="detect-init" ;;
             --check-templates) action="check-templates" ;;
+            --version)
+                shift
+                if [[ -z "${1:-}" ]]; then
+                    error "--version requires a value (e.g. 1.0.0-rc2)."
+                    exit 1
+                fi
+                MONOPSONY_VERSION="$1"
+                version_pinned=true
+                ;;
             --emit-templates)
                 action="emit-templates"
                 shift
@@ -2419,6 +2460,7 @@ main() {
                 echo "  (no args)       Configure this machine as a client (proxy setup)"
                 echo "  --client        Same as default — client proxy setup"
                 echo "  --server        Install Monopsony caching proxy server"
+                echo "  --version V     Pin the release version to install (default: latest)"
                 echo "  --uninstall     Remove Monopsony"
                 echo "  --upgrade       Upgrade to latest version"
                 echo "  --reconfigure   Re-run setup prompts"
@@ -2432,6 +2474,21 @@ main() {
         esac
         shift
     done
+
+    # A pinned --version only makes sense for an install/upgrade action —
+    # error instead of surprising the user with a default client install.
+    if [[ "${version_pinned}" == "true" && "${action}" == "client" && "${client_explicit}" != "true" ]]; then
+        error "--version must be combined with --server, --client, or --upgrade."
+        exit 1
+    fi
+
+    # Resolve the release version only for actions that download artifacts.
+    case "${action}" in
+        server|client|upgrade)
+            VERSION="$(resolve_version)"
+            info "Monopsony release: v${VERSION}"
+            ;;
+    esac
 
     case "${action}" in
         detect-init)
@@ -2458,6 +2515,7 @@ main() {
         client)
             require_root
             check_prereqs
+            download_binary "client"
             setup_client
             ;;
         server)

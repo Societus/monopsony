@@ -14,6 +14,8 @@
 .cursor/
 .hermes/
 *.jsonl
+# Local session/handoff notes (kept on disk, never tracked)
+context/
 
 # Internal development docs (not for public repo)
 PLAN*.md
