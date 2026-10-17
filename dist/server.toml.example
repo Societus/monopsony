@@ -402,3 +402,25 @@ server_key_path = "/var/lib/monopsony/server.key"
 # Default: false
 # Type: bool
 # always_require_login = false
+
+# Sustained per-IP request rate for the admin API (:3130), requests/sec.
+# A global bucket at 10x these values bounds total abuse; per-IP keys come
+# from X-Forwarded-For when present (trusted-proxy gating lands in pairing v2).
+# Default: 20.0
+# Type: float
+# rate_limit_rps = 20.0
+
+# Per-IP burst capacity (max instantaneous requests before 429).
+# Default: 40
+# Type: u64
+# rate_limit_burst = 40
+
+# Failed logins per (username, IP) before lockout.
+# Default: 5
+# Type: u32
+# login_max_attempts = 5
+
+# Login lockout duration in minutes after max_attempts failures.
+# Default: 15
+# Type: u64
+# login_lockout_minutes = 15

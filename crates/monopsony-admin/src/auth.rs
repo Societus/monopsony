@@ -297,7 +297,13 @@ impl SessionStore {
             created_at: now,
             expires_at: now + Duration::from_secs(timeout_hours * 3600),
         };
-        self.sessions.write().await.insert(token.clone(), session);
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(token.clone(), session);
+        // Lazy eviction: bound memory without a background task. Preserves
+        // unexpired sessions even past the threshold.
+        if sessions.len() > 10_000 {
+            sessions.retain(|_, s| Instant::now() < s.expires_at);
+        }
         token
     }
 
@@ -465,10 +471,11 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    // Check for valid session cookie
+    // Check for valid session cookie (pairing-v2 Phase 0: the token must
+    // exist in the SessionStore — previously any non-empty cookie passed)
     if let Some(cookie) = cookies.get(SESSION_COOKIE_NAME) {
         let token = cookie.value();
-        if !token.is_empty() {
+        if !token.is_empty() && state.sessions.validate(token).await {
             return next.run(req).await;
         }
     }
@@ -493,7 +500,7 @@ pub async fn auth_middleware(
         .into_response()
 }
 
-fn extract_client_ip(req: &Request) -> IpAddr {
+pub(crate) fn extract_client_ip(req: &Request) -> IpAddr {
     // Check X-Forwarded-For first (when behind a reverse proxy like Tailscale Serve)
     if let Some(forwarded) = req.headers().get("x-forwarded-for") {
         if let Ok(value) = forwarded.to_str() {
@@ -512,6 +519,15 @@ fn extract_client_ip(req: &Request) -> IpAddr {
                 return ip;
             }
         }
+    }
+
+    // Direct peer address, present when the server is started with
+    // `into_make_service_with_connect_info` (pairing-v2 Phase 0).
+    if let Some(ci) = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+    {
+        return ci.0.ip();
     }
 
     // Fallback to loopback (dashboard served from same host)
@@ -567,12 +583,33 @@ pub struct LoginResponse {
 }
 
 /// POST /api/v1/auth/login — authenticate with username/password.
+///
+/// Pairing-v2 Phase 0: (username, IP) lockout — 5 failures within the window
+/// (default 15 min) locks the pair; sessions are created in the shared
+/// `SessionStore` so the auth middleware can actually validate them.
 pub async fn handle_login(
     State(state): State<AdminState>,
     cookies: Cookies,
-    Json(req): Json<LoginRequest>,
-) -> impl IntoResponse {
+    req: Request,
+) -> Response {
     let config = &state.dashboard_config;
+
+    // Client IP uses the same view as the auth middleware (XFF → X-Real-IP →
+    // ConnectInfo → loopback) so lockout keys match what the rate limiter sees.
+    let client_ip = extract_client_ip(&req);
+
+    // Parse the JSON body manually: the Request extractor must be last-ish and
+    // Json cannot follow it, but we need the Request for the client IP.
+    let body =
+        match <axum::extract::Json<LoginRequest> as axum::extract::FromRequest<()>>::from_request(
+            req,
+            &(),
+        )
+        .await
+        {
+            Ok(axum::extract::Json(r)) => r,
+            Err(rej) => return rej.into_response(),
+        };
 
     // Check credentials are configured
     let (stored_user, stored_hash) = match (&config.username, &config.password_hash) {
@@ -582,33 +619,63 @@ pub async fn handle_login(
                 success: false,
                 message: Some("Dashboard credentials not configured".to_string()),
                 session_token: None,
-            });
+            })
+            .into_response();
         }
     };
 
+    // Lockout gate: reject before touching the password hash.
+    if let Some(remaining) = state.rate_limits.login.is_locked(&body.username, client_ip) {
+        return Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("Retry-After", remaining.as_secs().max(1).to_string())
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(
+                r#"{"success":false,"message":"Too many failed logins. Try again later.","session_token":null}"#,
+            ))
+            .unwrap();
+    }
+
     // Verify username
-    if req.username != stored_user {
+    if body.username != stored_user {
+        state
+            .rate_limits
+            .login
+            .record_failure(&body.username, client_ip);
         return Json(LoginResponse {
             success: false,
             message: Some("Invalid credentials".to_string()),
             session_token: None,
-        });
+        })
+        .into_response();
     }
 
     // Verify password against bcrypt hash
-    let valid = bcrypt::verify(&req.password, &stored_hash).unwrap_or(false);
+    let valid = bcrypt::verify(&body.password, &stored_hash).unwrap_or(false);
 
     if !valid {
+        state
+            .rate_limits
+            .login
+            .record_failure(&body.username, client_ip);
         return Json(LoginResponse {
             success: false,
             message: Some("Invalid credentials".to_string()),
             session_token: None,
-        });
+        })
+        .into_response();
     }
 
-    // Create session
-    // TODO: use shared SessionStore instance for validation in middleware
-    let token = generate_session_token();
+    state
+        .rate_limits
+        .login
+        .record_success(&body.username, client_ip);
+
+    // Create session in the shared store (validated by the auth middleware)
+    let token = state
+        .sessions
+        .create(&body.username, config.session_timeout_hours)
+        .await;
 
     // Set session cookie
     let cookie = Cookie::build((SESSION_COOKIE_NAME, token.clone()))
@@ -627,10 +694,18 @@ pub async fn handle_login(
         message: None,
         session_token: Some(token),
     })
+    .into_response()
 }
 
 /// POST /api/v1/auth/logout — destroy session.
-pub async fn handle_logout(cookies: Cookies) -> impl IntoResponse {
+pub async fn handle_logout(State(state): State<AdminState>, cookies: Cookies) -> impl IntoResponse {
+    // Remove the session from the store so the token stops validating.
+    if let Some(cookie) = cookies.get(SESSION_COOKIE_NAME) {
+        let token = cookie.value();
+        if !token.is_empty() {
+            state.sessions.remove(token).await;
+        }
+    }
     // Overwrite the session cookie with an expired one
     let expired = Cookie::build((SESSION_COOKIE_NAME, ""))
         .path("/")

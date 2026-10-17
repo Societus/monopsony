@@ -14,6 +14,7 @@ pub mod language_pms;
 pub mod mirrors;
 pub mod oracle;
 pub mod pairing;
+pub mod rate_limit;
 pub mod recipe;
 pub mod settings;
 pub mod shadow;
@@ -67,6 +68,12 @@ pub struct AdminState {
     pub pairing_manager: Arc<tokio::sync::Mutex<Option<pairing::PairingSession>>>,
     /// Handle to the spawned pairing listener task — aborted on cancel to free port 50052.
     pub pairing_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Login sessions (pairing-v2 Phase 0): created at login, validated by the
+    /// auth middleware. Before Phase 0 the middleware accepted any non-empty
+    /// cookie — the store was never consulted.
+    pub sessions: Arc<auth::SessionStore>,
+    /// Per-IP + global rate limiting and login lockout (pairing-v2 Phase 0).
+    pub rate_limits: Arc<rate_limit::AdminRateLimits>,
     /// Pin-store verifying key (Sprint 20 Phase 3) — 32 raw Ed25519 bytes,
     /// delivered to clients in PairResponse so they can verify pin attestations.
     pub mirror_verify_key: [u8; 32],
@@ -93,6 +100,19 @@ pub struct DashboardConfig {
     pub session_timeout_hours: u64,
     #[serde(default)]
     pub always_require_login: bool,
+    /// Sustained per-IP request rate for the admin API (requests/sec).
+    /// Pairing-v2 Phase 0 rate limiting.
+    #[serde(default = "default_rate_limit_rps")]
+    pub rate_limit_rps: f64,
+    /// Per-IP burst capacity (max instantaneous requests).
+    #[serde(default = "default_rate_limit_burst")]
+    pub rate_limit_burst: u64,
+    /// Failed logins per (username, IP) before lockout.
+    #[serde(default = "default_login_max_attempts")]
+    pub login_max_attempts: u32,
+    /// Lockout duration in minutes.
+    #[serde(default = "default_login_lockout_minutes")]
+    pub login_lockout_minutes: u64,
 }
 
 impl Default for DashboardConfig {
@@ -103,12 +123,32 @@ impl Default for DashboardConfig {
             password_hash: None,
             session_timeout_hours: 24,
             always_require_login: false,
+            rate_limit_rps: default_rate_limit_rps(),
+            rate_limit_burst: default_rate_limit_burst(),
+            login_max_attempts: default_login_max_attempts(),
+            login_lockout_minutes: default_login_lockout_minutes(),
         }
     }
 }
 
 fn default_session_timeout() -> u64 {
     24
+}
+
+fn default_rate_limit_rps() -> f64 {
+    20.0
+}
+
+fn default_rate_limit_burst() -> u64 {
+    40
+}
+
+fn default_login_max_attempts() -> u32 {
+    5
+}
+
+fn default_login_lockout_minutes() -> u64 {
+    15
 }
 
 /// Build the admin router with all API routes and the dashboard SPA.
@@ -280,6 +320,12 @@ pub fn admin_router(state: AdminState) -> Router {
         .merge(spa)
         .merge(ws)
         .layer(CookieManagerLayer::new())
+        // Phase 0 rate limiting — outermost so limited requests are rejected
+        // before any auth/cookie work. Covers the SPA, API, and /ws routes.
+        .layer(from_fn_with_state(
+            state.clone(),
+            rate_limit::rate_limit_middleware,
+        ))
         .with_state(state)
 }
 

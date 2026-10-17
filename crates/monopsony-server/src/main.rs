@@ -923,6 +923,18 @@ async fn main() -> anyhow::Result<()> {
         info!("Oracle delta: disabled (no database)");
     }
 
+    // Phase 0 guards (rate limit + login lockout) built from the dashboard
+    // config before it moves into the Arc.
+    let rate_limits = {
+        let cfg = &dashboard_config;
+        Arc::new(monopsony_admin::rate_limit::AdminRateLimits::from_config(
+            cfg.rate_limit_rps,
+            cfg.rate_limit_burst,
+            cfg.login_max_attempts,
+            cfg.login_lockout_minutes,
+        ))
+    };
+
     let admin_state = monopsony_admin::AdminState {
         db: db.clone(),
         cache_dir: cache_dir.clone(),
@@ -939,6 +951,8 @@ async fn main() -> anyhow::Result<()> {
         oracle_delta: oracle_delta_slot.clone(),
         pairing_manager: Arc::new(tokio::sync::Mutex::new(None)),
         pairing_task: Arc::new(tokio::sync::Mutex::new(None)),
+        sessions: Arc::new(monopsony_admin::auth::SessionStore::new()),
+        rate_limits,
     };
     let admin_router = monopsony_admin::admin_router(admin_state);
     let dashboard_handle = tokio::spawn(async move {
@@ -946,7 +960,14 @@ async fn main() -> anyhow::Result<()> {
             .await
             .expect("Failed to bind dashboard port");
         info!("Dashboard API listening on {}", dashboard_addr);
-        if let Err(e) = axum::serve(listener, admin_router.into_make_service()).await {
+        // ConnectInfo so rate limiting / lockout / observed-source display can
+        // key on the real peer address (pairing-v2 Phase 0).
+        if let Err(e) = axum::serve(
+            listener,
+            admin_router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        {
             error!("Dashboard server error: {}", e);
         }
     });
