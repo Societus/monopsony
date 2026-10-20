@@ -4,6 +4,7 @@ pub mod cache_storage;
 pub mod docker;
 pub mod language_artifacts;
 pub mod object_store_backend;
+pub mod oci_registry;
 pub mod prefetch;
 pub mod proxy;
 pub mod purge;

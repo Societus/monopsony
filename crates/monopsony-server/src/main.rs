@@ -14,7 +14,7 @@ use monopsony_admin::pairing;
 use monopsony_control::{announce, discovery, grpc, metrics};
 use monopsony_db::Database;
 use monopsony_mirror::mirror;
-use monopsony_proxy::{cache_storage, object_store_backend, prefetch, proxy, purge};
+use monopsony_proxy::{cache_storage, object_store_backend, oci_registry, prefetch, proxy, purge};
 use monopsony_shadow::ShadowPackageManager;
 
 mod ca_guard;
@@ -60,6 +60,12 @@ struct Args {
     /// Address for the distribution mirror HTTP server
     #[arg(long, default_value = "0.0.0.0:3129")]
     mirror_addr: String,
+
+    /// Address for the personal OCI registry (Sprint 25). Dedicated port: the
+    /// /v2 route namespace collides with docker.rs pull-through, and docker
+    /// clients cannot be prefix-routed.
+    #[arg(long, default_value = "0.0.0.0:3131")]
+    registry_addr: String,
 
     /// PostgreSQL connection URL
     #[arg(
@@ -560,6 +566,27 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or([0u8; 32]);
 
     let pin_key_for_proxy = pin_key.clone();
+
+    // Spawn the personal OCI registry (Sprint 25 S1: pull-back) on its own
+    // listener. Same keyed auth model as the proxy router (AuthMode applies);
+    // plain axum::serve — registry traffic never uses CONNECT.
+    let storage_for_registry = storage.clone();
+    let db_for_registry = db.clone();
+    let auth_mode_for_registry = auth_mode.clone();
+    let registry_listen_addr: SocketAddr = args.registry_addr.parse().expect("Invalid registry address");
+    let _registry_handle = tokio::spawn(async move {
+        if let Err(e) = oci_registry::run_registry(
+            registry_listen_addr,
+            storage_for_registry,
+            db_for_registry,
+            auth_mode_for_registry,
+        )
+        .await
+        {
+            error!("OCI registry error: {}", e);
+        }
+    });
+
     let proxy_handle = tokio::spawn(async move {
         if let Err(e) = proxy::run_proxy(
             http_addr,
