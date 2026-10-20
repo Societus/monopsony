@@ -279,6 +279,30 @@ The server's HTTP proxy is the most complete module. It:
 - Configurable hash verification policy (fail-closed vs fail-open)
 - GPG signature verification for repo metadata (Release/InRelease files)
 - Resolve sqlx 0.8.6+ upgrade blocked by libsqlite3-sys link conflict with rusqlite 0.31 (needs sqlx 0.9 or matching libsqlite3-sys)
+- Dashboard SPA frontend for pairing approval + enrollment key manager (P4 UI — backend API complete)
+
+## Pairing v2 (Sprint 28) — SECURITY-CRITICAL NOTES
+Plan: `docs/plans/2026-10-17-pairing-v2-sunshine-pin.md` (P0–P7 complete, uncommitted).
+Security docs: `docs/pairing-security.md` — read before touching pairing code.
+
+- **Three client flows** on `pair`: `--code` (legacy, LAN-only), `--pin` (v2 Sunshine:
+  client-generated PIN + ephemeral keypair → dashboard approve → collect w/ possession
+  proof), `--enrollment-key mopk-…` (pre-approved fleet path). Certs are 90-day,
+  serial-tracked, revocable at the TLS accept path; daemon auto-renews inside 30 days.
+- **Never** reintroduce unauthenticated code minting (the red-team F-class failures):
+  `POST /api/v1/pair/init` was reachable by anyone. v2 intake endpoints
+  (`/pair/request`, `/pair/collect`, `/pair/enroll`) are intentionally unauthenticated
+  but rate-limited and exempted in `auth_middleware` — keep that exemption list exact.
+- **Registration-at-collection**: no DB row exists until the client proves possession.
+  Do not "optimize" by registering at intake.
+- **Key invariants** (tested in pairing.rs): 3-strike PIN invalidation, 15-min pending
+  TTL, 5-min approved-uncollected TTL, idempotent approve, dedup-replace on same
+  claimed identity + source IP, cap 50 pending.
+- Enrollment keys stored **hashed only** (`mopk-` prefix, plaintext shown once);
+  use-count + expiry + revocation enforced server-side (`enrollment_keys` table).
+- Approver attribution in `pair_approval_audit` is `system`/`enrollment-key` —
+  session-username attribution is a known gap.
+
 
 ## RC milestone: Interactive bash installer
 **Target:** `curl -fsSL https://monopsony.dev/install.sh | bash` (like Tailscale's installer)

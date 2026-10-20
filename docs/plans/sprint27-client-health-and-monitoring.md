@@ -196,3 +196,38 @@ Remaining: fleet bench verification on .58/.20 per
 `references/fleet-bench-verification.md` rules (deploy new client binary,
 force a registration failure, observe gauge + CheckMK line; delete bench
 seeds after).
+
+## 9. Fleet bench record (2026-10-17, .58 server + .20 client — all PROVEN)
+
+Deployed: server `181d7037…` (staging track, now DB-connected via
+`--database-url`; backup `.bak-20261017`), client `47deee74…` on .20
+(backup `.bak-20261017`). Cadence confirmed: heartbeat 60 s.
+
+| # | Gate item | Verdict | Proven by |
+|---|-----------|---------|-----------|
+| 1 | New binaries live on both hosts | PROVEN | fresh PID/lstart + sha256 match + `Database connected` + config-loaded lines |
+| 2 | Part B gauges cross the wire | PROVEN | `monopsony_client_failed_updates{client_id="0ac5ebad…"} 0` from first heartbeat after deploy |
+| 3 | Policy refusal does NOT count | PROVEN | "package not detected" refusal left failed=0 (pre-fix recipe attempt) |
+| 4 | Attempt recorded on success | PROVEN | `…_last_update_attempt_age_seconds` = 60 one beat after registration (s27bench-curl 8.22.0) |
+| 5 | Operational failure counted | PROVEN | `ALTER TABLE shadow_packages RENAME` → register RPC `Internal` → next beat `failed_updates = 1` |
+| 6 | CheckMK spool bridge vs live | PROVEN | .20 renders `failed=1 → WARN`, 6 stale fleet clients, aggregate OK |
+
+Bench findings (product gaps, none blocking):
+- **Pair-time `mirror_verify_key` ≠ recipe signing key** on this fleet: the
+  delivered key is the pin key's public half (verified by derivation:
+  `a4cbae25…` = pub(pin-signing.key)). Recipe pushes sign with
+  `signing.key` (`b417f9fd…`) and can NEVER verify via the pairing key.
+  Working bench path: hold `mirror-verify.key`, set
+  `[shadow_trust].operator_verifying_key_path` to the recipe pubkey hex.
+  Durable fix candidate (Sprint 28): deliver the recipe verify key at
+  pair/register like the pin key.
+- `pending_shadow_assignments.status` stays "pending" / `resolved_at` NULL
+  after a successful registration (delivered_at set). Pre-existing S22
+  behavior; the ack path apparently never resolves rows. Also one stale
+  Sep 21 "curl" pending row predates this session (left in place).
+- `POST /api/v1/auth/login` returns the session token in the body but sets
+  no `Set-Cookie` header — API clients must place `monopsony_session`
+  manually.
+- Local-detect gate keys on `install_paths` file existence; `detect_command`
+  only runs after a path exists (recipes without `install_paths` derive
+  `target_dir/<name>`, which fails for renamed bench packages).
