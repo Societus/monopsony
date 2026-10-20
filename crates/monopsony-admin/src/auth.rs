@@ -5,7 +5,7 @@
 //! serve mode. Falls back to username/password session auth otherwise.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -446,8 +446,21 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
+    // Pairing intake (/api/v1/pair/request), cert collection
+    // (/api/v1/pair/collect), and enrollment-key pairing (/api/v1/pair/enroll)
+    // are client-facing and intentionally unauthenticated — the client has no
+    // session cookie. They are rate-limited by the outer middleware instead
+    // (pairing-v2 D8). Admin-only pair routes (approve/deny/pending) fall
+    // through to auth.
+    if path.starts_with("/api/v1/pair/request")
+        || path.starts_with("/api/v1/pair/collect")
+        || path.starts_with("/api/v1/pair/enroll")
+    {
+        return next.run(req).await;
+    }
+
     // Get client IP from connection info or X-Forwarded-For
-    let client_ip = extract_client_ip(&req);
+    let client_ip = extract_client_ip(&req, &state.trusted_proxies);
     let ctx = evaluate_auth(&state, &client_ip).await;
 
     // Check if this is a write/sensitive endpoint
@@ -500,38 +513,156 @@ pub async fn auth_middleware(
         .into_response()
 }
 
-pub(crate) fn extract_client_ip(req: &Request) -> IpAddr {
-    // Check X-Forwarded-For first (when behind a reverse proxy like Tailscale Serve)
+/// Trusted reverse proxies whose `X-Forwarded-For` / `X-Real-IP` headers are honored
+/// for observed-identity display and per-IP rate limiting.
+///
+/// Entries are parsed as CIDR (`"10.0.0.0/8"`) or single IPs (`"10.0.0.1"` = /32 or /128).
+/// When empty, forwarded headers are never trusted and the direct peer IP is used.
+///
+/// This is the red-team F5 control: a forged `X-Forwarded-For` behind Cloudflare/Caddy
+/// must not let an attacker spoof their observed source IP.
+#[derive(Debug, Clone, Default)]
+pub struct TrustedProxies {
+    /// `(network_ip, prefix_len)`. Single IPs are stored as /32 (IPv4) or /128 (IPv6).
+    entries: Vec<(IpAddr, u8)>,
+}
+
+impl TrustedProxies {
+    /// Parse config strings into a matchable set. Malformed entries are skipped.
+    pub fn from_config(strings: &[String]) -> Self {
+        let mut entries = Vec::new();
+        for s in strings {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Some((net, prefix)) = trimmed.split_once('/') {
+                if let (Ok(net_ip), Ok(p)) = (
+                    net.trim().parse::<IpAddr>(),
+                    prefix.trim().parse::<u8>(),
+                ) {
+                    let max_prefix = match net_ip {
+                        IpAddr::V4(_) => 32,
+                        IpAddr::V6(_) => 128,
+                    };
+                    if p <= max_prefix {
+                        entries.push((apply_mask(net_ip, p), p));
+                    }
+                }
+            } else if let Ok(ip) = trimmed.parse::<IpAddr>() {
+                let prefix = match ip {
+                    IpAddr::V4(_) => 32,
+                    IpAddr::V6(_) => 128,
+                };
+                entries.push((ip, prefix));
+            }
+        }
+        Self { entries }
+    }
+
+    /// Returns true when `ip` falls within any configured trusted network.
+    pub(crate) fn contains(&self, ip: &IpAddr) -> bool {
+        self.entries
+            .iter()
+            .any(|(net, prefix)| cidr_contains(*net, *prefix, *ip))
+    }
+}
+
+/// Apply a CIDR prefix mask to a network address, normalizing host bits to zero.
+fn apply_mask(ip: IpAddr, prefix: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(ip) => {
+            if prefix == 0 {
+                return IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0));
+            }
+            let mask: u32 = !((1u32 << (32 - prefix)) - 1);
+            IpAddr::V4(Ipv4Addr::from(u32::from(ip) & mask))
+        }
+        IpAddr::V6(ip) => IpAddr::V6(ip),
+    }
+}
+
+/// Returns true when `ip` is contained in the CIDR `net/prefix`.
+fn cidr_contains(net: IpAddr, prefix: u8, ip: IpAddr) -> bool {
+    match (net, ip) {
+        (IpAddr::V4(net), IpAddr::V4(ip)) => {
+            if prefix > 32 {
+                return false;
+            }
+            let mask: u32 = if prefix == 0 { 0 } else { !((1u32 << (32 - prefix)) - 1) };
+            (u32::from(net) & mask) == (u32::from(ip) & mask)
+        }
+        (IpAddr::V6(net), IpAddr::V6(ip)) => {
+            if prefix > 128 {
+                return false;
+            }
+            let net_octets = net.octets();
+            let ip_octets = ip.octets();
+            let full_bytes = prefix as usize / 8;
+            let rem_bits = prefix as usize % 8;
+            for i in 0..full_bytes {
+                if net_octets[i] != ip_octets[i] {
+                    return false;
+                }
+            }
+            if rem_bits > 0 {
+                let mask = 0xFFu8 << (8 - rem_bits);
+                return (net_octets[full_bytes] & mask) == (ip_octets[full_bytes] & mask);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Extract the client IP for auth decisions and per-IP rate limiting.
+///
+/// The direct peer (from `ConnectInfo`) is always the baseline. `X-Forwarded-For`
+/// / `X-Real-IP` are honored **only** when the direct peer is a configured trusted
+/// proxy — a forged header from an untrusted peer cannot spoof the observed IP.
+/// (red-team F5)
+pub(crate) fn extract_client_ip(req: &Request, trusted: &TrustedProxies) -> IpAddr {
+    // Direct peer address, present when the server is started with
+    // `into_make_service_with_connect_info` (pairing-v2 Phase 0).
+    let direct_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
+    // Honor forwarded headers only from a trusted direct peer.
+    if let Some(peer) = direct_ip {
+        if trusted.contains(&peer) {
+            if let Some(ip) = forwarded_ip(req) {
+                return ip;
+            }
+        }
+        return peer;
+    }
+
+    // Fallback to loopback (dashboard served from same host, no connect info).
+    "127.0.0.1".parse().unwrap()
+}
+
+/// Read the client IP from `X-Forwarded-For` (leftmost entry) or `X-Real-IP`.
+/// Caller is responsible for gating on a trusted direct peer.
+fn forwarded_ip(req: &Request) -> Option<IpAddr> {
     if let Some(forwarded) = req.headers().get("x-forwarded-for") {
         if let Ok(value) = forwarded.to_str() {
             if let Some(first) = value.split(',').next() {
                 if let Ok(ip) = first.trim().parse::<IpAddr>() {
-                    return ip;
+                    return Some(ip);
                 }
             }
         }
     }
-
-    // Check X-Real-IP
     if let Some(real_ip) = req.headers().get("x-real-ip") {
         if let Ok(value) = real_ip.to_str() {
-            if let Ok(ip) = value.parse::<IpAddr>() {
-                return ip;
+            if let Ok(ip) = value.trim().parse::<IpAddr>() {
+                return Some(ip);
             }
         }
     }
-
-    // Direct peer address, present when the server is started with
-    // `into_make_service_with_connect_info` (pairing-v2 Phase 0).
-    if let Some(ci) = req
-        .extensions()
-        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-    {
-        return ci.0.ip();
-    }
-
-    // Fallback to loopback (dashboard served from same host)
-    "127.0.0.1".parse().unwrap()
+    None
 }
 
 // ─── Auth Endpoints ───────────────────────────────────────────────────
@@ -551,7 +682,7 @@ pub async fn handle_auth_status(
     State(state): State<AdminState>,
     req: Request,
 ) -> impl IntoResponse {
-    let client_ip = extract_client_ip(&req);
+    let client_ip = extract_client_ip(&req, &state.trusted_proxies);
     let ctx = evaluate_auth(&state, &client_ip).await;
 
     let credentials_configured =
@@ -596,7 +727,7 @@ pub async fn handle_login(
 
     // Client IP uses the same view as the auth middleware (XFF → X-Real-IP →
     // ConnectInfo → loopback) so lockout keys match what the rate limiter sees.
-    let client_ip = extract_client_ip(&req);
+    let client_ip = extract_client_ip(&req, &state.trusted_proxies);
 
     // Parse the JSON body manually: the Request extractor must be last-ish and
     // Json cannot follow it, but we need the Request for the client IP.
@@ -728,6 +859,24 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    use std::net::SocketAddr;
+    use std::sync::{Arc, RwLock};
+
+    use axum::{
+        body::Body,
+        extract::connect_info::ConnectInfo,
+        http::{Method, Request, StatusCode},
+        routing::post,
+        Router,
+    };
+    use crate::{
+        AdminState, CookieManagerLayer, DashboardConfig, TlsManager,
+    };
+    use crate::pairing::PendingPairStore;
+    use crate::rate_limit::AdminRateLimits;
+    use tempfile::tempdir;
+    use tower::ServiceExt;
+
     #[test]
     fn test_session_token_generation() {
         let t1 = generate_session_token();
@@ -766,5 +915,106 @@ mod tests {
         assert!(!state.available);
         assert!(!state.serve_mode);
         assert!(!state.funnel_mode);
+    }
+
+    #[test]
+    fn test_trusted_proxies_empty_allows_nothing() {
+        let trusted = TrustedProxies::from_config(&Vec::new());
+        assert!(!trusted.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(!trusted.contains(&"127.0.0.1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_single_ip_match() {
+        let trusted = TrustedProxies::from_config(&["10.0.0.1".to_string()]);
+        assert!(trusted.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(!trusted.contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_cidr_match() {
+        let trusted = TrustedProxies::from_config(&["10.0.0.0/8".to_string()]);
+        assert!(trusted.contains(&"10.255.255.255".parse::<IpAddr>().unwrap()));
+        assert!(!trusted.contains(&"11.0.0.1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_malformed_skipped() {
+        let trusted =
+            TrustedProxies::from_config(&["not-an-ip".to_string(), "10.0.0.1".to_string()]);
+        assert!(trusted.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+        assert!(!trusted.contains(&"10.0.0.2".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn test_trusted_proxies_ipv6_cidr() {
+        let trusted = TrustedProxies::from_config(&["2001:db8::/32".to_string()]);
+        assert!(trusted.contains(&"2001:db8:1234::1".parse::<IpAddr>().unwrap()));
+        assert!(!trusted.contains(&"2002:db8::1".parse::<IpAddr>().unwrap()));
+    }
+
+    /// Regression test: login must set the session cookie (Set-Cookie), not
+    /// just return the token in the JSON body.
+    #[tokio::test]
+    async fn test_login_sets_session_cookie() {
+        let dir = tempdir().unwrap();
+        let ca_cert_path = dir.path().join("ca.crt");
+        let ca_key_path = dir.path().join("ca.key");
+        let tls_manager = Arc::new(TlsManager::load_or_create(&ca_cert_path, &ca_key_path).unwrap());
+        let password_hash = hash_password("testpass123").unwrap();
+
+        let state = AdminState {
+            db: None,
+            cache_dir: dir.path().to_path_buf(),
+            shadow_manager: None,
+            mirror_manager: None,
+            tls_manager,
+            config_path: dir.path().join("config.toml"),
+            dashboard_config: Arc::new(DashboardConfig {
+                username: Some("admin".to_string()),
+                password_hash: Some(password_hash),
+                ..DashboardConfig::default()
+            }),
+            trusted_proxies: TrustedProxies::from_config(&Vec::new()),
+            tailscale: Arc::new(TailscaleDetector::new()),
+            grpc_addr: "127.0.0.1:50051".to_string(),
+            ws_url: None,
+            pairing_manager: Arc::new(tokio::sync::Mutex::new(None)),
+            pairing_task: Arc::new(tokio::sync::Mutex::new(None)),
+            sessions: Arc::new(SessionStore::new()),
+            rate_limits: Arc::new(AdminRateLimits::from_config(20.0, 40, 5, 15)),
+            pending_pairs: Arc::new(tokio::sync::Mutex::new(PendingPairStore::new())),
+            mirror_verify_key: [0u8; 32],
+            oracle_last_update: Arc::new(RwLock::new(None)),
+            oracle_delta: Arc::new(RwLock::new(None)),
+        };
+
+        let router = Router::new()
+            .route("/api/v1/auth/login", post(handle_login))
+            .layer(CookieManagerLayer::new())
+            .with_state(state);
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/auth/login")
+            .header("content-type", "application/json")
+            .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+            .body(Body::from(r#"{"username":"admin","password":"testpass123"}"#.to_string()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let set_cookie: Vec<String> = resp
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .collect();
+        assert!(
+            set_cookie.iter().any(|c| c.starts_with("monopsony_session=")),
+            "login response must set the monopsony_session cookie, got {set_cookie:?}"
+        );
     }
 }

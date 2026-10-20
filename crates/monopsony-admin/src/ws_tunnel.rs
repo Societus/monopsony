@@ -17,6 +17,7 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -34,6 +35,13 @@ const GRPC_DEFAULT_PORT: u16 = 50051;
 
 /// Default port for the pairing listener (the `/ws/pair` target).
 const PAIRING_DEFAULT_PORT: u16 = 50052;
+
+/// Maximum concurrent `/ws/pair` WebSocket relay connections.
+/// Prevents connection-exhaustion attacks on the pairing port.
+const MAX_WS_PAIR_CONNECTIONS: usize = 10;
+
+/// Active `/ws/pair` WebSocket relay connections counter.
+static WS_PAIR_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 /// GET /ws/tunnel — WebSocket upgrade handler for the gRPC control plane.
 ///
@@ -54,8 +62,24 @@ pub async fn handle_ws_tunnel(ws: WebSocketUpgrade) -> impl IntoResponse {
 /// frames.
 ///
 /// Not behind auth middleware: the pairing code itself is the credential.
+/// Concurrency capped to prevent connection-exhaustion attacks.
 pub async fn handle_ws_pair(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(|socket| tunnel_connection(socket, PAIRING_DEFAULT_PORT, "pairing tunnel"))
+    let current = WS_PAIR_CONNECTIONS.fetch_add(1, Ordering::SeqCst);
+    if current >= MAX_WS_PAIR_CONNECTIONS {
+        WS_PAIR_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+            .header("Content-Type", "text/plain")
+            .body(axum::body::Body::from("pairing relay at capacity"))
+            .unwrap();
+    }
+
+    ws.on_upgrade(move |socket| {
+        async move {
+            tunnel_connection(socket, PAIRING_DEFAULT_PORT, "pairing tunnel").await;
+            WS_PAIR_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+        }
+    })
 }
 
 /// Handle a single WebSocket tunnel connection, relaying bidirectionally

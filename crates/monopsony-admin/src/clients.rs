@@ -5,6 +5,8 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use monopsony_common::ClientId;
+use tracing::{info};
 
 use crate::AdminState;
 
@@ -89,5 +91,74 @@ pub async fn handle_client_inventory(
         }
     } else {
         Json(serde_json::json!({"error": "Database not available"}))
+    }
+}
+
+/// POST /api/v1/clients/:id/certs/:serial/revoke — revoke a client
+/// certificate by serial (red-team F3). Revokes the DB row and the in-memory
+/// TLS accept-path cache so the cert is rejected immediately at TLS accept,
+/// covering both direct gRPC and /ws/tunnel-relayed connections.
+pub async fn handle_revoke_client_cert(
+    State(state): State<AdminState>,
+    Path((client_id, serial)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let cid = match ClientId::parse(&client_id) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid client ID: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let Some(ref db) = state.db else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Database not available"})),
+        )
+            .into_response();
+    };
+
+    // Only certificates issued to this client may be revoked through this endpoint.
+    let certs = match db.list_client_certs_for_client(&cid).await {
+        Ok(certs) => certs,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    if !certs.iter().any(|c| c.serial == serial) {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Certificate not found for this client"})),
+        )
+            .into_response();
+    }
+
+    match db.revoke_client_cert(&serial).await {
+        Ok(true) => {
+            state.tls_manager.note_revoked_serial(&serial);
+            info!(serial = %serial, client = %cid, "Revoked client certificate");
+            (
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!({"revoked": true, "serial": serial})),
+            )
+                .into_response()
+        }
+        Ok(false) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Certificate not found or already revoked"})),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }

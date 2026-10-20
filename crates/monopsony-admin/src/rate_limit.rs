@@ -217,7 +217,7 @@ pub async fn rate_limit_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let ip = crate::auth::extract_client_ip(&req);
+    let ip = crate::auth::extract_client_ip(&req, &state.trusted_proxies);
     if let Err(retry_after) = state.rate_limits.http.check(ip) {
         let body = format!(
             r#"{{"error":"rate_limited","message":"Too many requests","retry_after_secs":{}}}"#,

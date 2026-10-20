@@ -7,6 +7,7 @@ pub mod assign;
 pub mod auth;
 pub mod cache;
 pub mod clients;
+pub mod enrollment;
 pub mod features;
 pub mod health;
 pub mod help;
@@ -58,6 +59,9 @@ pub struct AdminState {
     pub tls_manager: Arc<TlsManager>,
     pub config_path: PathBuf,
     pub dashboard_config: Arc<DashboardConfig>,
+    /// Trusted reverse proxies whose X-Forwarded-For / X-Real-IP are honored
+    /// for observed identity and per-IP rate limiting (red-team F5).
+    pub trusted_proxies: auth::TrustedProxies,
     pub tailscale: Arc<auth::TailscaleDetector>,
     /// The server's gRPC listen address (e.g. "0.0.0.0:50051") used in PairResponse.
     pub grpc_addr: String,
@@ -74,6 +78,10 @@ pub struct AdminState {
     pub sessions: Arc<auth::SessionStore>,
     /// Per-IP + global rate limiting and login lockout (pairing-v2 Phase 0).
     pub rate_limits: Arc<rate_limit::AdminRateLimits>,
+    /// Pending v2 pairing requests (pairing-v2 Phase 2): in-memory store,
+    /// cap 50, TTL 15 min, dedup-replace, 3-strike PIN. Shared between the
+    /// intake handler, admin approve/pending endpoints, and the collect flow.
+    pub pending_pairs: Arc<tokio::sync::Mutex<pairing::PendingPairStore>>,
     /// Pin-store verifying key (Sprint 20 Phase 3) — 32 raw Ed25519 bytes,
     /// delivered to clients in PairResponse so they can verify pin attestations.
     pub mirror_verify_key: [u8; 32],
@@ -113,6 +121,30 @@ pub struct DashboardConfig {
     /// Lockout duration in minutes.
     #[serde(default = "default_login_lockout_minutes")]
     pub login_lockout_minutes: u64,
+    /// Pairing mode: `pin` (v2, admin approval + client PIN, default for new
+    /// installs), `legacy-code` (v1, 6-char code minted by server), or `off`.
+    #[serde(default = "default_pairing_mode")]
+    pub pairing_mode: PairingMode,
+    /// Trusted reverse proxies whose `X-Forwarded-For` / `X-Real-IP` headers are honored
+    /// for observed-identity display and per-IP rate limiting. Entries are CIDR ranges
+    /// (e.g. `"10.0.0.0/8"`) or single IPs (`"10.0.0.1"`).
+    /// When empty, forwarded headers are never trusted and the direct peer IP is used.
+    /// (red-team F5: forged X-Forwarded-For behind CF/Caddy must not spoof observed identity)
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+}
+
+/// Pairing mode selection (pairing-v2 D5).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PairingMode {
+    /// v2 Sunshine model: client-initiated request, admin approves with PIN.
+    #[default]
+    Pin,
+    /// v1 legacy: server mints a 6-char code, client presents it. Trusted-LAN only.
+    LegacyCode,
+    /// Pairing disabled entirely.
+    Off,
 }
 
 impl Default for DashboardConfig {
@@ -127,6 +159,8 @@ impl Default for DashboardConfig {
             rate_limit_burst: default_rate_limit_burst(),
             login_max_attempts: default_login_max_attempts(),
             login_lockout_minutes: default_login_lockout_minutes(),
+            pairing_mode: default_pairing_mode(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -151,6 +185,10 @@ fn default_login_lockout_minutes() -> u64 {
     15
 }
 
+fn default_pairing_mode() -> PairingMode {
+    PairingMode::Pin
+}
+
 /// Build the admin router with all API routes and the dashboard SPA.
 ///
 /// The router has two layers:
@@ -163,6 +201,12 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/api/v1/auth/status", get(auth::handle_auth_status))
         .route("/api/v1/auth/login", post(auth::handle_login))
         .route("/api/v1/auth/logout", post(auth::handle_logout))
+        // Pairing v2 intake — unauthenticated, rate-limited (client initiates).
+        .route("/api/v1/pair/request", post(pairing::handle_pair_request_v2))
+        .route(
+            "/api/v1/pair/request/:request_id/status",
+            get(pairing::handle_pair_request_status),
+        )
         // Health
         .route("/api/v1/health", get(health::handle_health))
         .route("/api/v1/stats", get(health::handle_stats))
@@ -232,6 +276,10 @@ pub fn admin_router(state: AdminState) -> Router {
             "/api/v1/clients/:id/inventory",
             get(clients::handle_client_inventory),
         )
+        .route(
+            "/api/v1/clients/:id/certs/:serial/revoke",
+            post(clients::handle_revoke_client_cert),
+        )
         // Mirrors
         .route("/api/v1/mirrors", get(mirrors::handle_list_mirrors))
         .route("/api/v1/mirrors", post(mirrors::handle_upsert_mirror))
@@ -268,6 +316,32 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/api/v1/pair/init", post(pairing::handle_pair_init))
         .route("/api/v1/pair/status", get(pairing::handle_pair_status))
         .route("/api/v1/pair/cancel", post(pairing::handle_pair_cancel))
+        // Pairing v2 admin endpoints (auth required — dashboard approve/deny).
+        .route("/api/v1/pair/pending", get(pairing::handle_pair_pending))
+        .route("/api/v1/pair/approve", post(pairing::handle_pair_approve))
+        .route("/api/v1/pair/deny/:request_id", post(pairing::handle_pair_deny))
+        // Pairing v2 approval audit — auth-gated, lists approve/deny history (P4).
+        .route("/api/v1/pair/audit", get(pairing::handle_pair_audit))
+        // Enrollment keys (P5) — auth-gated dashboard key manager.
+        .route(
+            "/api/v1/enrollment-keys",
+            post(enrollment::handle_create_enrollment_key),
+        )
+        .route(
+            "/api/v1/enrollment-keys",
+            get(enrollment::handle_list_enrollment_keys),
+        )
+        .route(
+            "/api/v1/enrollment-keys/:id",
+            axum::routing::delete(enrollment::handle_revoke_enrollment_key),
+        )
+        // Enrollment pairing — client presents a pre-approval key (P5);
+        // unauthenticated but rate-limited, like the v2 intake.
+        .route("/api/v1/pair/enroll", post(pairing::handle_pair_enroll))
+        // Pairing v2 client collection — client presents proof of possession,
+        // no session cookie (the client is not an admin); rate-limited by the
+        // outer middleware instead (pairing-v2 D8).
+        .route("/api/v1/pair/collect", post(pairing::handle_pair_collect))
         // Features & Monetization
         .route("/api/v1/features", get(features::handle_get_features))
         .route(

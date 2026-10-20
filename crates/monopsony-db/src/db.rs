@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use monopsony_common::package_manager::PackageManagerKind;
 use monopsony_common::{
-    ApiKey, ApiKeyId, Client, ClientId, ClientPackage, Package, PackageId, PackageRef,
+    ApiKey, ApiKeyId, Client, ClientCert, ClientId, ClientPackage, Package, PackageId, PackageRef,
 };
 use tracing::{debug, info, warn};
 
@@ -157,6 +157,58 @@ impl Database {
         .execute(&self.pool)
         .await?;
         info!("Created clients table");
+
+        // client_certs tracks every issued client certificate by serial so
+        // individual certs can be revoked (red-team F3: short-lived certs
+        // with revocation path, replacing the old 10-year un-revocable certs).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS client_certs (
+                serial TEXT PRIMARY KEY,
+                client_id UUID NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+                issued_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                revoked_at TIMESTAMPTZ NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("Created client_certs table");
+
+        // pair_approval_audit records every approve/deny action on v2 pairing
+        // requests (P4 approval audit view).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pair_approval_audit (
+                id          BIGSERIAL PRIMARY KEY,
+                request_id  TEXT NOT NULL,
+                action      TEXT NOT NULL,
+                approver    TEXT NOT NULL,
+                detail      TEXT NULL,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("Created pair_approval_audit table");
+
+        // enrollment_keys (P5): Tailscale-auth-key pattern for fleet-scale
+        // pairing. Plaintext keys are shown once at creation; only the
+        // SHA-256 hash is stored. Use-count + expiry bound the blast radius.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS enrollment_keys (
+                id          UUID PRIMARY KEY,
+                key_hash    TEXT NOT NULL UNIQUE,
+                label       TEXT NOT NULL,
+                max_uses    BIGINT NOT NULL DEFAULT 1,
+                use_count   BIGINT NOT NULL DEFAULT 0,
+                created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+                expires_at  TIMESTAMPTZ NULL,
+                revoked_at  TIMESTAMPTZ NULL
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("Created enrollment_keys table");
 
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS packages (
@@ -837,6 +889,336 @@ impl Database {
             .fetch_one(&self.pool)
             .await?;
         Ok(row.get("count"))
+    }
+
+    /// Record the issued certificate serial on a client row (red-team F3:
+    /// serial tracking enables per-cert revocation).
+    #[allow(dead_code)] // Admin API / revocation path
+    pub async fn update_client_cert_serial(&self, client_id: &ClientId, serial: &str) -> Result<()> {
+        let result = sqlx::query("UPDATE clients SET cert_serial = $1 WHERE id = $2")
+            .bind(serial)
+            .bind(client_id.0)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            warn!("update_client_cert_serial: unknown client {}", client_id);
+        } else {
+            debug!("Recorded cert serial {} for client {}", serial, client_id);
+        }
+        Ok(())
+    }
+
+    /// Insert a newly issued client certificate into the tracking table
+    /// (red-team F3: serial + expiry recorded for revocation).
+    #[allow(dead_code)] // Admin API / revocation path
+    pub async fn insert_client_cert(
+        &self,
+        serial: &str,
+        client_id: &ClientId,
+        issued_at: chrono::DateTime<Utc>,
+        expires_at: chrono::DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO client_certs (serial, client_id, issued_at, expires_at, status)
+             VALUES ($1, $2, $3, $4, 'active')",
+        )
+        .bind(serial)
+        .bind(client_id.0)
+        .bind(issued_at)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        debug!(
+            "Inserted client_cert serial={} for client {}",
+            serial, client_id
+        );
+        Ok(())
+    }
+
+    /// Look up a client certificate by serial (red-team F3: revocation check).
+    #[allow(dead_code)] // Admin API / TLS accept-path revocation check
+    pub async fn get_client_cert_by_serial(&self, serial: &str) -> Result<Option<ClientCert>> {
+        let row = sqlx::query(
+            "SELECT serial, client_id, issued_at, expires_at, status, revoked_at
+             FROM client_certs WHERE serial = $1",
+        )
+        .bind(serial)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| ClientCert {
+            serial: r.get("serial"),
+            client_id: ClientId(r.get("client_id")),
+            issued_at: r.get("issued_at"),
+            expires_at: r.get("expires_at"),
+            status: r.get("status"),
+            revoked_at: r.get("revoked_at"),
+        }))
+    }
+
+    /// Revoke a client certificate by serial (red-team F3: revoke API).
+    #[allow(dead_code)] // Admin API / revocation path
+    pub async fn revoke_client_cert(&self, serial: &str) -> Result<bool> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            "UPDATE client_certs SET status = 'revoked', revoked_at = $1
+             WHERE serial = $2 AND status = 'active'",
+        )
+        .bind(now)
+        .bind(serial)
+        .execute(&self.pool)
+        .await?;
+        let revoked = result.rows_affected() > 0;
+        if revoked {
+            info!("Revoked client cert serial={}", serial);
+        }
+        Ok(revoked)
+    }
+
+    /// List all certificates for a client (admin dashboard / audit).
+    #[allow(dead_code)] // Admin API query method
+    pub async fn list_client_certs_for_client(
+        &self,
+        client_id: &ClientId,
+    ) -> Result<Vec<ClientCert>> {
+        let rows = sqlx::query(
+            "SELECT serial, client_id, issued_at, expires_at, status, revoked_at
+             FROM client_certs WHERE client_id = $1 ORDER BY issued_at DESC",
+        )
+        .bind(client_id.0)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let certs: Vec<ClientCert> = rows
+            .iter()
+            .map(|r| ClientCert {
+                serial: r.get("serial"),
+                client_id: ClientId(r.get("client_id")),
+                issued_at: r.get("issued_at"),
+                expires_at: r.get("expires_at"),
+                status: r.get("status"),
+                revoked_at: r.get("revoked_at"),
+            })
+            .collect();
+        debug!("Listed {} client certs for client {}", certs.len(), client_id);
+        Ok(certs)
+    }
+
+    /// Check whether a certificate serial is revoked (TLS accept-path check).
+    #[allow(dead_code)] // TLS accept-path revocation check
+    pub async fn is_cert_revoked(&self, serial: &str) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT status FROM client_certs WHERE serial = $1",
+        )
+        .bind(serial)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some_and(|r| r.get::<String, _>("status") == "revoked"))
+    }
+
+    /// Return all currently revoked cert serials (for caching in the gRPC
+    /// accept-path revocation set).
+    #[allow(dead_code)] // Admin API / revocation path
+    pub async fn get_revoked_cert_serials(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query("SELECT serial FROM client_certs WHERE status = 'revoked'")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|r| r.get("serial")).collect())
+    }
+
+    /// Highest issued client-cert serial as a u64, used to seed the in-memory
+    /// serial counter after a restart so serials are never re-issued
+    /// (red-team F3). Serials are stored as hex text, so the max is computed
+    /// in Rust rather than relying on TEXT ordering.
+    #[allow(dead_code)] // TlsManager startup seeding
+    pub async fn max_client_cert_serial_u64(&self) -> Result<Option<u64>> {
+        let rows = sqlx::query("SELECT serial FROM client_certs")
+            .fetch_all(&self.pool)
+            .await?;
+        let mut max: Option<u64> = None;
+        for r in rows {
+            let serial: String = r.get("serial");
+            if let Ok(v) = u64::from_str_radix(&serial, 16) {
+                max = Some(max.map_or(v, |m| m.max(v)));
+            }
+        }
+        Ok(max)
+    }
+
+    /// Record a pairing approval/deny audit entry (P4 approval audit view).
+    #[allow(dead_code)] // Admin API / approval audit view
+    pub async fn record_pair_approval_audit(
+        &self,
+        request_id: &str,
+        action: &str,   // "approved" | "denied"
+        approver: &str, // username or "system"
+        detail: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pair_approval_audit (request_id, action, approver, detail, created_at)
+             VALUES ($1, $2, $3, $4, now())",
+        )
+        .bind(request_id)
+        .bind(action)
+        .bind(approver)
+        .bind(detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List pairing approval audit entries, newest first (P4 approval audit view).
+    #[allow(dead_code)] // Admin API / approval audit view
+    pub async fn list_pair_approval_audit(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<PairApprovalAuditRow>> {
+        let rows = sqlx::query(
+            "SELECT request_id, action, approver, detail, created_at
+             FROM pair_approval_audit
+             ORDER BY created_at DESC
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let out: Vec<PairApprovalAuditRow> = rows
+            .iter()
+            .map(|r| PairApprovalAuditRow {
+                request_id: r.get("request_id"),
+                action: r.get("action"),
+                approver: r.get("approver"),
+                detail: r.get("detail"),
+                created_at: r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").timestamp(),
+            })
+            .collect();
+        Ok(out)
+    }
+
+    // ─── Enrollment keys (P5) ─────────────────────────────────────────────
+
+    /// Create an enrollment key. `key_hash` is the hex SHA-256 of the
+    /// plaintext key; the plaintext is never stored. Returns the key id.
+    #[allow(dead_code)] // Admin API / enrollment key path
+    pub async fn create_enrollment_key(
+        &self,
+        key_hash: &str,
+        label: &str,
+        max_uses: i64,
+        expires_at: Option<chrono::DateTime<Utc>>,
+    ) -> Result<Uuid> {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO enrollment_keys (id, key_hash, label, max_uses, expires_at)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id)
+        .bind(key_hash)
+        .bind(label)
+        .bind(max_uses)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        info!("Created enrollment key {} (label={}, max_uses={})", id, label, max_uses);
+        Ok(id)
+    }
+
+    /// List all enrollment keys (dashboard key manager). Hashes are included
+    /// for uniqueness display but plaintext keys are never recoverable.
+    #[allow(dead_code)] // Admin API / enrollment key path
+    pub async fn list_enrollment_keys(&self) -> Result<Vec<EnrollmentKeyRow>> {
+        let rows = sqlx::query(
+            "SELECT id, key_hash, label, max_uses, use_count, created_at, expires_at, revoked_at
+             FROM enrollment_keys ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let out: Vec<EnrollmentKeyRow> = rows
+            .iter()
+            .map(|r| EnrollmentKeyRow {
+                id: r.get("id"),
+                key_hash: r.get("key_hash"),
+                label: r.get("label"),
+                max_uses: r.get("max_uses"),
+                use_count: r.get("use_count"),
+                created_at: r.get::<chrono::DateTime<Utc>, _>("created_at").timestamp(),
+                expires_at: r
+                    .try_get::<Option<chrono::DateTime<Utc>>, _>("expires_at")
+                    .ok()
+                    .flatten()
+                    .map(|t| t.timestamp()),
+                revoked_at: r
+                    .try_get::<Option<chrono::DateTime<Utc>>, _>("revoked_at")
+                    .ok()
+                    .flatten()
+                    .map(|t| t.timestamp()),
+            })
+            .collect();
+        Ok(out)
+    }
+
+    /// Revoke an enrollment key. Returns true if a live key was revoked.
+    #[allow(dead_code)] // Admin API / enrollment key path
+    pub async fn revoke_enrollment_key(&self, key_id: &Uuid) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE enrollment_keys SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(key_id)
+        .execute(&self.pool)
+        .await?;
+        let revoked = result.rows_affected() > 0;
+        if revoked {
+            info!("Revoked enrollment key {}", key_id);
+        }
+        Ok(revoked)
+    }
+
+    /// Validate a presented enrollment key by hash. Returns the key row when
+    /// it exists, is not revoked, is not expired, and has uses remaining.
+    #[allow(dead_code)] // Enrollment pairing path
+    pub async fn validate_enrollment_key(&self, key_hash: &str) -> Result<Option<EnrollmentKeyRow>> {
+        let row = sqlx::query(
+            "SELECT id, key_hash, label, max_uses, use_count, created_at, expires_at, revoked_at
+             FROM enrollment_keys
+             WHERE key_hash = $1
+               AND revoked_at IS NULL
+               AND use_count < max_uses
+               AND (expires_at IS NULL OR expires_at > now())",
+        )
+        .bind(key_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|r| EnrollmentKeyRow {
+            id: r.get("id"),
+            key_hash: r.get("key_hash"),
+            label: r.get("label"),
+            max_uses: r.get("max_uses"),
+            use_count: r.get("use_count"),
+            created_at: r.get::<chrono::DateTime<Utc>, _>("created_at").timestamp(),
+            expires_at: r
+                .try_get::<Option<chrono::DateTime<Utc>>, _>("expires_at")
+                .ok()
+                .flatten()
+                .map(|t| t.timestamp()),
+            revoked_at: r
+                .try_get::<Option<chrono::DateTime<Utc>>, _>("revoked_at")
+                .ok()
+                .flatten()
+                .map(|t| t.timestamp()),
+        }))
+    }
+
+    /// Increment the use counter on an enrollment key after successful use.
+    #[allow(dead_code)] // Enrollment pairing path
+    pub async fn increment_enrollment_key_use(&self, key_id: &Uuid) -> Result<()> {
+        sqlx::query("UPDATE enrollment_keys SET use_count = use_count + 1 WHERE id = $1")
+            .bind(key_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn ping(&self) -> Result<bool> {
@@ -2359,4 +2741,28 @@ pub struct PendingAssignmentRow {
     pub created_at: i64,
     pub delivered_at: Option<i64>,
     pub resolved_at: Option<i64>,
+}
+
+/// Row from pair_approval_audit: one approve/deny action on a v2 pairing
+/// request (P4 approval audit view).
+#[derive(Debug, Clone)]
+pub struct PairApprovalAuditRow {
+    pub request_id: String,
+    pub action: String,      // "approved" | "denied"
+    pub approver: String,    // username or "system"
+    pub detail: Option<String>,
+    pub created_at: i64,     // epoch seconds
+}
+
+/// Row from enrollment_keys (P5): a fleet-scale pre-approval key.
+#[derive(Debug, Clone)]
+pub struct EnrollmentKeyRow {
+    pub id: Uuid,
+    pub key_hash: String,    // hex SHA-256 of the plaintext key
+    pub label: String,
+    pub max_uses: i64,
+    pub use_count: i64,
+    pub created_at: i64,             // epoch seconds
+    pub expires_at: Option<i64>,     // epoch seconds
+    pub revoked_at: Option<i64>,     // epoch seconds
 }

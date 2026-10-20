@@ -1,20 +1,34 @@
 //! Pairing endpoints — daemon-managed client pairing via admin API.
 //!
-//! The dashboard or CLI calls `POST /api/v1/pair/init` to start a pairing
-//! session. The daemon spawns a short-lived TCP listener on port 50052 that
-//! accepts one pairing connection, validates the code, registers the client
-//! in the DB, generates an mTLS certificate, and sends the PairResponse.
+//! Two modes:
+//! - Legacy (pairing_mode = `legacy-code`): `POST /api/v1/pair/init` mints a
+//!   6-char code, starts a TCP listener on port 50052, the client connects
+//!   with the code, and the server issues an mTLS cert in one exchange.
+//! - v2 / Sunshine (pairing_mode = `pin`, default): client initiates with
+//!   `POST /api/v1/pair/request` (ephemeral pubkey + PIN hash), admin
+//!   approves via `POST /api/v1/pair/approve` (request_id + PIN), client
+//!   collects via `POST /api/v1/pair/collect` (proof of possession).
 //!
-//! This replaces the old separate-process `monopsony-server pair` command
-//! which was fragile when run over SSH (process lifecycle issues).
+//! Registration-at-collection: the DB row is created only when the client
+//! collects the cert, fixing the register-before-complete asymmetry.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::{extract::State, response::IntoResponse, Json};
+use axum::{
+    extract::{ConnectInfo, State},
+    response::IntoResponse,
+    Json,
+};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::AdminState;
+use anyhow::Context;
 
 /// How long a pairing session stays open waiting for a client to connect.
 const PAIRING_TIMEOUT_SECS: u64 = 300; // 5 minutes
@@ -32,6 +46,262 @@ const PAIRING_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3
 /// subsystem's config lock is contended or stuck, pairing proceeds without it
 /// (2026-10-17: a wedged sync task froze pairing mid-handshake exactly here).
 const MIRROR_ENSURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+// ─── Pending pair store (pairing-v2 Phase 2) ─────────────────────────────
+/// In-memory store for v2 pairing requests. Cap 50, TTL 15 min, dedup-replace
+/// on same claimed identity + source IP, 3-strike PIN invalidation.
+/// No DB writes happen here — registration occurs only at collect time.
+#[derive(Debug, Clone)]
+pub struct PendingPairEntry {
+    pub request_id: String,
+    pub claimed_hostname: String,
+    pub claimed_os: String,
+    pub claimed_os_version: String,
+    pub package_managers: Vec<String>,
+    pub ephemeral_pubkey: Vec<u8>,   // client Ed25519 pubkey (32 bytes)
+    pub pin_hash: String,             // hex SHA-256(pin_salt + pin)
+    pub pin_salt: String,             // client-generated random salt (hex)
+    pub pin_attempts: u32,            // 0-3
+    pub source_ip: String,            // observed peer IP
+    pub created_at: i64,              // epoch seconds
+    pub expires_at: i64,              // epoch seconds, pending TTL (15 min)
+    pub status: PendingPairStatus,
+    pub client_id: Option<String>,    // set at collect time
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingPairStatus {
+    Pending,      // awaiting admin approval
+    Approved,     // admin approved, awaiting client collection
+    Collected,    // client collected the cert (PIN single-use)
+    Expired,      // TTL passed without collection
+    Invalidated,  // 3 wrong PINs or admin deny
+}
+
+/// In-memory store with cap, TTL, dedup-replace, and expiry.
+#[derive(Debug, Default)]
+pub struct PendingPairStore {
+    /// request_id -> entry
+    entries: HashMap<String, PendingPairEntry>,
+    /// claimed_hostname + source_ip -> request_id (for dedup-replace)
+    by_identity: HashMap<(String, String), String>,
+}
+
+const PENDING_CAP: usize = 50;
+const PENDING_TTL_SECS: i64 = 900;   // 15 minutes
+const APPROVED_UNCOLLECTED_TTL_SECS: i64 = 300; // 5 minutes after approval
+const MAX_PIN_ATTEMPTS: u32 = 3;
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+impl PendingPairStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Submit a new pairing request. Dedup-replaces an existing entry from the
+    /// same claimed identity + source IP. Returns the request_id.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit(
+        &mut self,
+        claimed_hostname: String,
+        claimed_os: String,
+        claimed_os_version: String,
+        package_managers: Vec<String>,
+        ephemeral_pubkey: Vec<u8>,
+        pin_hash: String,
+        pin_salt: String,
+        source_ip: String,
+    ) -> String {
+        let now = now_secs();
+        let request_id = Uuid::new_v4().to_string();
+        let expires_at = now + PENDING_TTL_SECS;
+
+        // Dedup-replace: if same identity + source already has a pending
+        // request, invalidate the old one and reuse its request_id slot.
+        let dedup_key = (claimed_hostname.clone(), source_ip.clone());
+        if let Some(existing_id) = self.by_identity.remove(&dedup_key) {
+            if let Some(existing) = self.entries.get_mut(&existing_id) {
+                existing.status = PendingPairStatus::Invalidated;
+            }
+        }
+
+        let entry = PendingPairEntry {
+            request_id: request_id.clone(),
+            claimed_hostname,
+            claimed_os,
+            claimed_os_version,
+            package_managers,
+            ephemeral_pubkey,
+            pin_hash,
+            pin_salt,
+            pin_attempts: 0,
+            source_ip,
+            created_at: now,
+            expires_at,
+            status: PendingPairStatus::Pending,
+            client_id: None,
+        };
+
+        // Enforce cap: evict oldest expired/collected/invalidated first.
+        if self.entries.len() >= PENDING_CAP {
+            self.evict_stale();
+        }
+        // If still at cap, evict oldest pending.
+        if self.entries.len() >= PENDING_CAP {
+            let oldest = self
+                .entries
+                .iter()
+                .min_by_key(|(_, e)| e.created_at)
+                .map(|(id, _)| id.clone());
+            if let Some(id) = oldest {
+                if let Some(e) = self.entries.remove(&id) {
+                    self.by_identity.remove(&(e.claimed_hostname, e.source_ip));
+                }
+            }
+        }
+
+        self.entries.insert(request_id.clone(), entry);
+        self.by_identity.insert(dedup_key, request_id.clone());
+        request_id
+    }
+
+    fn evict_stale(&mut self) {
+        let now = now_secs();
+        let stale: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|(_, e)| {
+                e.status == PendingPairStatus::Collected
+                    || e.status == PendingPairStatus::Invalidated
+                    || now > e.expires_at
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            if let Some(e) = self.entries.remove(&id) {
+                self.by_identity.remove(&(e.claimed_hostname, e.source_ip));
+            }
+        }
+    }
+
+    /// List all pending (not-yet-collected) entries for the admin dashboard.
+    pub fn list_pending(&self) -> Vec<PendingPairEntry> {
+        let now = now_secs();
+        self.entries
+            .values()
+            .filter(|e| {
+                // Expired entries that haven't been marked yet
+                if now > e.expires_at && e.status == PendingPairStatus::Pending {
+                    return false;
+                }
+                // Approved-but-uncollected past its shorter clock
+                if e.status == PendingPairStatus::Approved
+                    && now > e.created_at + APPROVED_UNCOLLECTED_TTL_SECS
+                {
+                    return false;
+                }
+                e.status == PendingPairStatus::Pending
+                    || e.status == PendingPairStatus::Approved
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Get an entry by request_id.
+    pub fn get(&self, request_id: &str) -> Option<PendingPairEntry> {
+        self.entries.get(request_id).cloned()
+    }
+
+    /// Validate a PIN attempt. Returns Ok(true) if correct, Ok(false) if wrong
+    /// (incrementing attempts), Err if already invalidated/collected.
+    pub fn attempt_pin(&mut self, request_id: &str, pin: &str) -> Result<bool, String> {
+        let entry = self
+            .entries
+            .get_mut(request_id)
+            .ok_or_else(|| "Request not found".to_string())?;
+
+        // A pending request past its TTL can no longer be approved (D8).
+        let now = now_secs();
+        if entry.status == PendingPairStatus::Pending && now > entry.expires_at {
+            entry.status = PendingPairStatus::Expired;
+            warn!("Pairing request {} expired before approval", request_id);
+            return Err("Request expired".to_string());
+        }
+
+        if entry.status == PendingPairStatus::Approved {
+            // Idempotent: repeat approve of the same request is a no-ok, not an error (D8).
+            return Ok(true);
+        }
+
+        if entry.status != PendingPairStatus::Pending {
+            return Err(format!("Request is {:?}, not pending", entry.status));
+        }
+
+        // Compute expected hash: SHA-256(pin_salt + pin)
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(entry.pin_salt.as_bytes());
+        hasher.update(pin.as_bytes());
+        let expected = hex::encode(hasher.finalize());
+
+        if expected == entry.pin_hash {
+            entry.status = PendingPairStatus::Approved;
+            info!("Pairing request {} approved by PIN", request_id);
+            Ok(true)
+        } else {
+            entry.pin_attempts += 1;
+            if entry.pin_attempts >= MAX_PIN_ATTEMPTS {
+                entry.status = PendingPairStatus::Invalidated;
+                warn!(
+                    "Pairing request {} invalidated after {} failed PIN attempts",
+                    request_id, entry.pin_attempts
+                );
+            }
+            Ok(false)
+        }
+    }
+
+    /// Mark a request as collected (PIN single-use). Returns the entry if
+    /// found and collectable. Approved-but-uncollected requests expire on a
+    /// shorter clock than the pending TTL (D8).
+    pub fn mark_collected(&mut self, request_id: &str) -> Option<PendingPairEntry> {
+        let entry = self.entries.get_mut(request_id)?;
+        if entry.status != PendingPairStatus::Approved {
+            return None;
+        }
+        let now = now_secs();
+        if now > entry.created_at + APPROVED_UNCOLLECTED_TTL_SECS {
+            entry.status = PendingPairStatus::Expired;
+            warn!("Pairing request {} expired before collection", request_id);
+            return None;
+        }
+        entry.status = PendingPairStatus::Collected;
+        entry.client_id = entry.client_id.clone();
+        Some(entry.clone())
+    }
+
+    /// Deny a request (admin action).
+    pub fn deny(&mut self, request_id: &str) -> bool {
+        if let Some(entry) = self.entries.get_mut(request_id) {
+            if entry.status == PendingPairStatus::Pending
+                || entry.status == PendingPairStatus::Approved
+            {
+                entry.status = PendingPairStatus::Invalidated;
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    }
+}
 
 /// In-memory state for a single active pairing session.
 #[derive(Debug, Clone, Serialize)]
@@ -410,10 +680,19 @@ async fn run_pairing_listener(
             let new_client_id = cid.0.to_string();
 
             // Generate certificate with SAN matching the DB client_id
-            let (client_cert, client_key) = tls_manager.generate_client_cert(&new_client_id)?;
+            // (red-team F3: 90-day validity + serial tracked for revocation)
+            let (cert_serial, client_cert, client_key) =
+                tls_manager.generate_client_cert(&new_client_id)?;
             let (client_cert_pem, client_key_pem) =
                 monopsony_control::tls::TlsManager::cert_and_key_to_pem(&client_cert, &client_key);
             let ca_cert_pem = tls_manager.ca_cert_pem_bytes();
+
+            // Record the cert serial on the client row for revocation tracking.
+            if let Some(db) = db.as_ref() {
+                db.update_client_cert_serial(&cid, &cert_serial)
+                    .await
+                    .context("Failed to record client cert serial")?;
+            }
 
             // Derive the gRPC address to send to the client.
             // Prefer the override, then the socket's local address, then the config.
@@ -546,7 +825,507 @@ async fn update_pairing_session(
     }
 }
 
-#[cfg(test)]
+// ─── Pairing v2 / Sunshine request/response types ────────────────────────
+
+/// POST /api/v1/pair/request — client submits a v2 pairing request.
+#[derive(Debug, Deserialize)]
+pub struct PairRequestV2 {
+    /// Client-generated Ed25519 public key (32 bytes) for key-bound issuance.
+    pub ephemeral_pubkey: String, // hex-encoded
+    /// hex SHA-256(pin_salt + pin)
+    pub pin_hash: String,
+    /// Client-generated random salt (hex)
+    pub pin_salt: String,
+    pub claimed_hostname: String,
+    pub claimed_os: String,
+    pub claimed_os_version: String,
+    #[serde(default)]
+    pub package_managers: Vec<String>,
+}
+
+/// Response to POST /api/v1/pair/request.
+#[derive(Debug, Serialize)]
+pub struct PairRequestV2Response {
+    pub request_id: String,
+    pub expires_at: i64,
+}
+
+/// GET /api/v1/pair/request/:request_id/status — client polls for approval status.
+#[derive(Debug, Serialize)]
+pub struct PairRequestStatusResponse {
+    pub request_id: String,
+    pub status: String, // "pending" | "approved" | "collected" | "expired" | "invalidated"
+    pub pin_attempts: u32,
+    pub expires_at: i64,
+}
+
+/// POST /api/v1/pair/approve — admin approves a pending request.
+#[derive(Debug, Deserialize)]
+pub struct ApprovePairRequest {
+    pub request_id: String,
+    pub pin: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ApprovePairResponse {
+    pub approved: bool,
+    pub message: String,
+}
+
+/// POST /api/v1/pair/collect — client collects cert after approval.
+#[derive(Debug, Deserialize)]
+pub struct CollectPairRequest {
+    pub request_id: String,
+    /// hex-encoded Ed25519 public key (must match the one in the original request)
+    pub ephemeral_pubkey: String,
+    /// Ed25519 signature over request_id bytes (hex-encoded)
+    pub signature: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CollectPairResponse {
+    pub collected: bool,
+    pub client_id: String,
+    pub client_cert_pem: String,
+    pub client_key_pem: String,
+    pub ca_cert_pem: String,
+    pub grpc_addr: String,
+    pub ws_url: String,
+    pub mirror_verify_key: Vec<u8>,
+}
+
+/// POST /api/v1/pair/enroll — fleet-scale pre-approved pairing (P5).
+#[derive(Debug, Deserialize)]
+pub struct EnrollPairRequest {
+    /// Plaintext enrollment key (mopk-...); validated by hashed lookup.
+    pub enrollment_key: String,
+    /// hex-encoded Ed25519 ephemeral public key (32 bytes).
+    pub ephemeral_pubkey: String,
+    /// Ed25519 signature over `monopsony-enroll-v1` (hex, 64 bytes) —
+    /// proof of possession of the ephemeral private key.
+    pub signature: String,
+    pub claimed_hostname: String,
+    pub claimed_os: String,
+    pub claimed_os_version: String,
+    #[serde(default)]
+    pub package_managers: Vec<String>,
+}
+
+// ─── Pairing v2 handlers ─────────────────────────────────────────────────
+
+/// POST /api/v1/pair/request — v2 pairing intake (unauth, rate-limited).
+/// Client submits ephemeral pubkey + PIN hash; server stores as pending.
+pub async fn handle_pair_request_v2(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AdminState>,
+    Json(req): Json<PairRequestV2>,
+) -> impl IntoResponse {
+    // Check pairing mode
+    if state.dashboard_config.pairing_mode == crate::PairingMode::Off {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "pairing is disabled"})),
+        );
+    }
+
+    // Decode ephemeral pubkey
+    let ephemeral_pubkey = match hex::decode(&req.ephemeral_pubkey) {
+        Ok(bytes) if bytes.len() == 32 => bytes,
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "ephemeral_pubkey must be 32 hex bytes"})),
+            );
+        }
+    };
+
+    // Validate pin_hash and pin_salt are non-empty
+    if req.pin_hash.is_empty() || req.pin_salt.is_empty() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "pin_hash and pin_salt are required"})),
+        );
+    }
+
+    let source_ip = addr.ip().to_string();
+
+    let mut store = state.pending_pairs.lock().await;
+    let request_id = store.submit(
+        req.claimed_hostname.clone(),
+        req.claimed_os.clone(),
+        req.claimed_os_version.clone(),
+        req.package_managers,
+        ephemeral_pubkey,
+        req.pin_hash.clone(),
+        req.pin_salt.clone(),
+        source_ip.clone(),
+    );
+    let entry = store.get(&request_id).unwrap();
+
+    drop(store);
+
+    info!(
+        "Pairing v2 request submitted: request_id={}, hostname={}, source_ip={}",
+        request_id, req.claimed_hostname, source_ip
+    );
+
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({
+            "request_id": request_id,
+            "expires_at": entry.expires_at,
+        })),
+    )
+}
+
+/// GET /api/v1/pair/request/:request_id/status — client polls for status.
+pub async fn handle_pair_request_status(
+    State(state): State<AdminState>,
+    axum::extract::Path(request_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let store = state.pending_pairs.lock().await;
+    let entry = match store.get(&request_id) {
+        Some(e) => e,
+        None => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "request not found"})),
+            );
+        }
+    };
+    drop(store);
+
+    let status_str = match entry.status {
+        PendingPairStatus::Pending => "pending",
+        PendingPairStatus::Approved => "approved",
+        PendingPairStatus::Collected => "collected",
+        PendingPairStatus::Expired => "expired",
+        PendingPairStatus::Invalidated => "invalidated",
+    };
+
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({
+            "request_id": request_id,
+            "status": status_str,
+            "pin_attempts": entry.pin_attempts,
+            "expires_at": entry.expires_at,
+        })),
+    )
+}
+
+/// GET /api/v1/pair/pending — list pending requests (auth, admin dashboard).
+pub async fn handle_pair_pending(State(state): State<AdminState>) -> impl IntoResponse {
+    let store = state.pending_pairs.lock().await;
+    let pending = store.list_pending();
+    drop(store);
+
+    let result: Vec<serde_json::Value> = pending
+        .into_iter()
+        .map(|e| {
+            serde_json::json!({
+                "request_id": e.request_id,
+                "claimed_hostname": e.claimed_hostname,
+                "claimed_os": e.claimed_os,
+                "claimed_os_version": e.claimed_os_version,
+                "source_ip": e.source_ip,
+                "created_at": e.created_at,
+                "expires_at": e.expires_at,
+                "pin_attempts": e.pin_attempts,
+                "status": match e.status {
+                    PendingPairStatus::Pending => "pending",
+                    PendingPairStatus::Approved => "approved",
+                    PendingPairStatus::Collected => "collected",
+                    PendingPairStatus::Expired => "expired",
+                    PendingPairStatus::Invalidated => "invalidated",
+                },
+            })
+        })
+        .collect();
+
+    Json(serde_json::Value::Array(result))
+}
+
+/// POST /api/v1/pair/approve — admin approves a pending request (row-bound,
+/// 3-strike PIN, idempotent).
+pub async fn handle_pair_approve(
+    State(state): State<AdminState>,
+    Json(req): Json<ApprovePairRequest>,
+) -> impl IntoResponse {
+    let mut store = state.pending_pairs.lock().await;
+    let result = store.attempt_pin(&req.request_id, &req.pin);
+    drop(store);
+
+    let Some(ref db) = state.db else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Database not available"})),
+        )
+            .into_response();
+    };
+
+    match result {
+        Ok(true) => {
+            let _ = db
+                .record_pair_approval_audit(&req.request_id, "approved", "system", None)
+                .await;
+            (
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!({
+                    "approved": true,
+                    "message": "Request approved. Client may now collect the certificate."
+                })),
+            )
+                .into_response()
+        }
+        Ok(false) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "approved": false,
+                "message": "Invalid PIN."
+            })),
+        )
+            .into_response(),
+        Err(msg) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "approved": false,
+                "message": msg
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/pair/deny — admin denies a pending request (auth).
+pub async fn handle_pair_deny(
+    State(state): State<AdminState>,
+    axum::extract::Path(request_id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut store = state.pending_pairs.lock().await;
+    let denied = store.deny(&request_id);
+    drop(store);
+
+    let Some(ref db) = state.db else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Database not available"})),
+        )
+            .into_response();
+    };
+
+    if denied {
+        let _ = db
+            .record_pair_approval_audit(&request_id, "denied", "system", None)
+            .await;
+        (
+            axum::http::StatusCode::OK,
+            Json(serde_json::json!({"status": "denied"})),
+        )
+            .into_response()
+    } else {
+        (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "request not found or already resolved"})),
+        )
+            .into_response()
+    }
+}
+
+/// POST /api/v1/pair/collect — client collects cert after approval.
+/// Proof of possession: Ed25519 signature over request_id bytes using the
+/// ephemeral privkey. Registration-at-collection: DB row created here.
+pub async fn handle_pair_collect(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AdminState>,
+    Json(req): Json<CollectPairRequest>,
+) -> impl IntoResponse {
+    let source_ip = addr.ip().to_string();
+
+    // Decode ephemeral pubkey
+    let ephemeral_pubkey_bytes = match hex::decode(&req.ephemeral_pubkey) {
+        Ok(bytes) if bytes.len() == 32 => bytes,
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "ephemeral_pubkey must be 32 hex bytes"})),
+            );
+        }
+    };
+
+    // Decode signature (Ed25519 = 64 bytes)
+    let signature_bytes = match hex::decode(&req.signature) {
+        Ok(bytes) if bytes.len() == 64 => bytes,
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "signature must be 64 hex bytes"})),
+            );
+        }
+    };
+
+    // Look up the pending request
+    let mut store = state.pending_pairs.lock().await;
+    let entry = match store.get(&req.request_id) {
+        Some(e) => e,
+        None => {
+            drop(store);
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "request not found"})),
+            );
+        }
+    };
+
+    // Verify status is Approved
+    if entry.status != PendingPairStatus::Approved {
+        drop(store);
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Request is {:?}, not approved", entry.status)
+            })),
+        );
+    }
+
+    // Verify ephemeral_pubkey matches
+    if entry.ephemeral_pubkey != ephemeral_pubkey_bytes {
+        drop(store);
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "ephemeral_pubkey does not match the request"})),
+        );
+    }
+
+    // Verify Ed25519 signature over request_id bytes
+    let verifying_key = match VerifyingKey::from_bytes(&ephemeral_pubkey_bytes.try_into().unwrap()) {
+        Ok(vk) => vk,
+        Err(_) => {
+            drop(store);
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid ephemeral public key"})),
+            );
+        }
+    };
+    let sig = match Signature::from_slice(&signature_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            drop(store);
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid signature"})),
+            );
+        }
+    };
+
+    if verifying_key.verify(req.request_id.as_bytes(), &sig).is_err() {
+        drop(store);
+        warn!(
+            "Collect attempt with invalid signature: request_id={}, source_ip={}",
+            req.request_id, source_ip
+        );
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "signature verification failed"})),
+        );
+    }
+
+    // All checks passed — mark as collected
+    let collected_entry = match store.mark_collected(&req.request_id) {
+        Some(e) => e,
+        None => {
+            drop(store);
+            return (
+                axum::http::StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": "request already collected or invalid"})),
+            );
+        }
+    };
+    drop(store);
+
+    info!(
+        "Pairing v2 collect: request_id={}, client claimed hostname={}, source_ip={}",
+        req.request_id, collected_entry.claimed_hostname, source_ip
+    );
+
+    // Generate cert and register client (registration-at-collection)
+    // Use the TlsManager to generate a client cert bound to the client_id
+    let client_id = uuid::Uuid::new_v4().to_string();
+
+    let (cert_serial, client_cert, client_key) = match state
+        .tls_manager
+        .generate_client_cert(&client_id)
+    {
+        Ok(result) => result,
+        Err(e) => {
+            warn!("Failed to generate client cert for collect: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to generate certificate"})),
+            );
+        }
+    };
+
+    let (client_cert_pem, client_key_pem) =
+        monopsony_control::tls::TlsManager::cert_and_key_to_pem(&client_cert, &client_key);
+    let ca_cert_pem = state.tls_manager.ca_cert_pem_bytes();
+
+    // Register client in DB (registration-at-collection)
+    if let Some(ref db) = state.db {
+        match db
+            .register_client(
+                &collected_entry.claimed_hostname,
+                &collected_entry.claimed_os,
+                &collected_entry.claimed_os_version,
+                &collected_entry.package_managers,
+            )
+            .await
+        {
+            Ok(cid) => {
+                let issued_at = chrono::Utc::now();
+                let expires_at = issued_at
+                    + chrono::Duration::seconds(
+                        state.tls_manager.client_cert_validity_days() as i64 * 86_400,
+                    );
+                let _ = db.record_pairing(&cid, issued_at).await;
+                let _ = db.update_client_cert_serial(&cid, &cert_serial).await;
+                let _ = db
+                    .insert_client_cert(&cert_serial, &cid, issued_at, expires_at)
+                    .await;
+            }
+            Err(e) => {
+                warn!("Failed to register client during collect: {}", e);
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "failed to register client"})),
+                );
+            }
+        }
+    }
+
+    // Derive gRPC address
+    let grpc_addr = state.grpc_addr.clone();
+
+    // Convert PEM bytes to UTF-8 strings (they are valid ASCII/UTF-8 PEM)
+    let client_cert_pem = String::from_utf8_lossy(&client_cert_pem).into_owned();
+    let client_key_pem = String::from_utf8_lossy(&client_key_pem).into_owned();
+    let ca_cert_pem = String::from_utf8_lossy(&ca_cert_pem).into_owned();
+
+    (
+        axum::http::StatusCode::OK,
+        Json(serde_json::json!({
+            "collected": true,
+            "client_id": client_id,
+            "client_cert_pem": client_cert_pem,
+            "client_key_pem": client_key_pem,
+            "ca_cert_pem": ca_cert_pem,
+            "grpc_addr": grpc_addr,
+            "ws_url": state.ws_url.clone().unwrap_or_default(),
+            "mirror_verify_key": state.mirror_verify_key.to_vec(),
+        })),
+    )
+}
 mod tests {
     use super::*;
 
@@ -628,4 +1407,547 @@ mod tests {
 
         assert!(read_pair_request(&mut server).await.is_err());
     }
+
+    // ─── PendingPairStore tests ──────────────────────────────────────
+
+    #[test]
+    fn pending_store_submit_and_list() {
+        let mut store = PendingPairStore::new();
+        let id = store.submit(
+            "client1".to_string(),
+            "Linux".to_string(),
+            "6.0".to_string(),
+            vec!["apt".to_string()],
+            vec![1u8; 32],
+            "hash1".to_string(),
+            "salt1".to_string(),
+            "10.0.0.1".to_string(),
+        );
+        assert!(!id.is_empty());
+
+        let pending = store.list_pending();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request_id, id);
+        assert_eq!(pending[0].claimed_hostname, "client1");
+        assert_eq!(pending[0].status, PendingPairStatus::Pending);
+    }
+
+    #[test]
+    fn pending_store_approve_and_collect() {
+        let mut store = PendingPairStore::new();
+
+        // Pre-compute the correct PIN hash: SHA-256("salt" + "correct_pin")
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"salt");
+        hasher.update(b"correct_pin");
+        let correct_pin_hash = hex::encode(hasher.finalize());
+
+        let id = store.submit(
+            "client1".to_string(),
+            "Linux".to_string(),
+            "6.0".to_string(),
+            vec![],
+            vec![1u8; 32],
+            correct_pin_hash,   // pin_hash = SHA-256("salt" + "correct_pin")
+            "salt".to_string(),
+            "10.0.0.1".to_string(),
+        );
+
+        // Wrong PIN → attempt incremented, still pending
+        let result = store.attempt_pin(&id, "wrong_pin").unwrap();
+        assert!(!result);
+        let entry = store.get(&id).unwrap();
+        assert_eq!(entry.pin_attempts, 1);
+        assert_eq!(entry.status, PendingPairStatus::Pending);
+
+        // Correct PIN → approved
+        let result = store.attempt_pin(&id, "correct_pin").unwrap();
+        assert!(result);
+        let entry = store.get(&id).unwrap();
+        assert_eq!(entry.status, PendingPairStatus::Approved);
+
+        // Collect → marked collected, returns entry
+        let collected = store.mark_collected(&id).unwrap();
+        assert_eq!(collected.status, PendingPairStatus::Collected);
+
+        // Collect again → already collected, returns None
+        assert!(store.mark_collected(&id).is_none());
+    }
+
+    #[test]
+    fn pending_store_three_wrong_pins_invalidate() {
+        let mut store = PendingPairStore::new();
+        let id = store.submit(
+            "client1".to_string(),
+            "Linux".to_string(),
+            "6.0".to_string(),
+            vec![],
+            vec![1u8; 32],
+            "hash".to_string(),
+            "salt".to_string(),
+            "10.0.0.1".to_string(),
+        );
+
+        // Three wrong PINs
+        for _ in 0..3 {
+            let result = store.attempt_pin(&id, "wrong").unwrap();
+            assert!(!result);
+        }
+
+        let entry = store.get(&id).unwrap();
+        assert_eq!(entry.status, PendingPairStatus::Invalidated);
+        assert_eq!(entry.pin_attempts, 3);
+
+        // Fourth attempt on invalidated request → error
+        let result = store.attempt_pin(&id, "whatever");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pending_store_dedup_replace_same_identity() {
+        let mut store = PendingPairStore::new();
+        let id1 = store.submit(
+            "client1".to_string(),
+            "Linux".to_string(),
+            "6.0".to_string(),
+            vec![],
+            vec![1u8; 32],
+            "hash1".to_string(),
+            "salt1".to_string(),
+            "10.0.0.1".to_string(),
+        );
+        let id2 = store.submit(
+            "client1".to_string(), // same identity
+            "Linux".to_string(),
+            "6.0".to_string(),
+            vec![],
+            vec![2u8; 32],
+            "hash2".to_string(),
+            "salt2".to_string(),
+            "10.0.0.1".to_string(), // same source IP
+        );
+
+        // First request should be invalidated
+        let e1 = store.get(&id1).unwrap();
+        assert_eq!(e1.status, PendingPairStatus::Invalidated);
+
+        // Second request is pending
+        let e2 = store.get(&id2).unwrap();
+        assert_eq!(e2.status, PendingPairStatus::Pending);
+
+        // Only one entry in list_pending
+        let pending = store.list_pending();
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn pending_store_cap_evicts_stale() {
+        let mut store = PendingPairStore::new();
+        // Fill up to cap
+        for i in 0..PENDING_CAP {
+            store.submit(
+                format!("client{}", i),
+                "Linux".to_string(),
+                "6.0".to_string(),
+                vec![],
+                vec![i as u8; 32],
+                "hash".to_string(),
+                "salt".to_string(),
+                format!("10.0.0.{}", i),
+            );
+        }
+        assert_eq!(store.entries.len(), PENDING_CAP);
+
+        // One more submission should trigger eviction, keeping count at cap
+        store.submit(
+            "client_new".to_string(),
+            "Linux".to_string(),
+            "6.0".to_string(),
+            vec![],
+            vec![99u8; 32],
+            "hash".to_string(),
+            "salt".to_string(),
+            "10.0.0.99".to_string(),
+        );
+        assert_eq!(store.entries.len(), PENDING_CAP);
+        // At least one of the original entries should be gone
+        assert!(store.entries.values().any(|e| e.claimed_hostname == "client_new"));
+    }
+
+    #[test]
+    fn pending_store_expired_not_listed() {
+        let mut store = PendingPairStore::new();
+        let id = store.submit(
+            "client1".to_string(),
+            "Linux".to_string(),
+            "6.0".to_string(),
+            vec![],
+            vec![1u8; 32],
+            "hash".to_string(),
+            "salt".to_string(),
+            "10.0.0.1".to_string(),
+        );
+
+        // Manually expire the entry
+        {
+            let entry = store.entries.get_mut(&id).unwrap();
+            entry.expires_at = now_secs() - 1; // already expired
+        }
+
+        let pending = store.list_pending();
+        assert!(pending.is_empty());
+    }
+
+    /// P2 gate: a pending request past its TTL cannot be approved.
+    #[test]
+    fn pending_store_expired_cannot_be_approved() {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"salt");
+        hasher.update(b"correct_pin");
+        let correct_pin_hash = hex::encode(hasher.finalize());
+
+        let mut store = PendingPairStore::new();
+        let id = store.submit(
+            "client1".to_string(),
+            "Linux".to_string(),
+            "6.0".to_string(),
+            vec![],
+            vec![1u8; 32],
+            correct_pin_hash,
+            "salt".to_string(),
+            "10.0.0.1".to_string(),
+        );
+
+        // Expire the entry
+        {
+            let entry = store.entries.get_mut(&id).unwrap();
+            entry.expires_at = now_secs() - 1;
+        }
+
+        // Approve must fail with "expired", not succeed
+        let result = store.attempt_pin(&id, "correct_pin");
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err(), "Request expired");
+
+        let entry = store.get(&id).unwrap();
+        assert_eq!(entry.status, PendingPairStatus::Expired);
+    }
+
+    /// P2 gate: an approved-but-uncollected request expires on the shorter
+    /// collection clock (APPROVED_UNCOLLECTED_TTL_SECS), so mark_collected
+    /// rejects it and marks it Expired.
+    #[test]
+    fn pending_store_approved_expires_before_collection() {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"salt");
+        hasher.update(b"correct_pin");
+        let correct_pin_hash = hex::encode(hasher.finalize());
+
+        let mut store = PendingPairStore::new();
+        let id = store.submit(
+            "client1".to_string(),
+            "Linux".to_string(),
+            "6.0".to_string(),
+            vec![],
+            vec![1u8; 32],
+            correct_pin_hash,
+            "salt".to_string(),
+            "10.0.0.1".to_string(),
+        );
+
+        // Approve it
+        assert!(store.attempt_pin(&id, "correct_pin").unwrap());
+
+        // Push it past the approved-uncollected TTL
+        {
+            let entry = store.entries.get_mut(&id).unwrap();
+            entry.created_at = now_secs() - APPROVED_UNCOLLECTED_TTL_SECS - 1;
+        }
+
+        // Collection must fail (request expired before collection)
+        assert!(store.mark_collected(&id).is_none());
+        let entry = store.get(&id).unwrap();
+        assert_eq!(entry.status, PendingPairStatus::Expired);
+    }
+
+    /// P2 gate: repeating an approve on an already-approved request is a
+    /// no-op returning Ok(true), not an error (idempotent).
+    #[test]
+    fn pending_store_approve_is_idempotent() {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"salt");
+        hasher.update(b"correct_pin");
+        let correct_pin_hash = hex::encode(hasher.finalize());
+
+        let mut store = PendingPairStore::new();
+        let id = store.submit(
+            "client1".to_string(),
+            "Linux".to_string(),
+            "6.0".to_string(),
+            vec![],
+            vec![1u8; 32],
+            correct_pin_hash,
+            "salt".to_string(),
+            "10.0.0.1".to_string(),
+        );
+
+        // First approve succeeds
+        assert!(store.attempt_pin(&id, "correct_pin").unwrap());
+
+        // Repeat approve is a no-op, not an error
+        assert!(store.attempt_pin(&id, "correct_pin").unwrap());
+
+        let entry = store.get(&id).unwrap();
+        assert_eq!(entry.status, PendingPairStatus::Approved);
+    }
+}
+
+/// GET /api/v1/pair/audit — list pairing approval/deny audit history (auth,
+/// admin dashboard approval audit view).
+pub async fn handle_pair_audit(
+    State(state): State<AdminState>,
+) -> impl IntoResponse {
+    let Some(ref db) = state.db else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Database not available"})),
+        )
+            .into_response();
+    };
+
+    match db.list_pair_approval_audit(100).await {
+        Ok(entries) => {
+            let result: Vec<serde_json::Value> = entries
+                .into_iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "request_id": e.request_id,
+                        "action": e.action,
+                        "approver": e.approver,
+                        "detail": e.detail,
+                        "created_at": e.created_at,
+                    })
+                })
+                .collect();
+            Json(serde_json::Value::Array(result)).into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /api/v1/pair/enroll — fleet-scale pre-approved pairing (P5).
+///
+/// The client presents a valid enrollment key plus its ephemeral pubkey and a
+/// possession signature (Ed25519 over the literal bytes
+/// `monopsony-enroll-v1`). On success the server registers the client,
+/// issues a cert (same path as collect: registration-at-issuance), bumps the
+/// key's use counter, and returns the cert bundle. Unauthenticated but
+/// rate-limited; the key itself is the pre-approval (D6), and issuance is
+/// key-bound — the signature proves possession of the presented pubkey.
+pub async fn handle_pair_enroll(
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    State(state): State<AdminState>,
+    Json(req): Json<EnrollPairRequest>,
+) -> impl IntoResponse {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    const ENROLL_POSSESSION_MSG: &[u8] = b"monopsony-enroll-v1";
+
+    if state.dashboard_config.pairing_mode == crate::PairingMode::Off {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "pairing is disabled"})),
+        )
+            .into_response();
+    }
+
+    let Some(ref db) = state.db else {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "Database not available"})),
+        )
+            .into_response();
+    };
+
+    // 1. Validate the enrollment key (hashed lookup, revoked/expired/uses).
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(req.enrollment_key.as_bytes());
+    let key_hash = hex::encode(hasher.finalize());
+    let key = match db.validate_enrollment_key(&key_hash).await {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            warn!(
+                source_ip = %addr.ip(),
+                "Enroll rejected: invalid, expired, exhausted, or revoked key"
+            );
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "invalid or exhausted enrollment key"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    // 2. Decode and verify the ephemeral pubkey + possession signature.
+    let ephemeral_pubkey_bytes = match hex::decode(&req.ephemeral_pubkey) {
+        Ok(bytes) if bytes.len() == 32 => bytes,
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "ephemeral_pubkey must be 32 hex bytes"})),
+            )
+                .into_response();
+        }
+    };
+    let signature_bytes = match hex::decode(&req.signature) {
+        Ok(bytes) if bytes.len() == 64 => bytes,
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "signature must be 64 hex bytes"})),
+            )
+                .into_response();
+        }
+    };
+
+    let verifying_key = match VerifyingKey::from_bytes(
+        &ephemeral_pubkey_bytes.clone().try_into().unwrap(),
+    ) {
+        Ok(vk) => vk,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid ephemeral public key"})),
+            )
+                .into_response();
+        }
+    };
+    let sig = match Signature::from_slice(&signature_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "invalid signature"})),
+            )
+                .into_response();
+        }
+    };
+    if verifying_key.verify(ENROLL_POSSESSION_MSG, &sig).is_err() {
+        warn!(
+            source_ip = %addr.ip(),
+            "Enroll rejected: possession signature verification failed"
+        );
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "signature verification failed"})),
+        )
+            .into_response();
+    }
+
+    // 3. Issue the cert (key-bound: same generate path as collect) and
+    //    register the client.
+    let client_id = uuid::Uuid::new_v4().to_string();
+    let (cert_serial, client_cert, client_key) = match state.tls_manager.generate_client_cert(&client_id)
+    {
+        Ok(result) => result,
+        Err(e) => {
+            warn!("Failed to generate client cert for enroll: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to generate certificate"})),
+            )
+                .into_response();
+        }
+    };
+    let (client_cert_pem, client_key_pem) =
+        monopsony_control::tls::TlsManager::cert_and_key_to_pem(&client_cert, &client_key);
+    let ca_cert_pem = state.tls_manager.ca_cert_pem_bytes();
+
+    let issued_at = chrono::Utc::now();
+    let expires_at = issued_at
+        + chrono::Duration::seconds(
+            state.tls_manager.client_cert_validity_days() as i64 * 86_400,
+        );
+
+    match db
+        .register_client(
+            &req.claimed_hostname,
+            &req.claimed_os,
+            &req.claimed_os_version,
+            &req.package_managers,
+        )
+        .await
+    {
+        Ok(cid) => {
+            let _ = db.record_pairing(&cid, issued_at).await;
+            let _ = db.update_client_cert_serial(&cid, &cert_serial).await;
+            let _ = db
+                .insert_client_cert(&cert_serial, &cid, issued_at, expires_at)
+                .await;
+        }
+        Err(e) => {
+            warn!("Failed to register client during enroll: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to register client"})),
+            )
+                .into_response();
+        }
+    }
+
+    // 4. Bump the use counter.
+    if let Err(e) = db.increment_enrollment_key_use(&key.id).await {
+        warn!(
+            key_id = %key.id,
+            "Failed to increment enrollment key use count: {}", e
+        );
+    }
+
+    // 5. Audit the enrollment.
+    let _ = db
+        .record_pair_approval_audit(
+            &format!("enroll:{}", key.id),
+            "approved",
+            "enrollment-key",
+            Some(&req.claimed_hostname),
+        )
+        .await;
+
+    info!(
+        client_id = %client_id,
+        key_id = %key.id,
+        label = %key.label,
+        source_ip = %addr.ip(),
+        "Client enrolled via enrollment key"
+    );
+
+    (
+        axum::http::StatusCode::CREATED,
+        Json(serde_json::json!({
+            "enrolled": true,
+            "client_id": client_id,
+            "client_cert_pem": String::from_utf8_lossy(&client_cert_pem),
+            "client_key_pem": String::from_utf8_lossy(&client_key_pem),
+            "ca_cert_pem": String::from_utf8_lossy(&ca_cert_pem),
+            "grpc_addr": state.grpc_addr,
+            "ws_url": state.ws_url.clone().unwrap_or_default(),
+            "mirror_verify_key": state.mirror_verify_key.to_vec(),
+        })),
+    )
+        .into_response()
 }
