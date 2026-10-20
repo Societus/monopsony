@@ -28,6 +28,12 @@ futures = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 base64 = "0.22"
+x509-parser = { workspace = true }
+tokio-rustls = { workspace = true }
+http = "1"
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+tower = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 url = "2"
 parking_lot = "0.12"

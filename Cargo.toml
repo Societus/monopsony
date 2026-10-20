@@ -59,6 +59,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile = "2"
 rcgen = { version = "0.13", features = ["x509-parser"] }
+x509-parser = "0.16"
 
 # Discovery
 mdns-sd = "0.11"
@@ -81,6 +82,9 @@ async-stream = "0.3"
 futures = "0.3"
 tokio-stream = "0.1"
 tokio-cron-scheduler = "0.13"
+
+# TLS / mTLS
+tokio-rustls = "0.26"
 
 # Auth / Identity
 ed25519-dalek = { version = "2", features = ["serde"] }

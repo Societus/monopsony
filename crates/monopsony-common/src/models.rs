@@ -95,6 +95,17 @@ pub struct Client {
     pub cert_serial: Option<String>,
 }
 
+/// A tracked client certificate, enabling per-cert revocation (red-team F3).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientCert {
+    pub serial: String,
+    pub client_id: ClientId,
+    pub issued_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub status: String,      // "active" | "revoked" | "expired"
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
 /// A cached package
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Package {

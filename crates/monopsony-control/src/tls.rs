@@ -1,14 +1,22 @@
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use rcgen::{
     BasicConstraints, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
 };
-use rustls::pki_types::CertificateDer;
+use rustls::pki_types::{CertificateDer, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::server::WebPkiClientVerifier;
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use rustls::{ClientConfig, RootCertStore, ServerConfig, DigitallySignedStruct, Error, SignatureScheme};
+use rustls::client::danger::HandshakeSignatureValid;
+use rustls_pemfile::{certs, read_one, Item};
 use sha2::{Digest, Sha256};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+use x509_parser::parse_x509_certificate;
 
 /// Manages the Monopsony private Certificate Authority and all derived certificates.
 ///
@@ -30,9 +38,23 @@ pub struct TlsManager {
     /// PEM-encoded CA certificate string. Distributed to clients so they can
     /// verify the server's leaf certificate during the TLS handshake.
     ca_cert_pem: String,
+    /// Validity window for newly issued client certificates, in days.
+    /// Default: 90. Configurable via [`with_client_cert_validity_days`].
+    client_cert_validity_days: u32,
+    /// Monotonically increasing serial counter for client certificates.
+    /// Each issued client cert gets a unique serial, recorded in the DB so
+    /// revocation can target individual certs by serial.
+    next_client_cert_serial: AtomicU64,
+
+    /// Set of revoked client cert serials, checked by [`RevocationCheckingVerifier`]
+    /// at the TLS accept path (red-team F3).
+    revoked_serials: Arc<RwLock<HashSet<String>>>,
 }
 
 impl TlsManager {
+    /// Default client-certificate validity: 90 days.
+    const DEFAULT_CLIENT_CERT_VALIDITY_DAYS: u32 = 90;
+
     /// Return the PEM-encoded CA certificate bytes.
     pub fn ca_cert_pem_bytes(&self) -> Vec<u8> {
         self.ca_cert_pem.as_bytes().to_vec()
@@ -107,9 +129,11 @@ impl TlsManager {
             ca_cert,
             ca_key,
             ca_cert_pem,
+            client_cert_validity_days: Self::DEFAULT_CLIENT_CERT_VALIDITY_DAYS,
+            next_client_cert_serial: AtomicU64::new(1),
+            revoked_serials: Arc::new(RwLock::new(HashSet::new())),
         })
     }
-
     /// Generate a new self-signed CA certificate and private key.
     ///
     /// The CA is marked with `is_ca = true` and `BasicConstraints::Unconstrained`,
@@ -150,6 +174,9 @@ impl TlsManager {
             ca_cert: cert,
             ca_key: key,
             ca_cert_pem,
+            client_cert_validity_days: Self::DEFAULT_CLIENT_CERT_VALIDITY_DAYS,
+            next_client_cert_serial: AtomicU64::new(1),
+            revoked_serials: Arc::new(RwLock::new(HashSet::new())),
         })
     }
 
@@ -157,6 +184,19 @@ impl TlsManager {
     /// clients or writing to a trust-store file.
     pub fn ca_cert_pem(&self) -> &str {
         &self.ca_cert_pem
+    }
+
+    /// Set the validity window (in days) for newly issued client certificates.
+    /// Default is 90 days. The value takes effect for certs generated after
+    /// this call; already-issued certs keep their original expiry.
+    pub fn with_client_cert_validity_days(mut self, days: u32) -> Self {
+        self.client_cert_validity_days = days;
+        self
+    }
+
+    /// Return the configured client-certificate validity window in days.
+    pub fn client_cert_validity_days(&self) -> u32 {
+        self.client_cert_validity_days
     }
 
     /// Build a [`tonic::transport::ServerTlsConfig`] ready to be passed to
@@ -356,24 +396,40 @@ impl TlsManager {
     ///   certificate subject, typically a unique identifier for the client
     ///   machine (hostname or UUID).
     ///
-    /// EKU is set to `clientAuth`. Valid until 2036-01-01.
+    /// EKU is set to `clientAuth`. Valid for `client_cert_validity_days`
+    /// days from issuance (default 90). A unique serial number is assigned
+    /// and recorded in the return value so the DB can track it for
+    /// revocation.
     ///
     /// Includes SubjectKeyIdentifier and AuthorityKeyIdentifier extensions
     /// required for proper chain validation by webpki/rustls.
     ///
-    /// Returns the signed [`rcgen::Certificate`] and its [`KeyPair`]; use
+    /// Returns `(hex_serial, certificate, key_pair)`; use
     /// [`cert_and_key_to_pem`](Self::cert_and_key_to_pem) to serialize them
     /// for transport or storage.
     pub fn generate_client_cert(
         &self,
         client_id: &str,
-    ) -> anyhow::Result<(rcgen::Certificate, KeyPair)> {
+    ) -> anyhow::Result<(String, rcgen::Certificate, KeyPair)> {
         let mut params = CertificateParams::new(vec![client_id.to_string()])?;
         params
             .distinguished_name
             .push(rcgen::DnType::CommonName, client_id);
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
-        params.not_after = rcgen::date_time_ymd(2036, 1, 1);
+        // Configurable validity window (default 90 days), replacing the
+        // previous hard-coded 2036-01-01 expiry (red-team F3).
+        let not_after = SystemTime::now()
+            .checked_add(Duration::from_secs(
+                self.client_cert_validity_days as u64 * 86_400,
+            ))
+            .ok_or_else(|| anyhow::anyhow!("client_cert_validity_days overflow"))?;
+        params.not_after = not_after.into();
+        // Assign a unique, monotonically increasing serial so each issued
+        // client cert can be individually revoked by serial (red-team F3).
+        let serial = self
+            .next_client_cert_serial
+            .fetch_add(1, Ordering::Relaxed);
+        params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial.to_be_bytes()));
         // Use ExplicitNoCa to ensure SubjectKeyIdentifier extension is included
         params.is_ca = IsCa::ExplicitNoCa;
         // Enable AuthorityKeyIdentifier extension for proper chain building
@@ -382,15 +438,227 @@ impl TlsManager {
         let key = KeyPair::generate()?;
         let cert = params.signed_by(&key, &self.ca_cert, &self.ca_key)?;
 
-        debug!(client_id = client_id, "Generated client certificate");
-        Ok((cert, key))
+        let serial_hex = format!("{:x}", serial);
+
+        debug!(
+            client_id = client_id,
+            serial = %serial_hex,
+            validity_days = self.client_cert_validity_days,
+            "Generated client certificate"
+        );
+        Ok((serial_hex, cert, key))
     }
 
     /// Convenience helper to serialize an `rcgen` certificate and key pair into
     /// PEM byte vectors suitable for writing to disk or sending over gRPC.
-    ///
     /// Returns `(cert_pem_bytes, key_pem_bytes)`.
     pub fn cert_and_key_to_pem(cert: &rcgen::Certificate, key: &KeyPair) -> (Vec<u8>, Vec<u8>) {
         (cert.pem().into_bytes(), key.serialize_pem().into_bytes())
+    }
+
+    /// Attach a pre-populated revoked-serial set to this `TlsManager`.
+    /// Used to wire the accept-path revocation cache into the TLS verifier.
+    pub fn with_revoked_serials(
+        mut self,
+        revoked_serials: Arc<RwLock<HashSet<String>>>,
+    ) -> Self {
+        self.revoked_serials = revoked_serials;
+        self
+    }
+
+    /// Return the revoked-serial set for inspection or external wiring.
+    pub fn revoked_serials(&self) -> Arc<RwLock<HashSet<String>>> {
+        self.revoked_serials.clone()
+    }
+
+    /// Check whether a cert serial is currently revoked.
+    pub fn is_serial_revoked(&self, serial: &str) -> bool {
+        self.revoked_serials.read().unwrap().contains(serial)
+    }
+
+    /// Record a newly revoked serial in the accept-path cache. The caller
+    /// persists via [`Database::revoke_client_cert`]; this keeps the accept-
+    /// path cache in sync without a DB round trip on each check.
+    pub fn note_revoked_serial(&self, serial: &str) {
+        self.revoked_serials.write().unwrap().insert(serial.to_string());
+    }
+
+    /// Build a [`rustls::ServerConfig`] with mTLS and serial-level revocation
+    /// checking at the TLS accept path (red-team F3).
+    ///
+    /// The returned config requires client certificates signed by the CA and
+    /// rejects any whose serial appears in [`revoked_serials`](Self::revoked_serials).
+    /// This is the TLS-level enforcement point that complements the gRPC-level
+    /// checks in [`crate::grpc::MonopsonyGrpc`].
+    pub fn rustls_server_config_with_revocation(
+        &self,
+        bind_addr: Option<std::net::IpAddr>,
+        additional_sans: &[String],
+    ) -> anyhow::Result<ServerConfig> {
+        let (cert_pem, key_pem) =
+            self.generate_server_cert_with_sans(bind_addr, additional_sans)?;
+        let cert_str = String::from_utf8(cert_pem)?;
+        let key_str = String::from_utf8(key_pem)?;
+        let chain = format!("{}\n{}", cert_str, self.ca_cert_pem);
+
+        let certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut chain.as_bytes())
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(|c| c.into_owned())
+                .collect();
+
+        let key_item = rustls_pemfile::read_one(&mut key_str.as_bytes())?
+            .ok_or_else(|| anyhow::anyhow!("No private key in server key PEM"))?;
+        let key_der = match key_item {
+            rustls_pemfile::Item::Pkcs8Key(k) => k.into(),
+            rustls_pemfile::Item::Pkcs1Key(k) => k.into(),
+            rustls_pemfile::Item::Sec1Key(k) => k.into(),
+            _ => return Err(anyhow::anyhow!("Unexpected key type in server key PEM")),
+        };
+
+        let mut root_store = RootCertStore::empty();
+        root_store.add(self.ca_cert_der.clone())?;
+
+        let verifier = RevocationCheckingVerifier::new(
+            WebPkiClientVerifier::builder(Arc::new(root_store)).build()?,
+            self.revoked_serials.clone(),
+        );
+
+        let config = ServerConfig::builder()
+            .with_client_cert_verifier(Arc::new(verifier))
+            .with_single_cert(certs, key_der)?;
+
+        Ok(config)
+    }
+
+    /// Load revoked cert serials from the DB into the in-memory cache.
+    /// Called at startup so the accept-path check works immediately.
+    pub async fn load_revoked_serials(&self, db: &monopsony_db::Database) -> anyhow::Result<()> {
+        let serials = db.get_revoked_cert_serials().await?;
+        let mut set = self.revoked_serials.write().unwrap();
+        for serial in serials {
+            set.insert(serial);
+        }
+        info!("Loaded {} revoked cert serials into TLS accept-path cache", set.len());
+        Ok(())
+    }
+
+    /// Seed TLS accept-path state from the DB at startup: load revoked
+    /// serials into the accept-path cache, and advance the serial counter
+    /// past every serial already recorded in `client_certs` so restarts
+    /// never re-issue a duplicate serial (red-team F3).
+    pub async fn initialize_from_db(&self, db: &monopsony_db::Database) -> anyhow::Result<()> {
+        self.load_revoked_serials(db).await?;
+        if let Ok(Some(max_serial)) = db.max_client_cert_serial_u64().await {
+            self.next_client_cert_serial
+                .store(max_serial + 1, Ordering::Relaxed);
+            info!(
+                next_serial = max_serial + 1,
+                "Client cert serial counter seeded from DB"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Custom [`rustls::server::ClientCertVerifier`] that wraps [`WebPkiClientVerifier`]
+/// and additionally rejects client certificates whose serial appears in the
+/// revoked set. This provides serial-level revocation at the TLS accept path
+/// (red-team F3), complementing the gRPC-level checks in the control service.
+#[derive(Debug)]
+pub struct RevocationCheckingVerifier {
+    inner: Arc<dyn ClientCertVerifier>,
+    revoked_serials: Arc<RwLock<HashSet<String>>>,
+}
+
+impl RevocationCheckingVerifier {
+    pub fn new(
+        inner: Arc<dyn ClientCertVerifier>,
+        revoked_serials: Arc<RwLock<HashSet<String>>>,
+    ) -> Self {
+        Self {
+            inner,
+            revoked_serials,
+        }
+    }
+
+    /// Extract the certificate serial number as a lowercase hex string, matching
+    /// the format produced by [`TlsManager::generate_client_cert`]
+    /// (`format!("{:x}", serial)`).
+    fn cert_serial_hex(cert_der: &CertificateDer<'_>) -> Result<String, Error> {
+        let (_remainder, cert) =
+            parse_x509_certificate(cert_der).map_err(|e| {
+                Error::General(format!("failed to parse client certificate: {e}"))
+            })?;
+
+        // `serial` is a `BigUint` field on X509Certificate in x509-parser 0.16.
+        // `to_bytes_be()` returns the absolute value as big-endian bytes.
+        let bytes = cert.serial.to_bytes_be();
+        // Convert big-endian bytes to u64, then format as hex without leading zeros.
+        // This matches `format!("{:x}", serial)` from generate_client_cert.
+        let mut val: u64 = 0;
+        for b in &bytes {
+            val = (val << 8) | (*b as u64);
+        }
+        Ok(format!("{:x}", val))
+    }
+}
+
+impl ClientCertVerifier for RevocationCheckingVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, Error> {
+        // 1. Verify the chain with the inner verifier (CA trust, expiry, etc.)
+        self.inner.verify_client_cert(end_entity, intermediates, now)?;
+
+        // 2. Reject if the cert serial is revoked
+        let serial = Self::cert_serial_hex(end_entity)?;
+        if self.revoked_serials.read().unwrap().contains(&serial) {
+            warn!(
+                serial = %serial,
+                "TLS accept-path: rejecting revoked client certificate"
+            );
+            return Err(Error::General("client certificate revoked".into()));
+        }
+
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
     }
 }

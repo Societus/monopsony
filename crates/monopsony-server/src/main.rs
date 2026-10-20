@@ -10,6 +10,7 @@ use tracing_subscriber::FmtSubscriber;
 
 // Crate imports
 use monopsony_admin::DashboardConfig;
+use monopsony_admin::pairing;
 use monopsony_control::{announce, discovery, grpc, metrics};
 use monopsony_db::Database;
 use monopsony_mirror::mirror;
@@ -346,6 +347,15 @@ async fn main() -> anyhow::Result<()> {
     info!("CA fingerprint: {}", tls_manager.ca_fingerprint());
 
     let tls_manager = Arc::new(tls_manager);
+
+    // Seed the TLS accept-path revocation cache from the DB and advance the
+    // client-cert serial counter past every serial already recorded, so
+    // revoked certs are rejected at TLS accept (covering both direct gRPC
+    // and /ws/tunnel-relayed connections — red-team F3) and restarts never
+    // re-issue a duplicate serial.
+    if let Some(db) = db.as_ref() {
+        tls_manager.initialize_from_db(db).await?;
+    }
 
     let storage: Arc<dyn cache_storage::CacheStorage> = match args.cache_backend.as_str() {
         "s3" => {
@@ -942,7 +952,7 @@ async fn main() -> anyhow::Result<()> {
         mirror_manager: shared_mirror_manager.clone(),
         tls_manager: tls_manager.clone(),
         config_path: PathBuf::from(&args.config),
-        dashboard_config: Arc::new(dashboard_config),
+        dashboard_config: Arc::new(dashboard_config.clone()),
         tailscale: Arc::new(monopsony_admin::auth::TailscaleDetector::new()),
         grpc_addr: args.grpc_addr.clone(),
         ws_url,
@@ -953,6 +963,8 @@ async fn main() -> anyhow::Result<()> {
         pairing_task: Arc::new(tokio::sync::Mutex::new(None)),
         sessions: Arc::new(monopsony_admin::auth::SessionStore::new()),
         rate_limits,
+        trusted_proxies: monopsony_admin::auth::TrustedProxies::from_config(&dashboard_config.trusted_proxies),
+        pending_pairs: Arc::new(tokio::sync::Mutex::new(pairing::PendingPairStore::new())),
     };
     let admin_router = monopsony_admin::admin_router(admin_state);
     let dashboard_handle = tokio::spawn(async move {

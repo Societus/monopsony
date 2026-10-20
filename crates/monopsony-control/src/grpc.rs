@@ -3,10 +3,15 @@
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
+use std::future::Future;
 
 use anyhow::{Context, Result};
 use futures::stream::{Stream, StreamExt};
+use http::Request as HttpRequest;
+use hyper::body::Incoming;
 use tonic::{Request, Response, Status};
+use tower::util::ServiceExt;
 use tracing::{debug, error, info, warn};
 
 use monopsony_common::models::ClientId;
@@ -19,7 +24,9 @@ use monopsony_common::proto::monopsony::{
     ClientMessage, Command, DownloadShadowAssetRequest, GetShadowRecipeRequest, HeartbeatRequest,
     HeartbeatResponse, InventoryDelta, InventoryReport, InventoryResponse,
     ListShadowCatalogRequest, ListShadowPackagesRequest, RegisterRequest, RegisterResponse,
-    RegisterShadowPackageRequest, RollbackShadowUpdateRequest, ServerMessage, ShadowAssetChunk,
+    RegisterShadowPackageRequest, RenewClientCertRequest, RenewClientCertResponse,
+    RevokeClientCertRequest, RevokeClientCertResponse,
+    RollbackShadowUpdateRequest, ServerMessage, ShadowAssetChunk,
     ShadowCatalog, ShadowCatalogEntry, ShadowPackageInfo, ShadowPackageList, ShadowScanAck,
     ShadowScanReport, ShadowUpdateList, ShadowUpdateResult, SignedShadowRecipe, SyncRequest,
     UnregisterShadowPackageRequest, UnregisterShadowPackageResponse,
@@ -32,6 +39,65 @@ use monopsony_db::Database;
 use monopsony_mirror::MirrorManager;
 use monopsony_shadow::catalog_hash::{catalog_hash, entry_hash, sign_entry};
 use monopsony_shadow::ShadowPackageManager;
+use x509_parser::parse_x509_certificate;
+
+/// The presenting mTLS client certificate's serial (hex), injected into each
+/// request's extensions by [`PeerSerialSvc`] so handlers can bind key-bound
+/// operations (certificate renewal) to the actual TLS peer rather than the
+/// request body.
+#[derive(Clone, Debug)]
+struct PeerSerial(String);
+
+/// Per-connection tower middleware: extracts the presenting client
+/// certificate's serial once at TLS accept time and inserts it into every
+/// request's extensions. Wrapped around the hyper service inside
+/// [`start`](crate::grpc::start) so both direct gRPC and `/ws/tunnel`-relayed
+/// connections (which terminate the same mTLS handshake at this accept path)
+/// are covered.
+#[derive(Clone, Debug)]
+struct PeerSerialSvc<S> {
+    inner: S,
+    peer_serial: Option<String>,
+}
+
+impl<S> tower::Service<HttpRequest<Incoming>> for PeerSerialSvc<S>
+where
+    S: tower::Service<HttpRequest<Incoming>>,
+    S::Future: Send,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, _cx: &mut TaskContext<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, mut req: HttpRequest<Incoming>) -> Self::Future {
+        if let Some(ref serial) = self.peer_serial {
+            req.extensions_mut().insert(PeerSerial(serial.clone()));
+        }
+        self.inner.call(req)
+    }
+}
+
+/// Extract the presenting client certificate's serial as hex, using the same
+/// encoding `TlsManager::generate_client_cert` assigns
+/// (`format!("{:x}", serial)`). Returns `None` when no client certificate was
+/// presented — should not happen, since mTLS is mandatory on this listener.
+fn peer_cert_serial_hex(
+    tls_stream: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+) -> Option<String> {
+    let (_io, conn) = tls_stream.get_ref();
+    let der = conn.peer_certificates()?.first()?;
+    let (_rem, cert) = parse_x509_certificate(der).ok()?;
+    let bytes = cert.serial.to_bytes_be();
+    let mut val: u64 = 0;
+    for b in &bytes {
+        val = (val << 8) | (*b as u64);
+    }
+    Some(format!("{:x}", val))
+}
 
 pub struct MonopsonyGrpc {
     db: Arc<Database>,
@@ -64,6 +130,7 @@ impl MonopsonyGrpc {
         }
     }
 
+    /// Load revoked cert serials from the DB into the in-memory cache.
     /// Set the pin-attestation verifying key handed to clients at register.
     pub fn with_mirror_verify_key(mut self, mirror_verify_key: [u8; 32]) -> Self {
         self.mirror_verify_key = mirror_verify_key;
@@ -90,6 +157,34 @@ impl MonopsonyGrpc {
     ) -> Self {
         self.stale_tracker = tracker;
         self
+    }
+
+    /// Check whether a client's certificate is revoked. Returns an error if so.
+    /// Used at the gRPC accept path as defense-in-depth alongside TLS-level
+    /// checking (red-team F3).
+    async fn check_client_revoked(&self, client_id: &ClientId) -> Result<(), Status> {
+        let client = match self.db.get_client(client_id).await {
+            Ok(Some(client)) => client,
+            Ok(None) => return Ok(()),
+            Err(e) => {
+                return Err(Status::internal(format!(
+                    "failed to look up client: {e}"
+                )))
+            }
+        };
+
+        if let Some(serial) = client.cert_serial.as_deref() {
+            if self.tls_manager.is_serial_revoked(serial) {
+                warn!(
+                    client_id = %client_id,
+                    serial = %serial,
+                    "gRPC accept-path: rejecting request from revoked client"
+                );
+                return Err(Status::unauthenticated("client certificate revoked"));
+            }
+        }
+
+        Ok(())
     }
 
     async fn handle_register(&self, req: RegisterRequest) -> Result<RegisterResponse> {
@@ -124,11 +219,18 @@ impl MonopsonyGrpc {
             }
         }
 
-        // Generate client certificate
-        let (cert, key) = self
+        // Generate client certificate (red-team F3: 90-day validity + serial
+        // tracked for revocation)
+        let (cert_serial, cert, key) = self
             .tls_manager
             .generate_client_cert(&client_id.to_string())?;
         let (cert_pem, key_pem) = TlsManager::cert_and_key_to_pem(&cert, &key);
+
+        // Record the cert serial on the client row for revocation tracking.
+        self.db
+            .update_client_cert_serial(&client_id, &cert_serial)
+            .await
+            .context("Failed to record client cert serial")?;
 
         Ok(RegisterResponse {
             client_id: client_id.to_string(),
@@ -185,6 +287,142 @@ impl MonopsonyGrpc {
 
         Ok(HeartbeatResponse {
             server_time: chrono::Utc::now().timestamp(),
+        })
+    }
+
+    /// Revoke a client certificate by serial (red-team F3: revoke API).
+    /// Looks up the client's cert serial from the DB and marks it revoked,
+    /// then adds it to the in-memory accept-path cache.
+    async fn handle_revoke_client_cert(
+        &self,
+        req: RevokeClientCertRequest,
+    ) -> Result<RevokeClientCertResponse> {
+        let client_id =
+            ClientId::parse(&req.client_id).context("Invalid client ID in revoke request")?;
+
+        // Look up the client's cert serial from the DB.
+        let client = self
+            .db
+            .get_client(&client_id)
+            .await?
+            .context("Client not found")?;
+
+        let serial = client
+            .cert_serial
+            .as_deref()
+            .context("Client has no certificate serial on record")?;
+
+        // If a specific serial was provided, verify it matches the client's.
+        if !req.serial.is_empty() && req.serial != serial {
+            return Ok(RevokeClientCertResponse {
+                revoked: false,
+                message: format!(
+                    "Serial mismatch: client {} has serial {}, not {}",
+                    client_id, serial, req.serial
+                ),
+            });
+        }
+
+        // Revoke in DB.
+        let revoked = self.db.revoke_client_cert(serial).await?;
+        if !revoked {
+            return Ok(RevokeClientCertResponse {
+                revoked: false,
+                message: format!("Serial {} already revoked or not found", serial),
+            });
+        }
+
+        // Add to in-memory accept-path cache via TlsManager (shared with TLS verifier).
+        self.tls_manager
+            .revoked_serials()
+            .write()
+            .unwrap()
+            .insert(serial.to_string());
+
+        info!(
+            client_id = %client_id,
+            serial = %serial,
+            "Revoked client certificate"
+        );
+
+        Ok(RevokeClientCertResponse {
+            revoked: true,
+            message: format!("Certificate serial {} revoked for client {}", serial, client_id),
+        })
+    }
+
+    /// Re-issue a client certificate over mTLS (P1 renewal). The caller is
+    /// bound to the client identity of the certificate presented on the
+    /// connection — the request body cannot impersonate another client.
+    /// Issues a fresh 90-day cert/key pair for the same client_id, records
+    /// the serial in `client_certs`, and rotates the client's current serial
+    /// pointer. No re-pairing required.
+    async fn handle_renew_client_cert(
+        &self,
+        peer_serial: Option<&str>,
+        req: RenewClientCertRequest,
+    ) -> Result<RenewClientCertResponse> {
+        let peer_serial = peer_serial.context(
+            "RenewClientCert requires mTLS, but no peer certificate was presented",
+        )?;
+
+        // Bind the call to the client owning the presented certificate: a
+        // valid mTLS cert for client A cannot renew client B's certificate.
+        let client = self
+            .db
+            .get_client_cert_by_serial(peer_serial)
+            .await
+            .map_err(|e| Status::internal(format!("failed to look up client by cert serial: {e}")))?
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "presented certificate serial {peer_serial} is not provisioned to any client"
+                ))
+            })?;
+        let client_id = client.client_id;
+
+        self.check_client_revoked(&client_id).await?;
+
+        if !req.current_serial.is_empty() && req.current_serial != peer_serial {
+            return Err(Status::invalid_argument(format!(
+                "current_serial {} does not match the presented certificate serial {peer_serial}",
+                req.current_serial,
+            ))
+            .into());
+        }
+
+        // Issue a fresh cert/key pair for the same client_id: 90-day
+        // validity (configurable), new serial tracked in client_certs so it
+        // can be revoked independently (red-team F3).
+        let (serial, cert, key) = self
+            .tls_manager
+            .generate_client_cert(&client_id.to_string())?;
+        let (cert_pem, key_pem) = TlsManager::cert_and_key_to_pem(&cert, &key);
+
+        let now = chrono::Utc::now();
+        let expires_at =
+            now + chrono::Duration::days(self.tls_manager.client_cert_validity_days() as i64);
+        let expires_at_secs = expires_at.timestamp();
+
+        self.db
+            .insert_client_cert(&serial, &client_id, now, expires_at)
+            .await
+            .map_err(|e| Status::internal(format!("failed to record renewed certificate: {e}")))?;
+        self.db
+            .update_client_cert_serial(&client_id, &serial)
+            .await
+            .map_err(|e| Status::internal(format!("failed to update client cert serial: {e}")))?;
+
+        info!(
+            client_id = %client_id,
+            serial = %serial,
+            "Renewed client certificate over mTLS"
+        );
+
+        Ok(RenewClientCertResponse {
+            client_cert_pem: cert_pem,
+            client_key_pem: key_pem,
+            ca_cert_pem: self.tls_manager.ca_cert_pem().to_string(),
+            expires_at: expires_at_secs,
         })
     }
 
@@ -364,10 +602,13 @@ impl MonopsonyGrpc {
                 })
             }
             client_message::Msg::Heartbeat(req) => {
+                let client_id = ClientId::parse(&req.client_id)
+                    .map_err(|e| Status::invalid_argument(format!("invalid client id: {e}")))?;
+                self.check_client_revoked(&client_id).await?;
                 let client_id_str = req.client_id.clone();
                 let _resp = self.handle_heartbeat(req).await.map_err(|e| {
                     error!(error = %e, "Heartbeat handler failed");
-                    Status::internal(format!("Heartbeat failed: {}", e))
+                    Status::internal(format!("Heartbeat failed: {e}"))
                 })?;
                 // Sprint 22 slice 22-E2a: a pending shadow assignment is
                 // pushed INSTEAD of the sync_request ack, one ServerMessage
@@ -383,18 +624,24 @@ impl MonopsonyGrpc {
                 })
             }
             client_message::Msg::Inventory(req) => {
+                let client_id = ClientId::parse(&req.client_id)
+                    .map_err(|e| Status::invalid_argument(format!("invalid client id: {e}")))?;
+                self.check_client_revoked(&client_id).await?;
                 self.handle_inventory(req).await.map_err(|e| {
                     error!(error = %e, "Inventory handler failed");
-                    Status::internal(format!("Inventory report failed: {}", e))
+                    Status::internal(format!("Inventory report failed: {e}"))
                 })?;
                 Ok(ServerMessage {
                     msg: Some(server_message::Msg::SyncRequest(SyncRequest {})),
                 })
             }
             client_message::Msg::Delta(delta) => {
+                let client_id = ClientId::parse(&delta.client_id)
+                    .map_err(|e| Status::invalid_argument(format!("invalid client id: {e}")))?;
+                self.check_client_revoked(&client_id).await?;
                 self.handle_inventory_delta(delta).await.map_err(|e| {
                     error!(error = %e, "Inventory delta handler failed");
-                    Status::internal(format!("Inventory delta failed: {}", e))
+                    Status::internal(format!("Inventory delta failed: {e}"))
                 })?;
                 Ok(ServerMessage {
                     msg: Some(server_message::Msg::SyncRequest(SyncRequest {})),
@@ -537,8 +784,38 @@ impl MonopsonyControl for MonopsonyGrpc {
         &self,
         request: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatResponse>, Status> {
+        let req = request.into_inner();
+        let client_id = ClientId::parse(&req.client_id)
+            .map_err(|e| Status::invalid_argument(format!("invalid client id: {e}")))?;
+        self.check_client_revoked(&client_id).await?;
         let resp = self
-            .handle_heartbeat(request.into_inner())
+            .handle_heartbeat(req)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(resp))
+    }
+
+    async fn revoke_client_cert(
+        &self,
+        request: Request<RevokeClientCertRequest>,
+    ) -> Result<Response<RevokeClientCertResponse>, Status> {
+        let resp = self
+            .handle_revoke_client_cert(request.into_inner())
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(resp))
+    }
+
+    async fn renew_client_cert(
+        &self,
+        request: Request<RenewClientCertRequest>,
+    ) -> Result<Response<RenewClientCertResponse>, Status> {
+        let peer_serial = request
+            .extensions()
+            .get::<PeerSerial>()
+            .map(|s| s.0.clone());
+        let resp = self
+            .handle_renew_client_cert(peer_serial.as_deref(), request.into_inner())
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(resp))
@@ -548,8 +825,12 @@ impl MonopsonyControl for MonopsonyGrpc {
         &self,
         request: Request<InventoryReport>,
     ) -> Result<Response<InventoryResponse>, Status> {
+        let req = request.into_inner();
+        let client_id = ClientId::parse(&req.client_id)
+            .map_err(|e| Status::invalid_argument(format!("invalid client id: {e}")))?;
+        self.check_client_revoked(&client_id).await?;
         let resp = self
-            .handle_inventory(request.into_inner())
+            .handle_inventory(req)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
         Ok(Response::new(resp))
@@ -1249,36 +1530,89 @@ pub async fn start(
         .with_mirror_verify_key(mirror_verify_key)
         .with_stale_tracker(stale_tracker);
 
-    let tls_config =
-        tls_manager.tonic_server_tls_config_with_sans(Some(addr.ip()), additional_tls_sans)?;
+    // Load revoked cert serials into the TLS accept-path cache (red-team F3).
+    tls_manager.load_revoked_serials(&db).await?;
 
     let _ = access_control; // wired in future: tonic interceptor
 
-    let mut builder = tonic::transport::Server::builder()
-        .tls_config(tls_config)
-        .context("Failed to configure TLS")?;
+    // Build the tonic service router without TLS config — we handle TLS
+    // ourselves with a custom rustls ServerConfig that includes the
+    // RevocationCheckingVerifier (red-team F3).
+    let mut router = tonic::transport::Server::builder()
+        .add_service(MonopsonyControlServer::new(grpc));
 
     if let Some(mm) = mirror_manager {
         let mirror_grpc = MirrorControlGrpc::new(mm);
-        builder
-            .add_service(MonopsonyControlServer::new(grpc))
-            .add_service(
-                monopsony_common::proto::monopsony::mirror_control_server::MirrorControlServer::new(
-                    mirror_grpc,
-                ),
-            )
-            .serve(addr)
-            .await
-            .context("gRPC server failed")?;
-    } else {
-        builder
-            .add_service(MonopsonyControlServer::new(grpc))
-            .serve(addr)
-            .await
-            .context("gRPC server failed")?;
+        router = router.add_service(
+            monopsony_common::proto::monopsony::mirror_control_server::MirrorControlServer::new(
+                mirror_grpc,
+            ),
+        );
     }
 
-    Ok(())
+    // Convert the router into a tower service, then adapt it for hyper.
+    let svc = router.into_service();
+
+    // Build rustls ServerConfig with revocation checking at the TLS accept path.
+    let rustls_config = tls_manager.rustls_server_config_with_revocation(
+        Some(addr.ip()),
+        additional_tls_sans,
+    )?;
+    let tls_acceptor = tokio_rustls::server::TlsAcceptor::from(Arc::new(rustls_config));
+
+    // Build the HTTP/2 connection builder.
+    let mut conn_builder =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+    conn_builder = conn_builder.http2_only();
+
+    // Bind the TCP listener.
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("Failed to bind gRPC address")?;
+
+    info!(
+        addr = %addr,
+        "gRPC server listening with mTLS + cert revocation checking (red-team F3)"
+    );
+
+    // Accept loop: each connection is TLS-wrapped then served via hyper.
+    loop {
+        let (stream, peer_addr) = listener
+            .accept()
+            .await
+            .context("Failed to accept connection")?;
+
+        let acceptor = tls_acceptor.clone();
+        let svc = svc.clone();
+        let mapped = svc.map_request(|req: http::Request<Incoming>| {
+            req.map(tonic::body::boxed)
+        });
+        let builder = conn_builder.clone();
+
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    // Bind the presenting client certificate's serial into
+                    // request extensions so mTLS-bound RPCs (e.g.
+                    // RenewClientCert) are key-bound to the actual TLS peer.
+                    // Covers /ws/tunnel-relayed connections too: they carry
+                    // the same mTLS handshake bytes to this accept path.
+                    let peer_serial = peer_cert_serial_hex(&tls_stream);
+                    let io = hyper_util::rt::TokioIo::new(tls_stream);
+                    let conn_svc =
+                        PeerSerialSvc { inner: mapped, peer_serial };
+                    let hyper_svc =
+                        hyper_util::service::TowerToHyperService::new(conn_svc);
+                    if let Err(e) = builder.serve_connection(io, hyper_svc).await {
+                        warn!(peer = %peer_addr, "gRPC connection error: {e}");
+                    }
+                }
+                Err(e) => {
+                    warn!(peer = %peer_addr, "TLS handshake failed: {e}");
+                }
+            }
+        });
+    }
 }
 
 /// gRPC service for mirror management

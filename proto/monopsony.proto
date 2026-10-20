@@ -11,6 +11,9 @@ service MonopsonyControl {
     rpc Register(RegisterRequest) returns (RegisterResponse);
     rpc ReportInventory(InventoryReport) returns (InventoryResponse);
     rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+    // Cert lifecycle (red-team F3: short-lived certs with renewal + revocation)
+    rpc RenewClientCert(RenewClientCertRequest) returns (RenewClientCertResponse);
+    rpc RevokeClientCert(RevokeClientCertRequest) returns (RevokeClientCertResponse);
 
     // Shadow package management
     rpc ListShadowPackages(ListShadowPackagesRequest) returns (ShadowPackageList);
@@ -86,6 +89,31 @@ message HeartbeatResponse {
     int64 server_time = 1;
 }
 
+// Cert lifecycle (red-team F3)
+message RevokeClientCertRequest {
+    string client_id = 1;
+    string serial = 2;
+}
+
+message RevokeClientCertResponse {
+    bool revoked = 1;
+    string message = 2;
+}
+
+// Cert renewal: client presents its current cert via mTLS and receives a
+// freshly CA-signed cert/key pair for the same client_id (no re-pairing).
+message RenewClientCertRequest {
+    string client_id = 1;        // client identity, bound to the mTLS peer cert server-side
+    string current_serial = 2;   // hex serial of the cert presented via mTLS (verified when set)
+}
+
+message RenewClientCertResponse {
+    bytes client_cert_pem = 1;   // newly issued certificate
+    bytes client_key_pem = 2;    // newly issued private key
+    string ca_cert_pem = 3;      // CA certificate (clients refresh their trust anchor)
+    int64 expires_at = 4;        // new certificate not_after, epoch seconds
+}
+
 message InventoryReport {
     string client_id = 1;
     repeated PackageEntry packages = 2;
@@ -128,11 +156,67 @@ message SyncRequest {
 
 // Pairing messages (exchanged over plaintext pairing port 50052)
 message PairRequest {
-    string code = 1;                    // 6-char alphanumeric pairing code
+    string code = 1;                    // 6-char alphanumeric pairing code (legacy mode)
     string hostname = 2;
     string os = 3;
     string os_version = 4;
     repeated string package_managers = 5;
+    // v2 fields (pin mode — optional, zero-value = legacy):
+    bytes ephemeral_pubkey = 10;        // client ephemeral Ed25519 pubkey for key-bound issuance
+    string pin_hash = 11;               // hex SHA-256(pin_salt + pin), client-generated
+    string pin_salt = 12;               // client-generated random salt (hex), sent alongside pin_hash
+    string claimed_hostname = 13;       // client-claimed identity (observed IP shown separately on dashboard)
+    string claimed_os = 14;
+    string claimed_os_version = 15;
+}
+
+// v2 pairing intake response — server returns a request_id the client polls on.
+message PairRequestV2Response {
+    string request_id = 1;              // server-generated UUID for this pending request
+    int64 expires_at = 2;               // epoch seconds, pending TTL deadline
+}
+
+// Pending pair request surface for the admin dashboard (auth-gated GET /api/v1/pair/pending).
+message PendingPairInfo {
+    string request_id = 1;
+    string claimed_hostname = 2;
+    string claimed_os = 3;
+    string claimed_os_version = 4;
+    string source_ip = 5;               // observed peer IP (XFF-gated in Phase 2)
+    int64 created_at = 6;               // epoch seconds
+    int64 expires_at = 7;               // epoch seconds, pending TTL
+    int32 pin_attempts = 8;             // 0-3 wrong PINs before invalidation
+    bool approved = 9;
+    bool collected = 10;
+}
+
+// Admin approves a pending request by request_id + PIN (row-bound, 3-strike, idempotent).
+message ApprovePairRequest {
+    string request_id = 1;
+    string pin = 2;                     // 6-char PIN displayed by the client
+}
+
+message ApprovePairResponse {
+    bool approved = 1;
+    string message = 2;
+}
+
+// Client collects the issued cert after approval, proving possession of the ephemeral privkey.
+message CollectPairRequest {
+    string request_id = 1;
+    bytes ephemeral_pubkey = 2;         // must match the pubkey in the original PairRequest
+    bytes signature = 3;                // Ed25519 signature over request_id bytes
+}
+
+message CollectPairResponse {
+    bool collected = 1;
+    string client_id = 2;
+    bytes client_cert_pem = 3;
+    bytes client_key_pem = 4;
+    bytes ca_cert_pem = 5;
+    string grpc_addr = 6;
+    string ws_url = 7;
+    bytes mirror_verify_key = 8;
 }
 
 message PairResponse {
