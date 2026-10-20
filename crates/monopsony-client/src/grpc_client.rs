@@ -4,10 +4,12 @@ use monopsony_common::proto::monopsony::{
     client_message, ApplyShadowUpdateRequest, CheckShadowUpdatesRequest,
     DownloadShadowAssetRequest, GetShadowRecipeRequest, HeartbeatRequest, InventoryReport,
     ListShadowCatalogRequest, ListShadowPackagesRequest, PackageEntry, PairRequest, PairResponse,
-    RegisterRequest, RegisterShadowPackageRequest, RollbackShadowUpdateRequest, ShadowCatalogEntry,
+    RegisterRequest, RegisterShadowPackageRequest, RenewClientCertRequest,
+    RollbackShadowUpdateRequest, ShadowCatalogEntry,
     ShadowPackageInfo, ShadowScanFinding, ShadowScanReport, ShadowUpdateInfo,
     UnregisterShadowPackageRequest,
 };
+use anyhow::Context;
 use std::path::Path;
 use tonic::transport::Channel;
 use tracing::{debug, info};
@@ -23,6 +25,11 @@ const PAIR_RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Cap on the pairing response length prefix — parity with the server's
 /// request cap and the WebSocket pairing path's sanity check.
 const PAIR_RESPONSE_MAX: usize = 65536;
+
+/// Once a paired client's 90-day cert has 30 days or less of validity
+/// remaining, the daemon automatically re-issues it over mTLS — no human
+/// re-pairing required (P1 cert lifecycle, plan D4).
+pub const CERT_RENEWAL_WINDOW_DAYS: u64 = 30;
 
 pub struct MonopsonyGrpcClient {
     client: MonopsonyControlClient<Channel>,
@@ -68,6 +75,64 @@ impl ClientCerts {
         }
 
         info!("Client certificates saved to {}", cert_dir.display());
+        Ok(())
+    }
+
+    /// Expiry (`not_after`) of the client certificate, if parseable.
+    pub fn expiry(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        crate::trust::client_cert_expiry(&self.client_cert_pem)
+    }
+
+    /// Hex serial of the client certificate, in the server's encoding.
+    pub fn serial_hex(&self) -> Option<String> {
+        crate::trust::client_cert_serial_hex(&self.client_cert_pem)
+    }
+
+    /// Save certificates atomically: all three files are staged under temp
+    /// names and only renamed into place once every write succeeds, so a
+    /// crash mid-rotation never leaves a mismatched cert/key pair on disk.
+    pub fn save_atomic(&self, cert_dir: &Path) -> anyhow::Result<()> {
+        std::fs::create_dir_all(cert_dir)?;
+
+        let entries = [
+            (
+                cert_dir.join("client.crt"),
+                cert_dir.join("client.crt.tmp"),
+                self.client_cert_pem.as_slice(),
+            ),
+            (
+                cert_dir.join("client.key"),
+                cert_dir.join("client.key.tmp"),
+                self.client_key_pem.as_slice(),
+            ),
+            (
+                cert_dir.join("ca.crt"),
+                cert_dir.join("ca.crt.tmp"),
+                self.ca_cert_pem.as_slice(),
+            ),
+        ];
+
+        // Stage every temp file before renaming anything: a write failure
+        // here leaves the existing cert files untouched.
+        for (_, tmp, content) in &entries {
+            std::fs::write(tmp, content)?;
+        }
+        // Restrictive permissions on the key before it goes live.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                &entries[1].1,
+                std::fs::Permissions::from_mode(0o600),
+            )?;
+        }
+
+        // Rename into place — each rename is atomic on the same filesystem.
+        for (target, tmp, _) in &entries {
+            std::fs::rename(tmp, target)?;
+        }
+
+        info!("Client certificates rotated atomically into {}", cert_dir.display());
         Ok(())
     }
 }
@@ -220,6 +285,265 @@ impl MonopsonyGrpcClient {
         };
 
         Ok((resp.client_id, certs, resp.mirror_verify_key))
+    }
+
+    /// Request a freshly CA-signed cert/key pair for `client_id` over the
+    /// live mTLS channel (P1 renewal). The server binds issuance to the
+    /// certificate presented on the connection, so this re-issues without
+    /// any pairing code or human involvement. `current_serial` is the hex
+    /// serial of the cert presented via mTLS, sent as a hint the server
+    /// verifies against the peer certificate.
+    ///
+    /// Returns the new cert bundle and its expiry. The caller is
+    /// responsible for persisting (`ClientCerts::save_atomic`) and rotating
+    /// the live TLS config.
+    pub async fn renew_client_cert(
+        &mut self,
+        client_id: &str,
+        current_serial: Option<&str>,
+    ) -> anyhow::Result<(ClientCerts, chrono::DateTime<chrono::Utc>)> {
+        let req = RenewClientCertRequest {
+            client_id: client_id.to_string(),
+            current_serial: current_serial.unwrap_or_default().to_string(),
+        };
+
+        info!(
+            client_id = client_id,
+            current_serial = ?current_serial,
+            "Requesting certificate re-issue over mTLS"
+        );
+
+        let resp = self.client.renew_client_cert(req).await?;
+        let resp = resp.into_inner();
+
+        let expires_at = chrono::DateTime::<chrono::Utc>::from_timestamp(resp.expires_at, 0)
+            .context("server returned invalid expires_at")?;
+
+        let certs = ClientCerts {
+            client_cert_pem: resp.client_cert_pem,
+            client_key_pem: resp.client_key_pem,
+            ca_cert_pem: resp.ca_cert_pem.as_bytes().to_vec(),
+        };
+
+        info!(
+            client_id = client_id,
+            expiry = %expires_at,
+            "Client certificate re-issued by server over mTLS"
+        );
+
+        Ok((certs, expires_at))
+    }
+
+    // ─── Pairing v2 / Sunshine: HTTP-based submit → poll → collect ───────
+
+    /// Submit a v2 pairing request over HTTP (pairing_mode = pin).
+    /// Generates nothing here — the caller supplies the ephemeral pubkey and
+    /// salted PIN hash. Returns the server-assigned request_id and expiry.
+    pub async fn submit_pair_request_v2(
+        base_url: &str,
+        ephemeral_pubkey_hex: &str,
+        pin_hash: &str,
+        pin_salt: &str,
+        claimed_hostname: &str,
+        claimed_os: &str,
+        claimed_os_version: &str,
+        package_managers: &[String],
+    ) -> anyhow::Result<(String, i64)> {
+        #[derive(serde::Serialize)]
+        struct PairRequestV2 {
+            ephemeral_pubkey: String,
+            pin_hash: String,
+            pin_salt: String,
+            claimed_hostname: String,
+            claimed_os: String,
+            claimed_os_version: String,
+            package_managers: Vec<String>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct PairRequestV2Response {
+            request_id: String,
+            expires_at: i64,
+        }
+
+        let url = format!("{}/api/v1/pair/request", base_url.trim_end_matches('/'));
+        let resp: PairRequestV2Response = reqwest::Client::new()
+            .post(&url)
+            .json(&PairRequestV2 {
+                ephemeral_pubkey: ephemeral_pubkey_hex.to_string(),
+                pin_hash: pin_hash.to_string(),
+                pin_salt: pin_salt.to_string(),
+                claimed_hostname: claimed_hostname.to_string(),
+                claimed_os: claimed_os.to_string(),
+                claimed_os_version: claimed_os_version.to_string(),
+                package_managers: package_managers.to_vec(),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        info!(
+            request_id = %resp.request_id,
+            expires_at = resp.expires_at,
+            "Pairing v2 request submitted"
+        );
+        Ok((resp.request_id, resp.expires_at))
+    }
+
+    /// Poll the status of a v2 pairing request. Returns the status string
+    /// ("pending" | "approved" | "collected" | "expired" | "invalidated").
+    pub async fn poll_pair_request_status(
+        base_url: &str,
+        request_id: &str,
+    ) -> anyhow::Result<String> {
+        #[derive(serde::Deserialize)]
+        struct PairRequestStatusResponse {
+            status: String,
+        }
+
+        let url = format!(
+            "{}/api/v1/pair/request/{}/status",
+            base_url.trim_end_matches('/'),
+            request_id
+        );
+        let resp: PairRequestStatusResponse = reqwest::Client::new()
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        Ok(resp.status)
+    }
+
+    /// Collect a v2 pairing certificate with proof of possession.
+    /// Signs `request_id` bytes with the ephemeral private key and presents
+    /// the signature to the server.
+    pub async fn collect_pair_cert_v2(
+        base_url: &str,
+        request_id: &str,
+        ephemeral_pubkey_bytes: &[u8],
+        signature_bytes: &[u8],
+    ) -> anyhow::Result<(String, ClientCerts)> {
+        #[derive(serde::Serialize)]
+        struct CollectPairRequestV2 {
+            request_id: String,
+            ephemeral_pubkey: String,
+            signature: String,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct CollectPairResponseV2 {
+            collected: bool,
+            client_id: String,
+            client_cert_pem: String,
+            client_key_pem: String,
+            ca_cert_pem: String,
+            grpc_addr: String,
+            ws_url: String,
+        }
+
+        let url = format!("{}/api/v1/pair/collect", base_url.trim_end_matches('/'));
+        let resp: CollectPairResponseV2 = reqwest::Client::new()
+            .post(&url)
+            .json(&CollectPairRequestV2 {
+                request_id: request_id.to_string(),
+                ephemeral_pubkey: hex::encode(ephemeral_pubkey_bytes),
+                signature: hex::encode(signature_bytes),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        if !resp.collected {
+            anyhow::bail!("Server did not complete collection");
+        }
+
+        let certs = ClientCerts {
+            client_cert_pem: resp.client_cert_pem.into_bytes(),
+            client_key_pem: resp.client_key_pem.into_bytes(),
+            ca_cert_pem: resp.ca_cert_pem.into_bytes(),
+        };
+
+        info!(
+            client_id = %resp.client_id,
+            request_id = %request_id,
+            "Pairing v2 collect complete"
+        );
+        Ok((resp.client_id, certs))
+    }
+
+    /// Enroll via a pre-approval key (P5). Signs `monopsony-enroll-v1` with
+    /// the ephemeral private key as the possession proof; on success the
+    /// server registers the client and returns the cert bundle.
+    pub async fn enroll_pair_v2(
+        base_url: &str,
+        enrollment_key: &str,
+        ephemeral_pubkey_bytes: &[u8],
+        signature_bytes: &[u8],
+        claimed_hostname: &str,
+        claimed_os: &str,
+        claimed_os_version: &str,
+        package_managers: &[String],
+    ) -> anyhow::Result<(String, ClientCerts)> {
+        #[derive(serde::Serialize)]
+        struct EnrollPairRequest {
+            enrollment_key: String,
+            ephemeral_pubkey: String,
+            signature: String,
+            claimed_hostname: String,
+            claimed_os: String,
+            claimed_os_version: String,
+            package_managers: Vec<String>,
+        }
+
+        #[derive(serde::Deserialize)]
+        struct EnrollPairResponse {
+            enrolled: bool,
+            client_id: String,
+            client_cert_pem: String,
+            client_key_pem: String,
+            ca_cert_pem: String,
+        }
+
+        let url = format!("{}/api/v1/pair/enroll", base_url.trim_end_matches('/'));
+        let resp: EnrollPairResponse = reqwest::Client::new()
+            .post(&url)
+            .json(&EnrollPairRequest {
+                enrollment_key: enrollment_key.to_string(),
+                ephemeral_pubkey: hex::encode(ephemeral_pubkey_bytes),
+                signature: hex::encode(signature_bytes),
+                claimed_hostname: claimed_hostname.to_string(),
+                claimed_os: claimed_os.to_string(),
+                claimed_os_version: claimed_os_version.to_string(),
+                package_managers: package_managers.to_vec(),
+            })
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+
+        if !resp.enrolled {
+            anyhow::bail!("Server did not complete enrollment");
+        }
+
+        let certs = ClientCerts {
+            client_cert_pem: resp.client_cert_pem.into_bytes(),
+            client_key_pem: resp.client_key_pem.into_bytes(),
+            ca_cert_pem: resp.ca_cert_pem.into_bytes(),
+        };
+
+        info!(
+            client_id = %resp.client_id,
+            "Enrollment-key pairing complete"
+        );
+        Ok((resp.client_id, certs))
     }
 
     pub async fn heartbeat(
@@ -431,6 +755,13 @@ impl MonopsonyGrpcClient {
             os: os.to_string(),
             os_version: os_version.to_string(),
             package_managers: package_managers.to_vec(),
+            // v2 fields — empty for legacy code-based pairing
+            ephemeral_pubkey: Vec::new(),
+            pin_hash: String::new(),
+            pin_salt: String::new(),
+            claimed_hostname: String::new(),
+            claimed_os: String::new(),
+            claimed_os_version: String::new(),
         };
         let req_bytes = req.encode_to_vec();
         let len = req_bytes.len() as u32;
@@ -527,6 +858,13 @@ impl MonopsonyGrpcClient {
             os: os.to_string(),
             os_version: os_version.to_string(),
             package_managers: package_managers.to_vec(),
+            // v2 fields — empty for legacy code-based pairing
+            ephemeral_pubkey: Vec::new(),
+            pin_hash: String::new(),
+            pin_salt: String::new(),
+            claimed_hostname: String::new(),
+            claimed_os: String::new(),
+            claimed_os_version: String::new(),
         };
         let req_bytes = req.encode_to_vec();
         let len = req_bytes.len() as u32;
@@ -1022,5 +1360,43 @@ mod tests {
         drop(client); // EOF mid-frame
 
         assert!(read_pair_response(&mut server).await.is_err());
+    }
+
+    #[test]
+    fn client_certs_save_atomic_round_trip() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let certs = ClientCerts {
+            client_cert_pem: b"-----BEGIN CERT-----\nfake-cert\n-----END CERT-----".to_vec(),
+            client_key_pem: b"-----BEGIN KEY-----\nfake-key\n-----END KEY-----".to_vec(),
+            ca_cert_pem: b"-----BEGIN CA-----\nfake-ca\n-----END CA-----".to_vec(),
+        };
+
+        certs.save_atomic(dir.path()).expect("atomic save");
+
+        let back = ClientCerts::load(dir.path()).expect("load rotated certs");
+        assert_eq!(back.client_cert_pem, certs.client_cert_pem);
+        assert_eq!(back.client_key_pem, certs.client_key_pem);
+        assert_eq!(back.ca_cert_pem, certs.ca_cert_pem);
+
+        // No temp files left behind.
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.contains(".tmp")),
+            "temp files must be cleaned up: {names:?}"
+        );
+
+        // Key permissions 0600.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("client.key"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "client.key must be 0600");
+        }
     }
 }

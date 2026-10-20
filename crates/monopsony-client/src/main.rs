@@ -8,6 +8,8 @@ mod ws_transport;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use rand::Rng;
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -139,9 +141,20 @@ enum Commands {
         #[arg(long)]
         server: String,
 
-        /// 6-character pairing code from the server
+        /// 6-character pairing code from the server (legacy mode)
         #[arg(long)]
-        code: String,
+        code: Option<String>,
+
+        /// Use v2 Sunshine pairing: client generates a PIN, displays it,
+        /// submits a request, polls for admin approval, then collects the
+        /// cert with proof of possession. Requires pairing_mode=pin server.
+        #[arg(long)]
+        pin: bool,
+
+        /// Enroll with a pre-approval key (mopk-...): non-interactive fleet
+        /// pairing. Requires a valid, unexhausted enrollment key.
+        #[arg(long)]
+        enrollment_key: Option<String>,
     },
     /// Configure a local package manager to use a distribution mirror
     Mirror {
@@ -192,10 +205,27 @@ enum Commands {
     /// verb on current macOS; whether the scan's traffic routes through
     /// Monopsony depends on system-proxy / Content Caching state)
     UpdateScan,
+    /// Uninstall client-side integration: remove proxy configuration from
+    /// every detected package manager (and Docker/shadow hooks), leaving the
+    /// daemon + certs untouched. Run before package removal.
+    Uninstall,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum SetupMode {
+    /// Interactive setup (P6): detect installed package managers, configure
+    /// each to route through the Monopsony proxy, and print init-placement
+    /// guidance. Idempotent and re-runnable.
+    Interactive {
+        /// Server address used to derive proxy settings
+        /// (default: saved server.json, else 127.0.0.1:3128)
+        #[arg(long)]
+        server: Option<String>,
+        /// Configure ALL detected subsystems without prompting
+        /// (non-interactive; useful for scripts/Ansible)
+        #[arg(long)]
+        all: bool,
+    },
     /// macOS: activate Apple Content Caching (shared content only — no
     /// iCloud personal-blob caching). One sudo prompt; needs an admin user
     /// (rc=77 without root). Serves OS updates + App Store content to OTHER
@@ -524,8 +554,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Configure { server }) => {
             run_configure(&server).await?;
         }
-        Some(Commands::Pair { server, code }) => {
-            run_pair(&server, &code, &cert_dir).await?;
+        Some(Commands::Pair { server, code, pin, enrollment_key }) => {
+            run_pair(&server, code.as_deref(), pin, enrollment_key.as_deref(), &cert_dir).await?;
         }
         Some(Commands::Mirror {
             server,
@@ -550,10 +580,18 @@ async fn main() -> anyhow::Result<()> {
             run_override(mode, &cert_dir).await?;
         }
         Some(Commands::Setup { cmd }) => {
-            run_setup(cmd)?;
+            match cmd {
+                SetupMode::Interactive { server, all } => {
+                    run_setup_interactive(server.as_deref(), all, &cert_dir).await?;
+                }
+                other => run_setup(other)?,
+            }
         }
         Some(Commands::UpdateScan) => {
             run_update_scan()?;
+        }
+        Some(Commands::Uninstall) => {
+            run_uninstall(&cert_dir).await?;
         }
         None => {
             info!("No command specified. Use --help for usage.");
@@ -1364,9 +1402,14 @@ async fn run_daemon(
         const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
         const INVENTORY_INTERVAL: Duration = Duration::from_secs(300);
 
+        // Live TLS config for the control connection. Rotated in place after
+        // a successful mid-connection renewal — the connection itself is
+        // never dropped; the new cert/key take effect on the next handshake.
+        let mut tls_config: Option<tonic::transport::ClientTlsConfig> = None;
+
         loop {
             // Attempt connection with exponential backoff
-            let certs = match grpc_client::ClientCerts::load(&cert_dir_for_task) {
+            let mut certs = match grpc_client::ClientCerts::load(&cert_dir_for_task) {
                 Some(c) => c,
                 None => {
                     warn!("No certificates available for heartbeat");
@@ -1376,18 +1419,25 @@ async fn run_daemon(
                 }
             };
 
-            let tls = tonic::transport::ClientTlsConfig::new()
-                .ca_certificate(tonic::transport::Certificate::from_pem(&certs.ca_cert_pem))
-                .identity(tonic::transport::Identity::from_pem(
-                    &certs.client_cert_pem,
-                    &certs.client_key_pem,
-                ))
-                .domain_name("monopsony-server");
+            let tls = match &tls_config {
+                Some(cfg) => cfg.clone(),
+                None => {
+                    let cfg = tonic::transport::ClientTlsConfig::new()
+                        .ca_certificate(tonic::transport::Certificate::from_pem(&certs.ca_cert_pem))
+                        .identity(tonic::transport::Identity::from_pem(
+                            &certs.client_cert_pem,
+                            &certs.client_key_pem,
+                        ))
+                        .domain_name("monopsony-server");
+                    tls_config = Some(cfg.clone());
+                    cfg
+                }
+            };
 
             let mut client = if server_addr_for_task.starts_with("wss://")
                 || server_addr_for_task.starts_with("ws://")
             {
-                match grpc_client::MonopsonyGrpcClient::connect_ws(&server_addr_for_task, Some(tls))
+                match grpc_client::MonopsonyGrpcClient::connect_ws(&server_addr_for_task, Some(tls.clone()))
                     .await
                 {
                     Ok(c) => {
@@ -1403,7 +1453,7 @@ async fn run_daemon(
                     }
                 }
             } else {
-                match grpc_client::MonopsonyGrpcClient::connect(&server_addr_for_task, Some(tls))
+                match grpc_client::MonopsonyGrpcClient::connect(&server_addr_for_task, Some(tls.clone()))
                     .await
                 {
                     Ok(c) => {
@@ -1426,6 +1476,60 @@ async fn run_daemon(
 
             loop {
                 interval.tick().await;
+
+                // P1 renewal: inside the 30-day window, re-issue the cert
+                // over the live mTLS channel, persist the new cert/key
+                // atomically, and rotate the live TLS config. The control
+                // connection itself is not dropped — the new creds take
+                // effect on the next handshake.
+                let renewal_due = certs.expiry().map(|expires| {
+                    let days = (expires - chrono::Utc::now()).num_days();
+                    (days, days <= grpc_client::CERT_RENEWAL_WINDOW_DAYS as i64)
+                });
+                if let Some((days, true)) = renewal_due {
+                    info!(days, "Certificate in the 30-day renewal window — re-issuing over mTLS");
+                    match client
+                        .renew_client_cert(&client_id_for_task, certs.serial_hex().as_deref())
+                        .await
+                    {
+                        Ok((new_certs, new_expiry)) => {
+                            match new_certs.save_atomic(&cert_dir_for_task) {
+                                Ok(()) => {
+                                    // Rotate the live TLS config so subsequent
+                                    // connections use the new cert/key pair.
+                                    let renewed_tls =
+                                        tonic::transport::ClientTlsConfig::new()
+                                            .ca_certificate(tonic::transport::Certificate::from_pem(
+                                                &new_certs.ca_cert_pem,
+                                            ))
+                                            .identity(tonic::transport::Identity::from_pem(
+                                                &new_certs.client_cert_pem,
+                                                &new_certs.client_key_pem,
+                                            ))
+                                            .domain_name("monopsony-server");
+                                    tls_config = Some(renewed_tls);
+                                    certs = new_certs;
+                                    info!(
+                                        expiry = %new_expiry,
+                                        "Client certificate renewed; TLS config rotated, control connection kept alive"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        "Server re-issued the client certificate but atomic persist failed"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                "Certificate renewal failed — retrying on next heartbeat"
+                            );
+                        }
+                    }
+                }
 
                 // Send heartbeat (Sprint 27 Part B: carries the windowed
                 // update-failure snapshot — counts-only, no package identity)
@@ -1861,6 +1965,21 @@ async fn run_status(cert_dir: &Path) -> anyhow::Result<()> {
         info!("  Certificates: Found at {}", cert_dir.display());
         info!("  CA cert: {} bytes", certs.ca_cert_pem.len());
         info!("  Client cert: {} bytes", certs.client_cert_pem.len());
+
+        // Certificate expiry + renewal window (P1 cert lifecycle): the daemon
+        // auto-re-issues inside the 30-day window without human re-pairing.
+        match trust::client_cert_expiry(&certs.client_cert_pem) {
+            Some(expires) => {
+                let days = (expires - chrono::Utc::now()).num_days();
+                info!("  Certificate expires: {} ({} days)", expires.to_rfc3339(), days);
+                if days <= grpc_client::CERT_RENEWAL_WINDOW_DAYS as i64 {
+                    info!(
+                        "  Renewal window: ACTIVE — automatic mTLS re-issue inside 30 days"
+                    );
+                }
+            }
+            None => info!("  Certificate expires: unparseable"),
+        }
     } else {
         info!("  Certificates: Not found");
         info!("  Run monopsony-client register to obtain certificates");
@@ -1902,12 +2021,34 @@ fn run_status_quiet(cert_dir: &Path) {
                         .map(|s| s.to_string())
                 });
             if let Some(addr) = addr {
-                println!("Server: {}", addr);
+                println!("Server: {addr}");
             }
         }
     }
 
-    // Cache HIT ratio from the daemon's persisted X-Cache counters. The
+    // Certificate expiry + renewal window (P1 cert lifecycle), read from the
+    // paired cert on disk — a separate process from the daemon, so disk is
+    // the source of truth (rotated atomically by the renewal path).
+    if let Some(certs) = grpc_client::ClientCerts::load(cert_dir) {
+        match trust::client_cert_expiry(&certs.client_cert_pem) {
+            Some(expires) => {
+                let days = (expires - chrono::Utc::now()).num_days();
+                println!("Cert Expiry: {}", expires.to_rfc3339());
+                let renewal = if days <= grpc_client::CERT_RENEWAL_WINDOW_DAYS as i64 {
+                    "active"
+                } else {
+                    "not-due"
+                };
+                println!("Cert Renewal: {renewal} ({days} days remaining)");
+            }
+            None => {
+                println!("Cert Expiry: unknown");
+                println!("Cert Renewal: unknown");
+            }
+        }
+    }
+
+    // Cache HIT ratio from the daemon's persisted X-Cache counters.
     // daemon (not this process) owns the live counters; this reads its
     // last flushed snapshot, so a never-run daemon simply omits the line.
     let counter_path = hit_counter_state_path(cert_dir);
@@ -1973,7 +2114,13 @@ async fn run_configure(server: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_pair(server: &str, code: &str, cert_dir: &Path) -> anyhow::Result<()> {
+async fn run_pair(
+    server: &str,
+    code: Option<&str>,
+    pin: bool,
+    enrollment_key: Option<&str>,
+    cert_dir: &Path,
+) -> anyhow::Result<()> {
     // Check if already paired
     if grpc_client::ClientCerts::load(cert_dir).is_some() {
         warn!(
@@ -1995,6 +2142,10 @@ async fn run_pair(server: &str, code: &str, cert_dir: &Path) -> anyhow::Result<(
         .collect();
 
     info!("Pairing with server: {}", server);
+
+    // Legacy code-based pairing (pairing_mode = legacy-code)
+    if let Some(code) = code {
+        info!("Using legacy code mode");
 
     // Route to WebSocket pairing when the server address is a ws:// or wss:// URL.
     // This is used when the server is behind Cloudflare Tunnels or a reverse proxy.
@@ -2027,9 +2178,19 @@ async fn run_pair(server: &str, code: &str, cert_dir: &Path) -> anyhow::Result<(
         ))?
     };
 
-    certs.save(cert_dir)?;
+    certs.save_atomic(cert_dir)?;
     std::fs::write(cert_dir.join("client_id"), &client_id)?;
     store_mirror_verify_key(cert_dir, &mirror_verify_key);
+
+    // Surface the new cert's expiry so the operator sees the 90-day clock
+    // and the 30-day renewal window at pair time.
+    if let Some(expires) = trust::client_cert_expiry(&certs.client_cert_pem) {
+        info!(
+            expiry = %expires,
+            "Paired client certificate valid for 90 days; daemon auto-renews inside the 30-day window"
+        );
+        println!("  Certificate expires: {} (auto-renews inside 30 days)", expires.to_rfc3339());
+    }
 
     // Persist server connection info for future daemon connections.
     // Include ws_url when the server provided one — clients will prefer it
@@ -2053,7 +2214,389 @@ async fn run_pair(server: &str, code: &str, cert_dir: &Path) -> anyhow::Result<(
         cert_dir.display()
     );
     println!("Pairing complete! Client ID: {}", client_id);
+        return Ok(());
+    }
 
+    // v2 Sunshine pairing (pairing_mode = pin)
+    if pin {
+        return run_pair_v2(server, &hostname, &managers, cert_dir).await;
+    }
+
+    // Enrollment-key pairing (P5): pre-approved, non-interactive.
+    if let Some(enroll_key) = enrollment_key {
+        return run_pair_enroll(server, enroll_key, &hostname, &managers, cert_dir).await;
+    }
+
+    anyhow::bail!(
+        "Pairing mode not specified. Use --code <6-char-code> for legacy mode, \
+         --pin for v2 Sunshine pairing (admin approval + client PIN), or \
+         --enrollment-key <mopk-...> for pre-approved fleet enrollment."
+    );
+}
+
+/// Enrollment-key pairing (P5): non-interactive pre-approved pairing.
+/// Generates an ephemeral keypair, signs `monopsony-enroll-v1` as the
+/// possession proof, posts to /api/v1/pair/enroll, saves certs + TOFU pin.
+async fn run_pair_enroll(
+    server: &str,
+    enrollment_key: &str,
+    hostname: &str,
+    managers: &[String],
+    cert_dir: &Path,
+) -> anyhow::Result<()> {
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+
+    let base_url = if server.starts_with("http://") || server.starts_with("https://") {
+        server.to_string()
+    } else {
+        format!("http://{}", server)
+    };
+
+    info!(
+        "Starting enrollment-key pairing with server: {}",
+        server
+    );
+
+    // 1. Generate client ephemeral Ed25519 keypair
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let ephemeral_pubkey_bytes = signing_key.verifying_key().to_bytes();
+
+    // 2. Possession proof: Ed25519 signature over the fixed domain string
+    let signature = signing_key.sign(b"monopsony-enroll-v1");
+    let signature_bytes = signature.to_bytes();
+
+    // 3. Enroll (single round-trip — no PIN, no polling)
+    let (client_id, certs) = grpc_client::MonopsonyGrpcClient::enroll_pair_v2(
+        &base_url,
+        enrollment_key,
+        &ephemeral_pubkey_bytes,
+        &signature_bytes,
+        hostname,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        managers,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Enrollment failed: {}", e))?;
+
+    // 4. TOFU CA fingerprint pinning
+    let ca_fingerprint =
+        crate::trust::ca_fingerprint(&certs.ca_cert_pem).context("failed to compute CA fingerprint")?;
+    crate::trust::check_ca_fingerprint(cert_dir, &ca_fingerprint)
+        .map_err(|e| anyhow::anyhow!("CA fingerprint check failed: {}", e))?;
+    crate::trust::store_ca_fingerprint(cert_dir, &ca_fingerprint)?;
+
+    // 5. Save certificates
+    save_pair_result(cert_dir, &client_id, &certs, "", None, &[])?;
+
+    info!(
+        client_id = %client_id,
+        ca_fingerprint = %ca_fingerprint,
+        "Enrollment-key pairing complete — CA fingerprint TOFU-pinned"
+    );
+    println!("Enrollment complete! Client ID: {}", client_id);
+    println!("CA fingerprint (TOFU-pinned): {}", ca_fingerprint);
+    Ok(())
+}
+
+fn save_pair_result(
+    cert_dir: &Path,
+    client_id: &str,
+    certs: &grpc_client::ClientCerts,
+    grpc_addr: &str,
+    ws_url: Option<String>,
+    mirror_verify_key: &[u8],
+) -> anyhow::Result<()> {
+    certs.save_atomic(cert_dir)?;
+    std::fs::write(cert_dir.join("client_id"), client_id)?;
+
+    if !mirror_verify_key.is_empty() {
+        crate::store_mirror_verify_key(cert_dir, mirror_verify_key);
+    }
+
+    // Surface the new cert's expiry so the operator sees the 90-day clock
+    // and the 30-day renewal window at pair time.
+    if let Some(expires) = crate::trust::client_cert_expiry(&certs.client_cert_pem) {
+        info!(
+            expiry = %expires,
+            "Paired client certificate valid for 90 days; daemon auto-renews inside the 30-day window"
+        );
+        println!(
+            "  Certificate expires: {} (auto-renews inside 30 days)",
+            expires.to_rfc3339()
+        );
+    }
+
+    let server_info = serde_json::json!({
+        "grpc_addr": grpc_addr,
+        "ws_url": ws_url,
+        "paired_addr": "",
+        "paired_at": chrono::Utc::now().to_rfc3339(),
+    });
+    std::fs::write(
+        cert_dir.join("server.json"),
+        serde_json::to_string_pretty(&server_info)?,
+    )?;
+
+    Ok(())
+}
+
+/// v2 Sunshine pairing flow: generate PIN + ephemeral keypair, display PIN,
+/// submit request over HTTP, poll for admin approval, collect cert with
+/// proof of possession. TOFU-pins the server CA fingerprint on first collect.
+async fn run_pair_v2(
+    server: &str,
+    hostname: &str,
+    managers: &[String],
+    cert_dir: &Path,
+) -> anyhow::Result<()> {
+    use ed25519_dalek::{Signer, SigningKey};
+    use rand::rngs::OsRng;
+
+    let base_url = if server.starts_with("http://") || server.starts_with("https://") {
+        server.to_string()
+    } else {
+        format!("http://{}", server)
+    };
+
+    info!(
+        "Starting v2 Sunshine pairing with server: {} (pairing_mode=pin)",
+        server
+    );
+
+    // 1. Generate client ephemeral Ed25519 keypair
+    let signing_key = SigningKey::generate(&mut OsRng);
+    let ephemeral_pubkey_bytes = signing_key.verifying_key().to_bytes();
+    let ephemeral_pubkey_hex = hex::encode(ephemeral_pubkey_bytes);
+
+    // 2. Generate 6-char PIN (charset ABCDEFGHJKLMNPQRSTUVWXYZ23456789)
+    let charset = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut pin_bytes = [0u8; 6];
+    OsRng.fill(&mut pin_bytes);
+    let pin: String = pin_bytes
+        .iter()
+        .map(|&b| charset[b as usize % charset.len()] as char)
+        .collect();
+
+    // 3. Compute salted PIN hash: SHA-256(pin_salt + pin)
+    let mut pin_salt_bytes = [0u8; 16];
+    OsRng.fill(&mut pin_salt_bytes);
+    let pin_salt = hex::encode(pin_salt_bytes);
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(pin_salt_bytes);
+    hasher.update(pin.as_bytes());
+    let pin_hash = hex::encode(hasher.finalize());
+
+    // Display PIN to the user (out-of-band channel for admin approval)
+    println!();
+    println!("============================================================");
+    println!("  MONOPOSSONY PAIRING — v2 Sunshine mode");
+    println!("  Server: {}", server);
+    println!("  Your pairing PIN: {}", pin);
+    println!("  Show this PIN to the server administrator for approval.");
+    println!("============================================================");
+    println!();
+
+    // 4. Submit pairing request
+    info!("Submitting v2 pairing request");
+    let (request_id, _expires_at) = grpc_client::MonopsonyGrpcClient::submit_pair_request_v2(
+        &base_url,
+        &ephemeral_pubkey_hex,
+        &pin_hash,
+        &pin_salt,
+        hostname,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        managers,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to submit pairing request: {}", e))?;
+
+    info!(
+        request_id = %request_id,
+        "Pairing request submitted, waiting for admin approval"
+    );
+    println!(
+        "Pairing request submitted (request_id={}). Waiting for admin approval...",
+        request_id
+    );
+
+    // 5. Poll for approval (up to 15 minutes, matching the server's pending TTL)
+    let poll_deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
+    loop {
+        if std::time::Instant::now() > poll_deadline {
+            anyhow::bail!("Pairing request expired before admin approval");
+        }
+
+        let status = grpc_client::MonopsonyGrpcClient::poll_pair_request_status(&base_url, &request_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to poll pairing status: {}", e))?;
+
+        match status.as_str() {
+            "approved" => break,
+            "pending" => {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+            "expired" | "invalidated" => {
+                anyhow::bail!("Pairing request {} (status={})", request_id, status);
+            }
+            _ => {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                continue;
+            }
+        }
+    }
+
+    println!("Admin approved the request. Collecting certificate...");
+
+    // 6. Collect: sign request_id with ephemeral private key
+    let signature = signing_key.sign(request_id.as_bytes());
+    let signature_bytes = signature.to_bytes();
+
+    let (client_id, certs) = grpc_client::MonopsonyGrpcClient::collect_pair_cert_v2(
+        &base_url,
+        &request_id,
+        &ephemeral_pubkey_bytes,
+        &signature_bytes,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to collect certificate: {}", e))?;
+
+    // 7. TOFU CA fingerprint pinning
+    let ca_fingerprint =
+        crate::trust::ca_fingerprint(&certs.ca_cert_pem).context("failed to compute CA fingerprint")?;
+    crate::trust::check_ca_fingerprint(cert_dir, &ca_fingerprint)
+        .map_err(|e| anyhow::anyhow!("CA fingerprint check failed: {}", e))?;
+    crate::trust::store_ca_fingerprint(cert_dir, &ca_fingerprint)?;
+
+    // 8. Save certificates
+    save_pair_result(cert_dir, &client_id, &certs, "", None, &[])?;
+
+    info!(
+        client_id = %client_id,
+        ca_fingerprint = %ca_fingerprint,
+        "Pairing v2 complete — CA fingerprint TOFU-pinned"
+    );
+    println!("Pairing complete! Client ID: {}", client_id);
+    println!("CA fingerprint (TOFU-pinned): {}", ca_fingerprint);
+    Ok(())
+}
+
+/// Interactive setup (P6): detect installed package managers, apply the
+/// ProxyConfigActions for each (reusing proxy_toggle), and print init
+/// placement guidance. Idempotent — re-running re-applies the same config.
+async fn run_setup_interactive(
+    server: Option<&str>,
+    assume_all: bool,
+    cert_dir: &Path,
+) -> anyhow::Result<()> {
+    let server_addr = if let Some(s) = server {
+        s.to_string()
+    } else {
+        resolve_server_addr(cert_dir)
+            .await
+            .unwrap_or_else(|_| "127.0.0.1:3128".to_string())
+    };
+
+    // PM discovery: only offer backends that are actually installed.
+    let backends: Vec<String> = monopsony_common::package_manager::get_available_backends()
+        .iter()
+        .filter(|b| b.is_available())
+        .map(|b| b.kind().as_str().to_string())
+        .collect();
+
+    println!();
+    println!("Monopsony client setup");
+    println!("  Server:   {}", server_addr);
+    println!("  Detected package managers: {}", if backends.is_empty() { "(none)".into() } else { backends.join(", ") });
+    println!();
+
+    if !assume_all {
+        print!(
+            "Configure all detected package managers (plus Docker/shadow hooks) \
+             for proxying through Monopsony? [y/N]: "
+        );
+        use std::io::Write as _;
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer)?;
+        let answer = answer.trim().to_ascii_lowercase();
+        if answer != "y" && answer != "yes" {
+            println!("Setup cancelled — no changes made.");
+            return Ok(());
+        }
+    }
+
+    let results = crate::proxy_toggle::proxy_on(
+        crate::proxy_toggle::ToggleTarget::All,
+        &server_addr,
+    )
+    .await;
+
+    let mut succeeded = 0;
+    let mut failed = 0;
+    for r in &results {
+        if r.success {
+            println!("✓ {}: {}", r.subsystem, r.message);
+            succeeded += 1;
+        } else {
+            println!("✗ {}: {}", r.subsystem, r.message);
+            failed += 1;
+        }
+    }
+    println!("\n{} configured, {} failed", succeeded, failed);
+
+    // Init placement guidance — the installer (dist/install.sh) owns unit
+    // files; here we only point the operator at the next step.
+    println!();
+    println!("Next steps:");
+    println!("  1. Enable the daemon: systemctl enable --now monopsony-client");
+    println!("     (unit file placed by dist/install.sh; see docs/container-deploy.md");
+    println!("      for container deployments)");
+    println!("  2. Test one package: e.g. `pacman -Syu` (check the server dashboard");
+    println!("     for cache hits)");
+    println!("  Re-run this command any time — setup is idempotent.");
+
+    if failed > 0 {
+        anyhow::bail!("{} setup actions failed", failed);
+    }
+    Ok(())
+}
+
+/// Uninstall (P6): remove proxy configuration from every detected package
+/// manager and subsystem. Daemon + certs are left in place — the operator
+/// stops/disables the service and deletes the cert dir separately.
+async fn run_uninstall(cert_dir: &Path) -> anyhow::Result<()> {
+    println!("Removing Monopsony proxy configuration from all detected subsystems...");
+
+    let results =
+        crate::proxy_toggle::proxy_off(crate::proxy_toggle::ToggleTarget::All).await;
+
+    let mut succeeded = 0;
+    let mut failed = 0;
+    for r in &results {
+        if r.success {
+            println!("✓ {}: {}", r.subsystem, r.message);
+            succeeded += 1;
+        } else {
+            println!("✗ {}: {}", r.subsystem, r.message);
+            failed += 1;
+        }
+    }
+    println!("\n{} removed, {} failed", succeeded, failed);
+
+    println!();
+    println!("Proxy configuration removed. To fully uninstall:");
+    println!("  1. systemctl disable --now monopsony-client");
+    println!("  2. Remove the package (pacman -R monopsony-client / apt remove, ...)");
+    println!("  3. Optionally delete {}", cert_dir.display());
+    println!("  4. On the server: revoke this client's certificate from the dashboard");
+
+    if failed > 0 {
+        anyhow::bail!("{} uninstall actions failed", failed);
+    }
     Ok(())
 }
 
@@ -3018,10 +3561,14 @@ fn report_system_proxy_rows(
 /// Caching lane. Sync like the system-proxy lane — blocking process spawns
 /// only; never touches the async network stack.
 fn run_setup(cmd: SetupMode) -> anyhow::Result<()> {
+    // `Interactive` is handled (async) in main() before this call.
     let SetupMode::Mac {
         status: status_flag,
         disable,
-    } = cmd;
+    } = cmd
+    else {
+        anyhow::bail!("setup interactive must be handled by run_setup_interactive");
+    };
     if !content_cache::is_supported() {
         println!("✗ setup mac: only supported on macOS (/usr/bin/AssetCacheManagerUtil not found)");
         anyhow::bail!("unsupported platform");
