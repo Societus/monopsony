@@ -21,6 +21,9 @@ outside `crates/monopsony-proxy/src/docker.rs`) and (b) is GET-only — no write
 | GC policy | Blobs refcounted across manifests; auto-versioned tags **never** auto-deleted. | user, 2026-09-26 |
 | Sequencing | Independent of Sprints 23/24; macOS sprint led, OCI fills the next lane. | kickoff plan, 2026-10-01 |
 | Deferral-gate coupling | Docker/OCI deferral track lands AFTER this registry so both share tag/version plumbing. | deferral spec §11.4 |
+| Listen point (kickoff 2026-10-19) | **Dedicated port** — `--registry-bind`, default `0.0.0.0:3131`; NOT the mirror router :3129. Rationale: `docker.rs` pull-through owns the same `/v2` route namespace (verified in-tree); sharing a listener would hard-close S5 mount-or-cut. Also shrinks the auth-exemption surface (all routes keyed, no public/private policy threading). | user, kickoff slice-1 plan |
+| Auto-version scheme (kickoff 2026-10-19) | **`YYYYMMDD-HHMMSS`, no shorthash suffix.** Scope: OCI tagless pushes ONLY — non-OCI naming untouched. Digest is the rollback identity; shorthash added nothing in OCI context. | user, kickoff slice-1 plan |
+| Registry auth v1 (kickoff 2026-10-19) | **All routes keyed** (pulls + pushes) via `auth_middleware`/`AuthState` reuse; no rate limiter v1. Docker-client Basic-auth mapping = S2 design item. | user, kickoff slice-1 plan |
 
 ## Verified wire facts — OCI Distribution Spec (fetched 2026-10-16, `spec.md@main`, 940 lines)
 
@@ -72,10 +75,16 @@ Full endpoint table (end-1…end-14) + error codes saved at
 
 ## Trust / architecture model
 
-- Registry serves under the **mirror router :3129** (default; see open questions) — mirror
-  auth semantics already live there: pulls follow the mirror policy (private = keyed, public =
-  rate-limited); **push routes are ALWAYS authenticated** (API key / admin session) regardless
-  of mirror policy. A registry that accepts anonymous pushes is a malware dropbox.
+- Registry serves on a **dedicated listener** (`--registry-bind`, default `0.0.0.0:3131`;
+  kickoff decision 2026-10-19, replacing the earlier :3129 mirror-router default) — in-tree
+  fact that forced this: `docker.rs` pull-through registers `/v2/`,
+  `/v2/:name/manifests/:reference`, `/v2/:name/blobs/:digest`, the same `/v2` namespace the
+  registry needs, and docker clients cannot be prefix-routed; same-listener mounting would
+  hard-close the S5 mount-or-cut option. **All registry routes keyed in v1** (pulls and
+  pushes) via the existing `auth_middleware`/`AuthState`; no rate limiter v1.
+  **Push routes are ALWAYS authenticated** regardless of mode — a registry that accepts
+  anonymous pushes is a malware dropbox. Docker-client credential mapping (Basic-auth
+  `docker login` → monopsony key) is an S2 design item gating S6's keyed-registry e2e.
 - Blobs are content-addressed → store via `spool()` streaming (never buffer a whole layer);
   digest verified at commit (`get_checksum`), `400 DIGEST_INVALID` on mismatch.
 - Manifests are small JSON → `write()` + tag-index sidecar (meta JSON), byte-exact.
@@ -107,11 +116,12 @@ hometest swarm; tagless push addressable + rollback-able; refcount survives mani
 
 ## Open questions (assumed defaults; user flips cheaply at kickoff)
 
-1. **Auto-version scheme** — `YYYYMMDD-HHMMSS` (default) vs calendar `YYYY.MM.DD-<shorthash>`.
-2. **Listen point** — mirror router :3129 (default) vs dedicated port. Swarm nodes need
-   `insecure-registries` or the server cert if TLS — plain-HTTP on the tailnet/LAN is the
-   expected v1 posture.
-3. **Push auth default** — always-authenticated (recommended default); tie to existing API keys.
-4. **docker.rs pull-through** — mount in S5 (default) or declare cut.
+Resolved at kickoff 2026-10-19 (see decisions log + `sprint25-oci-registry/slice-1-pullback.md`):
+**1. Auto-version scheme → `YYYYMMDD-HHMMSS`** (no suffix; OCI-only scope). **2. Listen point →
+dedicated `--registry-bind` :3131** (not :3129). **3. Push auth → always-authenticated;
+v1 extends keyed auth to pulls too.** Still open:
+
+4. **docker.rs pull-through** — mount in S5 (default) or declare cut. *Unblocked by the
+   dedicated port; the route collision that forced the port decision no longer pre-judges this.*
 5. **Referenced-blob validation** — reject missing blobs (default, spec-idiomatic) vs allow
    lazy pushes (some CI flows push manifests first; docker CLI doesn't, buildkit might).
