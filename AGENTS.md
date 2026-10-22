@@ -55,6 +55,8 @@ monopsony/
 ├── docs/
 │   ├── sprint-roadmap.md
 │   ├── sprint-rollback-log.md
+│   ├── design/
+│   │   └── shadow-packages.md      # Shadow package system intent/north-star — read before extending the recipe pipeline
 │   └── research/
 │       └── public-mirror-network.md  # Phase 1-3 design: public mirrors, tracker, darknet transports
 ├── Dockerfile                     # Multi-stage container build (Alpine/musl)
