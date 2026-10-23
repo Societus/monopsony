@@ -251,6 +251,8 @@ mod tests {
                 config_paths: None,
                 backup_old: false,
                 health_check: None,
+                failure_policy: "rollback".to_string(),
+                success_monitor: None,
                 pre_update: None,
                 post_update: None,
                 on_failure: None,
@@ -266,6 +268,7 @@ mod tests {
             },
             notifications: None,
             direct_url: None,
+            downgrade_unsafe: false,
         }
     }
 

@@ -382,6 +382,19 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+        // P4a: binary_sha256 content-address column. CREATE TABLE IF NOT EXISTS
+        // does not add columns to a pre-existing table, so an additive ALTER
+        // converges shadow_packages onto the new schema on every startup.
+        match sqlx::query(
+            "ALTER TABLE shadow_packages ADD COLUMN IF NOT EXISTS binary_sha256 TEXT",
+        )
+        .execute(&self.pool)
+        .await
+        {
+            Ok(_) => debug!("shadow_packages.binary_sha256 column ensured"),
+            Err(e) => warn!("binary_sha256 column ensure failed (may already exist): {}", e),
+        }
+
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS shadow_package_versions (
                 id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -1963,11 +1976,12 @@ impl Database {
         config_paths: Option<&serde_json::Value>,
         service_name: Option<&str>,
         masked_from_pm: Option<&str>,
+        binary_sha256: Option<&str>,
     ) -> Result<uuid::Uuid> {
         let id = uuid::Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO shadow_packages (id, client_id, name, version, architecture, os_family, libc, source_type, source_url, recipe_path, install_paths, config_paths, service_name, masked_from_pm)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)"
+            "INSERT INTO shadow_packages (id, client_id, name, version, architecture, os_family, libc, source_type, source_url, recipe_path, install_paths, config_paths, service_name, masked_from_pm, binary_sha256)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)"
         )
         .bind(id)
         .bind(client_id)
@@ -1983,6 +1997,7 @@ impl Database {
         .bind(config_paths)
         .bind(service_name)
         .bind(masked_from_pm)
+        .bind(binary_sha256)
         .execute(&self.pool)
         .await?;
         Ok(id)
@@ -2043,6 +2058,93 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// P4a: QueryShadowRegistry backing query. Matches shadow packages by
+    /// binary_sha256 (exact content address) or by recipe name with an
+    /// optional service_name similarity hint, or by source_url, and assembles
+    /// fleet installs (hostname, version, install_paths, last_seen) from the
+    /// clients table. Signing state comes from the shadow_recipes catalog.
+    pub async fn query_shadow_registry(
+        &self,
+        binary_sha256: Option<&str>,
+        name: Option<&str>,
+        service_name: Option<&str>,
+        source_url: Option<&str>,
+    ) -> Result<Vec<ShadowRegistryMatchRow>> {
+        let base = "SELECT sp.name AS recipe_name, sp.version AS recipe_version,
+             sp.install_paths::text AS install_paths, c.hostname AS hostname,
+             c.last_seen AS last_seen, sr.signature AS signature, sr.key_id AS key_id
+          FROM shadow_packages sp
+          LEFT JOIN clients c ON c.id = sp.client_id
+          LEFT JOIN shadow_recipes sr ON sr.name = sp.name";
+        let rows: Vec<_> = match (binary_sha256, name, source_url) {
+            (Some(hash), ..) => sqlx::query(&format!("{} WHERE sp.binary_sha256 = $1", base))
+                .bind(hash)
+                .fetch_all(&self.pool)
+                .await?,
+            (None, Some(n), ..) => {
+                let svc = service_name.unwrap_or("");
+                sqlx::query(&format!(
+                    "{} WHERE sp.name = $1 AND ($2 = '' OR sp.service_name = $2)",
+                    base
+                ))
+                .bind(n)
+                .bind(svc)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            (None, None, Some(url)) => {
+                sqlx::query(&format!("{} WHERE sp.source_url = $1", base))
+                    .bind(url)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
+            (None, None, None) => Vec::new(),
+        };
+
+        let mut matches: Vec<ShadowRegistryMatchRow> = Vec::new();
+        for row in rows {
+            let recipe_name: String = row.get("recipe_name");
+            let recipe_version: String = row.get("recipe_version");
+            let install_paths: Vec<String> =
+                serde_json::from_str(&row.get::<String, _>("install_paths")).unwrap_or_default();
+            let hostname: Option<String> = row.get("hostname");
+            let last_seen: Option<chrono::DateTime<Utc>> = row.get("last_seen");
+            let signature: Option<String> = row.get("signature");
+            let key_id: Option<String> = row.get("key_id");
+
+            let fleet = FleetInstallRow {
+                hostname: hostname.unwrap_or_default(),
+                version: recipe_version.clone(),
+                install_paths,
+                last_seen: last_seen.map(|dt| dt.timestamp()).unwrap_or(0),
+            };
+
+            let signed = signature
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+                && key_id
+                    .as_deref()
+                    .map(|k| k != "unsigned")
+                    .unwrap_or(false);
+
+            match matches
+                .iter_mut()
+                .find(|m| m.recipe_name == recipe_name && m.recipe_version == recipe_version)
+            {
+                Some(m) => m.fleet_installs.push(fleet),
+                None => matches.push(ShadowRegistryMatchRow {
+                    recipe_name,
+                    recipe_version,
+                    signed,
+                    key_id: key_id.unwrap_or_default(),
+                    fleet_installs: vec![fleet],
+                }),
+            }
+        }
+        Ok(matches)
     }
 
     pub async fn record_shadow_package_version(
@@ -2765,4 +2867,24 @@ pub struct EnrollmentKeyRow {
     pub created_at: i64,             // epoch seconds
     pub expires_at: Option<i64>,     // epoch seconds
     pub revoked_at: Option<i64>,     // epoch seconds
+}
+
+/// One fleet client install of a shadow package, for QueryShadowRegistry.
+#[derive(Debug, Clone)]
+pub struct FleetInstallRow {
+    pub hostname: String,
+    pub version: String,
+    pub install_paths: Vec<String>,
+    pub last_seen: i64, // epoch seconds of the client's last heartbeat
+}
+
+/// One QueryShadowRegistry match: recipe name/version, signing state, and the
+/// fleet of clients that have installed that recipe version.
+#[derive(Debug, Clone)]
+pub struct ShadowRegistryMatchRow {
+    pub recipe_name: String,
+    pub recipe_version: String,
+    pub signed: bool,
+    pub key_id: String,
+    pub fleet_installs: Vec<FleetInstallRow>,
 }

@@ -4,7 +4,8 @@ use monopsony_common::proto::monopsony::{
     client_message, ApplyShadowUpdateRequest, CheckShadowUpdatesRequest,
     DownloadShadowAssetRequest, GetShadowRecipeRequest, HeartbeatRequest, InventoryReport,
     ListShadowCatalogRequest, ListShadowPackagesRequest, PackageEntry, PairRequest, PairResponse,
-    RegisterRequest, RegisterShadowPackageRequest, RenewClientCertRequest,
+    RegisterRequest, RegisterShadowPackageRequest, QueryShadowRegistryRequest,
+    QueryShadowRegistryResponse, RenewClientCertRequest,
     RollbackShadowUpdateRequest, ShadowCatalogEntry,
     ShadowPackageInfo, ShadowScanFinding, ShadowScanReport, ShadowUpdateInfo,
     UnregisterShadowPackageRequest,
@@ -422,12 +423,14 @@ impl MonopsonyGrpcClient {
     /// Collect a v2 pairing certificate with proof of possession.
     /// Signs `request_id` bytes with the ephemeral private key and presents
     /// the signature to the server.
+    /// Returns (client_id, ClientCerts, mirror_verify_key) — the server's
+    /// Ed25519 recipe-signing key when provisioned (older servers omit it).
     pub async fn collect_pair_cert_v2(
         base_url: &str,
         request_id: &str,
         ephemeral_pubkey_bytes: &[u8],
         signature_bytes: &[u8],
-    ) -> anyhow::Result<(String, ClientCerts)> {
+    ) -> anyhow::Result<(String, ClientCerts, Option<Vec<u8>>)> {
         #[derive(serde::Serialize)]
         struct CollectPairRequestV2 {
             request_id: String,
@@ -444,6 +447,8 @@ impl MonopsonyGrpcClient {
             ca_cert_pem: String,
             grpc_addr: String,
             ws_url: String,
+            #[serde(default)]
+            mirror_verify_key: Option<Vec<u8>>,
         }
 
         let url = format!("{}/api/v1/pair/collect", base_url.trim_end_matches('/'));
@@ -475,7 +480,7 @@ impl MonopsonyGrpcClient {
             request_id = %request_id,
             "Pairing v2 collect complete"
         );
-        Ok((resp.client_id, certs))
+        Ok((resp.client_id, certs, resp.mirror_verify_key))
     }
 
     /// Enroll via a pre-approval key (P5). Signs `monopsony-enroll-v1` with
@@ -1010,6 +1015,7 @@ impl MonopsonyGrpcClient {
         install_paths: &[String],
         config_paths: &[String],
         service_name: &str,
+        binary_sha256: &str,
         mask_from_pm: bool,
     ) -> anyhow::Result<ShadowPackageInfo> {
         let req = RegisterShadowPackageRequest {
@@ -1026,6 +1032,7 @@ impl MonopsonyGrpcClient {
             config_paths: config_paths.to_vec(),
             service_name: service_name.to_string(),
             mask_from_pm,
+            binary_sha256: binary_sha256.to_string(),
         };
         info!(
             client_id = client_id,
@@ -1033,6 +1040,34 @@ impl MonopsonyGrpcClient {
             "Registering shadow package"
         );
         let resp = self.client.register_shadow_package(req).await?;
+        Ok(resp.into_inner())
+    }
+
+    /// Query the server shadow registry: exact binary_sha256 match, or name
+    /// (+service_name similarity hint) / source_url hint. Returns recipe
+    /// matches with signing state plus fleet installs from other clients.
+    #[allow(dead_code)]
+    pub async fn query_shadow_registry(
+        &mut self,
+        binary_sha256: &str,
+        name: &str,
+        service_name: &str,
+        target_dir: &str,
+        source_url: &str,
+    ) -> anyhow::Result<QueryShadowRegistryResponse> {
+        let req = QueryShadowRegistryRequest {
+            binary_sha256: binary_sha256.to_string(),
+            name: name.to_string(),
+            service_name: service_name.to_string(),
+            target_dir: target_dir.to_string(),
+            source_url: source_url.to_string(),
+        };
+        debug!(
+            binary_sha256 = %binary_sha256,
+            name = %name,
+            "Querying shadow registry"
+        );
+        let resp = self.client.query_shadow_registry(req).await?;
         Ok(resp.into_inner())
     }
 

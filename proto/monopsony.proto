@@ -18,6 +18,7 @@ service MonopsonyControl {
     // Shadow package management
     rpc ListShadowPackages(ListShadowPackagesRequest) returns (ShadowPackageList);
     rpc RegisterShadowPackage(RegisterShadowPackageRequest) returns (ShadowPackageInfo);
+    rpc QueryShadowRegistry(QueryShadowRegistryRequest) returns (QueryShadowRegistryResponse);
     rpc UnregisterShadowPackage(UnregisterShadowPackageRequest) returns (UnregisterShadowPackageResponse);
     rpc CheckShadowUpdates(CheckShadowUpdatesRequest) returns (ShadowUpdateList);
     rpc ApplyShadowUpdate(ApplyShadowUpdateRequest) returns (ShadowUpdateResult);
@@ -350,6 +351,34 @@ message RegisterShadowPackageRequest {
     repeated string config_paths = 11;
     string service_name = 12;
     bool mask_from_pm = 13;
+    string binary_sha256 = 14; // P4a: SHA-256 of the registered binary blob (empty when unknown)
+}
+
+message QueryShadowRegistryRequest {
+    string binary_sha256 = 1; // exact content-address match on shadow_packages.binary_sha256
+    string name = 2;          // recipe name similarity hint
+    string service_name = 3;  // service name similarity hint (used with name)
+    string target_dir = 4;    // client-side install target dir (advisory, not queried)
+    string source_url = 5;    // source URL similarity hint
+}
+
+message FleetInstall {
+    string hostname = 1;
+    string version = 2;
+    repeated string install_paths = 3;
+    int64 last_seen = 4; // epoch seconds of the client's last heartbeat
+}
+
+message ShadowRegistryMatch {
+    string recipe_name = 1;
+    string recipe_version = 2;
+    bool signed = 3;        // recipe carries a server Ed25519 signature
+    string key_id = 4;      // signing key id ("unsigned" when no key provisioned)
+    repeated FleetInstall fleet_installs = 5;
+}
+
+message QueryShadowRegistryResponse {
+    repeated ShadowRegistryMatch matches = 1;
 }
 
 message UnregisterShadowPackageRequest {

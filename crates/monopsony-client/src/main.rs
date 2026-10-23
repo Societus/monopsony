@@ -3,13 +3,14 @@
 mod proxy_toggle;
 mod shadow;
 mod shadow_cli;
+mod shadow_executor;
 mod system_proxy;
 mod ws_transport;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use rand::Rng;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -53,6 +54,7 @@ mod pin_verify;
 mod proxy;
 mod self_update;
 mod trust;
+mod shadow_scorer;
 mod update_health;
 
 #[derive(Parser, Debug)]
@@ -888,6 +890,17 @@ fn load_operator_verifying_key(
     ed25519_dalek::VerifyingKey::from_bytes(&arr).ok()
 }
 
+/// Read one line from stdin. Used only for interactive prompts (register
+/// adopt-from-peer choice, update re-approval); never used by the daemon.
+fn read_line(prompt: &str) -> anyhow::Result<String> {
+    use std::io::{self, Write};
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line.trim().to_string())
+}
+
 fn load_mirror_verify_key(cert_dir: &Path) -> Option<[u8; 32]> {
     let bytes = std::fs::read(cert_dir.join("mirror-verify.key")).ok()?;
     if bytes.len() != 32 {
@@ -1149,6 +1162,7 @@ async fn handle_remote_assignment(
             &install_paths,
             &[], // config_paths: not consumed from the pushed recipe
             &service_name,
+            "", // binary_sha256: not probed on the heartbeat path
             false, // mask_from_pm: opt-in only
         )
         .await
@@ -1428,7 +1442,8 @@ async fn run_daemon(
                             &certs.client_cert_pem,
                             &certs.client_key_pem,
                         ))
-                        .domain_name("monopsony-server");
+                        .domain_name("monopsony-server")
+                        .assume_http2(true);
                     tls_config = Some(cfg.clone());
                     cfg
                 }
@@ -1462,7 +1477,7 @@ async fn run_daemon(
                         c
                     }
                     Err(e) => {
-                        warn!("Connection failed (retry in {:?}): {}", backoff, e);
+                        warn!("Connection failed (retry in {:?}): {e:?}", backoff);
                         tokio::time::sleep(backoff).await;
                         backoff = (backoff * 2).min(MAX_BACKOFF);
                         continue;
@@ -2380,11 +2395,13 @@ async fn run_pair_v2(
         .collect();
 
     // 3. Compute salted PIN hash: SHA-256(pin_salt + pin)
+    // pin_salt is a hex-encoded string; hash the hex string bytes to match
+    // the server's verification in PendingPairStore::attempt_pin.
     let mut pin_salt_bytes = [0u8; 16];
     OsRng.fill(&mut pin_salt_bytes);
     let pin_salt = hex::encode(pin_salt_bytes);
     let mut hasher = sha2::Sha256::new();
-    hasher.update(pin_salt_bytes);
+    hasher.update(pin_salt.as_bytes());
     hasher.update(pin.as_bytes());
     let pin_hash = hex::encode(hasher.finalize());
 
@@ -2455,7 +2472,7 @@ async fn run_pair_v2(
     let signature = signing_key.sign(request_id.as_bytes());
     let signature_bytes = signature.to_bytes();
 
-    let (client_id, certs) = grpc_client::MonopsonyGrpcClient::collect_pair_cert_v2(
+    let (client_id, certs, mirror_verify_key) = grpc_client::MonopsonyGrpcClient::collect_pair_cert_v2(
         &base_url,
         &request_id,
         &ephemeral_pubkey_bytes,
@@ -2463,6 +2480,13 @@ async fn run_pair_v2(
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to collect certificate: {}", e))?;
+
+    // Persist the server's Ed25519 recipe-signing key so shadow package
+    // updates verify against a provisioned trust anchor (v2 parity with the
+    // legacy register path — without this, updates abort trust-UNVERIFIED).
+    if let Some(k) = &mirror_verify_key {
+        store_mirror_verify_key(cert_dir, k);
+    }
 
     // 7. TOFU CA fingerprint pinning
     let ca_fingerprint =
@@ -2479,6 +2503,27 @@ async fn run_pair_v2(
         ca_fingerprint = %ca_fingerprint,
         "Pairing v2 complete — CA fingerprint TOFU-pinned"
     );
+
+    // Persist server connection info (mirrors legacy pairing) so the daemon
+    // can find the server without --server or mDNS. Derive the gRPC address
+    // from the paired host — same host, gRPC port 50051; the pairing port
+    // (:3130) is the dashboard API, not gRPC.
+    let host = server
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .unwrap_or(server);
+    let server_info = serde_json::json!({
+        "grpc_addr": format!("{}:50051", host),
+        "paired_addr": server,
+        "paired_at": chrono::Utc::now().to_rfc3339(),
+    });
+    std::fs::write(
+        cert_dir.join("server.json"),
+        serde_json::to_string_pretty(&server_info)?,
+    )?;
+
     println!("Pairing complete! Client ID: {}", client_id);
     println!("CA fingerprint (TOFU-pinned): {}", ca_fingerprint);
     Ok(())
@@ -2858,7 +2903,7 @@ async fn run_shadow_package(
             branch,
             requires,
         } => {
-            let pkg_name = name.unwrap_or_else(|| {
+            let pkg_name = name.clone().unwrap_or_else(|| {
                 std::path::Path::new(&path)
                     .file_name()
                     .map(|f| f.to_string_lossy().to_string())
@@ -2876,29 +2921,231 @@ async fn run_shadow_package(
                 println!("  Recipe file: {}", recipe_path);
             }
 
-            // Build the recipe TOML (from file when provided, else minimal).
-            let recipe_toml = if let Some(recipe_path) = &recipe {
-                std::fs::read_to_string(recipe_path)
-                    .with_context(|| format!("reading recipe file {}", recipe_path))?
-            } else {
-                format!(
-                    "[package]\nname = \"{}\"\nsource_type = \"{}\"\nsource_url = \"{}\"\n\n[install]\nmethod = \"{}\"\nbranch = \"{}\"\n",
-                    pkg_name,
-                    shadow_source_as_str(&source_type),
-                    source,
-                    method,
-                    branch
-                )
-            };
+            let source_opt: Option<&str> = Some(&source);
+
+            // Recipe TOML + version detection:
+            //   --recipe path: operator-authored recipes bypass detection
+            //   entirely (unchanged); the recipe's own [version]
+            //   detect_command detects the installed version.
+            //   No --recipe: run `detect::detect(path)`, render the draft
+            //   TOML via `render_draft_toml`, and take `detected_version`
+            //   from `report.version`. Blank-version registers die here; the
+            //   "registering blank" branch survives only as the --recipe
+            //   fallback when its probe genuinely fails.
+            let (mut recipe_toml, detected_version, report_opt) =
+                if let Some(recipe_path) = &recipe {
+                    let recipe_toml = std::fs::read_to_string(recipe_path)
+                        .with_context(|| format!("reading recipe file {}", recipe_path))?;
+                    let detected_version =
+                        shadow_executor::detect_current_version(&recipe_toml).await;
+                    (recipe_toml, detected_version, None)
+                } else {
+                    let report = detect::detect(Path::new(&path), name.as_deref()).await?;
+                    let draft = detect::render_draft_toml(&report, &pkg_name, source_opt);
+                    if source_opt.is_none() {
+                        // render_draft_toml emits source_url = "REPLACE_ME" plus
+                        // the T0.4 header; refuse to register without a source.
+                        anyhow::bail!(
+                            "registration requires --source while source_url is REPLACE_ME for '{}'",
+                            pkg_name
+                        );
+                    }
+                    let detected_version = match report.version {
+                        Some(ref v) => Some(v.clone()),
+                        None => {
+                            anyhow::bail!(
+                                "refusing to register '{}' with blank detected version (use --recipe)",
+                                pkg_name
+                            )
+                        }
+                    };
+                    (draft, detected_version, Some(report))
+                };
 
             let install_paths = vec![path.clone()];
+            match &detected_version {
+                Some(v) => println!("  Detected version: {}", v),
+                None => println!(
+                    "  Version: not detected (no runnable [version] detect_command; registering blank)"
+                ),
+            }
             println!("Connecting to server to register...");
             let (mut client, client_id) = connect(cert_dir).await?;
+
+            // ── T4.3 / T4.5: similarity scoring + adopt-from-peer offer ──
+            // (no-recipe path only; --recipe path registers as authored)
+            if let Some(report) = &report_opt {
+                let local_target_dir = report
+                    .resolved_path
+                    .as_deref()
+                    .and_then(|p| Path::new(p).parent())
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "/usr/local/bin".to_string());
+
+                let resp = client
+                    .query_shadow_registry(
+                        report.sha256.as_deref().unwrap_or(""),
+                        &pkg_name,
+                        report
+                            .service
+                            .as_ref()
+                            .map(|s| s.unit_name.as_str())
+                            .unwrap_or(""),
+                        &local_target_dir,
+                        &source,
+                    )
+                    .await?;
+
+                let scoring = shadow_scorer::score_report(
+                    report,
+                    &resp.matches,
+                    &pkg_name,
+                    &source,
+                    &local_target_dir,
+                );
+
+                match scoring.action {
+                    shadow_scorer::ScoringAction::DraftAnnotation => {
+                        let peer = scoring
+                            .best_match
+                            .as_ref()
+                            .map(|m| m.recipe_name.as_str())
+                            .unwrap_or("?");
+                        let comment = format!(
+                            "# SIMILARITY: score {} — near match to peer recipe '{}' \
+                             (register anyway to proceed)\n",
+                            scoring.score, peer
+                        );
+                        recipe_toml = format!("{}{}", comment, recipe_toml);
+                    }
+                    shadow_scorer::ScoringAction::InteractiveChoice => {
+                        let peer = scoring
+                            .best_match
+                            .as_ref()
+                            .map(|m| m.recipe_name.as_str())
+                            .unwrap_or("?");
+                        println!(
+                            "SIMILARITY MATCH (score {}) with peer recipe '{}'",
+                            scoring.score, peer
+                        );
+                        println!("  [r]egister this package as new");
+                        println!("  [a]dopt-from-peer (deploy the peer's recipe locally)");
+                        println!("  [q]uit / abort registration");
+                        let choice = read_line("Choice [r/a/q]: ")?;
+                        match choice.as_str() {
+                            "a" | "adopt" => {
+                                // T4.5: adopt-from-peer (private/tailnet servers).
+                                let best = scoring
+                                    .best_match
+                                    .context("interactive choice with no best match")?;
+                                let (peer_toml, key_id, signature, signed_at) =
+                                    client.get_shadow_recipe(&client_id, &best.recipe_name).await?;
+                                let signed = shadow_scorer::signed_peer_recipe(
+                                    peer_toml,
+                                    key_id,
+                                    signature,
+                                    signed_at,
+                                )?;
+                                let trust_config = shadow_scorer::load_trust_config();
+                                let operator_vk =
+                                    load_operator_verifying_key(&trust_config);
+                                trust::verify_recipe_trust(
+                                    &signed,
+                                    &trust_config,
+                                    operator_vk.as_ref(),
+                                )
+                                .context(format!(
+                                    "trust verification failed for peer recipe '{}'",
+                                    best.recipe_name
+                                ))?;
+                                let local_config_paths: Vec<String> = report
+                                    .config_findings
+                                    .iter()
+                                    .filter(|f| f.exists)
+                                    .map(|f| f.path.clone())
+                                    .collect();
+                                let mutated = shadow_scorer::mutate_recipe_for_local(
+                                    &signed.recipe_toml,
+                                    &local_target_dir,
+                                    &local_config_paths,
+                                    report
+                                        .service
+                                        .as_ref()
+                                        .map(|s| s.unit_name.as_str()),
+                                )?;
+                                let info = client
+                                    .register_shadow_package(
+                                        &client_id,
+                                        &pkg_name,
+                                        detected_version
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                        std::env::consts::ARCH,
+                                        std::env::consts::OS,
+                                        "", // libc: unknown from CLI
+                                        shadow_source_as_str(&source_type),
+                                        &source,
+                                        &mutated,
+                                        &install_paths,
+                                        &local_config_paths,
+                                        report
+                                            .service
+                                            .as_ref()
+                                            .map(|s| s.unit_name.as_str())
+                                            .unwrap_or(""),
+                                        report.sha256.as_deref().unwrap_or(""),
+                                        false, // mask_from_pm: opt-in only
+                                    )
+                                    .await?;
+                                println!("✓ Adopted from peer and registered:");
+                                println!("  ID:      {}", info.id);
+                                println!("  Name:    {}", info.name);
+                                println!("  Version: {}", info.version);
+                                return Ok(());
+                            }
+                            "q" | "quit" => {
+                                anyhow::bail!("registration aborted by operator");
+                            }
+                            _ => {
+                                // fall through to normal register below
+                            }
+                        }
+                    }
+                    shadow_scorer::ScoringAction::Silent => {
+                        // register silently below
+                    }
+                }
+            }
+
+            // Row metadata for the server (T2.1/T2.2): forward what the
+            // detect pipeline found — existing config findings, matched
+            // service unit, and the binary sha256. The --recipe path has
+            // no report, so it registers with empty metadata as before.
+            let reg_config_paths: Vec<String> = report_opt
+                .as_ref()
+                .map(|r| {
+                    r.config_findings
+                        .iter()
+                        .filter(|f| f.exists)
+                        .map(|f| f.path.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let reg_service_name = report_opt
+                .as_ref()
+                .and_then(|r| r.service.as_ref())
+                .map(|s| s.unit_name.clone())
+                .unwrap_or_default();
+            let reg_sha256 = report_opt
+                .as_ref()
+                .and_then(|r| r.sha256.clone())
+                .unwrap_or_default();
+
             let info = client
                 .register_shadow_package(
                     &client_id,
                     &pkg_name,
-                    "", // version: server/recipe decides
+                    detected_version.as_deref().unwrap_or(""),
                     std::env::consts::ARCH,
                     std::env::consts::OS,
                     "", // libc: unknown from CLI
@@ -2906,8 +3153,9 @@ async fn run_shadow_package(
                     &source,
                     &recipe_toml,
                     &install_paths,
-                    &[],   // config_paths: not provided by CLI
-                    "",    // service_name: not provided by CLI
+                    &reg_config_paths,
+                    &reg_service_name,
+                    &reg_sha256,
                     false, // mask_from_pm: opt-in only
                 )
                 .await?;
@@ -3027,17 +3275,16 @@ async fn run_shadow_package(
                 .iter()
                 .find(|u| u.package_id == package_id)
                 .or_else(|| updates.first());
-            match update {
-                Some(u) if u.latest_version != u.current_version => {
-                    println!("  Available: {} → {}", u.current_version, u.latest_version);
-                    if !u.asset_url.is_empty() {
-                        println!("  Asset:     {}", u.asset_url);
-                    }
-                }
+            let update = match update {
+                Some(u) if u.latest_version != u.current_version => u.clone(),
                 _ => {
                     println!("No update available for '{}'.", name);
                     return Ok(());
                 }
+            };
+            println!("  Available: {} → {}", update.current_version, update.latest_version);
+            if !update.asset_url.is_empty() {
+                println!("  Asset:     {}", update.asset_url);
             }
 
             if dry_run {
@@ -3065,19 +3312,120 @@ async fn run_shadow_package(
                     return Ok(());
                 }
             };
-            let _ = recipe_toml;
+            let recipe: monopsony_common::shadow_types::ShadowRecipe =
+                toml::from_str(&recipe_toml)
+                    .context("trust-verified recipe failed to parse")?;
 
+            // Resolve the asset URL. The Check RPC returns an empty
+            // asset_url for direct_url/scrape recipes (DirectUrlSource
+            // exposes no assets for scrape discovery), so fall back to the
+            // recipe's [direct_url].asset_url_template / github_release
+            // asset selector rules. Script recipes tolerate an empty URL.
+            let http = reqwest::Client::builder()
+                .user_agent("monopsony-client/shadow-executor")
+                .build()
+                .context("building HTTP client")?;
+            let asset_url = match shadow_executor::resolve_asset_url(
+                &recipe,
+                &update.asset_url,
+                &update.latest_version,
+                &http,
+            )
+            .await
+            {
+                Ok(url) => url,
+                Err(e)
+                    if recipe.install.method
+                        == monopsony_common::shadow_types::InstallMethod::Script =>
+                {
+                    println!("  Asset:     none resolved ({e}); script will fetch itself");
+                    String::new()
+                }
+                Err(e) => {
+                    anyhow::bail!("could not resolve asset URL for '{}': {e}", name);
+                }
+            };
+            if !asset_url.is_empty() {
+                println!("  Asset:     {}", asset_url);
+            }
+
+            // T4.7: repo-change gate — if the update's asset URL resolves to a
+            // different base repo (host + repo path) than the registered
+            // recipe's source_url, require operator re-approval before applying.
+            if !asset_url.is_empty()
+                && shadow_scorer::repo_base(&asset_url)
+                    != shadow_scorer::repo_base(&recipe.package.source_url)
+            {
+                println!(
+                    "⚠ RE-APPROVAL REQUIRED: asset base repo changed from {} to {}",
+                    shadow_scorer::repo_base(&recipe.package.source_url),
+                    shadow_scorer::repo_base(&asset_url)
+                );
+                let choice = read_line("Apply update anyway? [y/N]: ")?;
+                if choice.as_str() != "y" {
+                    println!("Update aborted (no re-approval).");
+                    return Ok(());
+                }
+            }
+
+            // Execute the verified recipe: download → pre_update → backup →
+            // install (extract/script) → post_update → health check, with
+            // automatic restore-from-backup on failure.
+            let outcome = shadow_executor::execute_update(
+                &recipe,
+                &update.latest_version,
+                &asset_url,
+                &http,
+            )
+            .await;
+            for line in &outcome.log {
+                println!("  {}", line);
+            }
+            if !outcome.success {
+                if outcome.rolled_back {
+                    eprintln!(
+                        "✗ Update FAILED and was ROLLED BACK — previous version restored: {}",
+                        outcome.error.as_deref().unwrap_or("unknown error")
+                    );
+                } else {
+                    eprintln!(
+                        "✗ Update FAILED (nothing to roll back yet): {}",
+                        outcome.error.as_deref().unwrap_or("unknown error")
+                    );
+                }
+                anyhow::bail!(
+                    "update of '{}' to {} failed: {}",
+                    name,
+                    update.latest_version,
+                    outcome.error.as_deref().unwrap_or("unknown error")
+                );
+            }
+
+            // Success: record the REAL version + asset URL server-side so
+            // history and package rows show actual versions.
             let (success, message, new_version, backup_path) = client
-                .apply_shadow_update(&client_id, &package_id, "", "", true)
+                .apply_shadow_update(
+                    &client_id,
+                    &package_id,
+                    &outcome.new_version,
+                    &asset_url,
+                    true,
+                )
                 .await?;
             if success {
                 println!("✓ Update applied: {}", message);
                 println!("  New version: {}", new_version);
-                if !backup_path.is_empty() {
+                if let Some(local_backup) = &outcome.backup_path {
+                    println!("  Backup:      {}", local_backup.display());
+                } else if !backup_path.is_empty() {
                     println!("  Backup:      {}", backup_path);
                 }
             } else {
-                anyhow::bail!("Update failed: {}", message);
+                eprintln!(
+                    "WARNING: update executed locally but server bookkeeping failed: {}",
+                    message
+                );
+                anyhow::bail!("server failed to record update: {}", message);
             }
         }
         Rollback { name } => {
@@ -3227,6 +3575,7 @@ async fn run_shadow_package(
                     &install_paths,
                     &[], // config_paths: not adopted from recipe install config_paths
                     &service_name,
+                    "", // binary_sha256: not probed on the adopt path
                     false, // mask_from_pm: opt-in only
                 )
                 .await?;

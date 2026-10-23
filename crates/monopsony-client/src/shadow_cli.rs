@@ -16,6 +16,16 @@ pub fn detect_source_type(url: &str) -> ShadowSource {
     }
 }
 
+/// Serialize a ShadowSource to its TOML/wire string
+/// ("github_release" / "git_build" / "direct_url").
+pub fn shadow_source_as_str(source: &ShadowSource) -> &'static str {
+    match source {
+        ShadowSource::GithubRelease => "github_release",
+        ShadowSource::GitBuild => "git_build",
+        ShadowSource::DirectUrl => "direct_url",
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub enum PackageCommand {
     /// Register a new shadow package from a local recipe

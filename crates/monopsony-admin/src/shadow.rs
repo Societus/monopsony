@@ -74,6 +74,7 @@ pub async fn handle_register_package(
                 config_paths,
                 None,
                 None,
+                None,
             )
             .await
         {

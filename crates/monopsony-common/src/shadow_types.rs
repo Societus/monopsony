@@ -173,6 +173,15 @@ pub struct RecipeInstall {
     pub backup_old: bool,
     #[serde(default)]
     pub health_check: Option<HealthCheck>,
+    /// Failure policy: "rollback" (restore backup on failure) or "hold"
+    /// (keep the broken state and await operator intervention). Default: "rollback".
+    #[serde(default = "default_failure_policy")]
+    pub failure_policy: String,
+    /// Optional provisional success-monitor window (seconds). During the
+    /// window the update is provisional; failure inside it triggers
+    /// `failure_policy`, expiry records the update as final.
+    #[serde(default)]
+    pub success_monitor: Option<SuccessMonitor>,
     /// Command to run before update starts
     #[serde(default)]
     pub pre_update: Option<String>,
@@ -194,6 +203,10 @@ pub struct RecipeInstall {
 
 fn default_max_backups() -> usize {
     3
+}
+
+fn default_failure_policy() -> String {
+    "rollback".to_string()
 }
 
 /// Describes a single binary to extract from a release archive.
@@ -237,6 +250,53 @@ pub struct HealthCheck {
     pub process: Option<String>,
     #[serde(default = "default_health_timeout_secs")]
     pub timeout_secs: u64,
+    /// Post-update stability criterion. When present the unit must not only
+    /// reach `active` but stay stable per `mode`. Absent = no extra stability
+    /// requirement beyond reaching active within `timeout_secs`.
+    #[serde(default)]
+    pub stable: Option<StableCriterion>,
+}
+
+/// How the unit must remain stable after reaching `active`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StableMode {
+    /// Stay `active` for `secs` (default 30s).
+    Time,
+    /// `NRestarts` must not exceed baseline + `count` within the window.
+    Restarts,
+    /// `journalctl -u <unit>` shows no new errors.
+    LogQuiet,
+}
+
+/// Stability criterion for `[install.health_check.stable]`.
+/// Default (when the table is present but fields omitted): `time:30`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StableCriterion {
+    #[serde(default = "default_stable_mode")]
+    pub mode: StableMode,
+    /// Seconds to wait (mode=time/log_quiet). Default 30.
+    #[serde(default = "default_stable_secs")]
+    pub secs: Option<u64>,
+    /// Max restarts allowed above baseline (mode=restarts).
+    #[serde(default)]
+    pub count: Option<u32>,
+}
+
+fn default_stable_mode() -> StableMode {
+    StableMode::Time
+}
+
+fn default_stable_secs() -> Option<u64> {
+    Some(30)
+}
+
+/// Optional provisional success-monitor window for `[install.success_monitor]`.
+/// During `window_secs` the update is provisional; failure inside the window
+/// triggers `failure_policy`, expiry records the update as final.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SuccessMonitor {
+    pub window_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -303,6 +363,10 @@ pub struct ShadowRecipe {
     pub notifications: Option<RecipeNotifications>,
     #[serde(default)]
     pub direct_url: Option<RecipeDirectUrl>,
+    /// Set when `failure_policy = "hold"`: catalog/adopt surfaces warn before
+    /// offering updates because downgrade is unsafe.
+    #[serde(default)]
+    pub downgrade_unsafe: bool,
 }
 
 /// A release asset from upstream
@@ -536,6 +600,7 @@ mod tests {
             port: Some(8080),
             process: None,
             timeout_secs: default_health_timeout_secs(),
+            stable: None,
         };
         assert_eq!(hc.timeout_secs, 30);
     }
@@ -682,5 +747,48 @@ mod tests {
         .join("\n");
         let recipe: ShadowRecipe = toml::from_str(&toml).unwrap();
         assert!(recipe.install.binaries.is_empty());
+    }
+
+    #[test]
+    fn failure_policy_defaults_to_rollback() {
+        let toml = "method = \"extract\"\ntarget_dir = \"/x\"\n";
+        let inst: RecipeInstall = toml::from_str(toml).unwrap();
+        assert_eq!(inst.failure_policy, "rollback");
+        assert!(inst.success_monitor.is_none());
+    }
+
+    #[test]
+    fn failure_policy_hold_and_success_monitor_parse() {
+        let toml = "method = \"extract\"\ntarget_dir = \"/x\"\nfailure_policy = \"hold\"\n\n[success_monitor]\nwindow_secs = 60\n";
+        let inst: RecipeInstall = toml::from_str(toml).unwrap();
+        assert_eq!(inst.failure_policy, "hold");
+        assert_eq!(inst.success_monitor.unwrap().window_secs, 60);
+    }
+
+    #[test]
+    fn stable_criterion_defaults_to_time_30() {
+        let toml = "method = \"extract\"\ntarget_dir = \"/x\"\n\n[health_check]\ntype = \"port\"\nport = 8080\n\n[health_check.stable]\n";
+        let inst: RecipeInstall = toml::from_str(toml).unwrap();
+        let st = inst.health_check.unwrap().stable.unwrap();
+        assert_eq!(st.mode, StableMode::Time);
+        assert_eq!(st.secs, Some(30));
+        assert_eq!(st.count, None);
+    }
+
+    #[test]
+    fn stable_criterion_restarts_mode() {
+        let toml = "method = \"extract\"\ntarget_dir = \"/x\"\n\n[health_check]\ntype = \"port\"\nport = 8080\n\n[health_check.stable]\nmode = \"restarts\"\ncount = 3\n";
+        let inst: RecipeInstall = toml::from_str(toml).unwrap();
+        let st = inst.health_check.unwrap().stable.unwrap();
+        assert_eq!(st.mode, StableMode::Restarts);
+        assert_eq!(st.count, Some(3));
+        assert_eq!(st.secs, Some(30)); // default secs still populated
+    }
+
+    #[test]
+    fn downgrade_unsafe_defaults_false() {
+        let toml = "[package]\nname = \"x\"\nsource_type = \"direct_url\"\nsource_url = \"u\"\n\n[install]\nmethod = \"extract\"\ntarget_dir = \"/x\"\n\n[version]\ndetect_command = \"x\"\ndetect_pattern = \"([0-9]+)\"\n";
+        let recipe: ShadowRecipe = toml::from_str(&toml).unwrap();
+        assert!(!recipe.downgrade_unsafe);
     }
 }

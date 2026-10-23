@@ -12,6 +12,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
+use crate::shadow_cli::{detect_source_type, shadow_source_as_str};
+
 /// Where a service-unit scan should look. Injectable so tests can point
 /// scans at temp directories instead of touching the real /etc tree.
 #[derive(Debug, Clone, Default)]
@@ -20,6 +22,9 @@ pub struct ScanPaths {
     pub user_units: Vec<PathBuf>,
     pub init_d: Vec<PathBuf>,
     pub proc_dir: Option<PathBuf>,
+    /// Injectible package-manager ownership probe. `None` (default/tests
+    /// without an override) falls back to the real `probe_pm_ownership`.
+    pub pm_probe: Option<fn(&Path) -> Option<bool>>,
 }
 
 impl ScanPaths {
@@ -45,6 +50,7 @@ impl ScanPaths {
             user_units,
             init_d,
             proc_dir,
+            pm_probe: Some(probe_pm_ownership),
         }
     }
 }
@@ -83,7 +89,6 @@ pub struct ElfInfo {
 #[serde(rename_all = "snake_case")]
 pub enum ConfigSource {
     UnitEnv,
-    #[allow(dead_code)] // kept for config-source reporting parity
     UnitArg,
     Conventional,
 }
@@ -149,6 +154,15 @@ pub struct DetectReport {
     pub needs_manual_verify: bool,
     pub service: Option<ServiceMatch>,
     pub config_findings: Vec<ConfigFinding>,
+    /// Parsed ExecStart= argv tokens (beyond argv[0]) from the matched unit.
+    /// Consumed later by health checks (T1.4).
+    pub exec_args: Vec<String>,
+    /// `User=` from the matched unit, if any (T1.4; consumed by T1.3).
+    pub unit_user: Option<String>,
+    /// Package-manager ownership of the resolved binary (T1.1).
+    /// `Some(true)`/`Some(false)` on a definitive probe answer; `None` when no
+    /// package manager is available on the host.
+    pub pm_managed: Option<bool>,
 }
 
 /// SHA-256 hex digest of raw bytes. Exposed for tests (golden vector).
@@ -279,7 +293,6 @@ fn extract_unit_paths(contents: &str) -> Vec<String> {
 }
 
 /// Extract argv tokens (beyond argv[0]) from an ExecStart= line.
-#[allow(dead_code)] // unit-file ExecStart parser; used when unit-arg config sources are enabled
 fn extract_execstart_args(contents: &str) -> Vec<String> {
     for line in contents.lines() {
         let line = line.trim();
@@ -292,6 +305,89 @@ fn extract_execstart_args(contents: &str) -> Vec<String> {
         }
     }
     Vec::new()
+}
+
+/// Extract `User=` from a unit file.
+fn extract_unit_user(contents: &str) -> Option<String> {
+    for line in contents.lines() {
+        let line = line.trim();
+        if let Some(user) = line.strip_prefix("User=") {
+            return Some(user.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Extract config-dir/data values from ExecStart args of the form
+/// `--data=/path`, `-data=/path`, `--config=/path`, `--datadir=/path`,
+/// `--confdir=/path` (value attached with `=`). Used for `ConfigSource::UnitArg`.
+fn extract_unit_arg_configs(contents: &str) -> Vec<String> {
+    const PREFIXES: &[&str] = &["--data=", "-data=", "--config=", "--datadir=", "--confdir="];
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("ExecStart=") else {
+            continue;
+        };
+        for tok in rest.split_whitespace().skip(1) {
+            for prefix in PREFIXES {
+                if let Some(value) = tok.strip_prefix(prefix) {
+                    if !value.is_empty() && looks_like_path(value) {
+                        out.push(value.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Capitalize the first character of `s` (e.g. `sonarr` -> `Sonarr`).
+fn capitalize_first(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+/// Probe package-manager ownership of `path`.
+///
+/// Tries `dpkg -S`, `rpm -qf`, `pacman -Qo` in that order, using whichever
+/// binary is available on the host. A definitive owned/unowned answer →
+/// `Some(true)`/`Some(false)`; no package-manager binary found → `None`.
+fn probe_pm_ownership(path: &Path) -> Option<bool> {
+    const PROBES: &[(&str, &[&str])] = &[
+        ("dpkg", &["-S"]),
+        ("rpm", &["-qf"]),
+        ("pacman", &["-Qo"]),
+    ];
+    for &(pm, args) in PROBES {
+        let mut cmd = std::process::Command::new(pm);
+        cmd.args(args).arg(path);
+        let output = match cmd.output() {
+            Ok(o) => o,
+            // Binary not on PATH → try the next package manager.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        };
+        // Exit status 0 = owned by a package; non-zero = not owned.
+        return Some(output.status.success());
+    }
+    None
+}
+
+/// Name of the package manager available on this host (dpkg/rpm/pacman order),
+/// used to label `pm-managed` draft comments. No process is spawned.
+fn pm_name() -> Option<&'static str> {
+    ["dpkg", "rpm", "pacman"]
+        .into_iter()
+        .find(|pm| {
+            std::env::var_os("PATH")
+                .is_some_and(|path| {
+                    std::env::split_paths(&path).any(|dir| dir.join(pm).is_file())
+                })
+        })
 }
 
 fn looks_like_path(s: &str) -> bool {
@@ -464,6 +560,7 @@ fn cgroup_unit(proc_entry: &Path) -> Option<String> {
 pub async fn discover_configs(
     name: &str,
     service: Option<&ServiceMatch>,
+    unit_user: Option<&str>,
     _scan: &ScanPaths,
 ) -> Result<Vec<ConfigFinding>> {
     let mut findings: Vec<ConfigFinding> = Vec::new();
@@ -487,19 +584,42 @@ pub async fn discover_configs(
                 for p in extract_unit_paths(&contents) {
                     push(p, ConfigSource::UnitEnv, Confidence::High);
                 }
+                // T1.2: `--data=/path`, `--config=/path`, etc. (value attached
+                // with `=`) outrank conventional guesses.
+                for p in extract_unit_arg_configs(&contents) {
+                    push(p, ConfigSource::UnitArg, Confidence::High);
+                }
             }
         }
     }
 
     // 2. Conventional locations.
     let home = std::env::var("HOME").unwrap_or_default();
-    let conventional = vec![
-        format!("/etc/{}", name),
-        format!("{}/.{}", home, name),
-        format!("{}/.config/{}", home, name),
+    let name_cap = capitalize_first(name);
+    let mut conventional: Vec<(String, Confidence)> = vec![
+        (format!("/etc/{}", name), Confidence::Medium),
+        (format!("/var/lib/{}", name), Confidence::Medium), // T1.3
+        (format!("{}/.{}", home, name), Confidence::Medium),
+        (format!("{}/.config/{}", home, name), Confidence::Medium),
     ];
-    for p in conventional {
-        push(p, ConfigSource::Conventional, Confidence::Medium);
+    // T1.3: user-aware candidate <home>/<user>/.config/<Name>.
+    if let Some(u) = unit_user {
+        conventional.push((
+            format!("/home/{}/.config/{}", u, name_cap),
+            Confidence::Medium,
+        ));
+    }
+    // T1.3: deprioritize /root/* when the service does not run as root.
+    let root_conf = if unit_user == Some("root") || unit_user.is_none() {
+        Confidence::Medium
+    } else {
+        Confidence::Guess
+    };
+    conventional.push((format!("/root/.config/{}", name_cap), root_conf));
+    conventional.push((format!("/root/{}", name), root_conf));
+
+    for (path, confidence) in conventional {
+        push(path, ConfigSource::Conventional, confidence);
     }
 
     Ok(findings)
@@ -548,11 +668,30 @@ pub async fn detect_with_scan(
     // --- service match ---
     let service = match_service(resolved.as_deref().map(Path::new), path, name_hint, scan).await?;
 
+    // T1.4: structured unit facts — ExecStart argv + `User=` from the matched unit.
+    let (exec_args, unit_user) = service
+        .as_ref()
+        .and_then(|svc| std::fs::read_to_string(&svc.unit_path).ok())
+        .map(|contents| {
+            (
+                extract_execstart_args(&contents),
+                extract_unit_user(&contents),
+            )
+        })
+        .unwrap_or_default();
+
+    // T1.1: PM-ownership probe (injectable via scan.pm_probe).
+    let pm_path = resolved.as_deref().unwrap_or(path);
+    let pm_managed = match scan.pm_probe {
+        Some(probe) => probe(pm_path),
+        None => probe_pm_ownership(pm_path),
+    };
+
     // --- config discovery ---
     let name = name_hint
         .map(|s| s.to_string())
         .unwrap_or_else(|| basename_of(path));
-    let config_findings = discover_configs(&name, service.as_ref(), scan).await?;
+    let config_findings = discover_configs(&name, service.as_ref(), unit_user.as_deref(), scan).await?;
 
     Ok(DetectReport {
         path_arg,
@@ -566,6 +705,9 @@ pub async fn detect_with_scan(
         needs_manual_verify,
         service,
         config_findings,
+        exec_args,
+        unit_user,
+        pm_managed,
     })
 }
 
@@ -577,6 +719,18 @@ fn basename_of(p: &Path) -> String {
     p.file_name()
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Strip a trailing ".git" (case-insensitive) from a source URL basename so
+/// "https://github.com/owner/foo.git" yields repo basename "foo".
+fn strip_git_suffix(name: &str) -> &str {
+    if name.len() >= 4
+        && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".git")
+    {
+        &name[..name.len() - 4]
+    } else {
+        name
+    }
 }
 
 /// Render a DRAFT ShadowRecipe TOML for operator review.
@@ -598,47 +752,68 @@ pub fn render_draft_toml(
     if let Some(sha) = &report.sha256 {
         out.push_str(&format!("# Detected binary sha256: {}\n", sha));
     }
+    if source_url.is_none() {
+        out.push_str("# registration requires --source while source_url is REPLACE_ME\n");
+    }
     if report.needs_manual_verify {
         out.push_str("# NOTE: version could not be probed automatically; verify manually.\n");
+    }
+    // T1.1: pm-ownership draft line.
+    match (report.pm_managed, pm_name()) {
+        (Some(false), Some(pm)) => {
+            out.push_str(&format!(
+                "# pm-managed: no (unowned by {pm}) — shadow candidate\n"
+            ));
+        }
+        (Some(true), Some(pm)) => {
+            out.push_str(&format!("# pm-managed: yes (owned by {pm})\n"));
+        }
+        (Some(_), None) => {}
+        (None, _) => {}
     }
     out.push('\n');
 
     // --- [package] ---
     let source = source_url.unwrap_or("REPLACE_ME");
-    let source_type = if source == "REPLACE_ME" {
-        "direct_url"
-    } else if source.contains("github.com") && !source.ends_with(".git") {
-        "github_release"
-    } else if source.ends_with(".git") {
-        "git_build"
+    let source_type = detect_source_type(source);
+    let source_type_str = shadow_source_as_str(&source_type);
+    // A real source URL is observable evidence; a REPLACE_ME placeholder is not.
+    let source_conf = if source_url.is_some() {
+        Confidence::Medium
     } else {
-        "direct_url"
+        Confidence::Guess
     };
+    // Name confidence: recipe name matching the source repo basename
+    // (case-insensitive) is real evidence; otherwise convention only.
+    let name_conf = source_url
+        .and_then(|url| Path::new(url).file_name().map(|f| f.to_string_lossy().to_string()))
+        .map(|repo_basename| {
+            let repo_base = strip_git_suffix(&repo_basename);
+            if recipe_name.to_lowercase() == repo_base.to_lowercase() {
+                Confidence::Medium
+            } else {
+                Confidence::Guess
+            }
+        })
+        .unwrap_or(Confidence::Guess);
     out.push_str("[package]\n");
     out.push_str(&format!(
         "name = \"{}\" # confidence: {}\n",
         recipe_name,
-        if source_url.is_some() {
-            "medium"
-        } else {
-            "guess"
-        }
+        name_conf.as_str()
     ));
     if let Some(v) = &report.version {
         out.push_str(&format!("# current installed version: {}\n", v));
     }
     out.push_str(&format!(
-        "source_type = \"{}\" # confidence: guess\n",
-        source_type
+        "source_type = \"{}\" # confidence: {}\n",
+        source_type_str,
+        source_conf.as_str()
     ));
     out.push_str(&format!(
         "source_url = \"{}\" # confidence: {}\n",
         source,
-        if source_url.is_some() {
-            "medium"
-        } else {
-            "guess"
-        }
+        source_conf.as_str()
     ));
     out.push('\n');
 
@@ -667,6 +842,20 @@ pub fn render_draft_toml(
             svc.unit_name,
             svc.confidence.as_str(),
             svc.method
+        ));
+        out.push_str(&format!(
+            "# pre_update = \"systemctl stop {}\" # confidence: {}\n",
+            svc.unit_name,
+            svc.confidence.as_str()
+        ));
+        out.push_str(&format!(
+            "# post_update = \"systemctl start {}\" # confidence: {}\n",
+            svc.unit_name,
+            svc.confidence.as_str()
+        ));
+        out.push_str(&format!(
+            "# health_check = \"<fill in>\" # confidence: guess (verify against service {})\n",
+            svc.unit_name
         ));
     }
 
@@ -807,6 +996,7 @@ mod tests {
             user_units: vec![],
             init_d: vec![],
             proc_dir: None,
+            pm_probe: None,
         }
     }
 
@@ -863,7 +1053,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(svc.unit_name, "foo.service");
-        let findings = discover_configs("foo", Some(&svc), &scan).await.unwrap();
+        let findings = discover_configs("foo", Some(&svc), None, &scan).await.unwrap();
         let found = findings
             .iter()
             .find(|f| f.path == conf.display().to_string())
@@ -882,6 +1072,9 @@ mod tests {
             size: Some(10),
             elf: None,
             version: Some("1.2.3".into()),
+            exec_args: vec![],
+            unit_user: None,
+            pm_managed: None,
             detect_command: Some("/tmp/foo --version".into()),
             detect_pattern: Some("([0-9]+\\.[0-9]+)".into()),
             needs_manual_verify: false,
@@ -906,6 +1099,9 @@ mod tests {
             size: None,
             elf: None,
             version: None,
+            exec_args: vec![],
+            unit_user: None,
+            pm_managed: None,
             detect_command: None,
             detect_pattern: None,
             needs_manual_verify: true,
@@ -924,6 +1120,115 @@ mod tests {
             }
         }
         assert!(toml.contains("# suggestion (confidence: guess)"));
+    }
+
+    // --- golden tests for T0.1–T0.4 (renderer correctness) ---
+
+    fn draft_report() -> DetectReport {
+        DetectReport {
+            path_arg: "/opt/bin/foo".into(),
+            resolved_path: Some("/opt/bin/foo".into()),
+            sha256: Some("deadbeef".into()),
+            size: Some(10),
+            elf: None,
+            version: Some("1.2.3".into()),
+            exec_args: vec![],
+            unit_user: None,
+            pm_managed: None,
+            detect_command: Some("/opt/bin/foo --version".into()),
+            detect_pattern: Some(r"([0-9]+\.[0-9]+)".into()),
+            needs_manual_verify: false,
+            service: None,
+            config_findings: vec![],
+        }
+    }
+
+    #[test]
+    fn draft_toml_uses_shared_source_type() {
+        // No duplication: source_type comes from shadow_cli::detect_source_type.
+        let toml = render_draft_toml(&draft_report(), "foo", Some("https://github.com/owner/foo"));
+        assert!(toml.contains("source_type = \"github_release\""));
+        assert!(toml.contains("source_url = \"https://github.com/owner/foo\""));
+
+        let toml = render_draft_toml(&draft_report(), "foo", Some("https://github.com/owner/foo.git"));
+        assert!(toml.contains("source_type = \"git_build\""));
+
+        let toml = render_draft_toml(&draft_report(), "foo", Some("https://pkgs.example.com/stable"));
+        assert!(toml.contains("source_type = \"direct_url\""));
+
+        // No source → REPLACE_ME placeholder kept, typed direct_url.
+        let toml = render_draft_toml(&draft_report(), "foo", None);
+        assert!(toml.contains("source_url = \"REPLACE_ME\""));
+        assert!(toml.contains("source_type = \"direct_url\""));
+    }
+
+    #[test]
+    fn draft_toml_source_confidence_follows_source() {
+        let with_source = render_draft_toml(&draft_report(), "foo", Some("https://github.com/owner/foo"));
+        assert!(with_source
+            .contains("source_type = \"github_release\" # confidence: medium"));
+        assert!(with_source
+            .contains("source_url = \"https://github.com/owner/foo\" # confidence: medium"));
+
+        let without = render_draft_toml(&draft_report(), "foo", None);
+        assert!(without
+            .contains("source_type = \"direct_url\" # confidence: guess"));
+        assert!(without
+            .contains("source_url = \"REPLACE_ME\" # confidence: guess"));
+    }
+
+    #[test]
+    fn draft_toml_name_confidence_repo_basename_match() {
+        // Case-insensitive basename match, trailing .git stripped → medium.
+        let toml = render_draft_toml(&draft_report(), "Foo", Some("https://github.com/owner/foo.git"));
+        assert!(toml.contains("name = \"Foo\" # confidence: medium"));
+
+        let toml = render_draft_toml(&draft_report(), "foo", Some("https://github.com/OWNER/Foo"));
+        assert!(toml.contains("name = \"foo\" # confidence: medium"));
+
+        // No match → guess.
+        let toml = render_draft_toml(&draft_report(), "bar", Some("https://github.com/owner/foo.git"));
+        assert!(toml.contains("name = \"bar\" # confidence: guess"));
+
+        // No source → guess (kills the arbitrary source_url.is_some() proxy).
+        let toml = render_draft_toml(&draft_report(), "foo", None);
+        assert!(toml.contains("name = \"foo\" # confidence: guess"));
+    }
+
+    #[test]
+    fn draft_toml_lifecycle_suggestions_when_service_matched() {
+        let mut report = draft_report();
+        report.service = Some(ServiceMatch {
+            unit_name: "foo.service".into(),
+            unit_path: "/tmp/foo.service".into(),
+            method: "execstart".into(),
+            confidence: Confidence::Medium,
+            pid: None,
+        });
+        let toml = render_draft_toml(&report, "foo", None);
+        assert!(toml
+            .contains("service = \"foo.service\" # confidence: medium (matched via execstart)"));
+        assert!(toml
+            .contains("# pre_update = \"systemctl stop foo.service\" # confidence: medium"));
+        assert!(toml
+            .contains("# post_update = \"systemctl start foo.service\" # confidence: medium"));
+        assert!(toml.contains(
+            "# health_check = \"<fill in>\" # confidence: guess (verify against service foo.service)"
+        ));
+        // Suggestions only: never uncommented.
+        assert!(!toml.lines().any(|l| l.starts_with("pre_update =")));
+        assert!(!toml.lines().any(|l| l.starts_with("post_update =")));
+        assert!(!toml.lines().any(|l| l.starts_with("health_check =")));
+    }
+
+    #[test]
+    fn draft_toml_replace_me_header() {
+        let without = render_draft_toml(&draft_report(), "foo", None);
+        assert!(without.contains(
+            "# registration requires --source while source_url is REPLACE_ME"
+        ));
+        let with_source = render_draft_toml(&draft_report(), "foo", Some("https://github.com/owner/foo"));
+        assert!(!with_source.contains("registration requires --source"));
     }
 
     #[cfg(unix)]
@@ -953,5 +1258,220 @@ mod tests {
             .unwrap();
         assert!(report.needs_manual_verify);
         assert!(report.version.is_none());
+    }
+
+    // --- T1.1: PM-ownership probe ---
+
+    fn test_scan(pm_probe: Option<fn(&Path) -> Option<bool>>) -> ScanPaths {
+        ScanPaths {
+            system_units: vec![],
+            user_units: vec![],
+            init_d: vec![],
+            proc_dir: None,
+            pm_probe,
+        }
+    }
+
+    #[tokio::test]
+    async fn detect_pm_managed_injected_unowned() {
+        let report = detect_with_scan(
+            Path::new("/opt/bin/foo"),
+            None,
+            &test_scan(Some(|_path| Some(false))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.pm_managed, Some(false));
+    }
+
+    #[tokio::test]
+    async fn detect_pm_managed_injected_owned() {
+        let report = detect_with_scan(
+            Path::new("/opt/bin/foo"),
+            None,
+            &test_scan(Some(|_path| Some(true))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.pm_managed, Some(true));
+    }
+
+    #[tokio::test]
+    async fn detect_pm_managed_injected_none() {
+        let report = detect_with_scan(
+            Path::new("/opt/bin/foo"),
+            None,
+            &test_scan(Some(|_path| None)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.pm_managed, None);
+    }
+
+    #[tokio::test]
+    async fn detect_pm_managed_real_probe_unowned() {
+        // No probe injected → falls back to probe_pm_ownership. pacman is
+        // available on this host, so a nonexistent path yields Some(false).
+        let report = detect_with_scan(
+            Path::new("/nonexistent/path/binary"),
+            None,
+            &test_scan(None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.pm_managed, Some(false));
+    }
+
+    #[test]
+    fn draft_toml_pm_managed_emission() {
+        let host_pm = pm_name();
+        let base = draft_report();
+
+        // None → no pm-managed line.
+        let mut none = base.clone();
+        none.pm_managed = None;
+        let toml = render_draft_toml(&none, "foo", None);
+        assert!(!toml.lines().any(|l| l.starts_with("# pm-managed:")));
+
+        // Some(false) → unowned shadow-candidate line.
+        let mut unowned = base.clone();
+        unowned.pm_managed = Some(false);
+        let toml = render_draft_toml(&unowned, "foo", None);
+        assert!(toml.contains("# pm-managed: no (unowned by"));
+        assert!(toml.contains("shadow candidate"));
+        if let Some(pm) = host_pm {
+            assert!(toml.contains(&format!("unowned by {pm}")));
+        }
+
+        // Some(true) → owned line.
+        let mut owned = base.clone();
+        owned.pm_managed = Some(true);
+        let toml = render_draft_toml(&owned, "foo", None);
+        assert!(toml.contains("# pm-managed: yes (owned by"));
+        if let Some(pm) = host_pm {
+            assert!(toml.contains(&format!("owned by {pm}")));
+        }
+    }
+
+    // --- T1.2: ConfigSource::UnitArg outranks conventional ---
+
+    #[tokio::test]
+    async fn config_discovery_unit_arg_outranks_conventional() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let unit = tmp.path().join("sonarr.service");
+        let exec = format!("/opt/sonarr/Sonarr --data={}", data_dir.display());
+        std::fs::write(
+            &unit,
+            format!("[Unit]\nDescription=sonarr\n[Service]\nExecStart={}\n", exec),
+        )
+        .unwrap();
+        let scan = scan_with(vec![tmp.path().to_path_buf()]);
+        let svc = match_service(None, Path::new("/opt/sonarr/Sonarr"), None, &scan)
+            .await
+            .unwrap()
+            .unwrap();
+        let findings = discover_configs("sonarr", Some(&svc), None, &scan)
+            .await
+            .unwrap();
+        let data = findings
+            .iter()
+            .find(|f| f.path == data_dir.display().to_string())
+            .expect("unit-arg data dir should be discovered");
+        assert_eq!(data.source, ConfigSource::UnitArg);
+        assert_eq!(data.confidence, Confidence::High);
+        assert!(data.exists);
+        // UnitArg findings must rank before any Conventional finding.
+        let unit_arg_pos = findings
+            .iter()
+            .position(|f| f.source == ConfigSource::UnitArg)
+            .expect("unit-arg finding present");
+        let first_conventional = findings
+            .iter()
+            .position(|f| f.source == ConfigSource::Conventional);
+        assert!(
+            first_conventional.map(|c| c > unit_arg_pos).unwrap_or(true)
+        );
+    }
+
+    // --- T1.3: user-aware search space ---
+
+    #[tokio::test]
+    async fn discover_configs_user_aware() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("sonarr.service");
+        std::fs::write(
+            &unit,
+            "[Unit]\nDescription=sonarr\n[Service]\nUser=sonarr\nExecStart=/opt/sonarr/Sonarr\n",
+        )
+        .unwrap();
+        let scan = scan_with(vec![tmp.path().to_path_buf()]);
+        let svc = match_service(None, Path::new("/opt/sonarr/Sonarr"), None, &scan)
+            .await
+            .unwrap()
+            .unwrap();
+        let findings = discover_configs("sonarr", Some(&svc), Some("sonarr"), &scan)
+            .await
+            .unwrap();
+        let var_lib = findings
+            .iter()
+            .find(|f| f.path == "/var/lib/sonarr")
+            .expect("/var/lib/sonarr candidate");
+        assert_eq!(var_lib.source, ConfigSource::Conventional);
+        assert_eq!(var_lib.confidence, Confidence::Medium);
+        let home_cfg = findings
+            .iter()
+            .find(|f| f.path == "/home/sonarr/.config/Sonarr")
+            .expect("/home/sonarr/.config/Sonarr candidate");
+        assert_eq!(home_cfg.confidence, Confidence::Medium);
+        // /root/* deprioritized to Guess when User != root.
+        let root_cfg = findings
+            .iter()
+            .find(|f| f.path == "/root/.config/Sonarr")
+            .expect("/root candidate present");
+        assert_eq!(root_cfg.confidence, Confidence::Guess);
+        let root_pos = findings
+            .iter()
+            .position(|f| f.path == "/root/.config/Sonarr")
+            .unwrap();
+        assert!(root_pos
+            > findings
+                .iter()
+                .position(|f| f.path == "/var/lib/sonarr")
+                .unwrap());
+    }
+
+    // --- T1.4: structured unit facts on DetectReport ---
+
+    #[tokio::test]
+    async fn detect_structured_unit_facts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("sonarr.service");
+        std::fs::write(
+            &unit,
+            "[Unit]\nDescription=sonarr\n[Service]\nUser=sonarr\nExecStart=/opt/sonarr/Sonarr --data=/var/lib/sonarr --browser\n",
+        )
+        .unwrap();
+        let scan = scan_with(vec![tmp.path().to_path_buf()]);
+        let report = detect_with_scan(
+            Path::new("/opt/sonarr/Sonarr"),
+            Some("sonarr"),
+            &scan,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.unit_user, Some("sonarr".to_string()));
+        assert_eq!(
+            report.exec_args,
+            vec![
+                "--data=/var/lib/sonarr".to_string(),
+                "--browser".to_string(),
+            ]
+        );
+        assert_eq!(
+            report.service.as_ref().map(|s| s.unit_name.as_str()),
+            Some("sonarr.service")
+        );
     }
 }

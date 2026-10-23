@@ -24,10 +24,12 @@ use monopsony_common::proto::monopsony::{
     ClientMessage, Command, DownloadShadowAssetRequest, GetShadowRecipeRequest, HeartbeatRequest,
     HeartbeatResponse, InventoryDelta, InventoryReport, InventoryResponse,
     ListShadowCatalogRequest, ListShadowPackagesRequest, RegisterRequest, RegisterResponse,
-    RegisterShadowPackageRequest, RenewClientCertRequest, RenewClientCertResponse,
+    RegisterShadowPackageRequest,
+    QueryShadowRegistryRequest, QueryShadowRegistryResponse, RenewClientCertRequest, RenewClientCertResponse,
     RevokeClientCertRequest, RevokeClientCertResponse,
-    RollbackShadowUpdateRequest, ServerMessage, ShadowAssetChunk,
-    ShadowCatalog, ShadowCatalogEntry, ShadowPackageInfo, ShadowPackageList, ShadowScanAck,
+    RollbackShadowUpdateRequest, ServerMessage, ShadowAssetChunk, FleetInstall,
+    ShadowCatalog, ShadowCatalogEntry, ShadowPackageInfo, ShadowPackageList, ShadowRegistryMatch,
+    ShadowScanAck,
     ShadowScanReport, ShadowUpdateList, ShadowUpdateResult, SignedShadowRecipe, SyncRequest,
     UnregisterShadowPackageRequest, UnregisterShadowPackageResponse,
 };
@@ -767,6 +769,65 @@ impl MonopsonyGrpc {
     }
 }
 
+impl MonopsonyGrpc {
+    /// P4a: QueryShadowRegistry — exact binary_sha256 match, or recipe name
+    /// (+service_name similarity hint) / source_url hint. Returns matching
+    /// recipes with signing state plus fleet installs from other clients.
+    async fn handle_query_shadow_registry(
+        &self,
+        req: QueryShadowRegistryRequest,
+    ) -> Result<QueryShadowRegistryResponse> {
+        let rows = self
+            .db
+            .query_shadow_registry(
+                if req.binary_sha256.is_empty() {
+                    None
+                } else {
+                    Some(&req.binary_sha256)
+                },
+                if req.name.is_empty() {
+                    None
+                } else {
+                    Some(&req.name)
+                },
+                if req.service_name.is_empty() {
+                    None
+                } else {
+                    Some(&req.service_name)
+                },
+                if req.source_url.is_empty() {
+                    None
+                } else {
+                    Some(&req.source_url)
+                },
+            )
+            .await
+            .map_err(|e| Status::internal(format!("DB error querying shadow registry: {e}")))?;
+
+        let matches = rows
+            .into_iter()
+            .map(|r| ShadowRegistryMatch {
+                recipe_name: r.recipe_name,
+                recipe_version: r.recipe_version,
+                signed: r.signed,
+                key_id: r.key_id,
+                fleet_installs: r
+                    .fleet_installs
+                    .into_iter()
+                    .map(|f| FleetInstall {
+                        hostname: f.hostname,
+                        version: f.version,
+                        install_paths: f.install_paths,
+                        last_seen: f.last_seen,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        Ok(QueryShadowRegistryResponse { matches })
+    }
+}
+
 #[tonic::async_trait]
 impl MonopsonyControl for MonopsonyGrpc {
     async fn register(
@@ -1028,8 +1089,13 @@ impl MonopsonyControl for MonopsonyGrpc {
         }
 
         let install_paths = serde_json::json!(req.install_paths);
-        // TODO: serialize config_paths to JSON value when proto supports it
-        let config_paths_val: Option<&serde_json::Value> = None;
+        // config_paths: the proto carries them now — serialize to a JSON
+        // array value; None when the client sent none (legacy/recipe path).
+        let config_paths_val: Option<serde_json::Value> = if req.config_paths.is_empty() {
+            None
+        } else {
+            Some(serde_json::json!(req.config_paths))
+        };
 
         let service_name = if req.service_name.is_empty() {
             None
@@ -1037,6 +1103,11 @@ impl MonopsonyControl for MonopsonyGrpc {
             Some(req.service_name.as_str())
         };
         let masked_from_pm = if req.mask_from_pm { Some("true") } else { None };
+        let binary_sha256 = if req.binary_sha256.is_empty() {
+            None
+        } else {
+            Some(req.binary_sha256.as_str())
+        };
 
         let id = self
             .db
@@ -1055,9 +1126,10 @@ impl MonopsonyControl for MonopsonyGrpc {
                 &req.source_url,
                 &req.recipe_toml,
                 &install_paths,
-                config_paths_val,
+                config_paths_val.as_ref(),
                 service_name,
                 masked_from_pm,
+                binary_sha256,
             )
             .await
             .map_err(|e| Status::internal(format!("DB error creating shadow package: {e}")))?;
@@ -1111,6 +1183,18 @@ impl MonopsonyControl for MonopsonyGrpc {
             last_updated_at: chrono::Utc::now().timestamp(),
             last_checked_at: 0,
         }))
+    }
+
+    async fn query_shadow_registry(
+        &self,
+        request: Request<QueryShadowRegistryRequest>,
+    ) -> Result<Response<QueryShadowRegistryResponse>, Status> {
+        let req = request.into_inner();
+        let resp = self
+            .handle_query_shadow_registry(req)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(resp))
     }
 
     async fn unregister_shadow_package(
