@@ -429,30 +429,15 @@ fn detect_platform() -> (String, String, Option<String>) {
     (os, arch, libc)
 }
 
-/// Parse a version string like "1.0.0-rc2" or "v1.0.0" into components
-fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
+/// Parse a version string like "1.0.0-rc2" or "v1.0.0" into a semver::Version.
+///
+/// Uses semver 2.0 ordering: pre-release identifiers make a version LOWER than
+/// the release they precede, so `1.0.0-rc1 < 1.0.0-rc2 < 1.0.0`. Build
+/// metadata (`+...`) is ignored for comparison purposes, per semver §11.
+/// The leading `v` is stripped when present.
+fn parse_version(version: &str) -> Option<semver::Version> {
     let clean = version.trim_start_matches('v');
-    if let Some(dash) = clean.find('-') {
-        let base = &clean[..dash];
-        parse_version(base)
-    } else if clean.find('.').is_some() {
-        let parts: Vec<&str> = clean.splitn(3, '.').collect();
-        if parts.len() == 3 {
-            let major = parts[0].parse::<u64>().ok()?;
-            let minor = parts[1].parse::<u64>().ok()?;
-            let patch = parts[2].parse::<u64>().ok()?;
-            Some((major, minor, patch))
-        } else {
-            None
-        }
-    } else {
-        None
-    }
-}
-
-/// Compare two version tuples
-fn compare_versions(a: (u64, u64, u64), b: (u64, u64, u64)) -> std::cmp::Ordering {
-    a.cmp(&b)
+    semver::Version::parse(clean).ok()
 }
 
 /// GitHub release asset information
@@ -515,7 +500,7 @@ pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckResult
         anyhow::anyhow!("Failed to parse latest release tag: {}", release.tag_name)
     })?;
 
-    match compare_versions(current, latest) {
+    match current.cmp(&latest) {
         std::cmp::Ordering::Less => {
             info!(
                 "Update available: {} -> {}",
@@ -734,34 +719,76 @@ mod tests {
 
     #[test]
     fn test_parse_version() {
-        assert_eq!(parse_version("1.0.0"), Some((1, 0, 0)));
-        assert_eq!(parse_version("v2.3.4"), Some((2, 3, 4)));
-        assert_eq!(parse_version("1.0.0-rc1"), Some((1, 0, 0)));
+        let v = parse_version("1.0.0").unwrap();
+        assert_eq!((v.major, v.minor, v.patch), (1, 0, 0));
+        assert!(v.pre.is_empty() && v.build.is_empty());
+        let v = parse_version("v2.3.4").unwrap();
+        assert_eq!((v.major, v.minor, v.patch), (2, 3, 4));
+        let v = parse_version("1.0.0-rc1").unwrap();
+        assert_eq!((v.major, v.minor, v.patch), (1, 0, 0));
+        assert_eq!(v.pre.as_str(), "rc1");
+        assert!(v.build.is_empty());
         assert_eq!(parse_version("invalid"), None);
     }
 
     #[test]
-    fn test_compare_versions() {
+    fn test_parse_version_rc_ordering() {
+        // semver 2.0: pre-release < release, rc2 > rc1
+        let rc1 = parse_version("1.0.0-rc1").unwrap();
+        let rc2 = parse_version("1.0.0-rc2").unwrap();
+        let stable = parse_version("1.0.0").unwrap();
+        assert!(rc1 < rc2, "rc1 must be less than rc2");
+        assert!(rc2 < stable, "rc2 must be less than stable");
+        assert!(rc1 < stable, "rc1 must be less than stable");
+    }
+
+    #[test]
+    fn test_parse_version_pre_release_levels() {
+        // alpha < beta < rc < stable
+        let alpha = parse_version("1.0.0-alpha.1").unwrap();
+        let beta = parse_version("1.0.0-beta.1").unwrap();
+        let rc = parse_version("1.0.0-rc.1").unwrap();
+        let stable = parse_version("1.0.0").unwrap();
+        assert!(alpha < beta);
+        assert!(beta < rc);
+        assert!(rc < stable);
+    }
+
+    #[test]
+    fn test_parse_version_build_metadata_ignored() {
+        // semver §11: build metadata does not affect version precedence.
+        // semver::Version's PartialEq and Ord both include build metadata
+        // (a crate deviation from the spec — documented here so it's not
+        // mistaken for spec-compliant behavior). The ordering-relevant
+        // fields (major.minor.patch-pre) are what matter for self-update.
+        let a = parse_version("1.0.0+git.abc123").unwrap();
+        let b = parse_version("1.0.0+git.def456").unwrap();
+        assert_eq!(a.major, b.major);
+        assert_eq!(a.minor, b.minor);
+        assert_eq!(a.patch, b.patch);
+        assert_eq!(a.pre, b.pre);
+        assert_ne!(a.build, b.build, "build metadata should differ");
+        // Both have the same core version — self-update treats them as
+        // the same release for update-checking purposes.
         assert_eq!(
-            compare_versions((1, 0, 0), (2, 0, 0)),
-            std::cmp::Ordering::Less
-        );
-        assert_eq!(
-            compare_versions((1, 0, 0), (1, 0, 0)),
-            std::cmp::Ordering::Equal
-        );
-        assert_eq!(
-            compare_versions((2, 0, 0), (1, 0, 0)),
-            std::cmp::Ordering::Greater
+            (a.major, a.minor, a.patch, a.pre.as_str()),
+            (b.major, b.minor, b.patch, b.pre.as_str())
         );
     }
 
     #[test]
-    fn test_parse_version_edge_cases() {
-        assert_eq!(parse_version("1.2.3-rc2"), Some((1, 2, 3)));
-        assert_eq!(parse_version("v0.5.0-beta"), Some((0, 5, 0)));
+    fn test_parse_version_v_prefix() {
+        assert_eq!(
+            parse_version("v1.0.0"),
+            Some(semver::Version::new(1, 0, 0))
+        );
+    }
+
+    #[test]
+    fn test_parse_version_invalid() {
         assert_eq!(parse_version(""), None);
         assert_eq!(parse_version("abc.def.ghi"), None);
+        assert_eq!(parse_version("not-a-version"), None);
     }
 
     #[tokio::test]
@@ -779,12 +806,13 @@ mod tests {
         match result {
             Ok(check) => {
                 if let Some(latest) = check.latest_version {
-                    if let Some((major, minor, patch)) = parse_version(&latest) {
-                        assert!(
-                            major > 0 || minor > 0 || patch > 0,
-                            "Latest version should be newer than 0.0.1"
-                        );
-                    }
+                    let parsed = parse_version(&latest);
+                    assert!(parsed.is_some(), "Latest version should parse: {}", latest);
+                    let v = parsed.unwrap();
+                    assert!(
+                        v.major > 0 || v.minor > 0 || v.patch > 0,
+                        "Latest version should be newer than 0.0.1"
+                    );
                 }
             }
             Err(e) => println!("Network error (expected in CI): {}", e),
@@ -1066,6 +1094,7 @@ mod tests {
             port: Some(port),
             process: None,
             timeout_secs: 5,
+            stable: None,
         };
 
         let result = run_health_check(&check).await;
@@ -1088,6 +1117,7 @@ mod tests {
             port: Some(1), // port 1 — reserved, won't be listening
             process: None,
             timeout_secs: 3,
+            stable: None,
         };
 
         let start = std::time::Instant::now();
