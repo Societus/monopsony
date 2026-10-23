@@ -1,0 +1,51 @@
+# Shadow package recipe: technitium-dns
+# Designed around the upstream install flow documented at
+# https://blog.technitium.com/2017/11/running-dns-server-on-ubuntu-linux.html
+# (portable tarball layout + systemd service; config lives in /etc/dns and is
+# operator-managed - never touched by updates).
+#
+# Upstream quirk: GitHub releases carry tags but NO assets; the portable
+# tarball is a version-less always-latest file on Technitium's own CDN:
+#   https://download.technitium.com/dns/DnsServerPortable.tar.gz
+# Therefore: source_type = direct_url with version discovery by scraping the
+# GitHub releases/latest page (which redirects to the tagged release).
+
+[package]
+name = "technitium-dns"
+description = "Technitium DNS Server - cross-platform authoritative/recursive DNS with DoH/DoT/DoQ and DHCP"
+homepage = "https://technitium.com/dns/"
+source_type = "direct_url"
+source_url = "https://download.technitium.com/dns/DnsServerPortable.tar.gz"
+
+[install]
+method = "extract"
+target_dir = "/opt/technitium/dns"
+service = "dns.service"
+config_paths = ["/etc/dns"]
+backup_old = true
+max_backups = 3
+
+pre_update = "systemctl stop dns.service || true"
+post_update = "systemctl start dns.service"
+
+# Web console must answer after an update (binds 127.0.0.1:5380 on this host)
+[install.health_check]
+type = "port"
+port = 5380
+timeout_secs = 60
+
+[direct_url]
+version_discovery = "scrape"
+scrape_url = "https://github.com/TechnitiumSoftware/DnsServer/releases/latest"
+scrape_pattern = "v(\\d+\\.\\d+\\.\\d+)"
+asset_url_template = "https://download.technitium.com/dns/DnsServerPortable.tar.gz"
+
+[version]
+# The .NET app has no --version flag and the admin API requires a token;
+# the server logs its version banner into the journal at startup.
+detect_command = "journalctl -u dns.service --no-pager 2>/dev/null | grep -ioE 'technitium dns server v[0-9.]+' | tail -1"
+detect_pattern = 'v(\d+\.\d+(\.\d+)*)'
+
+[notifications]
+changelog_url = "https://github.com/TechnitiumSoftware/DnsServer/releases/tag/v{version}"
+notes = "Extracts the portable tarball over /opt/technitium/dns and restarts dns.service. /etc/dns config and the tail0964.ts.net zone are untouched. First-time installs need the ASP.NET Core runtime (upstream install.sh handles that; updates do not)."
