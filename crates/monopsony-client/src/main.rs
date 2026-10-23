@@ -55,6 +55,7 @@ mod proxy;
 mod self_update;
 mod trust;
 mod shadow_scorer;
+mod shadow_service;
 mod update_health;
 
 #[derive(Parser, Debug)]
@@ -723,11 +724,11 @@ async fn connect_shadow_client(
 }
 
 /// Serialize a ShadowSource the same way serde snake_case does on the wire
-/// ("github_release" / "git_build" / "direct_url").
+/// ("github_release" / "git_release" / "direct_url").
 fn shadow_source_as_str(source: &monopsony_common::shadow_types::ShadowSource) -> &'static str {
     match source {
         monopsony_common::shadow_types::ShadowSource::GithubRelease => "github_release",
-        monopsony_common::shadow_types::ShadowSource::GitBuild => "git_build",
+        monopsony_common::shadow_types::ShadowSource::GitRelease => "git_release",
         monopsony_common::shadow_types::ShadowSource::DirectUrl => "direct_url",
     }
 }
@@ -3376,6 +3377,8 @@ async fn run_shadow_package(
                 &update.latest_version,
                 &asset_url,
                 &http,
+                Some(update.current_version.as_str()),
+                true,
             )
             .await;
             for line in &outcome.log {

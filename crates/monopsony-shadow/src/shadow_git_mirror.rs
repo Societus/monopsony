@@ -1,4 +1,4 @@
-//! Git mirror maintenance for shadow packages with git_build source type.
+//! Git mirror maintenance for shadow packages with git_release source type.
 
 use std::path::{Path, PathBuf};
 

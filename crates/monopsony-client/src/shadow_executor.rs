@@ -16,7 +16,7 @@
 //! - `install.config_paths` are NEVER touched by the executor.
 //! - Hooks run as-is via `bash -c`; `|| true` semantics are the recipe
 //!   author's responsibility.
-//! - git_build recipes are rejected with a clear error (not supported yet).
+//! - git_release recipes are rejected with a clear error (not supported yet).
 
 #![allow(dead_code)]
 
@@ -299,6 +299,22 @@ fn stage(stage: &'static str, e: impl std::fmt::Display) -> StageError {
     }
 }
 
+/// Return true iff `target` is strictly older than `current`, using semver 2.0
+/// ordering (so pre-release ranks below its release). Either input failing to
+/// parse fails open (false) so a valid update is never blocked on a bad
+/// version string. A leading `v` and build metadata are ignored, matching the
+/// client's self_update helper.
+pub fn is_downgrade(target: &str, current: &str) -> bool {
+    match (
+        semver::Version::parse(target.trim_start_matches('v')),
+        semver::Version::parse(current.trim_start_matches('v')),
+    ) {
+        (Ok(t), Ok(c)) => t < c,
+        _ => false,
+    }
+}
+
+
 /// Render an asset URL template, substituting `{version}`, `{arch}`, `{os}`.
 /// Static templates (no placeholders) pass through unchanged.
 pub fn render_asset_template(template: &str, version: &str, arch: &str, os: &str) -> String {
@@ -316,7 +332,7 @@ pub fn render_asset_template(template: &str, version: &str, arch: &str, os: &str
 /// discovery). When empty, resolve client-side from the recipe:
 /// - direct_url → `[direct_url].asset_url_template`
 /// - github_release → releases API lookup + `[asset_selector]` rules
-/// - git_build → unsupported (clear error)
+/// - git_release → unsupported (clear error)
 pub async fn resolve_asset_url(
     recipe: &ShadowRecipe,
     check_asset_url: &str,
@@ -367,8 +383,8 @@ pub async fn resolve_asset_url(
             let body = resp.text().await?;
             github_asset_url_from_release(&body, &repo, target_version, recipe)
         }
-        ShadowSource::GitBuild => Err(anyhow!(
-            "client-side executor does not support git_build yet"
+        ShadowSource::GitRelease => Err(anyhow!(
+            "client-side executor does not support git_release yet"
         )),
     }
 }
@@ -502,6 +518,14 @@ pub async fn detect_current_version(recipe_toml: &str) -> Option<String> {
     .ok()
 }
 
+/// Inputs to the downgrade-safety gate, bundled for readability at the
+/// `execute_inner` boundary: what is currently installed, and whether a human
+/// is present to confirm a `downgrade_unsafe` recipe's downgrade.
+pub struct DowngradeContext<'a> {
+    pub current_version: Option<&'a str>,
+    pub interactive: bool,
+}
+
 /// Execute the full update pipeline for a verified recipe. Never panics;
 /// failures (with rollback when possible) are reported via the outcome.
 pub async fn execute_update(
@@ -509,6 +533,8 @@ pub async fn execute_update(
     target_version: &str,
     asset_url: &str,
     http: &reqwest::Client,
+    current_version: Option<&str>,
+    interactive: bool,
 ) -> UpdateOutcome {
     let mut log: Vec<String> = Vec::new();
     let mut backup: Option<PathBuf> = None;
@@ -520,6 +546,10 @@ pub async fn execute_update(
         http,
         &mut log,
         &mut backup,
+        DowngradeContext {
+            current_version,
+            interactive,
+        },
     )
     .await
     {
@@ -624,16 +654,35 @@ async fn execute_inner(
     http: &reqwest::Client,
     log: &mut Vec<String>,
     backup: &mut Option<PathBuf>,
+    gate: DowngradeContext<'_>,
 ) -> std::result::Result<(), StageError> {
     let install = &recipe.install;
 
-    // git_build is out of scope for the client-side executor.
-    if recipe.package.source_type == ShadowSource::GitBuild
+    // git_release is out of scope for the client-side executor.
+    if recipe.package.source_type == ShadowSource::GitRelease
         || install.method == InstallMethod::Build
     {
         return Err(stage(
             "plan",
-            "client-side executor does not support git_build yet",
+            "client-side executor does not support git_release yet",
+        ));
+    }
+
+    // Downgrade gate: refuse to go OLDER unless the operator is interactive or
+    // success is health-verifiable. Fail-open (return false) when current
+    // version can't be parsed so we never block a valid update.
+    if recipe.downgrade_unsafe
+        && matches!(gate.current_version, Some(c) if is_downgrade(target_version, c))
+        && !gate.interactive
+        && install.health_check.is_none()
+    {
+        return Err(stage(
+            "plan",
+            format!(
+                "downgrade refused: downgrade_unsafe set and target {} < current {}; interactive or health-verifiable update required",
+                target_version,
+                gate.current_version.unwrap_or("unknown"),
+            ),
         ));
     }
 
@@ -728,7 +777,7 @@ async fn execute_inner(
         InstallMethod::Build => {
             return Err(stage(
                 "plan",
-                "client-side executor does not support git_build yet",
+                "client-side executor does not support git_release yet",
             ));
         }
     }
@@ -904,6 +953,25 @@ max_backups = {max_backups}
     }
 
     #[test]
+    fn is_downgrade_valid_semver_pairs() {
+        assert!(is_downgrade("1.0.0", "2.0.0"));
+        assert!(is_downgrade("1.2.3", "1.2.4"));
+        assert!(!is_downgrade("2.0.0", "1.0.0"));
+        assert!(!is_downgrade("1.0.0", "1.0.0")); // equal is not a downgrade
+        assert!(is_downgrade("1.0.0-rc1", "1.0.0")); // pre-release < release
+        assert!(!is_downgrade("1.0.0-rc2", "1.0.0-rc1")); // rc2 > rc1: upgrade, not downgrade
+        assert!(is_downgrade("1.0.0-rc1", "1.0.0-rc2")); // rc ordering: rc1 < rc2
+    }
+
+    #[test]
+    fn is_downgrade_unparseable_fails_open() {
+        assert!(!is_downgrade("not-a-version", "1.0.0"));
+        assert!(!is_downgrade("1.0.0", ""));
+        assert!(!is_downgrade("", ""));
+        // A bad target never blocks (fail-open): not a downgrade, proceed.
+    }
+
+    #[test]
     fn render_template_static_is_constant() {
         let out = render_asset_template(
             "https://download.technitium.com/dns/DnsServerPortable.tar.gz",
@@ -957,10 +1025,10 @@ max_backups = {max_backups}
     }
 
     #[tokio::test]
-    async fn resolve_asset_url_git_build_rejected() {
+    async fn resolve_asset_url_git_release_rejected() {
         let toml = r#"[package]
 name = "gb"
-source_type = "git_build"
+source_type = "git_release"
 source_url = "https://github.com/example/gb.git"
 
 [install]
@@ -976,14 +1044,14 @@ detect_pattern = "([0-9]+)"
             .await
             .unwrap_err()
             .to_string();
-        assert!(err.contains("does not support git_build"), "got: {err}");
+        assert!(err.contains("does not support git_release"), "got: {err}");
     }
 
     #[tokio::test]
-    async fn execute_update_git_build_rejected() {
+    async fn execute_update_git_release_rejected() {
         let toml = r#"[package]
 name = "gb"
-source_type = "git_build"
+source_type = "git_release"
 source_url = "https://github.com/example/gb.git"
 
 [install]
@@ -995,15 +1063,112 @@ detect_command = "gb --version"
 detect_pattern = "([0-9]+)"
 "#;
         let recipe: ShadowRecipe = toml::from_str(toml).unwrap();
-        let outcome = execute_update(&recipe, "v2", "", &http_client()).await;
+        let outcome = execute_update(&recipe, "v2", "", &http_client(), None, false).await;
         assert!(!outcome.success);
         assert!(!outcome.rolled_back);
         assert!(
             outcome
                 .error
                 .unwrap()
-                .contains("does not support git_build"),
-            "executor must reject git_build"
+                .contains("does not support git_release"),
+            "executor must reject git_release"
+        );
+    }
+
+    /// Root-level `downgrade_unsafe = true` prepended before the first section.
+    fn downgrade_unsafe_recipe_toml(extra_install: &str) -> String {
+        format!(
+            "downgrade_unsafe = true\n[package]\nname = \"dg\"\nsource_type = \"direct_url\"\nsource_url = \"https://example.com/dg.tar.gz\"\n\n[install]\nmethod = \"extract\"\ntarget_dir = \"/tmp/dg-test\"\n{extra_install}\n[direct_url]\nversion_discovery = \"scrape\"\nasset_url_template = \"https://example.com/dl/dg.tar.gz\"\n\n[version]\ndetect_command = \"echo 1.0.0\"\ndetect_pattern = \"([0-9]+\\\\.[0-9]+\\\\.[0-9]+)\"\n"
+        )
+    }
+
+    #[tokio::test]
+    async fn execute_update_downgrade_gate_refuses_non_interactive() {
+        let recipe: ShadowRecipe =
+            toml::from_str(&downgrade_unsafe_recipe_toml("")).unwrap();
+        // Target 1.0.0 < current 2.0.0, non-interactive, no health check -> refused.
+        let outcome = execute_update(
+            &recipe,
+            "1.0.0",
+            "https://example.com/dg.tar.gz",
+            &http_client(),
+            Some("2.0.0"),
+            false,
+        )
+        .await;
+        assert!(!outcome.success);
+        assert!(!outcome.rolled_back, "refusal happens before any changes");
+        assert!(
+            outcome.error.unwrap().contains("downgrade refused"),
+            "gate must refuse non-interactive downgrades"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_update_downgrade_gate_allows_health_verifiable() {
+        let toml = downgrade_unsafe_recipe_toml(
+            "\n[install.health_check]\ntype = \"port\"\nport = 5380\ntimeout_secs = 3\n",
+        );
+        let recipe: ShadowRecipe = toml::from_str(&toml).unwrap();
+        // Health-verifiable success path: gate must NOT fire (fails later at download).
+        let outcome = execute_update(
+            &recipe,
+            "1.0.0",
+            "https://127.0.0.1:1/dg.tar.gz",
+            &http_client(),
+            Some("2.0.0"),
+            false,
+        )
+        .await;
+        assert!(!outcome.success);
+        let err = outcome.error.unwrap();
+        assert!(
+            !err.contains("downgrade refused"),
+            "health-verifiable downgrade must not be gated, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_update_downgrade_gate_allows_interactive() {
+        let recipe: ShadowRecipe =
+            toml::from_str(&downgrade_unsafe_recipe_toml("")).unwrap();
+        // Interactive operator confirmed the downgrade: gate must NOT fire.
+        let outcome = execute_update(
+            &recipe,
+            "1.0.0",
+            "https://127.0.0.1:1/dg.tar.gz",
+            &http_client(),
+            Some("2.0.0"),
+            true,
+        )
+        .await;
+        assert!(!outcome.success);
+        let err = outcome.error.unwrap();
+        assert!(
+            !err.contains("downgrade refused"),
+            "interactive downgrade must not be gated, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_update_downgrade_gate_ignores_upgrades() {
+        let recipe: ShadowRecipe =
+            toml::from_str(&downgrade_unsafe_recipe_toml("")).unwrap();
+        // Target 2.0.0 > current 1.0.0: an upgrade; the flag only gates downgrades.
+        let outcome = execute_update(
+            &recipe,
+            "2.0.0",
+            "https://127.0.0.1:1/dg.tar.gz",
+            &http_client(),
+            Some("1.0.0"),
+            false,
+        )
+        .await;
+        assert!(!outcome.success);
+        let err = outcome.error.unwrap();
+        assert!(
+            !err.contains("downgrade refused"),
+            "upgrades must not be gated by downgrade_unsafe, got: {err}"
         );
     }
 
@@ -1225,7 +1390,7 @@ asset_url_template = "https://example.com/x.tar.gz"
         let recipe = parse_recipe(&toml);
         let url = format!("http://127.0.0.1:{port}/DnsServerPortable.tar.gz");
 
-        let outcome = execute_update(&recipe, "15.6.2", &url, &http_client()).await;
+        let outcome = execute_update(&recipe, "15.6.2", &url, &http_client(), None, false).await;
         assert!(outcome.success, "outcome: {outcome:?}");
         assert!(!outcome.rolled_back);
         // The version the CLI passes to apply_shadow_update is the REAL one.
@@ -1259,7 +1424,7 @@ asset_url_template = "https://example.com/x.tar.gz"
         let recipe = parse_recipe(&toml);
         let url = format!("http://127.0.0.1:{port}/x.tar.gz");
 
-        let outcome = execute_update(&recipe, "15.6.2", &url, &http_client()).await;
+        let outcome = execute_update(&recipe, "15.6.2", &url, &http_client(), None, false).await;
         assert!(!outcome.success);
         assert!(outcome.rolled_back, "expected rollback, got {outcome:?}");
         let err = outcome.error.unwrap();
@@ -1287,7 +1452,7 @@ asset_url_template = "https://example.com/x.tar.gz"
         let recipe = parse_recipe(&toml);
         let url = format!("http://127.0.0.1:{port}/x.tar.gz");
 
-        let outcome = execute_update(&recipe, "2.0.0", &url, &http_client()).await;
+        let outcome = execute_update(&recipe, "2.0.0", &url, &http_client(), None, false).await;
         assert!(!outcome.success);
         assert!(!outcome.rolled_back); // nothing to roll back (no backup yet)
         assert!(outcome.error.unwrap().starts_with("pre_update"));
@@ -1308,6 +1473,8 @@ asset_url_template = "https://example.com/x.tar.gz"
             "2.0.0",
             &format!("http://127.0.0.1:{closed}/x.tar.gz"),
             &http_client(),
+            None,
+            false,
         )
         .await;
         assert!(!outcome.success);
@@ -1335,7 +1502,7 @@ asset_url_template = "https://example.com/x.tar.gz"
         let recipe = parse_recipe(&toml);
         let url = format!("http://127.0.0.1:{port}/x.tar.gz");
 
-        let outcome = execute_update(&recipe, "1.0.0", &url, &http_client()).await;
+        let outcome = execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await;
         assert!(outcome.success, "outcome: {outcome:?}");
         assert!(outcome.log.iter().any(|l| l.contains("pruned")));
 
@@ -1380,7 +1547,7 @@ asset_url_template = "https://example.com/s"
         );
         let recipe = parse_recipe(&toml);
         // Empty asset URL for script method: no download, script runs.
-        let outcome = execute_update(&recipe, "7.7.7", "", &http_client()).await;
+        let outcome = execute_update(&recipe, "7.7.7", "", &http_client(), None, false).await;
         assert!(outcome.success, "outcome: {outcome:?}");
         assert_eq!(std::fs::read_to_string(&outfile).unwrap().trim(), "7.7.7");
     }
@@ -1417,7 +1584,7 @@ asset_url_template = "https://example.com/s"
             target.display()
         );
         let recipe = parse_recipe(&toml);
-        let outcome = execute_update(&recipe, "2.0.0", "", &http_client()).await;
+        let outcome = execute_update(&recipe, "2.0.0", "", &http_client(), None, false).await;
         assert!(!outcome.success);
         assert!(outcome.rolled_back);
         assert!(outcome.error.unwrap().starts_with("script"));
@@ -1725,7 +1892,7 @@ detect_pattern = "([0-9.]+)"
             "journalctl -u fake-unit -n 50: no errors\n".into(),
         ]);
         set_systemd_runner(Some(runner));
-        let outcome = execute_update(&recipe, "2.0.0", &url, &http_client()).await;
+        let outcome = execute_update(&recipe, "2.0.0", &url, &http_client(), None, false).await;
         set_systemd_runner(None);
 
         assert!(!outcome.success);

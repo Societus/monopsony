@@ -26,7 +26,7 @@ impl std::fmt::Display for SourceError {
     }
 }
 
-/// Trait for version checking (extensible for git_build and direct_url later)
+/// Trait for version checking (extensible for git_release and direct_url later)
 #[async_trait::async_trait]
 pub trait UpdateSource: Send + Sync {
     /// Get the latest version tag matching the recipe's tag_pattern
@@ -206,8 +206,8 @@ impl UpdateSource for GithubReleaseSource {
     }
 }
 
-/// Source for git_build packages. Uses a local bare clone (mirror) to list tags and versions.
-pub struct GitBuildSource {
+/// Source for git_release packages. Uses a local bare clone (mirror) to list tags and versions.
+pub struct GitReleaseSource {
     /// Path to the bare clone on the server
     mirror_path: PathBuf,
     /// Optional branch for HEAD tracking (default: main)
@@ -216,7 +216,7 @@ pub struct GitBuildSource {
     source_url: Option<String>,
 }
 
-impl GitBuildSource {
+impl GitReleaseSource {
     pub fn new(mirror_path: PathBuf, branch: Option<String>, source_url: Option<String>) -> Self {
         Self {
             mirror_path,
@@ -227,7 +227,7 @@ impl GitBuildSource {
 }
 
 #[async_trait::async_trait]
-impl UpdateSource for GitBuildSource {
+impl UpdateSource for GitReleaseSource {
     async fn latest_version(&self, tag_pattern: &str) -> Result<Option<String>, SourceError> {
         let pat = Regex::new(tag_pattern).map_err(|e| SourceError::Parse(e.to_string()))?;
 
@@ -255,7 +255,7 @@ impl UpdateSource for GitBuildSource {
         // Return the first tag matching the pattern (already sorted newest first)
         for tag in &tags {
             if pat.is_match(tag) {
-                debug!("GitBuildSource latest version: {}", tag);
+                debug!("GitReleaseSource latest version: {}", tag);
                 return Ok(Some(tag.clone()));
             }
         }
@@ -283,7 +283,7 @@ impl UpdateSource for GitBuildSource {
     }
 
     async fn release_assets(&self, _tag: &str) -> Result<Vec<ReleaseAsset>, SourceError> {
-        // For git_build, there are no release assets — the source IS the asset.
+        // For git_release, there are no release assets — the source IS the asset.
         // The client gets the source via worktree extraction.
         Ok(vec![])
     }
@@ -451,8 +451,8 @@ mod tests {
     }
 
     #[test]
-    fn git_build_source_changelog_github() {
-        let source = GitBuildSource::new(
+    fn git_release_source_changelog_github() {
+        let source = GitReleaseSource::new(
             PathBuf::from("/tmp/mirror"),
             None,
             Some("https://github.com/example/tool".into()),
@@ -464,8 +464,8 @@ mod tests {
     }
 
     #[test]
-    fn git_build_source_changelog_non_github() {
-        let source = GitBuildSource::new(
+    fn git_release_source_changelog_non_github() {
+        let source = GitReleaseSource::new(
             PathBuf::from("/tmp/mirror"),
             None,
             Some("https://gitlab.com/example/tool".into()),
@@ -520,8 +520,8 @@ mod tests {
     }
 
     #[test]
-    fn git_build_no_changelog_without_source_url() {
-        let source = GitBuildSource::new(PathBuf::from("/tmp/mirror"), None, None);
+    fn git_release_no_changelog_without_source_url() {
+        let source = GitReleaseSource::new(PathBuf::from("/tmp/mirror"), None, None);
         assert_eq!(source.changelog_url("1.0", "2.0"), None);
     }
 }

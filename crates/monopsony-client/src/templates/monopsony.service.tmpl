@@ -1,0 +1,16 @@
+# REPLACE_ME — default no-package systemd unit template embedded in the
+# monopsony-client binary. Hand-edit the placeholders below, or generate
+# a filled-in unit via shadow_service::render_service_file(). Copy to
+# /etc/systemd/system/{{unit_name}} and run `systemctl daemon-reload`.
+[Unit]
+Description={{description}}
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={{exec_start}}
+WorkingDirectory={{working_dir}}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

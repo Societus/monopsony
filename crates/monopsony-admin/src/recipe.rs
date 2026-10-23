@@ -154,7 +154,7 @@ pub async fn handle_estimate(
             }
         } else if url.starts_with("git://") || url.ends_with(".git") {
             (
-                monopsony_common::shadow_types::ShadowSource::GitBuild,
+                monopsony_common::shadow_types::ShadowSource::GitRelease,
                 vec![],
             )
         } else {
@@ -173,7 +173,7 @@ pub async fn handle_estimate(
 
     let source_type_str = match source_type {
         monopsony_common::shadow_types::ShadowSource::GithubRelease => "github_release",
-        monopsony_common::shadow_types::ShadowSource::GitBuild => "git_build",
+        monopsony_common::shadow_types::ShadowSource::GitRelease => "git_release",
         monopsony_common::shadow_types::ShadowSource::DirectUrl => "direct_url",
     };
 

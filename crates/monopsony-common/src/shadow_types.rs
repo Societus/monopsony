@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum ShadowSource {
     GithubRelease,
-    GitBuild,
+    GitRelease,
     DirectUrl,
 }
 
@@ -788,7 +788,7 @@ mod tests {
     #[test]
     fn downgrade_unsafe_defaults_false() {
         let toml = "[package]\nname = \"x\"\nsource_type = \"direct_url\"\nsource_url = \"u\"\n\n[install]\nmethod = \"extract\"\ntarget_dir = \"/x\"\n\n[version]\ndetect_command = \"x\"\ndetect_pattern = \"([0-9]+)\"\n";
-        let recipe: ShadowRecipe = toml::from_str(&toml).unwrap();
+        let recipe: ShadowRecipe = toml::from_str(toml).unwrap();
         assert!(!recipe.downgrade_unsafe);
     }
 }

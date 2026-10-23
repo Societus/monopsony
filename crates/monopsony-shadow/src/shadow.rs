@@ -21,7 +21,7 @@ pub struct ShadowPackageManager {
     poll_interval: std::time::Duration,
     // Cache of sources keyed by "owner/repo"
     sources: RwLock<std::collections::HashMap<String, Arc<dyn UpdateSource>>>,
-    /// Git mirror manager for git_build source type
+    /// Git mirror manager for git_release source type
     git_mirror_manager: GitMirrorManager,
 }
 

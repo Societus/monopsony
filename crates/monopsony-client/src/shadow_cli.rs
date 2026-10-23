@@ -10,18 +10,18 @@ pub fn detect_source_type(url: &str) -> ShadowSource {
     if url_lower.contains("github.com") && !url_lower.ends_with(".git") {
         ShadowSource::GithubRelease
     } else if url_lower.ends_with(".git") {
-        ShadowSource::GitBuild
+        ShadowSource::GitRelease
     } else {
         ShadowSource::DirectUrl
     }
 }
 
 /// Serialize a ShadowSource to its TOML/wire string
-/// ("github_release" / "git_build" / "direct_url").
+/// ("github_release" / "git_release" / "direct_url").
 pub fn shadow_source_as_str(source: &ShadowSource) -> &'static str {
     match source {
         ShadowSource::GithubRelease => "github_release",
-        ShadowSource::GitBuild => "git_build",
+        ShadowSource::GitRelease => "git_release",
         ShadowSource::DirectUrl => "direct_url",
     }
 }
@@ -44,10 +44,10 @@ pub enum PackageCommand {
         /// Install method: extract, build, or script
         #[arg(long, default_value = "extract")]
         method: String,
-        /// Git branch for HEAD tracking (git_build only)
+        /// Git branch for HEAD tracking (git_release only)
         #[arg(long, default_value = "main")]
         branch: String,
-        /// Build dependencies, comma-separated (git_build only)
+        /// Build dependencies, comma-separated (git_release only)
         #[arg(long)]
         requires: Option<String>,
     },
@@ -283,14 +283,14 @@ mod tests {
     }
 
     #[test]
-    fn detect_git_build() {
+    fn detect_git_release() {
         assert_eq!(
             detect_source_type("https://github.com/example/tool.git"),
-            ShadowSource::GitBuild
+            ShadowSource::GitRelease
         );
         assert_eq!(
             detect_source_type("https://gitlab.com/example/tool.git"),
-            ShadowSource::GitBuild
+            ShadowSource::GitRelease
         );
     }
 

@@ -1151,7 +1151,7 @@ mod tests {
         assert!(toml.contains("source_url = \"https://github.com/owner/foo\""));
 
         let toml = render_draft_toml(&draft_report(), "foo", Some("https://github.com/owner/foo.git"));
-        assert!(toml.contains("source_type = \"git_build\""));
+        assert!(toml.contains("source_type = \"git_release\""));
 
         let toml = render_draft_toml(&draft_report(), "foo", Some("https://pkgs.example.com/stable"));
         assert!(toml.contains("source_type = \"direct_url\""));

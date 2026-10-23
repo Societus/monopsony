@@ -73,14 +73,14 @@ mod tests {
     }
 
     #[test]
-    fn i2pd_recipe_is_git_build_with_tilde_target() {
+    fn i2pd_recipe_is_git_release_with_tilde_target() {
         let recipe = preloaded_recipes()
             .into_iter()
             .find(|r| r.package.name == "i2pd")
             .expect("i2pd recipe must be present in the catalog");
         assert!(matches!(
             recipe.package.source_type,
-            monopsony_common::shadow_types::ShadowSource::GitBuild
+            monopsony_common::shadow_types::ShadowSource::GitRelease
         ));
         assert!(recipe.install.target_dir.starts_with("~/"));
         assert_eq!(

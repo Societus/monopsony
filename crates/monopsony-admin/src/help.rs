@@ -99,7 +99,7 @@ const HELP_DATA: &[HelpEntry] = &[
     HelpEntry {
         key: "field:package.source_type",
         title: "package.source_type",
-        body: "Where releases come from: `github_release` (GitHub Releases API), `git_build` (clone + compile), or `direct_url` (scrape a URL).",
+        body: "Where releases come from: `github_release` (GitHub Releases API), `git_release` (clone + compile), or `direct_url` (scrape a URL).",
     },
     HelpEntry {
         key: "field:package.source_url",

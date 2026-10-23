@@ -1,0 +1,15 @@
+#!/sbin/openrc-run
+# REPLACE_ME — default no-package OpenRC init script template embedded in the
+# monopsony-client binary. Hand-edit the placeholders below, or generate
+# a filled-in script via shadow_service::render_service_file(). Copy to
+# /etc/init.d/{{unit_name}} and run `rc-update add {{unit_name}} default`.
+
+description="{{description}}"
+command="{{exec_start}}"
+directory="{{working_dir}}"
+command_background=yes
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+    need net
+}

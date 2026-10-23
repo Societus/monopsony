@@ -9,7 +9,7 @@
 #
 # Schema notes (validated against ShadowRecipe in
 # monopsony-common/src/shadow_types.rs):
-#   - source_type = "git_build" (ShadowSource::GitBuild)
+#   - source_type = "git_release" (ShadowSource::GitRelease)
 #   - [build] is a TOP-LEVEL table (RecipeBuild { steps, requires })
 #   - build.requires entries are checked with `which`, so they must be
 #     executables on PATH, not apt package names
@@ -23,7 +23,7 @@
 name = "i2pd"
 description = "PurpleI2P i2pd - C++ I2P router daemon"
 homepage = "https://geti2p.net"
-source_type = "git_build"
+source_type = "git_release"
 source_url = "https://github.com/PurpleI2P/i2pd"
 
 [install]

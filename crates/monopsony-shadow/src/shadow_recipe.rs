@@ -150,7 +150,7 @@ pub fn generate_registration_template(
          source_url = \"{source_url}\"\n\n",
         source_type_snake = match source_type {
             ShadowSource::GithubRelease => "github_release",
-            ShadowSource::GitBuild => "git_build",
+            ShadowSource::GitRelease => "git_release",
             ShadowSource::DirectUrl => "direct_url",
         }
     ));
