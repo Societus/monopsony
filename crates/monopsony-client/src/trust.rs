@@ -7,7 +7,7 @@
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
 use rustls_pemfile::certs;
-use sha2::{Digest, Sha256};
+use sha2::Digest;
 use std::path::Path;
 use tracing::{debug, warn};
 

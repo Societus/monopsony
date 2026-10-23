@@ -171,6 +171,43 @@ export interface TrackerStatus {
   message?: string;
 }
 
+// ─── Pairing v2 approval (admin dashboard) ─────────────────────────
+
+export type PendingPairStatus =
+  | 'pending'
+  | 'approved'
+  | 'collected'
+  | 'expired'
+  | 'invalidated';
+
+export interface PendingPairRequest {
+  request_id: string;
+  /** Self-reported by the client — forgeable, never trust for identity. */
+  claimed_hostname: string;
+  claimed_os: string;
+  claimed_os_version: string | null;
+  /** Observed peer IP — the trusted identity signal. */
+  source_ip: string;
+  created_at: number;
+  expires_at: number;
+  status: PendingPairStatus;
+  pin_attempts: number;
+}
+
+export interface PairApproveResponse {
+  approved: boolean;
+  message?: string;
+}
+
+export interface PairAuditEntry {
+  request_id: string;
+  action: string;
+  /** Known backend gap: currently always 'system' (session username not attributed). */
+  approver: string;
+  detail: string | null;
+  created_at: number;
+}
+
 // ─── Feature / Monetization Types ──────────────────────────────────
 
 export interface FeatureFlags {

@@ -65,6 +65,7 @@ pub struct PendingPairEntry {
     pub source_ip: String,            // observed peer IP
     pub created_at: i64,              // epoch seconds
     pub expires_at: i64,              // epoch seconds, pending TTL (15 min)
+    pub approved_at: Option<i64>,     // epoch seconds, set when admin approves (D8 collection clock base)
     pub status: PendingPairStatus,
     pub client_id: Option<String>,    // set at collect time
 }
@@ -145,6 +146,7 @@ impl PendingPairStore {
             source_ip,
             created_at: now,
             expires_at,
+            approved_at: None,
             status: PendingPairStatus::Pending,
             client_id: None,
         };
@@ -201,9 +203,10 @@ impl PendingPairStore {
                 if now > e.expires_at && e.status == PendingPairStatus::Pending {
                     return false;
                 }
-                // Approved-but-uncollected past its shorter clock
+                // Approved-but-uncollected past its shorter clock (D8:
+                // measured from approval time, not creation)
                 if e.status == PendingPairStatus::Approved
-                    && now > e.created_at + APPROVED_UNCOLLECTED_TTL_SECS
+                    && now > e.approved_at.unwrap_or(e.created_at) + APPROVED_UNCOLLECTED_TTL_SECS
                 {
                     return false;
                 }
@@ -245,6 +248,10 @@ impl PendingPairStore {
         }
 
         // Compute expected hash: SHA-256(pin_salt + pin)
+        // The PIN charset is uppercase-only (no I/O/0/1), so normalize the
+        // submitted PIN (trim + case-fold) — protects against lowercase or
+        // whitespace variants of the correct PIN without weakening entropy.
+        let pin = pin.trim().to_uppercase();
         let mut hasher = sha2::Sha256::new();
         hasher.update(entry.pin_salt.as_bytes());
         hasher.update(pin.as_bytes());
@@ -252,6 +259,7 @@ impl PendingPairStore {
 
         if expected == entry.pin_hash {
             entry.status = PendingPairStatus::Approved;
+            entry.approved_at = Some(now);
             info!("Pairing request {} approved by PIN", request_id);
             Ok(true)
         } else {
@@ -276,7 +284,12 @@ impl PendingPairStore {
             return None;
         }
         let now = now_secs();
-        if now > entry.created_at + APPROVED_UNCOLLECTED_TTL_SECS {
+        // D8: the approved-uncollected clock starts at APPROVAL time, not
+        // creation — otherwise late approvals (any request older than the
+        // 5-min window) can never be collected.
+        if now
+            > entry.approved_at.unwrap_or(entry.created_at) + APPROVED_UNCOLLECTED_TTL_SECS
+        {
             entry.status = PendingPairStatus::Expired;
             warn!("Pairing request {} expired before collection", request_id);
             return None;
@@ -1249,31 +1262,13 @@ pub async fn handle_pair_collect(
         req.request_id, collected_entry.claimed_hostname, source_ip
     );
 
-    // Generate cert and register client (registration-at-collection)
-    // Use the TlsManager to generate a client cert bound to the client_id
-    let client_id = uuid::Uuid::new_v4().to_string();
-
-    let (cert_serial, client_cert, client_key) = match state
-        .tls_manager
-        .generate_client_cert(&client_id)
-    {
-        Ok(result) => result,
-        Err(e) => {
-            warn!("Failed to generate client cert for collect: {}", e);
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "failed to generate certificate"})),
-            );
-        }
-    };
-
-    let (client_cert_pem, client_key_pem) =
-        monopsony_control::tls::TlsManager::cert_and_key_to_pem(&client_cert, &client_key);
-    let ca_cert_pem = state.tls_manager.ca_cert_pem_bytes();
-
-    // Register client in DB (registration-at-collection)
-    if let Some(ref db) = state.db {
-        match db
+    // Generate cert and register client (registration-at-collection).
+    // The DB row id is the single source of truth: register FIRST, then bind
+    // the cert and the collect response to the SAME id — otherwise the
+    // client's stored client_id diverges from its DB row and heartbeats and
+    // shadow ops (FK on clients.id) silently break.
+    let (client_id, cert_serial, client_cert, client_key) = if let Some(ref db) = state.db {
+        let cid = match db
             .register_client(
                 &collected_entry.claimed_hostname,
                 &collected_entry.claimed_os,
@@ -1282,18 +1277,7 @@ pub async fn handle_pair_collect(
             )
             .await
         {
-            Ok(cid) => {
-                let issued_at = chrono::Utc::now();
-                let expires_at = issued_at
-                    + chrono::Duration::seconds(
-                        state.tls_manager.client_cert_validity_days() as i64 * 86_400,
-                    );
-                let _ = db.record_pairing(&cid, issued_at).await;
-                let _ = db.update_client_cert_serial(&cid, &cert_serial).await;
-                let _ = db
-                    .insert_client_cert(&cert_serial, &cid, issued_at, expires_at)
-                    .await;
-            }
+            Ok(cid) => cid,
             Err(e) => {
                 warn!("Failed to register client during collect: {}", e);
                 return (
@@ -1301,8 +1285,56 @@ pub async fn handle_pair_collect(
                     Json(serde_json::json!({"error": "failed to register client"})),
                 );
             }
-        }
-    }
+        };
+
+        let (cert_serial, client_cert, client_key) = match state
+            .tls_manager
+            .generate_client_cert(cid.to_string().as_str())
+        {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("Failed to generate client cert for collect: {}", e);
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "failed to generate certificate"})),
+                );
+            }
+        };
+
+        let issued_at = chrono::Utc::now();
+        let expires_at = issued_at
+            + chrono::Duration::seconds(
+                state.tls_manager.client_cert_validity_days() as i64 * 86_400,
+            );
+        let _ = db.record_pairing(&cid, issued_at).await;
+        let _ = db.update_client_cert_serial(&cid, &cert_serial).await;
+        let _ = db
+            .insert_client_cert(&cert_serial, &cid, issued_at, expires_at)
+            .await;
+
+        (cid.to_string(), cert_serial, client_cert, client_key)
+    } else {
+        // DB-less mode: mint an id without a DB row
+        let cid = uuid::Uuid::new_v4().to_string();
+        let (cert_serial, client_cert, client_key) = match state
+            .tls_manager
+            .generate_client_cert(&cid)
+        {
+            Ok(result) => result,
+            Err(e) => {
+                warn!("Failed to generate client cert for collect: {}", e);
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "failed to generate certificate"})),
+                );
+            }
+        };
+        (cid, cert_serial, client_cert, client_key)
+    };
+
+    let (client_cert_pem, client_key_pem) =
+        monopsony_control::tls::TlsManager::cert_and_key_to_pem(&client_cert, &client_key);
+    let ca_cert_pem = state.tls_manager.ca_cert_pem_bytes();
 
     // Derive gRPC address
     let grpc_addr = state.grpc_addr.clone();
@@ -1436,12 +1468,12 @@ mod tests {
     fn pending_store_approve_and_collect() {
         let mut store = PendingPairStore::new();
 
-        // Pre-compute the correct PIN hash: SHA-256("salt" + "correct_pin")
+        // Pre-compute the correct PIN hash: SHA-256("salt" + "CORRECTPIN")
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(b"salt");
-        hasher.update(b"correct_pin");
-        let correct_pin_hash = hex::encode(hasher.finalize());
+        hasher.update(b"CORRECTPIN");
+        let CORRECTPIN_hash = hex::encode(hasher.finalize());
 
         let id = store.submit(
             "client1".to_string(),
@@ -1449,7 +1481,7 @@ mod tests {
             "6.0".to_string(),
             vec![],
             vec![1u8; 32],
-            correct_pin_hash,   // pin_hash = SHA-256("salt" + "correct_pin")
+            CORRECTPIN_hash,   // pin_hash = SHA-256("salt" + "CORRECTPIN")
             "salt".to_string(),
             "10.0.0.1".to_string(),
         );
@@ -1462,7 +1494,7 @@ mod tests {
         assert_eq!(entry.status, PendingPairStatus::Pending);
 
         // Correct PIN → approved
-        let result = store.attempt_pin(&id, "correct_pin").unwrap();
+        let result = store.attempt_pin(&id, "CORRECTPIN").unwrap();
         assert!(result);
         let entry = store.get(&id).unwrap();
         assert_eq!(entry.status, PendingPairStatus::Approved);
@@ -1605,8 +1637,8 @@ mod tests {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(b"salt");
-        hasher.update(b"correct_pin");
-        let correct_pin_hash = hex::encode(hasher.finalize());
+        hasher.update(b"CORRECTPIN");
+        let CORRECTPIN_hash = hex::encode(hasher.finalize());
 
         let mut store = PendingPairStore::new();
         let id = store.submit(
@@ -1615,7 +1647,7 @@ mod tests {
             "6.0".to_string(),
             vec![],
             vec![1u8; 32],
-            correct_pin_hash,
+            CORRECTPIN_hash,
             "salt".to_string(),
             "10.0.0.1".to_string(),
         );
@@ -1627,7 +1659,7 @@ mod tests {
         }
 
         // Approve must fail with "expired", not succeed
-        let result = store.attempt_pin(&id, "correct_pin");
+        let result = store.attempt_pin(&id, "CORRECTPIN");
         assert!(result.is_err());
         assert_eq!(result.unwrap_err(), "Request expired");
 
@@ -1643,8 +1675,8 @@ mod tests {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(b"salt");
-        hasher.update(b"correct_pin");
-        let correct_pin_hash = hex::encode(hasher.finalize());
+        hasher.update(b"CORRECTPIN");
+        let CORRECTPIN_hash = hex::encode(hasher.finalize());
 
         let mut store = PendingPairStore::new();
         let id = store.submit(
@@ -1653,18 +1685,19 @@ mod tests {
             "6.0".to_string(),
             vec![],
             vec![1u8; 32],
-            correct_pin_hash,
+            CORRECTPIN_hash,
             "salt".to_string(),
             "10.0.0.1".to_string(),
         );
 
         // Approve it
-        assert!(store.attempt_pin(&id, "correct_pin").unwrap());
+        assert!(store.attempt_pin(&id, "CORRECTPIN").unwrap());
 
-        // Push it past the approved-uncollected TTL
+        // Push it past the approved-uncollected TTL (measured from approval
+        // time, not creation — a late approval must still be collectable)
         {
             let entry = store.entries.get_mut(&id).unwrap();
-            entry.created_at = now_secs() - APPROVED_UNCOLLECTED_TTL_SECS - 1;
+            entry.approved_at = Some(now_secs() - APPROVED_UNCOLLECTED_TTL_SECS - 1);
         }
 
         // Collection must fail (request expired before collection)
@@ -1680,8 +1713,8 @@ mod tests {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(b"salt");
-        hasher.update(b"correct_pin");
-        let correct_pin_hash = hex::encode(hasher.finalize());
+        hasher.update(b"CORRECTPIN");
+        let CORRECTPIN_hash = hex::encode(hasher.finalize());
 
         let mut store = PendingPairStore::new();
         let id = store.submit(
@@ -1690,16 +1723,16 @@ mod tests {
             "6.0".to_string(),
             vec![],
             vec![1u8; 32],
-            correct_pin_hash,
+            CORRECTPIN_hash,
             "salt".to_string(),
             "10.0.0.1".to_string(),
         );
 
         // First approve succeeds
-        assert!(store.attempt_pin(&id, "correct_pin").unwrap());
+        assert!(store.attempt_pin(&id, "CORRECTPIN").unwrap());
 
         // Repeat approve is a no-op, not an error
-        assert!(store.attempt_pin(&id, "correct_pin").unwrap());
+        assert!(store.attempt_pin(&id, "CORRECTPIN").unwrap());
 
         let entry = store.get(&id).unwrap();
         assert_eq!(entry.status, PendingPairStatus::Approved);

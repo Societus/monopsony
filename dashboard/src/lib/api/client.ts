@@ -14,6 +14,7 @@ import type {
   MirrorConfig, MirrorStatus,
   TrackerStatus,
   FeatureFlags, MonetizationConfig,
+  PendingPairRequest, PairApproveResponse, PairAuditEntry,
 } from './types';
 
 const BASE = import.meta.env.VITE_API_BASE || '/api/v1';
@@ -112,6 +113,19 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ recipe_name: recipeName }),
       }),
+  },
+
+  // Pairing v2 admin approval (auth-gated — pending/approve/deny/audit).
+  pairing: {
+    pending: () => request<PendingPairRequest[]>('/pair/pending'),
+    approve: (requestId: string, pin: string) =>
+      request<PairApproveResponse>('/pair/approve', {
+        method: 'POST',
+        body: JSON.stringify({ request_id: requestId, pin }),
+      }),
+    deny: (requestId: string) =>
+      request<{ status: string }>(`/pair/deny/${encodeURIComponent(requestId)}`, { method: 'POST' }),
+    audit: () => request<PairAuditEntry[]>('/pair/audit'),
   },
 
   mirrors: {

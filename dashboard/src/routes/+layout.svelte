@@ -15,6 +15,7 @@
   import MonitorSmartphone from 'lucide-svelte/icons/monitor-smartphone';
   import Users from 'lucide-svelte/icons/users';
   import Coins from 'lucide-svelte/icons/coins';
+  import LinkIcon from 'lucide-svelte/icons/link';
   import Circle from 'lucide-svelte/icons/circle';
   import Logo from 'lucide-svelte/icons/boxes';
   import Lock from 'lucide-svelte/icons/lock';
@@ -42,12 +43,17 @@
       // no session cookie exists, redirect to login.
       // The /auth/status endpoint tells us if auth is required.
       if (status.auth_required) {
-        // Check if we have a session by trying a read endpoint
+        // Check if we have a VALID session by probing an endpoint the server
+        // always auth-gates. GET /api/v1/health is NOT usable for this: in
+        // tailnet-serve / direct-LAN mode it is an optional-auth read that
+        // returns 200 even with no/expired session — probing it made the SPA
+        // render as logged in while every write (POST) 401'd. GET /config is
+        // write-class (always requires auth) per auth::is_write_endpoint.
         try {
-          await api.health.get();
+          await api.config.get();
           // Success — we're authenticated (session cookie works)
         } catch {
-          // 401 on read means we need to login
+          // 401 on an always-auth read means we need to login
           await goto('/login');
           return;
         }
@@ -85,6 +91,7 @@
     { href: 'tracker', label: 'Tracker', icon: MonitorSmartphone },
     { href: 'monetization', label: 'Monetization', icon: Coins },
     { href: 'security', label: 'Security', icon: Shield },
+    { href: 'pairing', label: 'Pairing', icon: LinkIcon },
     { href: 'clients', label: 'Clients', icon: Users },
   ];
 
