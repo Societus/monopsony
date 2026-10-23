@@ -37,6 +37,7 @@ pub fn init_recipe_tables(conn: &rusqlite::Connection) {
             install_dir     TEXT,
             config_tracked  INTEGER DEFAULT 0,
             version         TEXT,
+            homepage        TEXT,
             created_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             updated_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
         );
@@ -88,6 +89,20 @@ pub fn init_recipe_tables(conn: &rusqlite::Connection) {
             ON annotations(package_name, from_version, to_version);
         ",
     );
+
+    // Idempotent migration for pre-existing DBs that lack `homepage`.
+    let needs_homepage = conn.query_row(
+        "SELECT group_concat(name) FROM pragma_table_info(shadow_recipes)",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .unwrap_or_default()
+    .contains("homepage");
+
+    if needs_homepage {
+        conn.execute_batch("ALTER TABLE shadow_recipes ADD COLUMN homepage TEXT")
+            .expect("add homepage column to shadow_recipes");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -99,6 +114,7 @@ pub struct PublishRecipeRequest {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    pub homepage: Option<String>,
     pub author_key_id: String,
     pub operator_key_id: Option<String>,
     pub recipe_toml: String,
@@ -130,6 +146,7 @@ pub struct RecipeSearchResult {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    pub homepage: Option<String>,
     pub author_key_id: String,
     pub operator_key_id: Option<String>,
     pub source_type: String,
@@ -147,6 +164,7 @@ pub struct RecipeDetail {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
+    pub homepage: Option<String>,
     pub author_key_id: String,
     pub operator_key_id: Option<String>,
     pub recipe_toml: String,
@@ -272,11 +290,12 @@ pub async fn handle_publish(
     let result = db.execute(
         "INSERT INTO shadow_recipes (id, name, description, author_key_id, operator_key_id,
             recipe_toml, author_sig, operator_sig, source_type, source_url,
-            architectures, install_dir, config_tracked, version, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            architectures, install_dir, config_tracked, version, homepage, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          ON CONFLICT(id) DO UPDATE SET
             name = excluded.name,
             description = excluded.description,
+            homepage = excluded.homepage,
             operator_key_id = excluded.operator_key_id,
             recipe_toml = excluded.recipe_toml,
             author_sig = excluded.author_sig,
@@ -303,6 +322,7 @@ pub async fn handle_publish(
             req.install_dir,
             req.config_tracked as i32,
             req.version,
+            req.homepage,
             now,
         ],
     );
@@ -329,8 +349,7 @@ pub async fn handle_search(
 
     let db = state.db.lock().await;
     let mut stmt = match db.prepare(
-        "SELECT id, name, description, author_key_id, operator_key_id,
-                source_type, source_url, architectures, version
+        "SELECT id, name, description, author_key_id, operator_key_id, source_type, source_url, architectures, version, homepage
          FROM shadow_recipes
          WHERE name LIKE ?1
          ORDER BY updated_at DESC
@@ -354,6 +373,7 @@ pub async fn handle_search(
             let src_url: String = row.get(6)?;
             let arch_json: String = row.get::<_, String>(7)?;
             let version: Option<String> = row.get(8)?;
+            let homepage: Option<String> = row.get(9)?;
 
             let archs: Vec<String> = serde_json::from_str(&arch_json).unwrap_or_default();
             let quarantined = is_quarantined(&db, &id);
@@ -365,6 +385,7 @@ pub async fn handle_search(
                 id,
                 name,
                 description: desc,
+                homepage,
                 author_key_id: author_key,
                 operator_key_id: op_key,
                 source_type: src_type,
@@ -395,7 +416,7 @@ pub async fn handle_get_recipe(
     let mut stmt = match db.prepare(
         "SELECT id, name, description, author_key_id, operator_key_id,
                 recipe_toml, author_sig, operator_sig, source_type, source_url,
-                architectures, install_dir, version, created_at, updated_at
+                architectures, install_dir, version, homepage, created_at, updated_at
          FROM shadow_recipes WHERE id = ?1",
     ) {
         Ok(s) => s,
@@ -419,8 +440,9 @@ pub async fn handle_get_recipe(
         let arch_json: String = row.get::<_, String>(10)?;
         let install_dir: Option<String> = row.get(11)?;
         let version: Option<String> = row.get(12)?;
-        let created: i64 = row.get(13)?;
-        let updated: i64 = row.get(14)?;
+        let homepage: Option<String> = row.get(13)?;
+        let created: i64 = row.get(14)?;
+        let updated: i64 = row.get(15)?;
 
         let archs: Vec<String> = serde_json::from_str(&arch_json).unwrap_or_default();
         let quarantined = is_quarantined(&db, &id);
@@ -432,6 +454,7 @@ pub async fn handle_get_recipe(
             id,
             name,
             description: desc,
+            homepage,
             author_key_id: author_key,
             operator_key_id: op_key,
             recipe_toml: toml,
@@ -880,6 +903,7 @@ mod tests {
             id: id.to_string(),
             name: name.to_string(),
             description: Some("A test recipe".into()),
+            homepage: None,
             author_key_id: "author_key_123".into(),
             operator_key_id: Some("operator_key_456".into()),
             recipe_toml: "[package]\nname = \"test\"".into(),
@@ -931,6 +955,55 @@ mod tests {
         let detail: RecipeDetail = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(detail.name, "sonarr");
         assert_eq!(detail.author_key_id, "author_key_123");
+    }
+
+    #[tokio::test]
+    async fn test_description_and_homepage_round_trip() {
+        let state = test_state_with_recipes();
+        let app = recipe_app(state.clone());
+
+        // Publish with both description and homepage set.
+        let req_body = PublishRecipeRequest {
+            id: "hash_desc".to_string(),
+            name: "desc-tool".to_string(),
+            description: Some("A load-bearing description".into()),
+            homepage: Some("https://example.com/".into()),
+            author_key_id: "author_key_123".into(),
+            operator_key_id: Some("operator_key_456".into()),
+            recipe_toml: "[package]\nname = \"desc-tool\"".into(),
+            author_sig: "base64sig".into(),
+            operator_sig: Some("base64opsig".into()),
+            source_type: "github_release".into(),
+            source_url: "https://github.com/example/desc-tool".into(),
+            architectures: vec!["linux/x86_64/glibc".into()],
+            install_dir: Some("/usr/local/bin".into()),
+            config_tracked: false,
+            version: Some("1.0.0".into()),
+        };
+        let body = serde_json::to_string(&req_body).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/recipes/publish")
+            .header("Content-Type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), AxumStatusCode::OK);
+
+        // GET it back and confirm both fields persisted.
+        let app = recipe_app(state);
+        let req = Request::builder()
+            .method("GET")
+            .uri("/recipes/hash_desc")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), AxumStatusCode::OK, "GET should return 200");
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let detail: RecipeDetail = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(detail.description.as_deref(), Some("A load-bearing description"));
+        assert_eq!(detail.homepage.as_deref(), Some("https://example.com/"));
     }
 
     #[tokio::test]
