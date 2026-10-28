@@ -101,6 +101,11 @@ fn peer_cert_serial_hex(
     Some(format!("{:x}", val))
 }
 
+/// Sprint 31 I4: empty filter = check all; otherwise exact id membership.
+fn passes_id_filter(package_id: &str, filter: &[String]) -> bool {
+    filter.is_empty() || filter.iter().any(|f| f == package_id)
+}
+
 pub struct MonopsonyGrpc {
     db: Arc<Database>,
     tls_manager: Arc<TlsManager>,
@@ -1246,6 +1251,9 @@ impl MonopsonyControl for MonopsonyGrpc {
                     None => continue,
                 };
                 let pkg_id_str = v.get("id").and_then(|x| x.as_str()).unwrap_or("");
+                if !passes_id_filter(pkg_id_str, &req.package_ids) {
+                    continue;
+                }
                 let pkg_id = match uuid::Uuid::parse_str(pkg_id_str) {
                     Ok(id) => id,
                     Err(_) => continue,
@@ -1889,5 +1897,27 @@ impl monopsony_common::proto::monopsony::mirror_control_server::MirrorControl
                 format!("Mirror {} not found", req.distro)
             },
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_id_filter_passes_all() {
+        assert!(passes_id_filter("abc-123", &[]));
+    }
+
+    #[test]
+    fn id_filter_matches_member() {
+        let filter = vec!["abc-123".to_string(), "other".to_string()];
+        assert!(passes_id_filter("abc-123", &filter));
+    }
+
+    #[test]
+    fn id_filter_rejects_non_member() {
+        let filter = vec!["abc-123".to_string()];
+        assert!(!passes_id_filter("other-id", &filter));
     }
 }
