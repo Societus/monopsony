@@ -166,6 +166,31 @@ pub fn extract_install_fields(recipe_toml: &str) -> (Vec<String>, String) {
     (paths, service)
 }
 
+/// Extract [install].config_paths from a recipe TOML (lenient, same style as
+/// extract_install_fields). Empty on missing/invalid TOML; never panics.
+pub fn extract_config_paths(recipe_toml: &str) -> Vec<String> {
+    let doc: toml::Value = match toml::from_str(recipe_toml) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
+    };
+    let table = match doc.as_table() {
+        Some(t) => t,
+        None => return Vec::new(),
+    };
+    let install = table.get("install").and_then(|i| i.as_table());
+    let paths: Vec<String> = install
+        .and_then(|i| i.get("config_paths"))
+        .or_else(|| table.get("config_paths"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    paths
+}
+
 #[derive(Subcommand, Debug)]
 pub enum RecipeCommand {
     /// Open recipe in $EDITOR
@@ -453,4 +478,25 @@ fn extract_install_fields_empty_when_missing() {
     let (paths, service) = extract_install_fields("not [ valid toml ===");
     assert!(paths.is_empty());
     assert!(service.is_empty());
+}
+
+#[test]
+fn extract_config_paths_parses_present() {
+    let recipe = "[package]\nname = \"sonarr\"\n\n[install]\nconfig_paths = [\"/etc/systemd/system/sonarr.service.d\", \"/run/sonarr\"]\n";
+    assert_eq!(extract_config_paths(recipe), vec!["/etc/systemd/system/sonarr.service.d", "/run/sonarr"]);
+}
+
+#[test]
+fn extract_config_paths_empty_when_missing() {
+    // No [install].config_paths → empty vec.
+    let paths = extract_config_paths("[package]\nname = \"x\"\n");
+    assert!(paths.is_empty());
+
+    // Invalid TOML → empty vec (never panics).
+    let paths = extract_config_paths("not [ valid toml ===");
+    assert!(paths.is_empty());
+
+    // config_paths present but not an array → empty.
+    let paths = extract_config_paths("[install]\nconfig_paths = \"nope\"");
+    assert!(paths.is_empty());
 }

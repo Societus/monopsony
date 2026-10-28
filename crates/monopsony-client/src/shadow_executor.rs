@@ -282,6 +282,8 @@ pub struct UpdateOutcome {
     pub log: Vec<String>,
     /// On failure: "<stage>: <message>".
     pub error: Option<String>,
+    /// True when failure_policy=hold deliberately kept the failed state, awaiting operator action.
+    pub held: bool,
 }
 
 #[derive(Debug)]
@@ -575,6 +577,7 @@ pub async fn execute_update(
                 backup_path: backup,
                 log,
                 error: None,
+                held: false,
             }
         }
         Err(err) => {
@@ -642,6 +645,7 @@ pub async fn execute_update(
                 backup_path: None,
                 log,
                 error: Some(format!("{}: {}", err.stage, err.message)),
+                held: hold,
             }
         }
     }
@@ -1900,6 +1904,11 @@ detect_pattern = "([0-9.]+)"
             !outcome.rolled_back,
             "hold must not restore the backup: {outcome:?}"
         );
+        // failure_policy=hold deliberately kept the failed state → held marker set.
+        assert!(
+            outcome.held,
+            "hold-failure must report held=true (kept failed state): {outcome:?}"
+        );
         assert!(
             outcome
                 .log
@@ -1915,5 +1924,48 @@ detect_pattern = "([0-9.]+)"
         );
         // Target keeps the NEW (broken) content — nothing restored.
         assert_eq!(std::fs::read(target.join("start.sh")).unwrap(), b"NEW");
+    }
+
+    #[tokio::test]
+    async fn execute_update_held_flag_false_after_auto_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("start.sh"), b"OLD-CONTENT").unwrap();
+
+        // Health check fails (closed port) but failure_policy is NOT hold, so the
+        // executor auto-restores the backup → held must be false.
+        let tarball = make_tar_gz(&[("start.sh", b"BROKEN-NEW")]);
+        let (port, _srv) = spawn_http_server(tarball);
+
+        let toml = recipe_toml(&target, Some(closed_port()), None, None, 3);
+        let recipe = parse_recipe(&toml);
+        let url = format!("http://127.0.0.1:{port}/x.tar.gz");
+
+        let outcome = execute_update(&recipe, "15.6.2", &url, &http_client(), None, false).await;
+        assert!(!outcome.success);
+        assert!(outcome.rolled_back, "expected auto-rollback, got {outcome:?}");
+        // Default policy restores → held is not set (operator did not hold).
+        assert!(!outcome.held, "auto-rollback must report held=false: {outcome:?}");
+    }
+
+    #[tokio::test]
+    async fn execute_update_held_flag_false_on_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("start.sh"), b"old").unwrap();
+
+        let tarball = make_tar_gz(&[("start.sh", b"NEW-15.6.2")]);
+        let (port, _srv) = spawn_http_server(tarball);
+
+        let toml = recipe_toml(&target, Some(open_port()), None, None, 3);
+        let recipe = parse_recipe(&toml);
+        let url = format!("http://127.0.0.1:{port}/DnsServerPortable.tar.gz");
+
+        let outcome = execute_update(&recipe, "15.6.2", &url, &http_client(), None, false).await;
+        assert!(outcome.success, "outcome: {outcome:?}");
+        // A clean success never holds the failed state.
+        assert!(!outcome.held, "success must report held=false: {outcome:?}");
     }
 }

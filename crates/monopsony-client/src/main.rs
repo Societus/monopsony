@@ -2985,7 +2985,32 @@ async fn run_shadow_package(
                     (draft, detected_version, Some(report))
                 };
 
-            let install_paths = vec![path.clone()];
+            // Sprint 31 I2: the --recipe path has no detect report, so its row
+            // metadata comes from the recipe TOML itself — [install] paths and
+            // service via the lenient extractors, sha256 from hashing the file
+            // at the install path (empty on unreadable/non-file). The detect
+            // path keeps its report-derived values below.
+            let (install_paths, recipe_service, recipe_config_paths, recipe_sha256) =
+                if report_opt.is_none() {
+                    let (recipe_install_paths, recipe_service) =
+                        shadow_cli::extract_install_fields(&recipe_toml);
+                    let install_paths = if recipe_install_paths.is_empty() {
+                        vec![path.clone()]
+                    } else {
+                        recipe_install_paths
+                    };
+                    let recipe_sha256 = std::fs::read(&path)
+                        .map(|bytes| detect::sha256_hex(&bytes))
+                        .unwrap_or_default();
+                    (
+                        install_paths,
+                        recipe_service,
+                        shadow_cli::extract_config_paths(&recipe_toml),
+                        recipe_sha256,
+                    )
+                } else {
+                    (vec![path.clone()], String::new(), Vec::new(), String::new())
+                };
             match &detected_version {
                 Some(v) => println!("  Detected version: {}", v),
                 None => println!(
@@ -3143,7 +3168,8 @@ async fn run_shadow_package(
             // Row metadata for the server (T2.1/T2.2): forward what the
             // detect pipeline found — existing config findings, matched
             // service unit, and the binary sha256. The --recipe path has
-            // no report, so it registers with empty metadata as before.
+            // no report, so it falls back to the recipe-derived values
+            // computed above (Sprint 31 I2).
             let reg_config_paths: Vec<String> = report_opt
                 .as_ref()
                 .map(|r| {
@@ -3153,16 +3179,16 @@ async fn run_shadow_package(
                         .map(|f| f.path.clone())
                         .collect()
                 })
-                .unwrap_or_default();
+                .unwrap_or(recipe_config_paths);
             let reg_service_name = report_opt
                 .as_ref()
                 .and_then(|r| r.service.as_ref())
                 .map(|s| s.unit_name.clone())
-                .unwrap_or_default();
+                .unwrap_or(recipe_service);
             let reg_sha256 = report_opt
                 .as_ref()
                 .and_then(|r| r.sha256.clone())
-                .unwrap_or_default();
+                .unwrap_or(recipe_sha256);
 
             let info = client
                 .register_shadow_package(
@@ -3410,6 +3436,13 @@ async fn run_shadow_package(
                 if outcome.rolled_back {
                     eprintln!(
                         "✗ Update FAILED and was ROLLED BACK — previous version restored: {}",
+                        outcome.error.as_deref().unwrap_or("unknown error")
+                    );
+                } else if outcome.held {
+                    // failure_policy=hold kept the failed state on purpose — a
+                    // backup exists but must not be restored without an operator.
+                    eprintln!(
+                        "✗ Update FAILED (failure_policy=hold — kept failed state, awaiting operator): {}",
                         outcome.error.as_deref().unwrap_or("unknown error")
                     );
                 } else {
