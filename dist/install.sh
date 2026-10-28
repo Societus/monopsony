@@ -351,6 +351,22 @@ download_binary() {
     mkdir -p "${INSTALL_DIR}"
     mv "${tmpdir}/${bin_name}" "${INSTALL_DIR}/${bin_name}"
     chmod 755 "${INSTALL_DIR}/${bin_name}"
+    # Sprint 31 I1: ensure the installed binary is reachable via $PATH.
+    if ! command -v "${bin_name}" >/dev/null 2>&1; then
+        warn "${bin_name} installed to ${INSTALL_DIR}, which is NOT on PATH."
+        if mkdir -p /etc/profile.d 2>/dev/null; then
+            cat > /etc/profile.d/monopsony-path.sh <<PROFILE
+# Installed by the monopsony installer: put the install dir on PATH.
+case ":\$PATH:" in
+  *":${INSTALL_DIR}:") ;;
+  *) export PATH="${INSTALL_DIR}:\$PATH" ;;
+esac
+PROFILE
+            chmod 644 /etc/profile.d/monopsony-path.sh
+            warn "Wrote /etc/profile.d/monopsony-path.sh (new login shells pick it up)."
+        fi
+        warn "For the current shell: export PATH=\"${INSTALL_DIR}:\$PATH\""
+    fi
     rm -rf "${tmpdir}"
     ok "Binary installed to ${INSTALL_DIR}/${bin_name}"
 }
