@@ -556,6 +556,18 @@ fn cgroup_unit(proc_entry: &Path) -> Option<String> {
     None
 }
 
+/// Sprint 31 I5: strip trailing '/' (except bare "/") so a UnitArg value
+/// like "/var/lib/sonarr/" dedups against conventional "/var/lib/sonarr".
+fn normalize_config_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        // "/" (or degenerate all-slash input): keep verbatim.
+        path.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Discover config files for the package.
 pub async fn discover_configs(
     name: &str,
@@ -567,10 +579,12 @@ pub async fn discover_configs(
     let mut seen = std::collections::HashSet::new();
 
     let mut push = |path: String, source: ConfigSource, confidence: Confidence| {
-        if seen.insert(path.clone()) {
+        // I5: dedup on the normalized path so slash-variants collapse into one finding.
+        let norm = normalize_config_path(&path);
+        if seen.insert(norm.clone()) {
             findings.push(ConfigFinding {
-                exists: Path::new(&path).exists(),
-                path,
+                exists: Path::new(&norm).exists(),
+                path: norm,
                 source,
                 confidence,
             });
@@ -859,9 +873,13 @@ pub fn render_draft_toml(
         ));
     }
 
-    // config_paths: only paths confirmed to exist are uncommented.
-    let existing: Vec<&ConfigFinding> =
-        report.config_findings.iter().filter(|f| f.exists).collect();
+    // config_paths: only paths confirmed to exist are uncommented. I5 T1.3: when the
+    // unit runs as a non-root user, /root/* findings were already demoted to Guess —
+    // exclude them so they never become uncommented config_paths.
+    let root_demoted = report.unit_user.as_deref().is_some_and(|u| u != "root");
+    let existing: Vec<&ConfigFinding> = report.config_findings.iter()
+        .filter(|f| f.exists && !(root_demoted && f.path.starts_with("/root/")))
+        .collect();
     if !existing.is_empty() {
         out.push_str("config_paths = [");
         for (i, f) in existing.iter().enumerate() {
@@ -883,8 +901,9 @@ pub fn render_draft_toml(
         out.push_str(worst.as_str());
         out.push('\n');
     }
-    // Nonexistent conventional suggestions → comment lines only.
-    for f in report.config_findings.iter().filter(|f| !f.exists) {
+    // Nonexistent conventional suggestions → comment lines only. I5 T1.3: demoted-but-existing
+    // /root/* paths (non-root unit) still surface as suggestion comments so they never vanish.
+    for f in report.config_findings.iter().filter(|f| !f.exists || (root_demoted && f.path.starts_with("/root/"))) {
         out.push_str(&format!(
             "# suggestion (confidence: guess): \"{}\"\n",
             f.path
@@ -1440,6 +1459,61 @@ mod tests {
                 .iter()
                 .position(|f| f.path == "/var/lib/sonarr")
                 .unwrap());
+    }
+
+    // --- I5: config_paths slash-dedup + /root demotion in the renderer ---
+
+    #[test]
+    fn normalize_config_path_strips_trailing_slash() {
+        assert_eq!(normalize_config_path("/var/lib/x/"), "/var/lib/x");
+        // Bare "/" stays; no-slash unchanged; all-slash input kept verbatim.
+        assert_eq!(normalize_config_path("/"), "/");
+        assert_eq!(normalize_config_path("//"), "//");
+        assert_eq!(normalize_config_path("/var/lib/x"), "/var/lib/x");
+    }
+
+    #[test]
+    fn root_demoted_existing_findings_never_uncommented_but_suggested() {
+        // Existing /root/.config/Sonarr finding + non-root unit user.
+        let mut report = draft_report();
+        report.unit_user = Some("sonarr".to_string());
+        report.config_findings = vec![ConfigFinding {
+            path: "/root/.config/Sonarr".into(),
+            source: ConfigSource::Conventional,
+            exists: true,
+            confidence: Confidence::Guess,
+        }];
+        let toml = render_draft_toml(&report, "sonarr", None);
+        // The /root path must NOT be uncommented as a config_paths entry...
+        for line in toml.lines() {
+            if line.starts_with("config_paths") && line.contains("/root/.config/Sonarr") {
+                panic!("demoted /root path leaked into uncommented config_paths");
+            }
+        }
+        // ...but it still appears as a suggestion comment so it is not lost.
+        assert!(toml.contains("# suggestion (confidence: guess): \"/root/.config/Sonarr\""));
+    }
+
+    #[test]
+    fn root_findings_stay_uncommented_for_root_or_none_user() {
+        // unit_user = Some("root") → /root path stays uncommented, no suggestion.
+        let mut report = draft_report();
+        report.unit_user = Some("root".to_string());
+        report.config_findings = vec![ConfigFinding {
+            path: "/root/.config/Sonarr".into(),
+            source: ConfigSource::Conventional,
+            exists: true,
+            confidence: Confidence::Guess,
+        }];
+        let toml = render_draft_toml(&report, "sonarr", None);
+        assert!(toml.lines().any(|l| l.starts_with("config_paths") && l.contains("/root/.config/Sonarr")));
+        assert!(!toml.contains("# suggestion (confidence: guess): \"/root/.config/Sonarr\""));
+
+        // unit_user = None → same behavior.
+        report.unit_user = None;
+        let toml2 = render_draft_toml(&report, "sonarr", None);
+        assert!(toml2.lines().any(|l| l.starts_with("config_paths") && l.contains("/root/.config/Sonarr")));
+        assert!(!toml2.contains("# suggestion (confidence: guess): \"/root/.config/Sonarr\""));
     }
 
     // --- T1.4: structured unit facts on DetectReport ---
