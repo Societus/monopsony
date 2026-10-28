@@ -2873,12 +2873,34 @@ async fn run_shadow_package(
         };
 
         // Load trust config (same source the Update arm documents).
+        // Only the [shadow_trust] section is needed here; the full
+        // ClientConfig requires [client]/[server]/[tls]/[proxy]/[metrics]/[logging]
+        // which a minimal client.toml may not have. Parse just shadow_trust
+        // so a trust-only config file works.
         let config_path = std::env::var("MONOPSONY_CLIENT_CONFIG")
             .unwrap_or_else(|_| "/etc/monopsony/client.toml".to_string());
         let trust_config = std::fs::read_to_string(&config_path)
             .ok()
-            .and_then(|c| toml::from_str::<monopsony_common::config::ClientConfig>(&c).ok())
-            .map(|c| c.shadow_trust)
+            .and_then(|content| toml::from_str::<toml::Value>(&content).ok())
+            .and_then(|value| value.get("shadow_trust").cloned())
+            .map(|table| {
+                let policy = table
+                    .get("policy")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("trusted_server_only")
+                    .to_string();
+                let operator_verifying_key_path = table
+                    .get("operator_verifying_key_path")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                monopsony_common::config::ShadowPackageTrustConfig {
+                    policy,
+                    trusted_author_keys: vec![],
+                    trusted_operator_keys: vec![],
+                    operator_verifying_key_path,
+                    accept_remote_assignment: false,
+                }
+            })
             .unwrap_or_default();
 
         // Without a locally configured operator verifying key we pass None;
