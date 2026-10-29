@@ -1,0 +1,43 @@
+# Phase 3 grounding — update-diffing baseline: example-app v1.0.0.
+# Diffed against app-v2.0.0.toml in this directory; expected warnings are in
+# README.md. All fields are real ShadowRecipe schema (parses clean).
+
+[package]
+name = "example-app"
+description = "Update-diffing fixture: v1.0.0 baseline"
+source_type = "direct_url"
+source_url = "https://github.com/example/app"
+
+[install]
+method = "extract"
+target_dir = "/opt/example-app"
+service = "app.service"
+config_paths = ["/etc/example-app"]
+backup_old = true
+max_backups = 3
+
+pre_update = "systemctl stop app.service || true"
+post_update = "systemctl start app.service || true"
+
+[install.health_check]
+type = "port"
+port = 8080
+timeout_secs = 60
+
+[build]
+requires = ["gcc", "make"]
+allow_network = true
+steps = [
+    "git clone --branch v{{version}} https://github.com/example/app /tmp/example-app",
+    "make -C /tmp/example-app BUILD_TYPE=Release",
+    "cp /tmp/example-app/app {{target_dir}}/app",
+]
+
+[direct_url]
+version_discovery = "scrape"
+scrape_url = "https://github.com/example/app/releases/latest"
+asset_url_template = "https://downloads.example.com/app/app-{{version}}-linux.tar.gz"
+
+[version]
+detect_command = "/opt/example-app/app --version"
+detect_pattern = "(\\d+\\.\\d+\\.\\d+)"

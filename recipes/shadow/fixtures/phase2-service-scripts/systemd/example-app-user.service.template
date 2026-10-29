@@ -1,0 +1,27 @@
+# Grounding fixture — systemd USER service template, grounded on the i2pd
+# recipe precedent (recipes/shadow/i2pd.toml: user-mode install at
+# ~/.local/lib/i2pd, operator config in ~/.i2pd, console on 127.0.0.1:7070/7071).
+#
+# User units install to ~/.config/systemd/user/ and are controlled with
+# systemctl --user. %h is systemd's home-directory specifier (no template
+# engine involvement). Headless persistence needs loginctl enable-linger:
+# without it the unit dies at logout — the renderer must run it for a
+# service-bearing user-mode install or document the limitation.
+
+[Unit]
+Description={{description}} (user service, managed by monopsony)
+After=network-online.target
+
+[Service]
+Type=simple
+# i2pd ground truth: binary at %h/.local/lib/i2pd/i2pd, config %h/.i2pd
+# (operator-managed — deliberately NOT in the recipe's config_paths).
+ExecStart=%h/.local/lib/i2pd/i2pd --service %h/.i2pd
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+
+# OPEN DECISION (scoping, see phase2 README): whether user units land in v1
+# or fast-follow. The i2pd fleet install is user-mode, so the real target
+# exists either way.

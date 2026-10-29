@@ -1,0 +1,32 @@
+# Grounding fixture — OpenRC service template (Alpine, ct/1904 class).
+# Standard openrc-run shape as used by Alpine aports: command +
+# command_background + pidfile. The renderer renders the file, writes it to
+# /etc/init.d/<name> mode 755, then `rc-update add <name> default`.
+#
+# OpenRC has no native templating — monopsony renders the {{...}} variables
+# (Phase 1 engine) BEFORE writing; a rendered init script containing a literal
+# `{{` is a bug (README: substitution contract).
+
+#!/sbin/openrc-run
+
+name="{{description}}"
+description="Example application daemon (managed by monopsony)"
+# Location substitution: the recipe's install.target_dir.
+command="{{target_dir}}/example-app"
+command_args="--config /etc/example-app/config.toml"
+command_background="yes"
+pidfile="/run/example-app.pid"
+output_log="/var/log/example-app.log"
+error_log="/var/log/example-app.err"
+
+depend() {
+    need net
+    use dns
+}
+
+# Enable (renderer runs after writing):
+#   rc-update add example-app default
+#   rc-service example-app start
+#
+# Persistence: rc-update add = unless-stopped (starts in the default runlevel
+# at boot); on-demand = skip rc-update, start only via rc-service on demand.

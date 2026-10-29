@@ -1,0 +1,53 @@
+# Phase 3 grounding — update-diffing target: example-app v2.0.0.
+# Churn vs v1.0.0 (each maps to a required warning — see README.md):
+#   1. service unit renamed  app.service  -> appd.service
+#   2. new build requirement openssl (which-checked; aborts the build if absent)
+#   3. new provisioning step: required env file /etc/example-app/env (APP_TOKEN)
+#   4. added sidecar container app-metrics (quadlet — systemd hosts only)
+#   5. health check moved 8080 (http) -> 8443 (https): old check proves nothing
+# Diffable fields are real schema; env/flag values inside strings are detected
+# via the step/hook diff plus the rendered service-script diff (README: split).
+
+[package]
+name = "example-app"
+description = "Update-diffing fixture: v2.0.0 with requirement churn"
+source_type = "direct_url"
+source_url = "https://github.com/example/app"
+
+[install]
+method = "extract"
+target_dir = "/opt/example-app"
+service = "appd.service"
+config_paths = ["/etc/example-app"]
+backup_old = true
+max_backups = 3
+
+pre_update = "systemctl stop appd.service || true"
+post_update = "set -a && . /etc/example-app/env && systemctl start appd.service || true"
+
+[install.health_check]
+type = "port"
+port = 8443
+timeout_secs = 60
+
+[build]
+requires = ["gcc", "make", "openssl"]
+allow_network = true
+steps = [
+    "git clone --branch v{{version}} https://github.com/example/app /tmp/example-app",
+    "make -C /tmp/example-app BUILD_TYPE=Release",
+    "cp /tmp/example-app/app {{target_dir}}/app",
+    # Required env file: operator must fill APP_TOKEN before the service starts.
+    "install -D -m600 /tmp/example-app/deploy/env.example /etc/example-app/env",
+    # Sidecar container (systemd hosts): quadlet unit for app-metrics.
+    "install -D -m644 /tmp/example-app/deploy/app-metrics.container /etc/containers/systemd/app-metrics.container && systemctl daemon-reload",
+]
+
+[direct_url]
+version_discovery = "scrape"
+scrape_url = "https://github.com/example/app/releases/latest"
+asset_url_template = "https://downloads.example.com/app/app-{{version}}-linux.tar.gz"
+
+[version]
+detect_command = "/opt/example-app/app --version"
+detect_pattern = "(\\d+\\.\\d+\\.\\d+)"

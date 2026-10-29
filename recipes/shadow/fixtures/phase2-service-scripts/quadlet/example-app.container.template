@@ -1,0 +1,28 @@
+# Grounding fixture — quadlet container persistence (systemd hosts only;
+# quadlet is systemd-only per design doc §3 invariant #2). Installs to
+# /etc/containers/systemd/<name>.container; the systemd generator produces
+# <name>.service on daemon-reload/boot.
+#
+# BENCH RULE (phase2 README): validate this fixture on a real podman host
+# before the template set is baked into the client binary — [Service]/[Install]
+# group merging into the generated unit must be confirmed live, not assumed.
+
+[Container]
+# {{version}} pins the image tag to the recipe version so rollbacks re-pull
+# the previous tag; `latest` would defeat the backup/rollback pipeline.
+Image=ghcr.io/example/app:v{{version}}
+# Location substitution: persistent data under the recipe's target_dir.
+# :Z for SELinux labeling on Fedora-family hosts.
+Volume={{target_dir}}/data:/var/lib/app:Z
+PublishPort=8080:8080
+
+[Service]
+# unless-stopped semantics (phase2 README): restart at boot + on failure;
+# manual stop stays stopped until next boot. For on-demand: Restart=no and
+# drop the [Install] section below.
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+
+# Activate: systemctl daemon-reload && systemctl start example-app.service

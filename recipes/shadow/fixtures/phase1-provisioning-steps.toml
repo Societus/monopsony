@@ -1,0 +1,67 @@
+# Grounding data — Sprint 32 Phase 1: provisioning engine ([build].steps templating)
+#
+# These are REAL-format shadow recipes whose [build].steps exercise the minimal
+# Jinja subset (variable substitution + simple conditionals). They double as the
+# fixtures an implementer wires `render_step` into, and as regression tests.
+#
+# Engine contract (docs/design/shadow-packages.md §3 invariant #1):
+#   - {{var}} substitutes from StepContext: version, target_dir, arch, os, libc.
+#     Whitespace-tolerant; unknown variable is a HARD error (never empty).
+#   - {{#if var == "literal"}}...{{/if}} includes the body only when equal; no else,
+#     no nesting.
+#   - Everything else passes through verbatim.
+#
+# Source-location awareness (--source / pull-if-missing) is a NEW capability for
+# Phase 1 (not yet in shadow_template.rs). The steps below show the author-facing
+# syntax and the expected runtime behavior; implementers must add it so these render
+# correctly end-to-end. See phase1-source-location.md for the exact contract.
+
+[package]
+name = "example-app"
+description = "Grounding fixture: templated provisioning steps + source-location awareness"
+source_type = "git_release"
+source_url = "https://github.com/example/app"
+
+[install]
+method = "build"
+target_dir = "~/.local/lib/example-app"
+backup_old = true
+max_backups = 3
+
+# ---- Phase 1: variable substitution + conditionals -------------------------
+pre_update = "systemctl stop example-app || true"
+post_update = "ln -sf $HOME/.local/lib/example-app/app $HOME/.local/bin/example-app"
+
+[build]
+requires = ["gcc", "make"]
+allow_network = false
+steps = [
+    # {{version}} and {{target_dir}} substitute from StepContext.
+    "mkdir -p {{target_dir}} && cd {{target_dir}}",
+    # The v-prefix on the tag is composed by the author — StepContext.version
+    # is bare semver (2.5.0), so a v-tagged repo writes v{{version}} here.
+    "git clone --branch v{{version}} https://github.com/example/app .",
+    "make BUILD_TYPE=Release CFLAGS=\"-DAPP_VERSION={{version}}\"",
+    # Conditional: only copy the systemd unit on Linux; skip on macOS.
+    "{{#if os == \"linux\"}}cp app.service /etc/systemd/system/ || true{{/if}}",
+    "{{#if libc == \"glibc\"}}ln -sf {{target_dir}}/app /usr/local/bin/example-app{{/if}}",
+]
+
+[version]
+detect_command = "example-app --version"
+detect_pattern = "(\\d+\\.\\d+\\.\\d+)"
+
+[asset_selector]
+tag_pattern = "v(\\d+\\.\\d+\\.\\d+)$"
+
+# ---- Expected rendered output (Phase 1 gate) --------------------------------
+# ctx: version=2.5.0 target_dir=~/.local/lib/example-app os=linux libc=glibc arch=x86_64
+#
+# step[0] -> "mkdir -p ~/.local/lib/example-app && cd ~/.local/lib/example-app"
+# step[1] -> "git clone --branch v2.5.0 https://github.com/example/app ."
+# step[2] -> "make BUILD_TYPE=Release CFLAGS=\"-DAPP_VERSION=2.5.0\""
+# step[3] -> "cp app.service /etc/systemd/system/ || true"   (linux branch included)
+# step[4] -> "ln -sf ~/.local/lib/example-app/app /usr/local/bin/example-app"  (glibc branch)
+#
+# On os=darwin, step[3] body is dropped entirely:
+#   "{{#if os == \"darwin\"}}launchctl load -w example-app{{/if}}" -> ""

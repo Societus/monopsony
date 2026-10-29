@@ -1,0 +1,33 @@
+# Grounding fixture — systemd service template (system-level), grounded on
+# recipes/shadow/technitium-dns.toml (dns.service, /opt/technitium/dns, dotnet
+# ExecStart — the upstream install.sh shape). This is the "real app" example the
+# default no-package template set must generalize.
+#
+# Placeholders render via monopsony-common::shadow_template::render_step.
+# {{exec_start}} and {{description}} require a StepContext extension (README,
+# open questions) — every other variable exists today.
+
+[Unit]
+Description={{description}} (managed by monopsony)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Location substitution: the recipe's install.target_dir.
+WorkingDirectory={{target_dir}}
+# technitium ground truth: ExecStart=/usr/bin/dotnet /opt/technitium/dns/DnsServerApp.dll
+ExecStart={{exec_start}}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+
+# Rendered expectation (technitium ground truth, target_dir=/opt/technitium/dns,
+# exec_start=/usr/bin/dotnet {{target_dir}}/DnsServerApp.dll):
+#   WorkingDirectory=/opt/technitium/dns
+#   ExecStart=/usr/bin/dotnet /opt/technitium/dns/DnsServerApp.dll
+#
+# Persistence: Restart=always + [Install] = unless-stopped semantics
+# (phase2 README). An on-demand variant drops [Install] and sets Restart=no.
