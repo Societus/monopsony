@@ -100,7 +100,10 @@ jobs:
       - name: Package tarballs
         run: |
           set -euo pipefail
+          # Strip leading 'v' and any build-metadata suffix ('+...'); branch
+          # dispatches (ref with '/') still fall back to a dev placeholder.
           VERSION="${GITHUB_REF_NAME#v}"
+          VERSION="${VERSION%%+*}"
           case "$VERSION" in
             */*) VERSION="0.0.0-dev" ;;   # workflow_dispatch from a branch
           esac

@@ -246,9 +246,16 @@ get_installed_version() {
 # latest release tag from the GitHub API > VERSION_FALLBACK.
 # Proven failure mode this fixes: a hardcoded VERSION fetches a nonexistent
 # release on re-run (v0.1.0 404).
+# Strip a leading 'v' and any build-metadata suffix (semver '+...' part).
+# Packaging versions must never carry build metadata (docs/version-convention.md).
+normalize_version() {
+    local v="${1#v}"
+    echo "${v%%+*}"
+}
+
 resolve_version() {
     if [[ -n "${MONOPSONY_VERSION:-}" ]]; then
-        echo "${MONOPSONY_VERSION#v}"
+        normalize_version "${MONOPSONY_VERSION}"
         return 0
     fi
 
@@ -257,7 +264,7 @@ resolve_version() {
         | grep -o '"tag_name"[^,]*' | head -1 \
         | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')" || true
     if [[ -n "${tag}" ]]; then
-        echo "${tag#v}"
+        normalize_version "${tag}"
         return 0
     fi
 
