@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0-rc2] — 2026-10-17
+
+### Added
+
+- HTTPS CONNECT pass-through on both server (:3128) and client (:3129) proxies, SSRF-guarded, making `https://` package URLs functional through the chain (Sprint 19)
+- Windows package-manager shims on the mirror router: scoop bucket server, choco NuGet v2 feed, and winget community-repo sync, with sync-time URL rewriting and client configure actions (Sprint 19)
+- Package integrity: hash pinning with Ed25519 attestations captured at spool commit and client verify-before-handoff (tamper → alert + 403 quarantine, live-verified end-to-end), plus a per-package downgrade ledger with normalized version ordering and warn/reject policy (Sprint 20)
+- sourcedb oracle: append-only observation log, demand-driven source resolution, data-driven version normalizer, and per-package version floors with freeze detection (Sprint 21)
+- Shadow recipe detect/adopt pipeline: `package detect` draft-recipe discovery, `package adopt` by name, server-global recipe catalog, dual-gated dashboard assignment, and sandboxed `method = "build"` execution (Sprint 22)
+- Language package-manager caches: npm registry, PyPI (PEP 503 simple-index), and crates.io (sparse-index) shims with retention floors, scrubber verification, and per-PM enablement — fleet gate all green (Sprint 23)
+- Homebrew backend: brew shim caching the formulae API and ghcr bottles (sha256-verified before spool commit) with `~/.homebrew/brew.env` proxy config — fleet gate 9/9 (Sprint 26 Phase 1)
+- Large-package streaming hardening: O(1)-memory tee+spool, atomic multipart commit, in-flight coalescing, client retry/backoff, and range/206 support — all fleet verification items passed
+- CA lifecycle guard (`ca_guard.rs`): fail-closed on unrecoverable CA loss with backup/auto-restore, eliminating the cache-wipe CA-loss failure mode
+- SvelteKit dashboard (rust-embed) with tiered Tailscale-aware auth, plus WebSocket tunnel transport for gRPC mTLS
+- Pairing v2: admin-approved, PIN-bound, key-bound pairing with enrollment keys and a 90-day cert lifecycle (serials in DB, revocation, mTLS renewal) (Sprint 28)
+
+### Changed
+
+- Semver 2.0 with pre-release identifiers and build metadata adopted as the single project versioning convention; canonical reference at `docs/version-convention.md`
+- Self-update version comparison uses semver 2.0 ordering: pre-release identifiers rank correctly (rc2 > rc1, pre-release < release)
+- Build metadata (`+git.<short-hash>`) is added by CI only and never affects version ordering
+
+### Fixed
+
+- Lying-version bug in self-update: version comparison used only the core (major.minor.patch) tuple, so consecutive release candidates compared equal and a deployed newer rc was reported as already up to date; fixed via semver pre-release ordering in the client self-update module
+
+---
+
 ## [1.0.0-rc1] — 2026-05-19
 
 ### Added
@@ -109,5 +137,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive bash installer with OS detection and PostgreSQL setup
 - systemd and OpenRC service units
 
+[1.0.0-rc2]: https://base.societus.club/societus/monopsony/releases/tag/v1.0.0-rc2
 [1.0.0-rc1]: https://base.societus.club/societus/monopsony/releases/tag/v1.0.0-rc1
 [0.1.0-rc1]: https://base.societus.club/societus/monopsony/releases/tag/v0.1.0-rc1
