@@ -248,6 +248,7 @@ mod tests {
                 target_dir: "/usr/local/bin".into(),
                 chmod: None,
                 service: None,
+                exec_start: None,
                 config_paths: None,
                 backup_old: false,
                 health_check: None,

@@ -9,6 +9,7 @@ pub mod models;
 pub mod package_manager;
 pub mod pin_store;
 pub mod proto;
+pub mod shadow_diff;
 pub mod shadow_template;
 pub mod shadow_types;
 pub mod version_ord;
@@ -19,4 +20,5 @@ pub use models::*;
 pub use package_manager::{
     PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern,
 };
+pub use shadow_diff::{ShadowDiffClass, ShadowDiffWarning, shadow_diff};
 pub use shadow_template::{StepContext, TemplateError, render_step};

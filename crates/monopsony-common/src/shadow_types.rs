@@ -167,6 +167,12 @@ pub struct RecipeInstall {
     pub chmod: Option<Vec<String>>,
     #[serde(default)]
     pub service: Option<String>,
+    /// The service command line rendered into the unit/init script
+    /// (Sprint 32 Phase 2). Required when `service` is set and the install
+    /// method is build/script; extract installs default it to
+    /// `target_dir/package.name`.
+    #[serde(default)]
+    pub exec_start: Option<String>,
     #[serde(default)]
     pub config_paths: Option<Vec<String>>,
     #[serde(default)]
@@ -747,6 +753,23 @@ mod tests {
         .join("\n");
         let recipe: ShadowRecipe = toml::from_str(&toml).unwrap();
         assert!(recipe.install.binaries.is_empty());
+    }
+
+    #[test]
+    fn exec_start_absent_defaults_to_none() {
+        // Phase 2 schema addition: exec_start is optional everywhere so
+        // pre-Phase-2 recipes keep parsing unchanged.
+        let toml = "method = \"extract\"\ntarget_dir = \"/x\"\nservice = \"x.service\"\n";
+        let inst: RecipeInstall = toml::from_str(toml).unwrap();
+        assert_eq!(inst.service.as_deref(), Some("x.service"));
+        assert!(inst.exec_start.is_none());
+    }
+
+    #[test]
+    fn exec_start_parses_when_set() {
+        let toml = "method = \"extract\"\ntarget_dir = \"/opt/app\"\nservice = \"app.service\"\nexec_start = \"/opt/app/bin/app --serve\"\n";
+        let inst: RecipeInstall = toml::from_str(toml).unwrap();
+        assert_eq!(inst.exec_start.as_deref(), Some("/opt/app/bin/app --serve"));
     }
 
     #[test]

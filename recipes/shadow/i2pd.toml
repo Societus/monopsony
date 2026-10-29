@@ -16,8 +16,10 @@
 #   - install.pre_update / post_update are plain hook STRINGS
 #   - health_check supports http|port|process only (no command type), so
 #     version verification lives in [version] instead
-#   - {target_dir} is substituted literally in build steps; a per-user
-#     path requires tilde expansion support in the executor (proposed)
+#   - build steps use the Phase 1 double-brace engine: {{target_dir}} /
+#     {{version}} substitute from StepContext (whitespace-tolerant); a
+#     leading ~ in target_dir stays literal through rendering and is
+#     expanded executor-side (and by bash $HOME inside the steps)
 
 [package]
 name = "i2pd"
@@ -48,7 +50,7 @@ post_update = "ln -sf $HOME/.local/lib/i2pd/i2pd $HOME/.local/bin/i2pd"
 requires = ["g++", "make"]
 steps = [
     "make -j\"$(nproc)\" BUILD_TYPE=Release",
-    "mkdir -p {target_dir} && cp i2pd {target_dir}/i2pd",
+    "mkdir -p {{target_dir}} && cp i2pd {{target_dir}}/i2pd",
 ]
 
 [asset_selector]

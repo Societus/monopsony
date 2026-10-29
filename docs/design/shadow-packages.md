@@ -98,7 +98,9 @@ From `crates/monopsony-common/src/shadow_types.rs` (`ShadowRecipe`):
 - `[package]` (`RecipePackage`) — `name`, `description`, `homepage`, `source_type`
   (`direct_url` / `git_release` / `github_release` / `binary_sha256`), `source_url`.
 - `[install]` (`RecipeInstall`) — `method` (extract/build/script), `target_dir`, `chmod[]`,
-  `service` (unit name, optional), `config_paths[]`, `backup_old`, `max_backups`,
+  `service` (unit name, optional), `exec_start` (the service command line rendered into
+  the unit/init script; required for build/script recipes that set `service`, defaulted
+  to `target_dir/package.name` for extract), `config_paths[]`, `backup_old`, `max_backups`,
   `binaries[]` (per-binary extract map), and the update hooks: `pre_update`, `post_update`,
   `on_failure`; plus `health_check {type, port/…, timeout_secs}` and `failure_policy`
   (`rollback` / `hold`).

@@ -16,7 +16,8 @@
 //! - `install.config_paths` are NEVER touched by the executor.
 //! - Hooks run as-is via `bash -c`; `|| true` semantics are the recipe
 //!   author's responsibility.
-//! - git_release recipes are rejected with a clear error (not supported yet).
+//! - git_release is only reachable through install.method = build (whose
+//!   steps provision from source; Sprint 32 Phase 1).
 
 #![allow(dead_code)]
 
@@ -25,6 +26,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
+use monopsony_common::shadow_diff::shadow_diff;
+use monopsony_common::shadow_template::{render_step, StepContext};
 use monopsony_common::shadow_types::{
     InstallMethod, ShadowRecipe, ShadowSource, DEFAULT_MONOPSONY_RECIPE,
 };
@@ -32,6 +35,8 @@ use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::shadow;
+use crate::shadow_provision;
+use crate::shadow_service::{detect_init_system, render_service_file, InitSystem, ServiceSpec};
 
 /// Injectable `systemctl`/`journalctl` command runner (test seam).
 type SystemdRunner = Box<dyn Fn(&[&str]) -> Result<String> + Send + Sync>;
@@ -528,6 +533,183 @@ pub struct DowngradeContext<'a> {
     pub interactive: bool,
 }
 
+/// Derive the libc flavor for `StepContext`. Nothing else in the client
+/// derives libc today (heartbeats send it empty), so detect locally: on
+/// Linux, musl's dynamic loader lives at a well-known arch-specific path;
+/// everything else is assumed glibc. Non-Linux platforms return the OS name.
+fn detect_libc() -> String {
+    if std::env::consts::OS != "linux" {
+        return std::env::consts::OS.to_string();
+    }
+    let musl_loaders = [
+        "/lib/ld-musl-x86_64.so.1",
+        "/lib/ld-musl-aarch64.so.1",
+        "/lib/ld-musl-armhf.so.1",
+    ];
+    if musl_loaders.iter().any(|p| Path::new(p).exists()) {
+        "musl".to_string()
+    } else {
+        "glibc".to_string()
+    }
+}
+
+/// Injectable install root for service-script writes (test seam).
+///
+/// Units/init scripts are written under `<root>/systemd/system` and
+/// `<root>/init.d` respectively. Defaults to the real `/etc`; tests point
+/// this at a tempdir so hermetic tests never touch host init state.
+static SERVICE_INSTALL_ROOT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Injectable /etc/os-release CONTENT (test seam). `None` means the
+/// production wrapper reads the real `/etc/os-release` (absent/unreadable →
+/// empty content, which `detect_init_system` maps to systemd by design).
+static OS_RELEASE_OVERRIDE: Mutex<Option<String>> = Mutex::new(None);
+
+fn service_install_root() -> PathBuf {
+    SERVICE_INSTALL_ROOT
+        .lock()
+        .expect("service install root lock")
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/etc"))
+}
+
+/// Production wrapper: os-release content from the test override when set,
+/// otherwise the real file (empty when absent/unreadable — detect_init_system
+/// then lands on systemd).
+fn read_os_release() -> String {
+    if let Some(c) = OS_RELEASE_OVERRIDE
+        .lock()
+        .expect("os-release override lock")
+        .clone()
+    {
+        return c;
+    }
+    std::fs::read_to_string("/etc/os-release").unwrap_or_default()
+}
+
+/// Run async `f` with the service-script test seams installed (install root
+/// and/or os-release content), restoring both overrides afterwards. Tests
+/// using this must hold `TEST_RUNNER_LOCK`: the seams are shared statics and
+/// service-enabled updates also exercise the shared SYSTEMD_RUNNER.
+/// Deliberately no `Send` bounds — `execute_update`'s future is not `Send`
+/// (restore_backup boxes a non-Send future), and tests run on the
+/// current-thread runtime.
+pub async fn with_service_env_async<F, Fut, R>(install_root: Option<PathBuf>, os_release: Option<String>, f: F) -> R
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = R>,
+{
+    *SERVICE_INSTALL_ROOT.lock().expect("service install root lock") = install_root;
+    *OS_RELEASE_OVERRIDE.lock().expect("os-release override lock") = os_release;
+    let result = f().await;
+    *SERVICE_INSTALL_ROOT.lock().expect("service install root lock") = None;
+    *OS_RELEASE_OVERRIDE.lock().expect("os-release override lock") = None;
+    result
+}
+
+/// Detect the init system, render a [`ServiceSpec`] from the recipe, write
+/// the unit/init script to the init-specific path, and enable it.
+///
+/// Persistence default is unless-stopped (v1): the in-binary templates carry
+/// `Restart=on-failure` + `[Install] WantedBy=multi-user.target` (systemd)
+/// and `rc-update add <name> default` (OpenRC); an on-demand knob is
+/// deferred. The service is deliberately NOT started here — fleet recipes
+/// start it in their post_update hook, which runs immediately after this
+/// step (the unit must exist first, hence this runs before that hook).
+///
+/// Rollback semantics: a written unit/init script is NOT rolled back on a
+/// later failure (binary/config rollback only); re-rendering on the next
+/// update is idempotent (the write is an overwrite).
+async fn install_service_script(
+    recipe: &ShadowRecipe,
+    service: &str,
+    log: &mut Vec<String>,
+) -> std::result::Result<(), StageError> {
+    let install = &recipe.install;
+    let init = detect_init_system(&read_os_release());
+
+    // exec_start is validated at plan stage for build/script; extract may
+    // default to target_dir/package.name.
+    let exec_start = install.exec_start.clone().unwrap_or_else(|| {
+        format!(
+            "{}/{}",
+            install.target_dir.trim_end_matches('/'),
+            recipe.package.name
+        )
+    });
+    let unit_name = match init {
+        InitSystem::Systemd => {
+            if service.ends_with(".service") {
+                service.to_string()
+            } else {
+                format!("{service}.service")
+            }
+        }
+        // OpenRC names carry no .service suffix; fleet recipes write the
+        // systemd-style name into `install.service` (e.g. technitium's
+        // "dns.service"), so strip it for the init.d script name.
+        InitSystem::OpenRC => service.trim_end_matches(".service").to_string(),
+    };
+    let spec = ServiceSpec {
+        unit_name: unit_name.clone(),
+        description: recipe
+            .package
+            .description
+            .clone()
+            .unwrap_or_else(|| format!("{} (managed by monopsony)", recipe.package.name)),
+        exec_start,
+        working_dir: install.target_dir.clone(),
+    };
+
+    let rendered = render_service_file(init, &spec)
+        .map_err(|e| stage("service", format!("rendering {init} service file: {e}")))?;
+
+    let path = match init {
+        InitSystem::Systemd => service_install_root()
+            .join("systemd")
+            .join("system")
+            .join(&unit_name),
+        InitSystem::OpenRC => service_install_root().join("init.d").join(&unit_name),
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))
+            .map_err(|e| stage("service", e))?;
+    }
+    std::fs::write(&path, &rendered)
+        .with_context(|| format!("writing {}", path.display()))
+        .map_err(|e| stage("service", e))?;
+    if init == InitSystem::OpenRC {
+        // OpenRC init scripts must be executable to be usable.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("chmod 755 {}", path.display()))
+            .map_err(|e| stage("service", e))?;
+    }
+    log.push(format!(
+        "wrote {init} service script: {}",
+        path.display()
+    ));
+
+    // Enable only (see doc comment: starting is the post_update hook's job).
+    match init {
+        InitSystem::Systemd => {
+            run_systemd_cmd("systemctl", &["daemon-reload"])
+                .await
+                .map_err(|e| stage("service", format!("systemctl daemon-reload: {e}")))?;
+            run_systemd_cmd("systemctl", &["enable", unit_name.as_str()])
+                .await
+                .map_err(|e| stage("service", format!("systemctl enable {unit_name}: {e}")))?;
+        }
+        InitSystem::OpenRC => {
+            run_systemd_cmd("rc-update", &["add", unit_name.as_str(), "default"])
+                .await
+                .map_err(|e| stage("service", format!("rc-update add {unit_name}: {e}")))?;
+        }
+    }
+    Ok(())
+}
+
 /// Execute the full update pipeline for a verified recipe. Never panics;
 /// failures (with rollback when possible) are reported via the outcome.
 pub async fn execute_update(
@@ -651,6 +833,55 @@ pub async fn execute_update(
     }
 }
 
+/// Execute the update pipeline with Sprint 32 Phase 3 update-diffing.
+///
+/// Thin wrapper around [`execute_update`] (same signature plus `previous` —
+/// deliberately NOT a widened `execute_update`, which has ~20 test callers):
+/// when `previous` is `Some`, compute the pure recipe diff
+/// ([`monopsony_common::shadow_diff::shadow_diff`]) between the previously
+/// registered/adopted recipe and the incoming one, and PREPEND the warning
+/// lines — format `diff warning: <class>: <message>` — to the returned
+/// outcome's log. Failure coupling is satisfied by this ordering: on a
+/// health_check failure the warnings are already in the same outcome log that
+/// receives the journalctl capture. `previous = None` (first install, or no
+/// loadable previous recipe) yields zero diff lines and behavior identical to
+/// `execute_update`.
+pub async fn execute_update_with_diff(
+    recipe: &ShadowRecipe,
+    previous: Option<&ShadowRecipe>,
+    target_version: &str,
+    asset_url: &str,
+    http: &reqwest::Client,
+    current_version: Option<&str>,
+    interactive: bool,
+) -> UpdateOutcome {
+    let mut outcome = execute_update(
+        recipe,
+        target_version,
+        asset_url,
+        http,
+        current_version,
+        interactive,
+    )
+    .await;
+    if let Some(old) = previous {
+        // Diff lines are warnings ABOUT the update, so they lead the log; the
+        // executor's own stage lines (including any journalctl capture and
+        // the FAILED line) follow unchanged.
+        let mut log: Vec<String> = Vec::new();
+        for warning in shadow_diff(old, recipe) {
+            log.push(format!(
+                "diff warning: {}: {}",
+                warning.class.label(),
+                warning.message
+            ));
+        }
+        log.extend(outcome.log);
+        outcome.log = log;
+    }
+    outcome
+}
+
 async fn execute_inner(
     recipe: &ShadowRecipe,
     target_version: &str,
@@ -662,13 +893,14 @@ async fn execute_inner(
 ) -> std::result::Result<(), StageError> {
     let install = &recipe.install;
 
-    // git_release is out of scope for the client-side executor.
+    // git_release has no release asset to download; it is only reachable
+    // through the Build pipeline, whose steps provision from source.
     if recipe.package.source_type == ShadowSource::GitRelease
-        || install.method == InstallMethod::Build
+        && install.method != InstallMethod::Build
     {
         return Err(stage(
             "plan",
-            "client-side executor does not support git_release yet",
+            "git_release recipes require install.method = build (no release asset to download)",
         ));
     }
 
@@ -693,17 +925,40 @@ async fn execute_inner(
     // T3.2: capture pre-update systemd baseline before any changes are made,
     // so NRestarts comparisons only count restarts introduced by this update.
     let service = install.service.as_deref();
+
+    // Plan-stage service validation: extract installs can default exec_start
+    // to target_dir/package.name, but a built/scripted tree's service command
+    // line cannot be guessed — fail loud BEFORE any host change (pre_update,
+    // backup, install).
+    if service.is_some()
+        && install.exec_start.is_none()
+        && install.method != InstallMethod::Extract
+    {
+        return Err(stage(
+            "plan",
+            "install.service set without exec_start: build/script recipes require exec_start (no guessing a service command line)",
+        ));
+    }
+
     let mut baseline: Option<SystemdBaseline> = None;
     if service.is_some() {
         baseline = Some(capture_systemd_baseline(service.unwrap()).await);
     }
 
     // Steps 1-2: download the asset to a temp file (skipped for script
-    // recipes with no resolvable URL — the script fetches its own bits).
+    // recipes with no resolvable URL — the script fetches its own bits —
+    // and for build recipes, which provision from source instead).
     let tmp =
         tempfile::tempdir().map_err(|e| stage("download", format!("creating tempdir: {e}")))?;
-    let asset_path = if install.method == InstallMethod::Script && asset_url.is_empty() {
-        log.push("no asset URL resolved; script method will fetch itself".to_string());
+    let asset_path = if (install.method == InstallMethod::Script
+        || install.method == InstallMethod::Build)
+        && asset_url.is_empty()
+    {
+        if install.method == InstallMethod::Build {
+            log.push("build method: no asset URL; steps provision from source".to_string());
+        } else {
+            log.push("no asset URL resolved; script method will fetch itself".to_string());
+        }
         None
     } else {
         let dest = tmp.path().join("asset");
@@ -713,6 +968,22 @@ async fn execute_inner(
         log.push(format!("downloaded {asset_url}"));
         Some(dest)
     };
+
+    // Build recipes: verify build requirements via `which` BEFORE any host
+    // change — pre_update may stop the service and backup mutates the
+    // target, so a missing toolchain must abort before both.
+    if install.method == InstallMethod::Build {
+        let build = recipe.build.as_ref().ok_or_else(|| {
+            stage(
+                "plan",
+                "install.method = build but recipe has no [build] section",
+            )
+        })?;
+        shadow::check_build_deps(&build.requires)
+            .await
+            .map_err(|e| stage("requires", e))?;
+        log.push("build requires: satisfied".to_string());
+    }
 
     // Step 3: pre_update hook (run as-is; failure aborts before any change).
     shadow::run_hook(install.pre_update.as_deref(), "pre_update")
@@ -779,11 +1050,57 @@ async fn execute_inner(
             log.push("update script: ok".to_string());
         }
         InstallMethod::Build => {
-            return Err(stage(
-                "plan",
-                "client-side executor does not support git_release yet",
-            ));
+            let build = recipe.build.as_ref().ok_or_else(|| {
+                stage(
+                    "plan",
+                    "install.method = build but recipe has no [build] section",
+                )
+            })?;
+            let ctx = StepContext {
+                version: target_version.to_string(),
+                target_dir: install.target_dir.clone(),
+                arch: std::env::consts::ARCH.to_string(),
+                os: std::env::consts::OS.to_string(),
+                libc: detect_libc(),
+            };
+            // Render first (legacy single-brace translated at this boundary,
+            // then the double-brace engine), then resolve --source on the
+            // rendered text — a {{target_dir}}/.env guard must compose.
+            let mut rendered = Vec::with_capacity(build.steps.len());
+            for (i, step) in build.steps.iter().enumerate() {
+                let legacy_free = shadow_provision::translate_legacy_braces(step);
+                let r = render_step(&legacy_free, &ctx).map_err(|e| {
+                    stage("build", format!("rendering step {}: {e}", i + 1))
+                })?;
+                rendered.push(r);
+            }
+            log.push(format!("rendered {} build step(s)", rendered.len()));
+            let config_paths = install.config_paths.as_deref().unwrap_or(&[]);
+            let resolved = shadow_provision::resolve_step_sources(
+                &rendered,
+                config_paths,
+                http,
+            )
+            .await
+            .map_err(|e| stage("provision", e))?;
+            // Steps run ONE AT A TIME, fail fast, under the recipe's network
+            // policy (deny is the serde default).
+            let policy = shadow::resolve_network_policy(build.allow_network);
+            for (i, step) in resolved.iter().enumerate() {
+                shadow_provision::run_build_step(step, &policy)
+                    .await
+                    .map_err(|e| stage("build", format!("build step {} failed: {e}", i + 1)))?;
+                log.push(format!("step {}: ok", i + 1));
+            }
         }
+    }
+
+    // Step 5.5: service script — the unit/init script must exist BEFORE the
+    // post_update hook runs (fleet recipes start their service in that hook;
+    // the unit must exist first). Detection/render/enable details live in
+    // install_service_script.
+    if let Some(svc) = service {
+        install_service_script(recipe, svc, log).await?;
     }
 
     // Step 6: post_update hook.
@@ -1052,14 +1369,16 @@ detect_pattern = "([0-9]+)"
     }
 
     #[tokio::test]
-    async fn execute_update_git_release_rejected() {
+    async fn execute_update_git_release_non_build_rejected() {
+        // git_release with method != build has no asset path at all — still
+        // a hard plan error (Build is its only route through the executor).
         let toml = r#"[package]
 name = "gb"
 source_type = "git_release"
 source_url = "https://github.com/example/gb.git"
 
 [install]
-method = "build"
+method = "extract"
 target_dir = "/opt/gb"
 
 [version]
@@ -1074,8 +1393,194 @@ detect_pattern = "([0-9]+)"
             outcome
                 .error
                 .unwrap()
-                .contains("does not support git_release"),
-            "executor must reject git_release"
+                .contains("git_release recipes require install.method = build"),
+            "executor must reject git_release outside the build pipeline"
+        );
+    }
+
+    /// Build-method recipe TOML with the given requires/steps.
+    fn build_recipe_toml(
+        target: &Path,
+        requires: &[&str],
+        allow_network: bool,
+        steps: &[String],
+    ) -> String {
+        let requires_toml = requires
+            .iter()
+            .map(|r| format!("\"{r}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let steps_toml = steps
+            .iter()
+            .map(|s| format!("\"{}\"", s.replace('"', "\\\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            r#"[package]
+name = "built"
+source_type = "git_release"
+source_url = "https://github.com/example/built"
+
+[install]
+method = "build"
+target_dir = "{}"
+backup_old = true
+
+[build]
+requires = [{}]
+allow_network = {}
+steps = [{}]
+
+[version]
+detect_command = "echo 1.0.0"
+detect_pattern = "([0-9.]+)"
+"#,
+            target.display(),
+            requires_toml,
+            allow_network,
+            steps_toml
+        )
+    }
+
+    #[tokio::test]
+    async fn execute_update_build_happy_path_renders_and_runs_steps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+
+        let toml = build_recipe_toml(
+            &target,
+            &["bash"],
+            false,
+            &[
+                "mkdir -p {{target_dir}} && echo v{{version}} > {{target_dir}}/out.txt".to_string(),
+                "test -f {{target_dir}}/out.txt".to_string(),
+            ],
+        );
+        let recipe = parse_recipe(&toml);
+        // Empty asset URL: Build skips the download like Script does.
+        let outcome = execute_update(&recipe, "2.5.0", "", &http_client(), None, false).await;
+        assert!(outcome.success, "outcome: {outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(target.join("out.txt")).unwrap().trim(),
+            "v2.5.0",
+            "StepContext.version is bare semver; the v-prefix is author-composed"
+        );
+        assert!(outcome.log.iter().any(|l| l == "build requires: satisfied"));
+        assert!(outcome.log.iter().any(|l| l == "step 1: ok"));
+        assert!(outcome.log.iter().any(|l| l == "step 2: ok"));
+    }
+
+    #[tokio::test]
+    async fn execute_update_build_legacy_single_brace_steps_translated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+
+        // Already-registered recipes use the asset-template brace style;
+        // the executor boundary must translate the five known names.
+        let toml = build_recipe_toml(
+            &target,
+            &["bash"],
+            false,
+            &["mkdir -p {target_dir} && echo {version} > {target_dir}/legacy.txt".to_string()],
+        );
+        let recipe = parse_recipe(&toml);
+        let outcome = execute_update(&recipe, "3.1.4", "", &http_client(), None, false).await;
+        assert!(outcome.success, "outcome: {outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(target.join("legacy.txt"))
+                .unwrap()
+                .trim(),
+            "3.1.4"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_missing_requires_aborts_before_any_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+
+        let toml = build_recipe_toml(
+            &target,
+            &["monopsony-no-such-binary-xyz"],
+            false,
+            &["mkdir -p {{target_dir}} && touch {{target_dir}}/changed".to_string()],
+        );
+        let recipe = parse_recipe(&toml);
+        let outcome = execute_update(&recipe, "1.0.0", "", &http_client(), None, false).await;
+        assert!(!outcome.success);
+        assert!(!outcome.rolled_back, "nothing to roll back yet");
+        assert!(outcome.backup_path.is_none(), "no backup taken");
+        let err = outcome.error.unwrap();
+        assert!(
+            err.starts_with("requires") && err.contains("monopsony-no-such-binary-xyz"),
+            "stage error must name the missing executable, got: {err}"
+        );
+        assert!(
+            !target.join("changed").exists(),
+            "requires check must abort before any step runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_step_failure_aborts_naming_step_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+
+        let toml = build_recipe_toml(
+            &target,
+            &["bash"],
+            false,
+            &[
+                "mkdir -p {{target_dir}}".to_string(),
+                "exit 7".to_string(),
+                "touch {{target_dir}}/never".to_string(),
+            ],
+        );
+        let recipe = parse_recipe(&toml);
+        let outcome = execute_update(&recipe, "1.0.0", "", &http_client(), None, false).await;
+        assert!(!outcome.success);
+        let err = outcome.error.unwrap();
+        assert!(
+            err.starts_with("build") && err.contains("build step 2 failed"),
+            "error must name the failing step index, got: {err}"
+        );
+        assert!(
+            !target.join("never").exists(),
+            "steps must run one at a time, fail fast: step 3 must never run"
+        );
+        assert!(
+            !outcome.log.iter().any(|l| l == "step 3: ok"),
+            "no ok entry for a step that never ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_step_source_resolution_via_executor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+        let (port, _srv) = spawn_http_server(b"SEED=executor".to_vec());
+
+        let toml = build_recipe_toml(
+            &target,
+            &["bash"],
+            true,
+            &[
+                // The directive-bearing step keeps a runnable remainder:
+                // resolution strips `--source <path> <fallback>` and the
+                // rest executes (the doc's helper name is illustrative).
+                format!(
+                    "true --source {{target_dir}}/.env http://127.0.0.1:{port}/.env.example"
+                ),
+                "cp {{target_dir}}/.env {{target_dir}}/copied.env".to_string(),
+            ],
+        );
+        let recipe = parse_recipe(&toml);
+        let outcome = execute_update(&recipe, "1.0.0", "", &http_client(), None, false).await;
+        assert!(outcome.success, "outcome: {outcome:?}");
+        // The fetched file landed AND the following step consumed it.
+        assert_eq!(
+            std::fs::read(target.join("copied.env")).unwrap(),
+            b"SEED=executor"
         );
     }
 
@@ -1888,15 +2393,23 @@ detect_pattern = "([0-9.]+)"
         let recipe = parse_recipe(&toml);
         let url = format!("http://127.0.0.1:{port}/x.tar.gz");
 
-        // baseline (3 sysctl queries) + journalctl capture on failure
+        // baseline (3 sysctl queries) + service step (daemon-reload, enable)
+        // + journalctl capture on failure. Hermetic: unit writes land in a
+        // temp root, os-release forced to systemd.
+        let svc_root = tempfile::tempdir().unwrap();
         let (runner, _calls) = scripted_fake(vec![
             "ActiveState=active\n".into(),
             "SubState=running\n".into(),
             "NRestarts=0\n".into(),
+            "".into(), // systemctl daemon-reload (service step)
+            "".into(), // systemctl enable fake-unit.service
             "journalctl -u fake-unit -n 50: no errors\n".into(),
         ]);
         set_systemd_runner(Some(runner));
-        let outcome = execute_update(&recipe, "2.0.0", &url, &http_client(), None, false).await;
+        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
+            execute_update(&recipe, "2.0.0", &url, &http_client(), None, false).await
+        })
+        .await;
         set_systemd_runner(None);
 
         assert!(!outcome.success);
@@ -1967,5 +2480,589 @@ detect_pattern = "([0-9.]+)"
         assert!(outcome.success, "outcome: {outcome:?}");
         // A clean success never holds the failed state.
         assert!(!outcome.held, "success must report held=false: {outcome:?}");
+    }
+
+    // --- Sprint 32 Phase 2: service-script wiring (hermetic) ---
+
+    /// Extract-method recipe declaring `install.service`, in the fleet
+    /// convention (technitium carries the .service suffix in the field).
+    fn service_extract_recipe_toml(
+        target: &Path,
+        exec_start: Option<&str>,
+        post: Option<&str>,
+    ) -> String {
+        let mut s = format!(
+            r#"[package]
+name = "svcapp"
+description = "Service App"
+source_type = "direct_url"
+source_url = "https://example.com/svcapp"
+
+[install]
+method = "extract"
+target_dir = "{}"
+service = "svcapp.service"
+backup_old = true
+"#,
+            target.display()
+        );
+        if let Some(e) = exec_start {
+            s.push_str(&format!("exec_start = \"{e}\"\n"));
+        }
+        if let Some(p) = post {
+            s.push_str(&format!("post_update = \"{p}\"\n"));
+        }
+        s.push_str("\n[direct_url]\nversion_discovery = \"scrape\"\nasset_url_template = \"https://example.com/dl/svcapp.tar.gz\"\n");
+        s.push_str("\n[version]\ndetect_command = \"echo 1.0.0\"\ndetect_pattern = \"([0-9.]+)\"\n");
+        s
+    }
+
+    #[tokio::test]
+    async fn service_step_renders_writes_and_enables_systemd_unit() {
+        let _lock = TEST_RUNNER_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let svc_root = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let tarball = make_tar_gz(&[("start.sh", b"NEW")]);
+        let (port, _srv) = spawn_http_server(tarball);
+        let toml = service_extract_recipe_toml(
+            &target,
+            Some("/opt/app/bin/svcapp --serve"),
+            None,
+        );
+        let recipe = parse_recipe(&toml);
+        let url = format!("http://127.0.0.1:{port}/x.tar.gz");
+
+        // baseline(3) + daemon-reload + enable
+        let (runner, calls) = scripted_fake(vec![
+            "ActiveState=active\n".into(),
+            "SubState=running\n".into(),
+            "NRestarts=0\n".into(),
+            "".into(),
+            "".into(),
+        ]);
+        set_systemd_runner(Some(runner));
+        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
+            execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await
+        })
+        .await;
+        set_systemd_runner(None);
+
+        assert!(outcome.success, "outcome: {outcome:?}");
+
+        // Unit written to <root>/systemd/system/<unit>.
+        let unit = svc_root.path().join("systemd/system/svcapp.service");
+        let content = std::fs::read_to_string(&unit)
+            .unwrap_or_else(|e| panic!("unit must be written at {}: {e}", unit.display()));
+        assert!(
+            content.contains("ExecStart=/opt/app/bin/svcapp --serve"),
+            "unit must contain the rendered exec_start: {content}"
+        );
+        assert!(
+            content.contains(&format!("WorkingDirectory={}", target.display())),
+            "unit must contain target_dir as WorkingDirectory: {content}"
+        );
+        assert!(
+            !content.contains("{{"),
+            "a rendered unit containing a literal double-brace placeholder is a bug: {content}"
+        );
+        assert!(outcome.log.iter().any(|l| l.contains("systemd service script")));
+
+        // Enable ran, in order: daemon-reload BEFORE enable. And no start.
+        let c = calls.lock().unwrap();
+        assert_eq!(c[3], vec!["systemctl", "daemon-reload"]);
+        assert_eq!(c[4], vec!["systemctl", "enable", "svcapp.service"]);
+        assert!(
+            !c.iter().any(|a| a.contains(&"start".to_string())),
+            "the executor must never start the service (post_update's job): {c:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_step_exec_start_default_for_extract() {
+        let _lock = TEST_RUNNER_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let svc_root = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let tarball = make_tar_gz(&[("start.sh", b"NEW")]);
+        let (port, _srv) = spawn_http_server(tarball);
+        // exec_start absent: extract method defaults to target_dir/package.name.
+        let toml = service_extract_recipe_toml(&target, None, None);
+        let recipe = parse_recipe(&toml);
+        let url = format!("http://127.0.0.1:{port}/x.tar.gz");
+
+        let (runner, _calls) = scripted_fake(vec![
+            "ActiveState=active\n".into(),
+            "SubState=running\n".into(),
+            "NRestarts=0\n".into(),
+            "".into(),
+            "".into(),
+        ]);
+        set_systemd_runner(Some(runner));
+        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
+            execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await
+        })
+        .await;
+        set_systemd_runner(None);
+
+        assert!(outcome.success, "outcome: {outcome:?}");
+        let content = std::fs::read_to_string(svc_root.path().join("systemd/system/svcapp.service")).unwrap();
+        let expected = format!("{}/svcapp", target.display());
+        assert!(
+            content.contains(&format!("ExecStart={expected}")),
+            "exec_start must default to target_dir/package.name ({expected}): {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_step_build_script_without_exec_start_plan_error_before_any_change() {
+        let _lock = TEST_RUNNER_LOCK.lock().await;
+        let svc_root = tempfile::tempdir().unwrap();
+
+        // Build method: service set, exec_start absent.
+        let btmp = tempfile::tempdir().unwrap();
+        let btarget = btmp.path().join("app");
+        let toml = build_recipe_toml(
+            &btarget,
+            &["bash"],
+            false,
+            &["touch {{target_dir}}/changed".to_string()],
+        )
+        .replace(
+            "backup_old = true",
+            "backup_old = true\nservice = \"built.service\"",
+        );
+        let recipe = parse_recipe(&toml);
+        let (runner, calls) = scripted_fake(vec![]);
+        set_systemd_runner(Some(runner));
+        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
+            execute_update(&recipe, "1.0.0", "", &http_client(), None, false).await
+        })
+        .await;
+        set_systemd_runner(None);
+
+        assert!(!outcome.success);
+        let err = outcome.error.unwrap();
+        assert!(
+            err.starts_with("plan") && err.contains("exec_start"),
+            "must be a plan-stage error naming exec_start, got: {err}"
+        );
+        assert!(
+            !btarget.join("changed").exists(),
+            "plan error must fire before any build step runs"
+        );
+
+        // Script method: same gate.
+        let stmp = tempfile::tempdir().unwrap();
+        let starget = stmp.path().join("app");
+        let toml = format!(
+            r#"[package]
+name = "scripted"
+source_type = "direct_url"
+source_url = "https://example.com/scripted"
+
+[install]
+method = "script"
+target_dir = "{}"
+service = "scripted.service"
+
+[script]
+update = "touch {{}}/marker"
+
+[version]
+detect_command = "echo 1.0"
+detect_pattern = "([0-9.]+)"
+
+[direct_url]
+version_discovery = "scrape"
+asset_url_template = "https://example.com/s"
+"#,
+            starget.display()
+        );
+        let recipe = parse_recipe(&toml);
+        let (runner, calls2) = scripted_fake(vec![]);
+        set_systemd_runner(Some(runner));
+        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
+            execute_update(&recipe, "1.0.0", "", &http_client(), None, false).await
+        })
+        .await;
+        set_systemd_runner(None);
+
+        assert!(!outcome.success);
+        let err = outcome.error.unwrap();
+        assert!(
+            err.starts_with("plan") && err.contains("exec_start"),
+            "script method must hit the same plan gate, got: {err}"
+        );
+        assert!(
+            !starget.join("marker").exists(),
+            "plan error must fire before the script runs"
+        );
+
+        // Nothing was written or run for either case.
+        assert!(calls.lock().unwrap().is_empty(), "no service ops before plan failure");
+        assert!(calls2.lock().unwrap().is_empty(), "no service ops before plan failure");
+        assert_eq!(
+            std::fs::read_dir(svc_root.path()).unwrap().count(),
+            0,
+            "plan-stage refusal must not write any unit/init script"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_step_openrc_writes_init_script_mode_755_and_enables() {
+        let _lock = TEST_RUNNER_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let svc_root = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let tarball = make_tar_gz(&[("start.sh", b"NEW")]);
+        let (port, _srv) = spawn_http_server(tarball);
+        let toml = service_extract_recipe_toml(&target, Some("/opt/app/bin/svcapp --serve"), None);
+        let recipe = parse_recipe(&toml);
+        let url = format!("http://127.0.0.1:{port}/x.tar.gz");
+
+        // Injected Alpine os-release content → OpenRC path.
+        let alpine = "NAME=\"Alpine Linux\"\nID=alpine\n";
+        // baseline(3, best-effort systemctl shows even on OpenRC hosts) + rc-update add
+        let (runner, calls) = scripted_fake(vec![
+            "ActiveState=active\n".into(),
+            "SubState=running\n".into(),
+            "NRestarts=0\n".into(),
+            "".into(),
+        ]);
+        set_systemd_runner(Some(runner));
+        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(alpine.to_string()), || async {
+            execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await
+        })
+        .await;
+        set_systemd_runner(None);
+
+        assert!(outcome.success, "outcome: {outcome:?}");
+
+        let script = svc_root.path().join("init.d/svcapp");
+        let content = std::fs::read_to_string(&script)
+            .unwrap_or_else(|e| panic!("init script must be written at {}: {e}", script.display()));
+        assert!(content.starts_with("#!/sbin/openrc-run"), "got: {content}");
+        assert!(
+            content.contains("command=\"/opt/app/bin/svcapp --serve\""),
+            "init script must render exec_start: {content}"
+        );
+        assert!(
+            content.contains(&format!("directory=\"{}\"", target.display())),
+            "init script must render working_dir: {content}"
+        );
+        assert!(!content.contains("{{"), "no literal placeholders may survive: {content}");
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "init script must be mode 755");
+
+        let c = calls.lock().unwrap();
+        assert_eq!(c[3], vec!["rc-update", "add", "svcapp", "default"]);
+    }
+
+    #[tokio::test]
+    async fn rollback_after_failure_leaves_written_unit_in_place() {
+        let _lock = TEST_RUNNER_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let svc_root = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("start.sh"), b"OLD").unwrap();
+
+        let tarball = make_tar_gz(&[("start.sh", b"NEW")]);
+        let (port, _srv) = spawn_http_server(tarball);
+        // post_update fails AFTER the unit was written and enabled.
+        let toml = service_extract_recipe_toml(
+            &target,
+            Some("/opt/app/bin/svcapp --serve"),
+            Some("exit 9"),
+        );
+        let recipe = parse_recipe(&toml);
+        let url = format!("http://127.0.0.1:{port}/x.tar.gz");
+
+        let (runner, _calls) = scripted_fake(vec![
+            "ActiveState=active\n".into(),
+            "SubState=running\n".into(),
+            "NRestarts=0\n".into(),
+            "".into(), // daemon-reload
+            "".into(), // enable
+        ]);
+        set_systemd_runner(Some(runner));
+        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
+            execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await
+        })
+        .await;
+        set_systemd_runner(None);
+
+        assert!(!outcome.success);
+        assert!(outcome.rolled_back, "binary/config must roll back: {outcome:?}");
+        assert!(
+            outcome.error.as_deref().unwrap_or_default().starts_with("post_update"),
+            "got: {outcome:?}"
+        );
+        // Decision 5: the written unit is NOT rolled back — re-render on the
+        // next update is idempotent (overwrite).
+        assert!(
+            svc_root.path().join("systemd/system/svcapp.service").exists(),
+            "unit-survives-rollback: written unit must remain after rollback"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_service_field_means_zero_service_ops() {
+        let _lock = TEST_RUNNER_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let svc_root = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let tarball = make_tar_gz(&[("start.sh", b"NEW")]);
+        let (port, _srv) = spawn_http_server(tarball);
+        let toml = recipe_toml(&target, None, None, None, 3);
+        let recipe = parse_recipe(&toml);
+        let url = format!("http://127.0.0.1:{port}/x.tar.gz");
+
+        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
+            execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await
+        })
+        .await;
+
+        assert!(outcome.success, "outcome: {outcome:?}");
+        assert_eq!(
+            std::fs::read_dir(svc_root.path()).unwrap().count(),
+            0,
+            "no service field → no unit/init script writes"
+        );
+        assert!(
+            !outcome.log.iter().any(|l| l.contains("service script")),
+            "no service field → no service-script log entries: {:?}",
+            outcome.log
+        );
+    }
+
+    // --- Sprint 32 Phase 3: execute_update_with_diff (update diffing) ---
+
+    /// Script-method recipe (no service, empty asset URL → no download):
+    /// the cheapest green path; `detect_command` slot is parameterized so
+    /// tests can diff the inert version-detect pair.
+    fn script_recipe_toml(target: &Path, outfile: &Path, detect_command: &str) -> String {
+        format!(
+            r#"[package]
+name = "scripted"
+source_type = "direct_url"
+source_url = "https://example.com/scripted"
+
+[install]
+method = "script"
+target_dir = "{}"
+
+[script]
+update = "echo $MONOPSONY_VERSION > {}"
+
+[version]
+detect_command = "{}"
+detect_pattern = "([0-9.]+)"
+
+[direct_url]
+version_discovery = "scrape"
+asset_url_template = "https://example.com/s"
+"#,
+            target.display(),
+            outfile.display(),
+            detect_command
+        )
+    }
+
+    #[tokio::test]
+    async fn with_diff_prepends_warnings_and_keeps_success_path_green() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+        std::fs::create_dir_all(&target).unwrap();
+        let outfile = tmp.path().join("diff-out.txt");
+
+        // New recipe executes; the previous recipe differs only in the
+        // version-detect pair (inert to execution) → exactly one warning.
+        let new_recipe = parse_recipe(&script_recipe_toml(&target, &outfile, "echo 1.0"));
+        let old_recipe = parse_recipe(&script_recipe_toml(
+            &target,
+            &outfile,
+            "/usr/bin/scripted --version",
+        ));
+
+        let outcome = execute_update_with_diff(
+            &new_recipe,
+            Some(&old_recipe),
+            "7.7.7",
+            "",
+            &http_client(),
+            None,
+            false,
+        )
+        .await;
+
+        assert!(outcome.success, "outcome: {outcome:?}");
+        let diff_lines: Vec<&String> = outcome
+            .log
+            .iter()
+            .filter(|l| l.starts_with("diff warning: "))
+            .collect();
+        assert_eq!(diff_lines.len(), 1, "log: {:?}", outcome.log);
+        assert!(
+            diff_lines[0].contains("version_detect") && diff_lines[0].contains("/usr/bin/scripted"),
+            "warning must name class and old value: {}",
+            diff_lines[0]
+        );
+        // PREPEND contract: diff lines lead, executor stage lines follow.
+        assert!(outcome.log[0].starts_with("diff warning: "));
+        assert_eq!(
+            outcome.log[1],
+            "no asset URL resolved; script method will fetch itself"
+        );
+        // The update itself still ran end to end.
+        assert_eq!(std::fs::read_to_string(&outfile).unwrap().trim(), "7.7.7");
+    }
+
+    #[tokio::test]
+    async fn with_diff_previous_none_adds_no_diff_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+        std::fs::create_dir_all(&target).unwrap();
+        let outfile = tmp.path().join("diff-out-none.txt");
+
+        let recipe = parse_recipe(&script_recipe_toml(&target, &outfile, "echo 1.0"));
+        let outcome = execute_update_with_diff(
+            &recipe,
+            None,
+            "7.7.7",
+            "",
+            &http_client(),
+            None,
+            false,
+        )
+        .await;
+
+        assert!(outcome.success, "outcome: {outcome:?}");
+        assert!(
+            !outcome.log.iter().any(|l| l.starts_with("diff warning: ")),
+            "previous=None (first install) must stay silent: {:?}",
+            outcome.log
+        );
+    }
+
+    #[tokio::test]
+    async fn with_diff_failure_path_carries_warnings_and_journalctl_in_same_log() {
+        let _lock = TEST_RUNNER_LOCK.lock().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("start.sh"), b"OLD").unwrap();
+
+        let tarball = make_tar_gz(&[("start.sh", b"NEW")]);
+        let (port, _srv) = spawn_http_server(tarball);
+        let url = format!("http://127.0.0.1:{port}/x.tar.gz");
+
+        // failure_policy=hold + closed-port health check: the health stage
+        // fails and journalctl is captured into the outcome log (T3.5).
+        let failure_toml = format!(
+            r#"[package]
+name = "pkg"
+source_type = "direct_url"
+source_url = "https://example.com/pkg"
+
+[install]
+method = "extract"
+target_dir = "{}"
+backup_old = true
+failure_policy = "hold"
+service = "fake-unit"
+
+[install.health_check]
+type = "port"
+port = {}
+timeout_secs = 1
+
+[direct_url]
+version_discovery = "scrape"
+asset_url_template = "https://example.com/p.tar.gz"
+
+[version]
+detect_command = "echo 1.0"
+detect_pattern = "([0-9.]+)"
+"#,
+            target.display(),
+            closed_port()
+        );
+        let new_recipe = parse_recipe(&failure_toml);
+        // The previously registered recipe used the OLD unit name → one
+        // service-unit diff warning on this update.
+        let old_recipe = parse_recipe(
+            &failure_toml.replace("service = \"fake-unit\"", "service = \"old-unit.service\""),
+        );
+
+        // baseline (3 systemctl shows) + service step (daemon-reload, enable)
+        // + journalctl capture on health failure. Hermetic seams as in the
+        // Phase 2 service tests.
+        let svc_root = tempfile::tempdir().unwrap();
+        let (runner, _calls) = scripted_fake(vec![
+            "ActiveState=active\n".into(),
+            "SubState=running\n".into(),
+            "NRestarts=0\n".into(),
+            "".into(),
+            "".into(),
+            "journalctl -u fake-unit -n 50: no errors\n".into(),
+        ]);
+        set_systemd_runner(Some(runner));
+        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
+            execute_update_with_diff(
+                &new_recipe,
+                Some(&old_recipe),
+                "2.0.0",
+                &url,
+                &http_client(),
+                None,
+                false,
+            )
+            .await
+        })
+        .await;
+        set_systemd_runner(None);
+
+        assert!(!outcome.success);
+        let diff_idx = outcome
+            .log
+            .iter()
+            .position(|l| l.starts_with("diff warning: "))
+            .expect("diff warnings must be present on the failure path");
+        let diff_lines: Vec<&String> = outcome
+            .log
+            .iter()
+            .filter(|l| l.starts_with("diff warning: "))
+            .collect();
+        assert_eq!(diff_lines.len(), 1, "log: {:?}", outcome.log);
+        assert!(
+            diff_lines[0].contains("service_unit") && diff_lines[0].contains("old-unit.service"),
+            "warning must name the service-unit diff: {}",
+            diff_lines[0]
+        );
+        let failed_idx = outcome
+            .log
+            .iter()
+            .position(|l| l.contains("update FAILED at stage 'health_check'"))
+            .expect("failure line must be in the same log");
+        let journal_idx = outcome
+            .log
+            .iter()
+            .position(|l| l.contains("journalctl"))
+            .expect("journalctl capture must be in the same log");
+        // Failure coupling via ordering: the warnings lead the shared log.
+        assert!(diff_idx < failed_idx, "log: {:?}", outcome.log);
+        assert!(diff_idx < journal_idx, "log: {:?}", outcome.log);
     }
 }

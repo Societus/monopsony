@@ -4,6 +4,7 @@ mod proxy_toggle;
 mod shadow;
 mod shadow_cli;
 mod shadow_executor;
+mod shadow_provision;
 mod system_proxy;
 mod ws_transport;
 
@@ -3374,24 +3375,35 @@ async fn run_shadow_package(
                 .user_agent("monopsony-client/shadow-executor")
                 .build()
                 .context("building HTTP client")?;
-            let asset_url = match shadow_executor::resolve_asset_url(
-                &recipe,
-                &update.asset_url,
-                &update.latest_version,
-                &http,
-            )
-            .await
+            // Build-method recipes provision from source via [build].steps:
+            // there is no release asset to resolve (git_release recipes
+            // would error in resolve_asset_url), so pass an empty URL —
+            // the executor skips the download for Build + empty URL the
+            // same way it does for Script.
+            let asset_url = if recipe.install.method
+                == monopsony_common::shadow_types::InstallMethod::Build
             {
-                Ok(url) => url,
-                Err(e)
-                    if recipe.install.method
-                        == monopsony_common::shadow_types::InstallMethod::Script =>
+                String::new()
+            } else {
+                match shadow_executor::resolve_asset_url(
+                    &recipe,
+                    &update.asset_url,
+                    &update.latest_version,
+                    &http,
+                )
+                .await
                 {
-                    println!("  Asset:     none resolved ({e}); script will fetch itself");
-                    String::new()
-                }
-                Err(e) => {
-                    anyhow::bail!("could not resolve asset URL for '{}': {e}", name);
+                    Ok(url) => url,
+                    Err(e)
+                        if recipe.install.method
+                            == monopsony_common::shadow_types::InstallMethod::Script =>
+                    {
+                        println!("  Asset:     none resolved ({e}); script will fetch itself");
+                        String::new()
+                    }
+                    Err(e) => {
+                        anyhow::bail!("could not resolve asset URL for '{}': {e}", name);
+                    }
                 }
             };
             if !asset_url.is_empty() {
@@ -3420,8 +3432,17 @@ async fn run_shadow_package(
             // Execute the verified recipe: download → pre_update → backup →
             // install (extract/script) → post_update → health check, with
             // automatic restore-from-backup on failure.
-            let outcome = shadow_executor::execute_update(
+            //
+            // Sprint 32 Phase 3: go through the diffing wrapper so recipe
+            // requirement changes land in the same update log. GAP (recorded,
+            // per hub decision 4): the client has NO local store of the
+            // previously registered/adopted recipe (Sprint 30 persistence is
+            // server-side only; recipes are fetched via gRPC), so previous is
+            // always None today — zero diff warnings until a loadable
+            // accessor lands. Do not invent new persistence here.
+            let outcome = shadow_executor::execute_update_with_diff(
                 &recipe,
+                None,
                 &update.latest_version,
                 &asset_url,
                 &http,
