@@ -85,7 +85,7 @@ monopsony/
     │       ├── config.rs         # ServerConfig, ClientConfig + sub-structs (all TOML-based)
     │       ├── models.rs         # ClientId, PackageId, ApiKeyId, Client, Package, ClientPackage, ApiKey, PurgeEntry, OsInfo, ServerStatus, DiscoveryInfo
     │       ├── error.rs          # Error enum (Config, Io, Database, PackageManager, Cache, Network, Tls, Certificate, Auth, Discovery, Grpc, InvalidUrl, PackageNotFound, ClientNotFound, UpstreamFetch, HashMismatch, CommandFailed, Parse, Toml)
-    │       ├── metrics.rs        # Metric names + helper fns (cache_request_hit/miss, cache_bytes_served, etc.) — NEVER CALLED from code
+    │       ├── metrics.rs        # Metric names + helper fns (cache_request_hit/miss, etc.) — called from client proxy + control client_health
     │       ├── proto.rs          # Re-exports tonic-generated proto types
     │       ├── shadow_types.rs  # Shared types: ShadowSource, InstallMethod, ShadowRecipe, ReleaseAsset, AssetSelector, HealthCheck
     │       └── package_manager/
@@ -245,7 +245,7 @@ The server's HTTP proxy is the most complete module. It:
 | Auth | API keys (validated over mTLS connection) |
 | Database | PostgreSQL (via `sqlx` with `runtime-tokio`, `tls-rustls`) |
 | HTTP framework | `axum` 0.7 (server proxy), `hyper` 1.x (upstream client) |
-| Observability | Prometheus metrics (`metrics` crate) — defined but never called. No metrics server started. |
+| Observability | Prometheus metrics (`metrics` crate) — wired into proxy/gRPC/prefetch/mirror; exporter on :9090/metrics |
 | CLI | `clap` 4 with derive macros |
 | Caching | File-based with JSON sidecar metadata (will migrate to PostgreSQL for tracking) |
 
@@ -258,7 +258,7 @@ The server's HTTP proxy is the most complete module. It:
 - **sqlx** 0.8 (postgres, chrono, uuid) — Database
 - **rustls** 0.23, **rcgen** 0.13 (with x509-parser feature) — TLS/CA
 - **mdns-sd** 0.11 — mDNS discovery
-- **metrics** 0.24, **metrics-exporter-prometheus** 0.16 — Observability (defined but unused)
+- **metrics** 0.24, **metrics-exporter-prometheus** 0.16 — Observability (wired into proxy/gRPC/prefetch/mirror; :9090 exporter)
 - **clap** 4 (derive, env) — CLI
 - **tracing** 0.1, **tracing-subscriber** 0.3 (env-filter, json) — Logging
 - **sha2** 0.10, **hex** 0.4 — Hashing

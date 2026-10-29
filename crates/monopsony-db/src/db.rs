@@ -85,17 +85,6 @@ pub struct ScanResultRow {
     pub scanned_at: chrono::DateTime<Utc>,
 }
 
-/// Row from cache_pins: a signed origin-integrity pin for a cached URL.
-#[derive(Debug, Clone)]
-pub struct PinRow {
-    pub url: String,
-    pub expected_sha256: String,
-    pub origin: String,
-    pub key_id: String,
-    pub observed_at: i64,
-    pub signature: String,
-}
-
 /// New tamper alert to insert into tamper_alerts.
 #[derive(Debug, Clone)]
 pub struct TamperAlertInsert {
@@ -1323,59 +1312,6 @@ impl Database {
             hit_count: r.get("hit_count"),
             sha256: r.get("sha256"),
         }))
-    }
-
-    /// Record (or update) a signed origin-integrity pin for a cached URL.
-    pub async fn record_pin(&self, pin: &PinRow) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO cache_pins (url, expected_sha256, origin, key_id, observed_at, signature)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (url) DO UPDATE SET
-                 expected_sha256 = EXCLUDED.expected_sha256,
-                 origin = EXCLUDED.origin,
-                 key_id = EXCLUDED.key_id,
-                 observed_at = EXCLUDED.observed_at,
-                 signature = EXCLUDED.signature",
-        )
-        .bind(&pin.url)
-        .bind(&pin.expected_sha256)
-        .bind(&pin.origin)
-        .bind(&pin.key_id)
-        .bind(pin.observed_at)
-        .bind(&pin.signature)
-        .execute(&self.pool)
-        .await?;
-        debug!("Recorded pin for {}", pin.url);
-        Ok(())
-    }
-
-    /// Fetch the pin for a URL, if one exists.
-    pub async fn get_pin(&self, url: &str) -> Result<Option<PinRow>> {
-        let row = sqlx::query(
-            "SELECT url, expected_sha256, origin, key_id, observed_at, signature
-             FROM cache_pins WHERE url = $1",
-        )
-        .bind(url)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row.map(|r| PinRow {
-            url: r.get("url"),
-            expected_sha256: r.get("expected_sha256"),
-            origin: r.get("origin"),
-            key_id: r.get("key_id"),
-            observed_at: r.get("observed_at"),
-            signature: r.get("signature"),
-        }))
-    }
-
-    /// Delete the pin for a URL. Returns true if a row was removed.
-    pub async fn delete_pin(&self, url: &str) -> Result<bool> {
-        let result = sqlx::query("DELETE FROM cache_pins WHERE url = $1")
-            .bind(url)
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected() > 0)
     }
 
     /// Record a shadow recipe remote-assignment audit entry (Sprint 22 Phase F).

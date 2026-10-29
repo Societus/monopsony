@@ -1574,7 +1574,8 @@ async fn run_tee(
                 debug!("Pinned {} (origin {})", ctx.url, pin_origin.as_str());
             }
         }
-        // DB upsert: slice-2 wires db.record_pin()
+        // No DB upsert by decision (2026-10-29): the pin file is the source of
+        // truth; the unwired cache_pins DB CRUD was dead code and was removed.
     }
 
     if let Some(db) = &ctx.state.db {
