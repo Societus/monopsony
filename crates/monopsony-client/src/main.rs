@@ -2933,6 +2933,77 @@ async fn run_cache_stats(server: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Helper: fetch the signed recipe for a package and verify it against the
+// client trust policy. Returns the recipe TOML on success. Without a
+// verifying key configured we still check policy shape via
+// trust::verify_recipe_trust (which bails when the policy needs a key).
+// Module-private so the accept flow shares the exact same verification path
+// as the register/update dispatch.
+async fn load_verified_recipe(
+    client: &mut grpc_client::MonopsonyGrpcClient,
+    client_id: &str,
+    name: &str,
+) -> anyhow::Result<String> {
+    let (recipe_toml, key_id, signature_b64, signed_at) =
+        client.get_shadow_recipe(client_id, name).await?;
+    let recipe: monopsony_common::shadow_types::ShadowRecipe =
+        toml::from_str(&recipe_toml).context("server recipe failed to parse as TOML")?;
+    let signed = monopsony_common::shadow_types::SignedRecipe {
+        recipe_toml: recipe_toml.clone(),
+        recipe,
+        operator_signature: monopsony_common::shadow_types::RecipeSignature {
+            key_id,
+            signature: signature_b64,
+            signed_at: chrono::DateTime::<chrono::Utc>::from_timestamp(signed_at, 0)
+                .unwrap_or_default(),
+        },
+        author_signature: None,
+    };
+
+    // Load trust config (same source the Update arm documents).
+    // Only the [shadow_trust] section is needed here; the full
+    // ClientConfig requires [client]/[server]/[tls]/[proxy]/[metrics]/[logging]
+    // which a minimal client.toml may not have. Parse just shadow_trust
+    // so a trust-only config file works.
+    let config_path = std::env::var("MONOPSONY_CLIENT_CONFIG")
+        .unwrap_or_else(|_| "/etc/monopsony/client.toml".to_string());
+    let trust_config = std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|content| toml::from_str::<toml::Value>(&content).ok())
+        .and_then(|value| value.get("shadow_trust").cloned())
+        .map(|table| {
+            let policy = table
+                .get("policy")
+                .and_then(|v| v.as_str())
+                .unwrap_or("trusted_server_only")
+                .to_string();
+            let operator_verifying_key_path = table
+                .get("operator_verifying_key_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            monopsony_common::config::ShadowPackageTrustConfig {
+                policy,
+                trusted_author_keys: vec![],
+                trusted_operator_keys: vec![],
+                operator_verifying_key_path,
+                accept_remote_assignment: false,
+            }
+        })
+        .unwrap_or_default();
+
+    // Without a locally configured operator verifying key we pass None;
+    // verify_recipe_trust enforces the policy (e.g. trusted_authors works
+    // without the raw key, trusted_server_only fails closed without one).
+    let operator_vk = load_operator_verifying_key(&trust_config);
+    trust::verify_recipe_trust(&signed, &trust_config, operator_vk.as_ref()).context(
+        format!(
+            "trust verification failed for recipe of '{}' (key_id: {})",
+            name, signed.operator_signature.key_id
+        ),
+    )?;
+    Ok(recipe_toml)
+}
+
 async fn run_shadow_package(
     cmd: shadow_cli::PackageCommand,
     cert_dir: &Path,
@@ -2966,75 +3037,6 @@ async fn run_shadow_package(
                     .join(", ")
             ),
         }
-    }
-
-    // Helper: fetch the signed recipe for a package and verify it against the
-    // client trust policy. Returns the recipe TOML on success. Without a
-    // verifying key configured we still check policy shape via
-    // trust::verify_recipe_trust (which bails when the policy needs a key).
-    async fn load_verified_recipe(
-        client: &mut grpc_client::MonopsonyGrpcClient,
-        client_id: &str,
-        name: &str,
-    ) -> anyhow::Result<String> {
-        let (recipe_toml, key_id, signature_b64, signed_at) =
-            client.get_shadow_recipe(client_id, name).await?;
-        let recipe: monopsony_common::shadow_types::ShadowRecipe =
-            toml::from_str(&recipe_toml).context("server recipe failed to parse as TOML")?;
-        let signed = monopsony_common::shadow_types::SignedRecipe {
-            recipe_toml: recipe_toml.clone(),
-            recipe,
-            operator_signature: monopsony_common::shadow_types::RecipeSignature {
-                key_id,
-                signature: signature_b64,
-                signed_at: chrono::DateTime::<chrono::Utc>::from_timestamp(signed_at, 0)
-                    .unwrap_or_default(),
-            },
-            author_signature: None,
-        };
-
-        // Load trust config (same source the Update arm documents).
-        // Only the [shadow_trust] section is needed here; the full
-        // ClientConfig requires [client]/[server]/[tls]/[proxy]/[metrics]/[logging]
-        // which a minimal client.toml may not have. Parse just shadow_trust
-        // so a trust-only config file works.
-        let config_path = std::env::var("MONOPSONY_CLIENT_CONFIG")
-            .unwrap_or_else(|_| "/etc/monopsony/client.toml".to_string());
-        let trust_config = std::fs::read_to_string(&config_path)
-            .ok()
-            .and_then(|content| toml::from_str::<toml::Value>(&content).ok())
-            .and_then(|value| value.get("shadow_trust").cloned())
-            .map(|table| {
-                let policy = table
-                    .get("policy")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("trusted_server_only")
-                    .to_string();
-                let operator_verifying_key_path = table
-                    .get("operator_verifying_key_path")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                monopsony_common::config::ShadowPackageTrustConfig {
-                    policy,
-                    trusted_author_keys: vec![],
-                    trusted_operator_keys: vec![],
-                    operator_verifying_key_path,
-                    accept_remote_assignment: false,
-                }
-            })
-            .unwrap_or_default();
-
-        // Without a locally configured operator verifying key we pass None;
-        // verify_recipe_trust enforces the policy (e.g. trusted_authors works
-        // without the raw key, trusted_server_only fails closed without one).
-        let operator_vk = load_operator_verifying_key(&trust_config);
-        trust::verify_recipe_trust(&signed, &trust_config, operator_vk.as_ref()).context(
-            format!(
-                "trust verification failed for recipe of '{}' (key_id: {})",
-                name, signed.operator_signature.key_id
-            ),
-        )?;
-        Ok(recipe_toml)
     }
 
     match cmd {
@@ -3856,7 +3858,22 @@ async fn run_shadow_view(cert_dir: &Path) -> anyhow::Result<()> {
             }
         }
     }
-    println!("\nUse `monopsony-client shadow accept --name <package>` to review and approve.");
+    println!(
+        "\nUse `monopsony-client package accept --name <package>` to review and approve."
+    );
+    Ok(())
+}
+
+/// Fails when a resolved asset URL still contains an unresolved template
+/// placeholder (a literal `{`), e.g. when the recipe's detect_pattern could
+/// not be expanded because the installed version was undetectable. Pure, so
+/// the accept flow can gate the install on it without side effects.
+fn validate_resolved_asset_url(asset_url: &str) -> anyhow::Result<()> {
+    if asset_url.contains('{') {
+        anyhow::bail!(
+            "resolved asset URL still contains an unresolved template placeholder: '{asset_url}' — fix the recipe's [version] detect_pattern so it matches the installed version string"
+        );
+    }
     Ok(())
 }
 
@@ -3901,9 +3918,7 @@ async fn run_shadow_accept(
             Err(msg) => anyhow::bail!("{msg}"),
         }
     };
-    let (recipe_toml, _key_id, _signature, _signed_at) = client
-        .get_shadow_recipe(&client_id, &selected.recipe_name)
-        .await?;
+    let recipe_toml = load_verified_recipe(&mut client, &client_id, &selected.recipe_name).await?;
     let recipe: monopsony_common::shadow_types::ShadowRecipe =
         toml::from_str(&recipe_toml).context("staged recipe failed to parse as TOML")?;
     let (final_target_dir, final_accessory_dirs, final_firewall_rules, final_health_check): (
@@ -4018,14 +4033,24 @@ async fn run_shadow_accept(
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
-    let asset_url =
-        shadow_executor::resolve_asset_url(&recipe, "", &recipe.version.detect_pattern, &http)
-            .await
-            .unwrap_or_default();
+    // Detect the currently installed version BEFORE resolving the asset URL:
+    // resolve_asset_url needs the real version to fill its template, and the
+    // same value is passed to execute_update as the version being installed.
     let current_version = shadow_executor::detect_current_version(&recipe_toml).await;
+    let target_version = current_version.clone().unwrap_or_default();
+    if target_version.is_empty() {
+        eprintln!(
+            "⚠ Could not detect the currently installed version of {}; asset URL resolution may fail.",
+            selected.recipe_name
+        );
+    }
+    let asset_url = shadow_executor::resolve_asset_url(&recipe, "", &target_version, &http)
+        .await
+        .unwrap_or_default();
+    validate_resolved_asset_url(&asset_url)?;
     let outcome = shadow_executor::execute_update(
         &recipe,
-        "1.0.0",
+        &target_version,
         &asset_url,
         &http,
         current_version.as_deref(),
@@ -4479,5 +4504,33 @@ mod remote_assignment_tests {
         // Opted in but trust failed → refused.
         assert!(!remote_assignment_allowed(true, false));
         assert!(!remote_assignment_allowed(false, false));
+    }
+}
+
+#[cfg(test)]
+mod resolved_asset_url_tests {
+    use super::validate_resolved_asset_url;
+
+    #[test]
+    fn placeholder_free_url_passes() {
+        assert!(validate_resolved_asset_url(
+            "https://example.com/download/tool-1.2.3-linux-amd64.tar.gz"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn unresolved_placeholder_fails_naming_recipe_field() {
+        let err = validate_resolved_asset_url("https://example.com/download/tool-{version}.tar.gz")
+            .expect_err("placeholder URL must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("detect_pattern"),
+            "error should name the recipe field to fix, got: {msg}"
+        );
+        assert!(
+            msg.contains("placeholder"),
+            "error should mention the placeholder, got: {msg}"
+        );
     }
 }
