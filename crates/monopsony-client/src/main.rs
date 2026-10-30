@@ -51,12 +51,17 @@ mod index_parse;
 mod lang_pm_config;
 mod ledger;
 mod oracle_update;
+mod os_release;
+// Sprint 29 Phase 3 (grounding D5): vendor preflight parsing — readiness
+// verdict + notes via WARN/FAIL from the platform's own tools.
 mod pin_verify;
+mod preflight;
 mod proxy;
 mod self_update;
-mod trust;
 mod shadow_scorer;
 mod shadow_service;
+mod trust;
+mod update_counts;
 mod update_health;
 
 #[derive(Parser, Debug)]
@@ -558,8 +563,20 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Configure { server }) => {
             run_configure(&server).await?;
         }
-        Some(Commands::Pair { server, code, pin, enrollment_key }) => {
-            run_pair(&server, code.as_deref(), pin, enrollment_key.as_deref(), &cert_dir).await?;
+        Some(Commands::Pair {
+            server,
+            code,
+            pin,
+            enrollment_key,
+        }) => {
+            run_pair(
+                &server,
+                code.as_deref(),
+                pin,
+                enrollment_key.as_deref(),
+                &cert_dir,
+            )
+            .await?;
         }
         Some(Commands::Mirror {
             server,
@@ -583,14 +600,12 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Override { mode }) => {
             run_override(mode, &cert_dir).await?;
         }
-        Some(Commands::Setup { cmd }) => {
-            match cmd {
-                SetupMode::Interactive { server, all } => {
-                    run_setup_interactive(server.as_deref(), all, &cert_dir).await?;
-                }
-                other => run_setup(other)?,
+        Some(Commands::Setup { cmd }) => match cmd {
+            SetupMode::Interactive { server, all } => {
+                run_setup_interactive(server.as_deref(), all, &cert_dir).await?;
             }
-        }
+            other => run_setup(other)?,
+        },
         Some(Commands::UpdateScan) => {
             run_update_scan()?;
         }
@@ -1164,7 +1179,7 @@ async fn handle_remote_assignment(
             &install_paths,
             &[], // config_paths: not consumed from the pushed recipe
             &service_name,
-            "", // binary_sha256: not probed on the heartbeat path
+            "",    // binary_sha256: not probed on the heartbeat path
             false, // mask_from_pm: opt-in only
         )
         .await
@@ -1418,6 +1433,21 @@ async fn run_daemon(
         const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
         const INVENTORY_INTERVAL: Duration = Duration::from_secs(300);
 
+        // Sprint 29 B1 (grounding D2): the client reports its own distro
+        // identity, read once at daemon start.
+        let distro_info = os_release::detect();
+
+        // Sprint 29 B1 (grounding D3): upgradable counts computed at
+        // inventory cadence, cached locally, attached to heartbeats while
+        // fresh. Option<(counts, computed_at)>; None until first compute.
+        let mut update_counts: Option<(update_counts::AggregatedUpdateCounts, std::time::Instant)> =
+            None;
+
+        // Sprint 29 Phase 3 (grounding D5): vendor preflight verdict,
+        // computed at the same TTL cadence as the counts — vendor tools can
+        // take seconds to minutes, never per heartbeat tick.
+        let mut preflight: Option<(preflight::PreflightVerdict, std::time::Instant)> = None;
+
         // Live TLS config for the control connection. Rotated in place after
         // a successful mid-connection renewal — the connection itself is
         // never dropped; the new cert/key take effect on the next handshake.
@@ -1454,8 +1484,11 @@ async fn run_daemon(
             let mut client = if server_addr_for_task.starts_with("wss://")
                 || server_addr_for_task.starts_with("ws://")
             {
-                match grpc_client::MonopsonyGrpcClient::connect_ws(&server_addr_for_task, Some(tls.clone()))
-                    .await
+                match grpc_client::MonopsonyGrpcClient::connect_ws(
+                    &server_addr_for_task,
+                    Some(tls.clone()),
+                )
+                .await
                 {
                     Ok(c) => {
                         info!("Connected to server via WebSocket tunnel");
@@ -1470,8 +1503,11 @@ async fn run_daemon(
                     }
                 }
             } else {
-                match grpc_client::MonopsonyGrpcClient::connect(&server_addr_for_task, Some(tls.clone()))
-                    .await
+                match grpc_client::MonopsonyGrpcClient::connect(
+                    &server_addr_for_task,
+                    Some(tls.clone()),
+                )
+                .await
                 {
                     Ok(c) => {
                         info!("Connected to server");
@@ -1504,7 +1540,10 @@ async fn run_daemon(
                     (days, days <= grpc_client::CERT_RENEWAL_WINDOW_DAYS as i64)
                 });
                 if let Some((days, true)) = renewal_due {
-                    info!(days, "Certificate in the 30-day renewal window — re-issuing over mTLS");
+                    info!(
+                        days,
+                        "Certificate in the 30-day renewal window — re-issuing over mTLS"
+                    );
                     match client
                         .renew_client_cert(&client_id_for_task, certs.serial_hex().as_deref())
                         .await
@@ -1514,16 +1553,15 @@ async fn run_daemon(
                                 Ok(()) => {
                                     // Rotate the live TLS config so subsequent
                                     // connections use the new cert/key pair.
-                                    let renewed_tls =
-                                        tonic::transport::ClientTlsConfig::new()
-                                            .ca_certificate(tonic::transport::Certificate::from_pem(
-                                                &new_certs.ca_cert_pem,
-                                            ))
-                                            .identity(tonic::transport::Identity::from_pem(
-                                                &new_certs.client_cert_pem,
-                                                &new_certs.client_key_pem,
-                                            ))
-                                            .domain_name("monopsony-server");
+                                    let renewed_tls = tonic::transport::ClientTlsConfig::new()
+                                        .ca_certificate(tonic::transport::Certificate::from_pem(
+                                            &new_certs.ca_cert_pem,
+                                        ))
+                                        .identity(tonic::transport::Identity::from_pem(
+                                            &new_certs.client_cert_pem,
+                                            &new_certs.client_key_pem,
+                                        ))
+                                        .domain_name("monopsony-server");
                                     tls_config = Some(renewed_tls);
                                     certs = new_certs;
                                     info!(
@@ -1552,8 +1590,90 @@ async fn run_daemon(
                 // update-failure snapshot — counts-only, no package identity)
                 let health_snapshot =
                     update_health_for_task.snapshot(chrono::Utc::now().timestamp());
+
+                // Sprint 29 B1 (grounding D3): refresh the upgradable-count
+                // cache when it has gone stale, then attach it to the
+                // heartbeat while fresh. Compute failures are per-backend
+                // notes, never a heartbeat failure.
+                let counts_fresh = update_counts
+                    .as_ref()
+                    .map(|(_, at)| update_counts::is_fresh(*at))
+                    .unwrap_or(false);
+                if !counts_fresh {
+                    let counts = update_counts::compute().await;
+                    for note in &counts.notes {
+                        debug!("upgradable: {}", note);
+                    }
+                    update_counts = Some((counts, std::time::Instant::now()));
+                }
+
+                // Sprint 29 Phase 3 (grounding D5): refresh the vendor
+                // preflight verdict when stale — only on hosts with a distro
+                // identity (non-Linux hosts never run preflight).
+                if let Some(d) = distro_info.as_ref() {
+                    let preflight_fresh = preflight
+                        .as_ref()
+                        .map(|(_, at)| preflight::is_fresh(*at))
+                        .unwrap_or(false);
+                    if !preflight_fresh {
+                        let verdict = preflight::run(d).await;
+                        debug!(
+                            "preflight: {} ready={} notes={:?}",
+                            verdict.distro, verdict.ready, verdict.readiness_notes
+                        );
+                        preflight = Some((verdict, std::time::Instant::now()));
+                    }
+                }
+
+                let update_report = update_counts
+                    .as_ref()
+                    .filter(|(_, at)| update_counts::is_fresh(*at))
+                    .map(|(counts, _)| {
+                        // Sprint 29 Phase 3 (grounding D5): attach the
+                        // vendor preflight verdict while fresh. Non-Linux
+                        // hosts (no distro identity) never run preflight.
+                        let verdict = preflight
+                            .as_ref()
+                            .filter(|(_, at)| preflight::is_fresh(*at))
+                            .map(|(v, _)| v.clone());
+                        monopsony_common::proto::monopsony::UpdateReport {
+                            client_id: client_id_for_task.clone(),
+                            total_updates: counts.total,
+                            security_updates: counts.security,
+                            other_updates: counts.other,
+                            // Server-curated availability (Phase 2) lives
+                            // on the server; the client's own readiness
+                            // verdict rides selected_release (Phase 3).
+                            releases: Vec::new(),
+                            selected_release: verdict.as_ref().map(|v| {
+                                monopsony_common::proto::monopsony::OsReleaseUpgrade {
+                                    distro: v.distro.clone(),
+                                    from_version: v.from_version.clone(),
+                                    // The target version is server-curated
+                                    // (catalog merge); the host cannot know
+                                    // it, so it stays empty on the wire.
+                                    to_version: String::new(),
+                                    ready: v.ready,
+                                    readiness_notes: v.readiness_notes.clone(),
+                                }
+                            }),
+                            readiness_notes: verdict
+                                .as_ref()
+                                .map(|v| v.readiness_notes.clone())
+                                .unwrap_or_default(),
+                            distro: distro_info
+                                .as_ref()
+                                .map(|d| d.id.clone())
+                                .unwrap_or_default(),
+                            distro_version: distro_info
+                                .as_ref()
+                                .map(|d| d.version_id.clone())
+                                .unwrap_or_default(),
+                        }
+                    });
+
                 match client
-                    .heartbeat(&client_id_for_task, &health_snapshot)
+                    .heartbeat(&client_id_for_task, &health_snapshot, update_report)
                     .await
                 {
                     Ok(_) => {
@@ -1988,11 +2108,13 @@ async fn run_status(cert_dir: &Path) -> anyhow::Result<()> {
         match trust::client_cert_expiry(&certs.client_cert_pem) {
             Some(expires) => {
                 let days = (expires - chrono::Utc::now()).num_days();
-                info!("  Certificate expires: {} ({} days)", expires.to_rfc3339(), days);
+                info!(
+                    "  Certificate expires: {} ({} days)",
+                    expires.to_rfc3339(),
+                    days
+                );
                 if days <= grpc_client::CERT_RENEWAL_WINDOW_DAYS as i64 {
-                    info!(
-                        "  Renewal window: ACTIVE — automatic mTLS re-issue inside 30 days"
-                    );
+                    info!("  Renewal window: ACTIVE — automatic mTLS re-issue inside 30 days");
                 }
             }
             None => info!("  Certificate expires: unparseable"),
@@ -2164,13 +2286,14 @@ async fn run_pair(
     if let Some(code) = code {
         info!("Using legacy code mode");
 
-    // Route to WebSocket pairing when the server address is a ws:// or wss:// URL.
-    // This is used when the server is behind Cloudflare Tunnels or a reverse proxy.
-    let (client_id, certs, grpc_addr, ws_url, mirror_verify_key) = if server.starts_with("wss://")
-        || server.starts_with("ws://")
-    {
-        info!("Using WebSocket tunnel for pairing");
-        grpc_client::MonopsonyGrpcClient::pair_ws(
+        // Route to WebSocket pairing when the server address is a ws:// or wss:// URL.
+        // This is used when the server is behind Cloudflare Tunnels or a reverse proxy.
+        let (client_id, certs, grpc_addr, ws_url, mirror_verify_key) = if server
+            .starts_with("wss://")
+            || server.starts_with("ws://")
+        {
+            info!("Using WebSocket tunnel for pairing");
+            grpc_client::MonopsonyGrpcClient::pair_ws(
             server,
             code,
             &hostname,
@@ -2181,8 +2304,8 @@ async fn run_pair(
             "Pairing with server {} failed: {}. Is the server running and the pairing code correct?",
             server, e
         ))?
-    } else {
-        grpc_client::MonopsonyGrpcClient::pair(
+        } else {
+            grpc_client::MonopsonyGrpcClient::pair(
             server,
             code,
             &hostname,
@@ -2193,44 +2316,47 @@ async fn run_pair(
             "Pairing with server {} failed: {}. Is the server running and the pairing code correct?",
             server, e
         ))?
-    };
+        };
 
-    certs.save_atomic(cert_dir)?;
-    std::fs::write(cert_dir.join("client_id"), &client_id)?;
-    store_mirror_verify_key(cert_dir, &mirror_verify_key);
+        certs.save_atomic(cert_dir)?;
+        std::fs::write(cert_dir.join("client_id"), &client_id)?;
+        store_mirror_verify_key(cert_dir, &mirror_verify_key);
 
-    // Surface the new cert's expiry so the operator sees the 90-day clock
-    // and the 30-day renewal window at pair time.
-    if let Some(expires) = trust::client_cert_expiry(&certs.client_cert_pem) {
+        // Surface the new cert's expiry so the operator sees the 90-day clock
+        // and the 30-day renewal window at pair time.
+        if let Some(expires) = trust::client_cert_expiry(&certs.client_cert_pem) {
+            info!(
+                expiry = %expires,
+                "Paired client certificate valid for 90 days; daemon auto-renews inside the 30-day window"
+            );
+            println!(
+                "  Certificate expires: {} (auto-renews inside 30 days)",
+                expires.to_rfc3339()
+            );
+        }
+
+        // Persist server connection info for future daemon connections.
+        // Include ws_url when the server provided one — clients will prefer it
+        // over grpc_addr for daemon connections (WS tunnel through CF/proxy).
+        let server_info = serde_json::json!({
+            "grpc_addr": grpc_addr,
+            "ws_url": ws_url,
+            "paired_addr": server,
+            "paired_at": chrono::Utc::now().to_rfc3339(),
+        });
+        std::fs::write(
+            cert_dir.join("server.json"),
+            serde_json::to_string_pretty(&server_info)?,
+        )?;
+
+        info!("Pairing complete!");
+        info!("  Client ID: {}", client_id);
+        info!("  Certificates saved to: {}", cert_dir.display());
         info!(
-            expiry = %expires,
-            "Paired client certificate valid for 90 days; daemon auto-renews inside the 30-day window"
+            "  Server address saved to: {}/server.json",
+            cert_dir.display()
         );
-        println!("  Certificate expires: {} (auto-renews inside 30 days)", expires.to_rfc3339());
-    }
-
-    // Persist server connection info for future daemon connections.
-    // Include ws_url when the server provided one — clients will prefer it
-    // over grpc_addr for daemon connections (WS tunnel through CF/proxy).
-    let server_info = serde_json::json!({
-        "grpc_addr": grpc_addr,
-        "ws_url": ws_url,
-        "paired_addr": server,
-        "paired_at": chrono::Utc::now().to_rfc3339(),
-    });
-    std::fs::write(
-        cert_dir.join("server.json"),
-        serde_json::to_string_pretty(&server_info)?,
-    )?;
-
-    info!("Pairing complete!");
-    info!("  Client ID: {}", client_id);
-    info!("  Certificates saved to: {}", cert_dir.display());
-    info!(
-        "  Server address saved to: {}/server.json",
-        cert_dir.display()
-    );
-    println!("Pairing complete! Client ID: {}", client_id);
+        println!("Pairing complete! Client ID: {}", client_id);
         return Ok(());
     }
 
@@ -2270,10 +2396,7 @@ async fn run_pair_enroll(
         format!("http://{}", server)
     };
 
-    info!(
-        "Starting enrollment-key pairing with server: {}",
-        server
-    );
+    info!("Starting enrollment-key pairing with server: {}", server);
 
     // 1. Generate client ephemeral Ed25519 keypair
     let signing_key = SigningKey::generate(&mut OsRng);
@@ -2298,8 +2421,8 @@ async fn run_pair_enroll(
     .map_err(|e| anyhow::anyhow!("Enrollment failed: {}", e))?;
 
     // 4. TOFU CA fingerprint pinning
-    let ca_fingerprint =
-        crate::trust::ca_fingerprint(&certs.ca_cert_pem).context("failed to compute CA fingerprint")?;
+    let ca_fingerprint = crate::trust::ca_fingerprint(&certs.ca_cert_pem)
+        .context("failed to compute CA fingerprint")?;
     crate::trust::check_ca_fingerprint(cert_dir, &ca_fingerprint)
         .map_err(|e| anyhow::anyhow!("CA fingerprint check failed: {}", e))?;
     crate::trust::store_ca_fingerprint(cert_dir, &ca_fingerprint)?;
@@ -2448,9 +2571,10 @@ async fn run_pair_v2(
             anyhow::bail!("Pairing request expired before admin approval");
         }
 
-        let status = grpc_client::MonopsonyGrpcClient::poll_pair_request_status(&base_url, &request_id)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to poll pairing status: {}", e))?;
+        let status =
+            grpc_client::MonopsonyGrpcClient::poll_pair_request_status(&base_url, &request_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to poll pairing status: {}", e))?;
 
         match status.as_str() {
             "approved" => break,
@@ -2474,14 +2598,15 @@ async fn run_pair_v2(
     let signature = signing_key.sign(request_id.as_bytes());
     let signature_bytes = signature.to_bytes();
 
-    let (client_id, certs, mirror_verify_key) = grpc_client::MonopsonyGrpcClient::collect_pair_cert_v2(
-        &base_url,
-        &request_id,
-        &ephemeral_pubkey_bytes,
-        &signature_bytes,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to collect certificate: {}", e))?;
+    let (client_id, certs, mirror_verify_key) =
+        grpc_client::MonopsonyGrpcClient::collect_pair_cert_v2(
+            &base_url,
+            &request_id,
+            &ephemeral_pubkey_bytes,
+            &signature_bytes,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to collect certificate: {}", e))?;
 
     // Persist the server's Ed25519 recipe-signing key so shadow package
     // updates verify against a provisioned trust anchor (v2 parity with the
@@ -2491,8 +2616,8 @@ async fn run_pair_v2(
     }
 
     // 7. TOFU CA fingerprint pinning
-    let ca_fingerprint =
-        crate::trust::ca_fingerprint(&certs.ca_cert_pem).context("failed to compute CA fingerprint")?;
+    let ca_fingerprint = crate::trust::ca_fingerprint(&certs.ca_cert_pem)
+        .context("failed to compute CA fingerprint")?;
     crate::trust::check_ca_fingerprint(cert_dir, &ca_fingerprint)
         .map_err(|e| anyhow::anyhow!("CA fingerprint check failed: {}", e))?;
     crate::trust::store_ca_fingerprint(cert_dir, &ca_fingerprint)?;
@@ -2557,7 +2682,14 @@ async fn run_setup_interactive(
     println!();
     println!("Monopsony client setup");
     println!("  Server:   {}", server_addr);
-    println!("  Detected package managers: {}", if backends.is_empty() { "(none)".into() } else { backends.join(", ") });
+    println!(
+        "  Detected package managers: {}",
+        if backends.is_empty() {
+            "(none)".into()
+        } else {
+            backends.join(", ")
+        }
+    );
     println!();
 
     if !assume_all {
@@ -2576,11 +2708,8 @@ async fn run_setup_interactive(
         }
     }
 
-    let results = crate::proxy_toggle::proxy_on(
-        crate::proxy_toggle::ToggleTarget::All,
-        &server_addr,
-    )
-    .await;
+    let results =
+        crate::proxy_toggle::proxy_on(crate::proxy_toggle::ToggleTarget::All, &server_addr).await;
 
     let mut succeeded = 0;
     let mut failed = 0;
@@ -2618,8 +2747,7 @@ async fn run_setup_interactive(
 async fn run_uninstall(cert_dir: &Path) -> anyhow::Result<()> {
     println!("Removing Monopsony proxy configuration from all detected subsystems...");
 
-    let results =
-        crate::proxy_toggle::proxy_off(crate::proxy_toggle::ToggleTarget::All).await;
+    let results = crate::proxy_toggle::proxy_off(crate::proxy_toggle::ToggleTarget::All).await;
 
     let mut succeeded = 0;
     let mut failed = 0;
@@ -2811,14 +2939,6 @@ async fn run_shadow_package(
 ) -> anyhow::Result<()> {
     use shadow_cli::PackageCommand::*;
 
-    // Helper: resolve server addr + connect (Sprint 22 slice 22-A).
-    async fn connect(
-        cert_dir: &Path,
-    ) -> anyhow::Result<(grpc_client::MonopsonyGrpcClient, String)> {
-        let server_addr = resolve_server_addr(cert_dir).await?;
-        connect_shadow_client(Some(&server_addr), cert_dir).await
-    }
-
     // Helper: find the package id for a name-or-id selector.
     async fn resolve_package_id(
         client: &mut grpc_client::MonopsonyGrpcClient,
@@ -2956,35 +3076,34 @@ async fn run_shadow_package(
             //   from `report.version`. Blank-version registers die here; the
             //   "registering blank" branch survives only as the --recipe
             //   fallback when its probe genuinely fails.
-            let (mut recipe_toml, detected_version, report_opt) =
-                if let Some(recipe_path) = &recipe {
-                    let recipe_toml = std::fs::read_to_string(recipe_path)
-                        .with_context(|| format!("reading recipe file {}", recipe_path))?;
-                    let detected_version =
-                        shadow_executor::detect_current_version(&recipe_toml).await;
-                    (recipe_toml, detected_version, None)
-                } else {
-                    let report = detect::detect(Path::new(&path), name.as_deref()).await?;
-                    let draft = detect::render_draft_toml(&report, &pkg_name, source_opt);
-                    if source_opt.is_none() {
-                        // render_draft_toml emits source_url = "REPLACE_ME" plus
-                        // the T0.4 header; refuse to register without a source.
+            let (mut recipe_toml, detected_version, report_opt) = if let Some(recipe_path) = &recipe
+            {
+                let recipe_toml = std::fs::read_to_string(recipe_path)
+                    .with_context(|| format!("reading recipe file {}", recipe_path))?;
+                let detected_version = shadow_executor::detect_current_version(&recipe_toml).await;
+                (recipe_toml, detected_version, None)
+            } else {
+                let report = detect::detect(Path::new(&path), name.as_deref()).await?;
+                let draft = detect::render_draft_toml(&report, &pkg_name, source_opt);
+                if source_opt.is_none() {
+                    // render_draft_toml emits source_url = "REPLACE_ME" plus
+                    // the T0.4 header; refuse to register without a source.
+                    anyhow::bail!(
+                        "registration requires --source while source_url is REPLACE_ME for '{}'",
+                        pkg_name
+                    );
+                }
+                let detected_version = match report.version {
+                    Some(ref v) => Some(v.clone()),
+                    None => {
                         anyhow::bail!(
-                            "registration requires --source while source_url is REPLACE_ME for '{}'",
+                            "refusing to register '{}' with blank detected version (use --recipe)",
                             pkg_name
-                        );
+                        )
                     }
-                    let detected_version = match report.version {
-                        Some(ref v) => Some(v.clone()),
-                        None => {
-                            anyhow::bail!(
-                                "refusing to register '{}' with blank detected version (use --recipe)",
-                                pkg_name
-                            )
-                        }
-                    };
-                    (draft, detected_version, Some(report))
                 };
+                (draft, detected_version, Some(report))
+            };
 
             // Sprint 31 I2: the --recipe path has no detect report, so its row
             // metadata comes from the recipe TOML itself — [install] paths and
@@ -3019,7 +3138,7 @@ async fn run_shadow_package(
                 ),
             }
             println!("Connecting to server to register...");
-            let (mut client, client_id) = connect(cert_dir).await?;
+            let (mut client, client_id) = connect_shadow(cert_dir).await?;
 
             // ── T4.3 / T4.5: similarity scoring + adopt-from-peer offer ──
             // (no-recipe path only; --recipe path registers as authored)
@@ -3087,17 +3206,14 @@ async fn run_shadow_package(
                                 let best = scoring
                                     .best_match
                                     .context("interactive choice with no best match")?;
-                                let (peer_toml, key_id, signature, signed_at) =
-                                    client.get_shadow_recipe(&client_id, &best.recipe_name).await?;
+                                let (peer_toml, key_id, signature, signed_at) = client
+                                    .get_shadow_recipe(&client_id, &best.recipe_name)
+                                    .await?;
                                 let signed = shadow_scorer::signed_peer_recipe(
-                                    peer_toml,
-                                    key_id,
-                                    signature,
-                                    signed_at,
+                                    peer_toml, key_id, signature, signed_at,
                                 )?;
                                 let trust_config = shadow_scorer::load_trust_config();
-                                let operator_vk =
-                                    load_operator_verifying_key(&trust_config);
+                                let operator_vk = load_operator_verifying_key(&trust_config);
                                 trust::verify_recipe_trust(
                                     &signed,
                                     &trust_config,
@@ -3117,18 +3233,13 @@ async fn run_shadow_package(
                                     &signed.recipe_toml,
                                     &local_target_dir,
                                     &local_config_paths,
-                                    report
-                                        .service
-                                        .as_ref()
-                                        .map(|s| s.unit_name.as_str()),
+                                    report.service.as_ref().map(|s| s.unit_name.as_str()),
                                 )?;
                                 let info = client
                                     .register_shadow_package(
                                         &client_id,
                                         &pkg_name,
-                                        detected_version
-                                            .as_deref()
-                                            .unwrap_or(""),
+                                        detected_version.as_deref().unwrap_or(""),
                                         std::env::consts::ARCH,
                                         std::env::consts::OS,
                                         "", // libc: unknown from CLI
@@ -3232,7 +3343,7 @@ async fn run_shadow_package(
         }
         Unregister { name } => {
             println!("Unregistering shadow package: {}", name);
-            let (mut client, client_id) = connect(cert_dir).await?;
+            let (mut client, client_id) = connect_shadow(cert_dir).await?;
             let package_id = resolve_package_id(&mut client, &client_id, &name).await?;
             let (deleted, message) = client
                 .unregister_shadow_package(&client_id, &package_id, true)
@@ -3244,7 +3355,7 @@ async fn run_shadow_package(
             }
         }
         List => {
-            let (mut client, client_id) = connect(cert_dir).await?;
+            let (mut client, client_id) = connect_shadow(cert_dir).await?;
             let packages = client.list_shadow_packages(&client_id).await?;
             if packages.is_empty() {
                 println!("No shadow packages registered.");
@@ -3261,7 +3372,7 @@ async fn run_shadow_package(
             }
         }
         Inspect { name } => {
-            let (mut client, client_id) = connect(cert_dir).await?;
+            let (mut client, client_id) = connect_shadow(cert_dir).await?;
             let (recipe_toml, key_id, _signature, signed_at) =
                 client.get_shadow_recipe(&client_id, &name).await?;
             println!("Recipe for '{}':", name);
@@ -3274,7 +3385,7 @@ async fn run_shadow_package(
             }
         }
         Check { name } => {
-            let (mut client, client_id) = connect(cert_dir).await?;
+            let (mut client, client_id) = connect_shadow(cert_dir).await?;
             // Resolve the optional name filter to an id (empty = check all).
             let ids: Vec<String> = match &name {
                 Some(n) => vec![resolve_package_id(&mut client, &client_id, n).await?],
@@ -3314,7 +3425,7 @@ async fn run_shadow_package(
                 println!("Updating shadow package: {}", name);
             }
 
-            let (mut client, client_id) = connect(cert_dir).await?;
+            let (mut client, client_id) = connect_shadow(cert_dir).await?;
             let package_id = resolve_package_id(&mut client, &client_id, &name).await?;
 
             // Latest known update info (current→latest + asset URL).
@@ -3332,7 +3443,10 @@ async fn run_shadow_package(
                     return Ok(());
                 }
             };
-            println!("  Available: {} → {}", update.current_version, update.latest_version);
+            println!(
+                "  Available: {} → {}",
+                update.current_version, update.latest_version
+            );
             if !update.asset_url.is_empty() {
                 println!("  Asset:     {}", update.asset_url);
             }
@@ -3363,8 +3477,7 @@ async fn run_shadow_package(
                 }
             };
             let recipe: monopsony_common::shadow_types::ShadowRecipe =
-                toml::from_str(&recipe_toml)
-                    .context("trust-verified recipe failed to parse")?;
+                toml::from_str(&recipe_toml).context("trust-verified recipe failed to parse")?;
 
             // Resolve the asset URL. The Check RPC returns an empty
             // asset_url for direct_url/scrape recipes (DirectUrlSource
@@ -3380,32 +3493,31 @@ async fn run_shadow_package(
             // would error in resolve_asset_url), so pass an empty URL —
             // the executor skips the download for Build + empty URL the
             // same way it does for Script.
-            let asset_url = if recipe.install.method
-                == monopsony_common::shadow_types::InstallMethod::Build
-            {
-                String::new()
-            } else {
-                match shadow_executor::resolve_asset_url(
-                    &recipe,
-                    &update.asset_url,
-                    &update.latest_version,
-                    &http,
-                )
-                .await
-                {
-                    Ok(url) => url,
-                    Err(e)
-                        if recipe.install.method
-                            == monopsony_common::shadow_types::InstallMethod::Script =>
+            let asset_url =
+                if recipe.install.method == monopsony_common::shadow_types::InstallMethod::Build {
+                    String::new()
+                } else {
+                    match shadow_executor::resolve_asset_url(
+                        &recipe,
+                        &update.asset_url,
+                        &update.latest_version,
+                        &http,
+                    )
+                    .await
                     {
-                        println!("  Asset:     none resolved ({e}); script will fetch itself");
-                        String::new()
+                        Ok(url) => url,
+                        Err(e)
+                            if recipe.install.method
+                                == monopsony_common::shadow_types::InstallMethod::Script =>
+                        {
+                            println!("  Asset:     none resolved ({e}); script will fetch itself");
+                            String::new()
+                        }
+                        Err(e) => {
+                            anyhow::bail!("could not resolve asset URL for '{}': {e}", name);
+                        }
                     }
-                    Err(e) => {
-                        anyhow::bail!("could not resolve asset URL for '{}': {e}", name);
-                    }
-                }
-            };
+                };
             if !asset_url.is_empty() {
                 println!("  Asset:     {}", asset_url);
             }
@@ -3447,7 +3559,15 @@ async fn run_shadow_package(
                 &asset_url,
                 &http,
                 Some(update.current_version.as_str()),
-                true,
+                // Honest interactivity: the downgrade-safety gate allows a
+                // downgrade_unsafe downgrade only for a real operator session.
+                // The hardcoded `true` previously made the refuse path dead via
+                // the CLI (caught live 2026-10-30: a 2.0.0 → 1.0.0 downgrade
+                // applied without a prompt).
+                {
+                    use std::io::IsTerminal;
+                    std::io::stdin().is_terminal()
+                },
             )
             .await;
             for line in &outcome.log {
@@ -3509,7 +3629,7 @@ async fn run_shadow_package(
         }
         Rollback { name } => {
             println!("Rolling back shadow package: {}", name);
-            let (mut client, client_id) = connect(cert_dir).await?;
+            let (mut client, client_id) = connect_shadow(cert_dir).await?;
             let package_id = resolve_package_id(&mut client, &client_id, &name).await?;
             let (success, message, new_version, backup_path) = client
                 .rollback_shadow_update(&client_id, &package_id)
@@ -3584,7 +3704,7 @@ async fn run_shadow_package(
             // 1. Fetch the catalog recipe and verify it against the trust
             //    policy. Unlike Update, a trust failure is a HARD abort: we
             //    never adopt (register + manage) an unverified recipe.
-            let (mut client, client_id) = connect(cert_dir).await?;
+            let (mut client, client_id) = connect_shadow(cert_dir).await?;
             let recipe_toml = match load_verified_recipe(&mut client, &client_id, &name).await {
                 Ok(t) => {
                     println!("Trust check: PASSED");
@@ -3654,7 +3774,7 @@ async fn run_shadow_package(
                     &install_paths,
                     &[], // config_paths: not adopted from recipe install config_paths
                     &service_name,
-                    "", // binary_sha256: not probed on the adopt path
+                    "",    // binary_sha256: not probed on the adopt path
                     false, // mask_from_pm: opt-in only
                 )
                 .await?;
@@ -3672,6 +3792,261 @@ async fn run_shadow_package(
             println!("  Method:  {}", finding.method);
             println!("  ID:      {}", info.id);
         }
+        View => {
+            run_shadow_view(cert_dir).await?;
+        }
+        Accept {
+            name,
+            non_interactive,
+        } => {
+            run_shadow_accept(cert_dir, name.as_deref(), non_interactive).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn connect_shadow(
+    cert_dir: &Path,
+) -> anyhow::Result<(grpc_client::MonopsonyGrpcClient, String)> {
+    let server_addr = resolve_server_addr(cert_dir).await?;
+    connect_shadow_client(Some(&server_addr), cert_dir).await
+}
+
+async fn run_shadow_view(cert_dir: &Path) -> anyhow::Result<()> {
+    use monopsony_client::staging_review as review;
+    let (mut client, client_id) = connect_shadow(cert_dir).await?;
+    println!("═════════════════════════════════════════════════════════════════");
+    println!("Monopsony Managed Shadow Software — Client {}", client_id);
+    println!("═════════════════════════════════════════════════════════════════");
+    let packages = client.list_shadow_packages(&client_id).await?;
+    println!("\n[Installed / managed packages] ({})", packages.len());
+    if packages.is_empty() {
+        println!("  (none)");
+    } else {
+        for p in &packages {
+            println!("{}", review::render_installed_summary(p));
+            if !p.config_paths.is_empty() {
+                println!("      config_paths: {}", p.config_paths.join(", "));
+            }
+            if !p.service_name.is_empty() {
+                println!("      service: {}", p.service_name);
+            }
+        }
+    }
+    let staging = client.list_shadow_staging(&client_id).await?;
+    println!("\n[Staged — awaiting your approval] ({})", staging.len());
+    if staging.is_empty() {
+        println!("  (none)");
+    } else {
+        for s in &staging {
+            println!("{}", review::render_staged_summary(s));
+            if !s.suggested_accessory_dirs.is_empty() {
+                println!(
+                    "      accessory_dirs: {}",
+                    s.suggested_accessory_dirs.join(", ")
+                );
+            }
+            if !s.suggested_firewall_rules.is_empty() {
+                for fw in &s.suggested_firewall_rules {
+                    println!("{}", review::render_firewall_view_line(fw));
+                }
+            }
+            if !s.suggested_health_check.is_empty() {
+                println!("      health_check: {}", s.suggested_health_check);
+            }
+        }
+    }
+    println!("\nUse `monopsony-client shadow accept --name <package>` to review and approve.");
+    Ok(())
+}
+
+async fn run_shadow_accept(
+    cert_dir: &Path,
+    name: Option<&str>,
+    non_interactive: bool,
+) -> anyhow::Result<()> {
+    use monopsony_client::staging_review as review;
+    let (mut client, client_id) = connect_shadow(cert_dir).await?;
+    let staging = client.list_shadow_staging(&client_id).await?;
+    let pending: Vec<_> = staging
+        .into_iter()
+        .filter(|s| s.status == "pending")
+        .collect();
+    if pending.is_empty() {
+        anyhow::bail!("No staged shadow packages pending approval for this client.");
+    }
+    let selected = if let Some(name) = name {
+        review::find_staged(&pending, name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("No pending staged package matching '{name}'"))?
+    } else if non_interactive {
+        pending.into_iter().next().unwrap()
+    } else {
+        println!("\nStaged packages pending approval:");
+        for (i, s) in pending.iter().enumerate() {
+            println!(
+                "  [{}] {} (target: {})",
+                i + 1,
+                s.recipe_name,
+                s.suggested_target_dir
+            );
+        }
+        let choice = read_line("Select package number [q to quit]: ")?;
+        match review::parse_menu_selection(&choice, pending.len()) {
+            Ok(None) => {
+                println!("Aborted.");
+                return Ok(());
+            }
+            Ok(Some(i)) => pending[i].clone(),
+            Err(msg) => anyhow::bail!("{msg}"),
+        }
+    };
+    let (recipe_toml, _key_id, _signature, _signed_at) = client
+        .get_shadow_recipe(&client_id, &selected.recipe_name)
+        .await?;
+    let recipe: monopsony_common::shadow_types::ShadowRecipe =
+        toml::from_str(&recipe_toml).context("staged recipe failed to parse as TOML")?;
+    let (final_target_dir, final_accessory_dirs, final_firewall_rules, final_health_check): (
+        String,
+        Vec<String>,
+        Vec<String>,
+        String,
+    ) = if non_interactive {
+        (
+            selected.suggested_target_dir.clone(),
+            selected.suggested_accessory_dirs.clone(),
+            review::firewall_strings_non_interactive(&selected.suggested_firewall_rules),
+            selected.suggested_health_check.clone(),
+        )
+    } else {
+        println!("\nReviewing staged package: {}", selected.recipe_name);
+        println!("  source_type: {:?}", recipe.package.source_type);
+        println!("  source_url:  {}", recipe.package.source_url);
+        println!("  install method: {:?}", recipe.install.method);
+        println!("  suggested target dir: {}", selected.suggested_target_dir);
+        if !selected.suggested_accessory_dirs.is_empty() {
+            println!(
+                "  suggested accessory dirs: {}",
+                selected.suggested_accessory_dirs.join(", ")
+            );
+        }
+        if !selected.suggested_firewall_rules.is_empty() {
+            println!("  suggested firewall rules:");
+            for fw in &selected.suggested_firewall_rules {
+                println!("{}", review::render_firewall_review_line(fw));
+            }
+        }
+        if !selected.suggested_health_check.is_empty() {
+            println!(
+                "  suggested health check: {}",
+                selected.suggested_health_check
+            );
+        }
+        let target_dir = read_line(&format!(
+            "Install location [{}] (enter to keep): ",
+            selected.suggested_target_dir
+        ))?;
+        let final_target_dir = review::keep_or_replace(&target_dir, &selected.suggested_target_dir);
+        let acc_input = read_line(&format!(
+            "Accessory directories [{}] (comma-separated, enter to keep): ",
+            selected.suggested_accessory_dirs.join(", ")
+        ))?;
+        let final_accessory_dirs: Vec<String> =
+            review::parse_csv_or_keep(&acc_input, &selected.suggested_accessory_dirs);
+        let fw_input = read_line("Firewall rules (port/protocol/direction:description, comma-separated; enter to keep): ")?;
+        let final_firewall_rules: Vec<String> =
+            review::firewall_rules_or_keep(&fw_input, &selected.suggested_firewall_rules);
+        let hc_input = read_line(&format!(
+            "Health check config [{}] (enter to keep): ",
+            if selected.suggested_health_check.is_empty() {
+                "<none>".to_string()
+            } else {
+                selected.suggested_health_check.clone()
+            }
+        ))?;
+        let final_health_check =
+            review::keep_or_replace(&hc_input, &selected.suggested_health_check);
+        (
+            final_target_dir,
+            final_accessory_dirs,
+            final_firewall_rules,
+            final_health_check,
+        )
+    };
+    if !non_interactive {
+        println!("\nAccepted values:");
+        println!("  target_dir:        {final_target_dir}");
+        println!("  accessory_dirs:    {}", final_accessory_dirs.join(", "));
+        println!("  firewall_rules:    {}", final_firewall_rules.join(", "));
+        println!("  health_check:      {final_health_check}");
+        let confirm = read_line("\nAccept and install? [y/N]: ")?;
+        if confirm.trim().to_lowercase() != "y" {
+            println!("Accept declined.");
+            let _ = client
+                .resolve_shadow_staging(
+                    &client_id,
+                    &selected.recipe_name,
+                    "rejected",
+                    None,
+                    &[],
+                    &[],
+                    None,
+                )
+                .await;
+            return Ok(());
+        }
+    }
+    let fw_rules: Vec<monopsony_common::proto::monopsony::FirewallRuleInfo> =
+        review::parse_firewall_rule_strings(&final_firewall_rules);
+    client
+        .resolve_shadow_staging(
+            &client_id,
+            &selected.recipe_name,
+            "approved",
+            Some(&final_target_dir),
+            &final_accessory_dirs,
+            &fw_rules,
+            if final_health_check.is_empty() {
+                None
+            } else {
+                Some(&final_health_check)
+            },
+        )
+        .await?;
+    println!("✓ Staging approved for {}", selected.recipe_name);
+    println!("\nInstalling {} ...", selected.recipe_name);
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let asset_url =
+        shadow_executor::resolve_asset_url(&recipe, "", &recipe.version.detect_pattern, &http)
+            .await
+            .unwrap_or_default();
+    let current_version = shadow_executor::detect_current_version(&recipe_toml).await;
+    let outcome = shadow_executor::execute_update(
+        &recipe,
+        "1.0.0",
+        &asset_url,
+        &http,
+        current_version.as_deref(),
+        true,
+    )
+    .await;
+    if outcome.success {
+        println!(
+            "✓ Installed {} v{}",
+            selected.recipe_name, outcome.new_version
+        );
+        if let Some(bp) = outcome.backup_path {
+            println!("  Backup kept at: {}", bp.display());
+        }
+    } else {
+        eprintln!(
+            "✗ Install failed at {}: {}",
+            outcome.error.as_deref().unwrap_or("unknown"),
+            outcome.log.join("; ")
+        );
+        anyhow::bail!("Install of {} failed", selected.recipe_name);
     }
     Ok(())
 }

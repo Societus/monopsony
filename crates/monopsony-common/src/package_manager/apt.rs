@@ -4,6 +4,8 @@ use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAc
 use async_trait::async_trait;
 use std::path::PathBuf;
 
+use super::upgradable::{parse_apt_upgradable, UpgradableReport};
+
 /// Apt package manager backend
 pub struct AptBackend {
     #[allow(dead_code)] // Will be used when reading actual apt config
@@ -67,6 +69,37 @@ impl PackageManagerBackend for AptBackend {
         }
 
         Ok(packages)
+    }
+
+    /// Slow: `apt list --upgradable` may refresh package lists. Call at
+    /// inventory cadence only, never per heartbeat tick (grounding D3).
+    async fn list_upgradable(&self) -> crate::Result<UpgradableReport> {
+        let output = tokio::process::Command::new("apt")
+            .args(["list", "--upgradable"])
+            .output()
+            .await
+            .map_err(|_| crate::Error::CommandFailed {
+                command: "apt list --upgradable".to_string(),
+                exit_code: None,
+            })?;
+
+        if !output.status.success() {
+            return Err(crate::Error::CommandFailed {
+                command: "apt list --upgradable".to_string(),
+                exit_code: output.status.code(),
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Security channel = `-security` suite membership in the listing
+        // origin (grounding D4); everything else lands in "other".
+        let (security, other) = parse_apt_upgradable(&stdout);
+        Ok(UpgradableReport {
+            security,
+            other,
+            supported: true,
+            note: "security = apt listing origin suite contains -security".to_string(),
+        })
     }
 
     fn upstream_url_patterns(&self) -> Vec<UrlPattern> {

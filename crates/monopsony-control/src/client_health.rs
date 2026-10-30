@@ -241,6 +241,15 @@ mod tests {
             last_seen: Utc::now() - chrono::Duration::seconds(age_secs),
             registered_at: Utc::now(),
             cert_serial: None,
+            // Sprint 29 B1: no UpdateReport data in these fixtures.
+            update_security: 0,
+            update_other: 0,
+            update_total: 0,
+            update_reported_at: None,
+            reported_distro: None,
+            reported_distro_version: None,
+            update_ready: None,
+            update_readiness_notes: None,
         }
     }
 

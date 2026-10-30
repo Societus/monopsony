@@ -11,6 +11,7 @@ import type {
   RecipeValidationResult, EstimateResponse,
   ClientInfo, ConfigResponse,
   ShadowContext, AssignRecipeResponse,
+  ReleaseGuideResponse,
   MirrorConfig, MirrorStatus,
   TrackerStatus,
   FeatureFlags, MonetizationConfig,
@@ -106,6 +107,9 @@ export const api = {
     list: () => request<ClientInfo[]>('/clients'),
     get: (id: string) => request<ClientInfo>(`/clients/${id}`),
     inventory: (id: string) => request<{ packages: { name: string; version: string }[] }>(`/clients/${id}/inventory`),
+    // Sprint 29 Phase 4: rendered display-only upgrade guide (server-rendered text; nothing executes).
+    releaseGuide: (id: string) =>
+      request<ReleaseGuideResponse>(`/clients/${encodeURIComponent(id)}/release-guide`),
     getShadowContext: (id: string) =>
       request<ShadowContext>(`/admin/clients/${encodeURIComponent(id)}/shadow-context`),
     assignRecipe: (id: string, recipeName: string) =>

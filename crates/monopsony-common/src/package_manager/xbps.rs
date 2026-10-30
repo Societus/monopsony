@@ -4,6 +4,7 @@
 //! It comes in glibc and musl variants. XBPS respects standard http_proxy /
 //! https_proxy environment variables, making proxy configuration straightforward.
 
+use super::upgradable::{parse_xbps_un, UpgradableReport};
 use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -84,6 +85,36 @@ impl PackageManagerBackend for XbpsBackend {
         }
 
         Ok(packages)
+    }
+
+    /// Best-effort (grounding D4): xbps dry-run lists updates with no
+    /// security channel, so all counts land in "other" with a note.
+    async fn list_upgradable(&self) -> crate::Result<UpgradableReport> {
+        let output = tokio::process::Command::new("xbps-install")
+            .args(["-un"])
+            .output()
+            .await
+            .map_err(|_| crate::Error::CommandFailed {
+                command: "xbps-install -un".to_string(),
+                exit_code: None,
+            })?;
+
+        if !output.status.success() {
+            return Err(crate::Error::CommandFailed {
+                command: "xbps-install -un".to_string(),
+                exit_code: output.status.code(),
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let other = parse_xbps_un(&stdout);
+        Ok(UpgradableReport {
+            security: 0,
+            other,
+            supported: true,
+            note: "xbps exposes no security channel; all counts are other (best-effort)"
+                .to_string(),
+        })
     }
 
     fn upstream_url_patterns(&self) -> Vec<UrlPattern> {

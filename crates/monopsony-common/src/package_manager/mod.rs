@@ -20,6 +20,7 @@ mod pkg;
 mod pkg_add;
 mod pkgin;
 mod scoop;
+mod upgradable;
 mod winget;
 mod xbps;
 mod zypper;
@@ -40,6 +41,7 @@ pub use pkg::PkgBackend;
 pub use pkg_add::PkgAddBackend;
 pub use pkgin::PkginBackend;
 pub use scoop::ScoopBackend;
+pub use upgradable::UpgradableReport;
 pub use winget::WingetBackend;
 pub use xbps::XbpsBackend;
 pub use zypper::ZypperBackend;
@@ -304,6 +306,18 @@ pub trait PackageManagerBackend: Send + Sync {
 
     /// List all installed packages
     async fn list_installed(&self) -> crate::Result<Vec<PackageRef>>;
+
+    /// List upgradable packages as aggregate counts (Sprint 29, grounding D4).
+    ///
+    /// Default answer is "unsupported" with a note — only distro PMs with an
+    /// upgradable listing override this (apt/dnf/pacman/apk first-class;
+    /// zypper/xbps/emerge best-effort). `apt list --upgradable` and friends
+    /// are slow: callers must run this at inventory cadence, never per
+    /// heartbeat tick (grounding D3).
+    async fn list_upgradable(&self) -> crate::Result<UpgradableReport> {
+        let _ = self;
+        Ok(UpgradableReport::unsupported(self.kind()))
+    }
 
     /// Get URL patterns for matching upstream package URLs
     fn upstream_url_patterns(&self) -> Vec<UrlPattern>;

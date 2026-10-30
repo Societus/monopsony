@@ -57,10 +57,7 @@ pub fn set_systemd_runner(runner: Option<SystemdRunner>) {
 
 /// Run `f` with `runner` installed as the systemd command runner, restoring
 /// the previous override afterwards.
-pub fn with_systemd_runner<F, R>(
-    runner: Option<SystemdRunner>,
-    f: F,
-) -> R
+pub fn with_systemd_runner<F, R>(runner: Option<SystemdRunner>, f: F) -> R
 where
     F: FnOnce() -> R,
 {
@@ -72,10 +69,7 @@ where
 
 /// Async variant: run async `f` with `runner` installed, restoring the
 /// override afterwards. Used by tests that await systemd calls.
-pub async fn with_systemd_runner_async<F, Fut, R>(
-    runner: Option<SystemdRunner>,
-    f: F,
-) -> R
+pub async fn with_systemd_runner_async<F, Fut, R>(runner: Option<SystemdRunner>, f: F) -> R
 where
     F: FnOnce() -> Fut + Send,
     Fut: std::future::Future<Output = R> + Send,
@@ -89,8 +83,14 @@ where
 /// Run `program args...`, using the injected fake when present, otherwise
 /// spawning the real binary.
 async fn run_systemd_cmd(program: &str, args: &[&str]) -> Result<String> {
-    let argv: Vec<&str> = std::iter::once(program).chain(args.iter().copied()).collect();
-    if let Some(runner) = SYSTEMD_RUNNER.lock().expect("systemd runner lock").as_deref() {
+    let argv: Vec<&str> = std::iter::once(program)
+        .chain(args.iter().copied())
+        .collect();
+    if let Some(runner) = SYSTEMD_RUNNER
+        .lock()
+        .expect("systemd runner lock")
+        .as_deref()
+    {
         return runner(&argv);
     }
     let output = tokio::process::Command::new(program)
@@ -135,8 +135,7 @@ struct SystemdBaseline {
 /// (defaults used) so a missing unit or old systemd never aborts an update.
 async fn capture_systemd_baseline(service: &str) -> SystemdBaseline {
     let mut b = SystemdBaseline::default();
-    if let Ok(out) = run_systemd_cmd("systemctl", &["show", "-p", "ActiveState", service]).await
-    {
+    if let Ok(out) = run_systemd_cmd("systemctl", &["show", "-p", "ActiveState", service]).await {
         b.active_state = parse_show_prop(&out, "ActiveState");
     }
     if let Ok(out) = run_systemd_cmd("systemctl", &["show", "-p", "SubState", service]).await {
@@ -213,14 +212,17 @@ async fn systemd_health_check(
                 }
             }
             monopsony_common::shadow_types::StableMode::LogQuiet => {
-                let out = run_systemd_cmd("journalctl", &["-u", service, "-n", "50"]).await
+                let out = run_systemd_cmd("journalctl", &["-u", service, "-n", "50"])
+                    .await
                     .map_err(|e| format!("journalctl: {e}"))?;
                 let lower = out.to_lowercase();
                 if lower.contains("error")
                     || lower.contains("failed")
                     || lower.contains("traceback")
                 {
-                    return Err(format!("unit {service} journal shows errors (log_quiet breach)"));
+                    return Err(format!(
+                        "unit {service} journal shows errors (log_quiet breach)"
+                    ));
                 }
             }
         }
@@ -242,8 +244,7 @@ async fn success_monitor_window(
     let interval = Duration::from_secs(1);
     while start.elapsed() < window {
         match run_systemd_cmd("systemctl", &["show", "-p", "ActiveState", service]).await {
-            Ok(out)
-                if parse_show_prop(&out, "ActiveState").as_deref() == Some("active") => {}
+            Ok(out) if parse_show_prop(&out, "ActiveState").as_deref() == Some("active") => {}
             _ => {
                 return Err(format!(
                     "unit {service} left active during success-monitor window"
@@ -320,7 +321,6 @@ pub fn is_downgrade(target: &str, current: &str) -> bool {
         _ => false,
     }
 }
-
 
 /// Render an asset URL template, substituting `{version}`, `{arch}`, `{os}`.
 /// Static templates (no placeholders) pass through unchanged.
@@ -594,16 +594,28 @@ fn read_os_release() -> String {
 /// Deliberately no `Send` bounds — `execute_update`'s future is not `Send`
 /// (restore_backup boxes a non-Send future), and tests run on the
 /// current-thread runtime.
-pub async fn with_service_env_async<F, Fut, R>(install_root: Option<PathBuf>, os_release: Option<String>, f: F) -> R
+pub async fn with_service_env_async<F, Fut, R>(
+    install_root: Option<PathBuf>,
+    os_release: Option<String>,
+    f: F,
+) -> R
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = R>,
 {
-    *SERVICE_INSTALL_ROOT.lock().expect("service install root lock") = install_root;
-    *OS_RELEASE_OVERRIDE.lock().expect("os-release override lock") = os_release;
+    *SERVICE_INSTALL_ROOT
+        .lock()
+        .expect("service install root lock") = install_root;
+    *OS_RELEASE_OVERRIDE
+        .lock()
+        .expect("os-release override lock") = os_release;
     let result = f().await;
-    *SERVICE_INSTALL_ROOT.lock().expect("service install root lock") = None;
-    *OS_RELEASE_OVERRIDE.lock().expect("os-release override lock") = None;
+    *SERVICE_INSTALL_ROOT
+        .lock()
+        .expect("service install root lock") = None;
+    *OS_RELEASE_OVERRIDE
+        .lock()
+        .expect("os-release override lock") = None;
     result
 }
 
@@ -623,6 +635,7 @@ where
 async fn install_service_script(
     recipe: &ShadowRecipe,
     service: &str,
+    target_version: &str,
     log: &mut Vec<String>,
 ) -> std::result::Result<(), StageError> {
     let install = &recipe.install;
@@ -630,13 +643,27 @@ async fn install_service_script(
 
     // exec_start is validated at plan stage for build/script; extract may
     // default to target_dir/package.name.
-    let exec_start = install.exec_start.clone().unwrap_or_else(|| {
+    let exec_start_raw = install.exec_start.clone().unwrap_or_else(|| {
         format!(
             "{}/{}",
             install.target_dir.trim_end_matches('/'),
             recipe.package.name
         )
     });
+    // Author variables inside exec_start render through the Phase-1 engine —
+    // a literal {{target_dir}} in the unit was caught live 2026-10-30 (fleet
+    // verification: ExecStart shipped unsubstituted while WorkingDirectory,
+    // substituted at the spec level, was fine).
+    let ctx = StepContext {
+        version: target_version.to_string(),
+        target_dir: install.target_dir.clone(),
+        arch: std::env::consts::ARCH.to_string(),
+        os: std::env::consts::OS.to_string(),
+        libc: detect_libc(),
+    };
+    let legacy_free = shadow_provision::translate_legacy_braces(&exec_start_raw);
+    let exec_start = render_step(&legacy_free, &ctx)
+        .map_err(|e| stage("service", format!("rendering exec_start: {e}")))?;
     let unit_name = match init {
         InitSystem::Systemd => {
             if service.ends_with(".service") {
@@ -686,10 +713,7 @@ async fn install_service_script(
             .with_context(|| format!("chmod 755 {}", path.display()))
             .map_err(|e| stage("service", e))?;
     }
-    log.push(format!(
-        "wrote {init} service script: {}",
-        path.display()
-    ));
+    log.push(format!("wrote {init} service script: {}", path.display()));
 
     // Enable only (see doc comment: starting is the post_update hook's job).
     match init {
@@ -817,7 +841,10 @@ pub async fn execute_update(
                     }
                 }
             } else {
-                log.push("failure_policy=hold: NOT restoring backup; awaiting operator intervention".to_string());
+                log.push(
+                    "failure_policy=hold: NOT restoring backup; awaiting operator intervention"
+                        .to_string(),
+                );
             }
             UpdateOutcome {
                 success: false,
@@ -930,9 +957,7 @@ async fn execute_inner(
     // to target_dir/package.name, but a built/scripted tree's service command
     // line cannot be guessed — fail loud BEFORE any host change (pre_update,
     // backup, install).
-    if service.is_some()
-        && install.exec_start.is_none()
-        && install.method != InstallMethod::Extract
+    if service.is_some() && install.exec_start.is_none() && install.method != InstallMethod::Extract
     {
         return Err(stage(
             "plan",
@@ -1069,20 +1094,15 @@ async fn execute_inner(
             let mut rendered = Vec::with_capacity(build.steps.len());
             for (i, step) in build.steps.iter().enumerate() {
                 let legacy_free = shadow_provision::translate_legacy_braces(step);
-                let r = render_step(&legacy_free, &ctx).map_err(|e| {
-                    stage("build", format!("rendering step {}: {e}", i + 1))
-                })?;
+                let r = render_step(&legacy_free, &ctx)
+                    .map_err(|e| stage("build", format!("rendering step {}: {e}", i + 1)))?;
                 rendered.push(r);
             }
             log.push(format!("rendered {} build step(s)", rendered.len()));
             let config_paths = install.config_paths.as_deref().unwrap_or(&[]);
-            let resolved = shadow_provision::resolve_step_sources(
-                &rendered,
-                config_paths,
-                http,
-            )
-            .await
-            .map_err(|e| stage("provision", e))?;
+            let resolved = shadow_provision::resolve_step_sources(&rendered, config_paths, http)
+                .await
+                .map_err(|e| stage("provision", e))?;
             // Steps run ONE AT A TIME, fail fast, under the recipe's network
             // policy (deny is the serde default).
             let policy = shadow::resolve_network_policy(build.allow_network);
@@ -1100,7 +1120,7 @@ async fn execute_inner(
     // the unit must exist first). Detection/render/enable details live in
     // install_service_script.
     if let Some(svc) = service {
-        install_service_script(recipe, svc, log).await?;
+        install_service_script(recipe, svc, target_version, log).await?;
     }
 
     // Step 6: post_update hook.
@@ -1159,11 +1179,10 @@ mod tests {
     // #[tokio::test] functions concurrently and they all share the static
     // `SYSTEMD_RUNNER`, so tests that await while the runner is installed must
     // be mutually exclusive.
-    static TEST_RUNNER_LOCK: tokio::sync::Mutex<()> =
-        tokio::sync::Mutex::const_new(());
-    use std::sync::Arc;
+    static TEST_RUNNER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Arc;
     use std::time::Duration;
 
     /// Minimal HTTP/1.1 file server on 127.0.0.1:0 serving `body` for every
@@ -1461,7 +1480,9 @@ detect_pattern = "([0-9.]+)"
         let outcome = execute_update(&recipe, "2.5.0", "", &http_client(), None, false).await;
         assert!(outcome.success, "outcome: {outcome:?}");
         assert_eq!(
-            std::fs::read_to_string(target.join("out.txt")).unwrap().trim(),
+            std::fs::read_to_string(target.join("out.txt"))
+                .unwrap()
+                .trim(),
             "v2.5.0",
             "StepContext.version is bare semver; the v-prefix is author-composed"
         );
@@ -1568,9 +1589,7 @@ detect_pattern = "([0-9.]+)"
                 // The directive-bearing step keeps a runnable remainder:
                 // resolution strips `--source <path> <fallback>` and the
                 // rest executes (the doc's helper name is illustrative).
-                format!(
-                    "true --source {{target_dir}}/.env http://127.0.0.1:{port}/.env.example"
-                ),
+                format!("true --source {{target_dir}}/.env http://127.0.0.1:{port}/.env.example"),
                 "cp {{target_dir}}/.env {{target_dir}}/copied.env".to_string(),
             ],
         );
@@ -1593,8 +1612,7 @@ detect_pattern = "([0-9.]+)"
 
     #[tokio::test]
     async fn execute_update_downgrade_gate_refuses_non_interactive() {
-        let recipe: ShadowRecipe =
-            toml::from_str(&downgrade_unsafe_recipe_toml("")).unwrap();
+        let recipe: ShadowRecipe = toml::from_str(&downgrade_unsafe_recipe_toml("")).unwrap();
         // Target 1.0.0 < current 2.0.0, non-interactive, no health check -> refused.
         let outcome = execute_update(
             &recipe,
@@ -1639,8 +1657,7 @@ detect_pattern = "([0-9.]+)"
 
     #[tokio::test]
     async fn execute_update_downgrade_gate_allows_interactive() {
-        let recipe: ShadowRecipe =
-            toml::from_str(&downgrade_unsafe_recipe_toml("")).unwrap();
+        let recipe: ShadowRecipe = toml::from_str(&downgrade_unsafe_recipe_toml("")).unwrap();
         // Interactive operator confirmed the downgrade: gate must NOT fire.
         let outcome = execute_update(
             &recipe,
@@ -1661,8 +1678,7 @@ detect_pattern = "([0-9.]+)"
 
     #[tokio::test]
     async fn execute_update_downgrade_gate_ignores_upgrades() {
-        let recipe: ShadowRecipe =
-            toml::from_str(&downgrade_unsafe_recipe_toml("")).unwrap();
+        let recipe: ShadowRecipe = toml::from_str(&downgrade_unsafe_recipe_toml("")).unwrap();
         // Target 2.0.0 > current 1.0.0: an upgrade; the flag only gates downgrades.
         let outcome = execute_update(
             &recipe,
@@ -2111,12 +2127,7 @@ asset_url_template = "https://example.com/s"
 
     /// Scripted fake `systemctl`/`journalctl` runner: pops canned responses in
     /// call order and records every argv for assertions.
-    fn scripted_fake(
-        responses: Vec<String>,
-    ) -> (
-        SystemdRunner,
-        Arc<Mutex<Vec<Vec<String>>>>,
-    ) {
+    fn scripted_fake(responses: Vec<String>) -> (SystemdRunner, Arc<Mutex<Vec<Vec<String>>>>) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let responses = Mutex::new(responses);
         let calls_clone = calls.clone();
@@ -2145,10 +2156,10 @@ asset_url_template = "https://example.com/s"
     async fn systemd_health_check_reaches_active_ok() {
         let _lock = TEST_RUNNER_LOCK.lock().await;
         let (runner, _calls) = scripted_fake(vec![
-            "ActiveState=active\n".into(),   // baseline ActiveState
-            "SubState=running\n".into(),     // baseline SubState
-            "NRestarts=0\n".into(),          // baseline NRestarts
-            "ActiveState=active\n".into(),   // health check: active
+            "ActiveState=active\n".into(), // baseline ActiveState
+            "SubState=running\n".into(),   // baseline SubState
+            "NRestarts=0\n".into(),        // baseline NRestarts
+            "ActiveState=active\n".into(), // health check: active
         ]);
         let hc = default_hc();
         let base = with_systemd_runner_async(Some(runner), || async {
@@ -2217,10 +2228,8 @@ asset_url_template = "https://example.com/s"
         .await;
         assert_eq!(base.n_restarts, Some(5));
 
-        let (runner2, _calls2) = scripted_fake(vec![
-            "ActiveState=active\n".into(),
-            "NRestarts=5\n".into(),
-        ]);
+        let (runner2, _calls2) =
+            scripted_fake(vec!["ActiveState=active\n".into(), "NRestarts=5\n".into()]);
         let res = with_systemd_runner_async(Some(runner2), || async {
             systemd_health_check("fake-unit", &hc, &base).await
         })
@@ -2252,10 +2261,8 @@ asset_url_template = "https://example.com/s"
         })
         .await;
 
-        let (runner2, _calls2) = scripted_fake(vec![
-            "ActiveState=active\n".into(),
-            "NRestarts=6\n".into(),
-        ]);
+        let (runner2, _calls2) =
+            scripted_fake(vec!["ActiveState=active\n".into(), "NRestarts=6\n".into()]);
         let res = with_systemd_runner_async(Some(runner2), || async {
             systemd_health_check("fake-unit", &hc, &base).await
         })
@@ -2268,11 +2275,11 @@ asset_url_template = "https://example.com/s"
     async fn stable_time_stays_active_ok() {
         let _lock = TEST_RUNNER_LOCK.lock().await;
         let (runner, _calls) = scripted_fake(vec![
-            "ActiveState=active\n".into(),   // baseline
+            "ActiveState=active\n".into(), // baseline
             "SubState=running\n".into(),
             "NRestarts=0\n".into(),
-            "ActiveState=active\n".into(),   // reached active
-            "ActiveState=active\n".into(),   // still active after stable window
+            "ActiveState=active\n".into(), // reached active
+            "ActiveState=active\n".into(), // still active after stable window
         ]);
         let mut hc = default_hc();
         hc.timeout_secs = 1;
@@ -2322,9 +2329,7 @@ asset_url_template = "https://example.com/s"
             "ActiveState=active\n".into(),
             "ActiveState=active\n".into(),
         ]);
-        let monitor = monopsony_common::shadow_types::SuccessMonitor {
-            window_secs: 2,
-        };
+        let monitor = monopsony_common::shadow_types::SuccessMonitor { window_secs: 2 };
         let res = with_systemd_runner_async(Some(runner), || async {
             success_monitor_window("fake-unit", &monitor).await
         })
@@ -2339,9 +2344,7 @@ asset_url_template = "https://example.com/s"
             "ActiveState=active\n".into(),
             "ActiveState=inactive\n".into(),
         ]);
-        let monitor = monopsony_common::shadow_types::SuccessMonitor {
-            window_secs: 2,
-        };
+        let monitor = monopsony_common::shadow_types::SuccessMonitor { window_secs: 2 };
         let res = with_systemd_runner_async(Some(runner), || async {
             success_monitor_window("fake-unit", &monitor).await
         })
@@ -2406,9 +2409,11 @@ detect_pattern = "([0-9.]+)"
             "journalctl -u fake-unit -n 50: no errors\n".into(),
         ]);
         set_systemd_runner(Some(runner));
-        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
-            execute_update(&recipe, "2.0.0", &url, &http_client(), None, false).await
-        })
+        let outcome = with_service_env_async(
+            Some(svc_root.path().to_path_buf()),
+            Some(String::new()),
+            || async { execute_update(&recipe, "2.0.0", &url, &http_client(), None, false).await },
+        )
         .await;
         set_systemd_runner(None);
 
@@ -2457,9 +2462,15 @@ detect_pattern = "([0-9.]+)"
 
         let outcome = execute_update(&recipe, "15.6.2", &url, &http_client(), None, false).await;
         assert!(!outcome.success);
-        assert!(outcome.rolled_back, "expected auto-rollback, got {outcome:?}");
+        assert!(
+            outcome.rolled_back,
+            "expected auto-rollback, got {outcome:?}"
+        );
         // Default policy restores → held is not set (operator did not hold).
-        assert!(!outcome.held, "auto-rollback must report held=false: {outcome:?}");
+        assert!(
+            !outcome.held,
+            "auto-rollback must report held=false: {outcome:?}"
+        );
     }
 
     #[tokio::test]
@@ -2513,7 +2524,9 @@ backup_old = true
             s.push_str(&format!("post_update = \"{p}\"\n"));
         }
         s.push_str("\n[direct_url]\nversion_discovery = \"scrape\"\nasset_url_template = \"https://example.com/dl/svcapp.tar.gz\"\n");
-        s.push_str("\n[version]\ndetect_command = \"echo 1.0.0\"\ndetect_pattern = \"([0-9.]+)\"\n");
+        s.push_str(
+            "\n[version]\ndetect_command = \"echo 1.0.0\"\ndetect_pattern = \"([0-9.]+)\"\n",
+        );
         s
     }
 
@@ -2527,11 +2540,7 @@ backup_old = true
 
         let tarball = make_tar_gz(&[("start.sh", b"NEW")]);
         let (port, _srv) = spawn_http_server(tarball);
-        let toml = service_extract_recipe_toml(
-            &target,
-            Some("/opt/app/bin/svcapp --serve"),
-            None,
-        );
+        let toml = service_extract_recipe_toml(&target, Some("/opt/app/bin/svcapp --serve"), None);
         let recipe = parse_recipe(&toml);
         let url = format!("http://127.0.0.1:{port}/x.tar.gz");
 
@@ -2544,9 +2553,11 @@ backup_old = true
             "".into(),
         ]);
         set_systemd_runner(Some(runner));
-        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
-            execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await
-        })
+        let outcome = with_service_env_async(
+            Some(svc_root.path().to_path_buf()),
+            Some(String::new()),
+            || async { execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await },
+        )
         .await;
         set_systemd_runner(None);
 
@@ -2568,7 +2579,10 @@ backup_old = true
             !content.contains("{{"),
             "a rendered unit containing a literal double-brace placeholder is a bug: {content}"
         );
-        assert!(outcome.log.iter().any(|l| l.contains("systemd service script")));
+        assert!(outcome
+            .log
+            .iter()
+            .any(|l| l.contains("systemd service script")));
 
         // Enable ran, in order: daemon-reload BEFORE enable. And no start.
         let c = calls.lock().unwrap();
@@ -2603,14 +2617,17 @@ backup_old = true
             "".into(),
         ]);
         set_systemd_runner(Some(runner));
-        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
-            execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await
-        })
+        let outcome = with_service_env_async(
+            Some(svc_root.path().to_path_buf()),
+            Some(String::new()),
+            || async { execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await },
+        )
         .await;
         set_systemd_runner(None);
 
         assert!(outcome.success, "outcome: {outcome:?}");
-        let content = std::fs::read_to_string(svc_root.path().join("systemd/system/svcapp.service")).unwrap();
+        let content =
+            std::fs::read_to_string(svc_root.path().join("systemd/system/svcapp.service")).unwrap();
         let expected = format!("{}/svcapp", target.display());
         assert!(
             content.contains(&format!("ExecStart={expected}")),
@@ -2639,9 +2656,11 @@ backup_old = true
         let recipe = parse_recipe(&toml);
         let (runner, calls) = scripted_fake(vec![]);
         set_systemd_runner(Some(runner));
-        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
-            execute_update(&recipe, "1.0.0", "", &http_client(), None, false).await
-        })
+        let outcome = with_service_env_async(
+            Some(svc_root.path().to_path_buf()),
+            Some(String::new()),
+            || async { execute_update(&recipe, "1.0.0", "", &http_client(), None, false).await },
+        )
         .await;
         set_systemd_runner(None);
 
@@ -2686,9 +2705,11 @@ asset_url_template = "https://example.com/s"
         let recipe = parse_recipe(&toml);
         let (runner, calls2) = scripted_fake(vec![]);
         set_systemd_runner(Some(runner));
-        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
-            execute_update(&recipe, "1.0.0", "", &http_client(), None, false).await
-        })
+        let outcome = with_service_env_async(
+            Some(svc_root.path().to_path_buf()),
+            Some(String::new()),
+            || async { execute_update(&recipe, "1.0.0", "", &http_client(), None, false).await },
+        )
         .await;
         set_systemd_runner(None);
 
@@ -2704,8 +2725,14 @@ asset_url_template = "https://example.com/s"
         );
 
         // Nothing was written or run for either case.
-        assert!(calls.lock().unwrap().is_empty(), "no service ops before plan failure");
-        assert!(calls2.lock().unwrap().is_empty(), "no service ops before plan failure");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "no service ops before plan failure"
+        );
+        assert!(
+            calls2.lock().unwrap().is_empty(),
+            "no service ops before plan failure"
+        );
         assert_eq!(
             std::fs::read_dir(svc_root.path()).unwrap().count(),
             0,
@@ -2737,9 +2764,11 @@ asset_url_template = "https://example.com/s"
             "".into(),
         ]);
         set_systemd_runner(Some(runner));
-        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(alpine.to_string()), || async {
-            execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await
-        })
+        let outcome = with_service_env_async(
+            Some(svc_root.path().to_path_buf()),
+            Some(alpine.to_string()),
+            || async { execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await },
+        )
         .await;
         set_systemd_runner(None);
 
@@ -2757,7 +2786,10 @@ asset_url_template = "https://example.com/s"
             content.contains(&format!("directory=\"{}\"", target.display())),
             "init script must render working_dir: {content}"
         );
-        assert!(!content.contains("{{"), "no literal placeholders may survive: {content}");
+        assert!(
+            !content.contains("{{"),
+            "no literal placeholders may survive: {content}"
+        );
 
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&script).unwrap().permissions().mode() & 0o777;
@@ -2795,22 +2827,34 @@ asset_url_template = "https://example.com/s"
             "".into(), // enable
         ]);
         set_systemd_runner(Some(runner));
-        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
-            execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await
-        })
+        let outcome = with_service_env_async(
+            Some(svc_root.path().to_path_buf()),
+            Some(String::new()),
+            || async { execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await },
+        )
         .await;
         set_systemd_runner(None);
 
         assert!(!outcome.success);
-        assert!(outcome.rolled_back, "binary/config must roll back: {outcome:?}");
         assert!(
-            outcome.error.as_deref().unwrap_or_default().starts_with("post_update"),
+            outcome.rolled_back,
+            "binary/config must roll back: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("post_update"),
             "got: {outcome:?}"
         );
         // Decision 5: the written unit is NOT rolled back — re-render on the
         // next update is idempotent (overwrite).
         assert!(
-            svc_root.path().join("systemd/system/svcapp.service").exists(),
+            svc_root
+                .path()
+                .join("systemd/system/svcapp.service")
+                .exists(),
             "unit-survives-rollback: written unit must remain after rollback"
         );
     }
@@ -2829,9 +2873,11 @@ asset_url_template = "https://example.com/s"
         let recipe = parse_recipe(&toml);
         let url = format!("http://127.0.0.1:{port}/x.tar.gz");
 
-        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
-            execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await
-        })
+        let outcome = with_service_env_async(
+            Some(svc_root.path().to_path_buf()),
+            Some(String::new()),
+            || async { execute_update(&recipe, "1.0.0", &url, &http_client(), None, false).await },
+        )
         .await;
 
         assert!(outcome.success, "outcome: {outcome:?}");
@@ -2937,16 +2983,8 @@ asset_url_template = "https://example.com/s"
         let outfile = tmp.path().join("diff-out-none.txt");
 
         let recipe = parse_recipe(&script_recipe_toml(&target, &outfile, "echo 1.0"));
-        let outcome = execute_update_with_diff(
-            &recipe,
-            None,
-            "7.7.7",
-            "",
-            &http_client(),
-            None,
-            false,
-        )
-        .await;
+        let outcome =
+            execute_update_with_diff(&recipe, None, "7.7.7", "", &http_client(), None, false).await;
 
         assert!(outcome.success, "outcome: {outcome:?}");
         assert!(
@@ -3019,18 +3057,22 @@ detect_pattern = "([0-9.]+)"
             "journalctl -u fake-unit -n 50: no errors\n".into(),
         ]);
         set_systemd_runner(Some(runner));
-        let outcome = with_service_env_async(Some(svc_root.path().to_path_buf()), Some(String::new()), || async {
-            execute_update_with_diff(
-                &new_recipe,
-                Some(&old_recipe),
-                "2.0.0",
-                &url,
-                &http_client(),
-                None,
-                false,
-            )
-            .await
-        })
+        let outcome = with_service_env_async(
+            Some(svc_root.path().to_path_buf()),
+            Some(String::new()),
+            || async {
+                execute_update_with_diff(
+                    &new_recipe,
+                    Some(&old_recipe),
+                    "2.0.0",
+                    &url,
+                    &http_client(),
+                    None,
+                    false,
+                )
+                .await
+            },
+        )
         .await;
         set_systemd_runner(None);
 

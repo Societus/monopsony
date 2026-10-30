@@ -98,6 +98,51 @@ export interface EstimateResponse {
   warnings: string[];
 }
 
+export interface OsReleaseUpgrade {
+  distro: string;
+  from_version: string;
+  to_version: string;
+  ready: boolean;
+  readiness_notes: string[];
+}
+
+// Sprint 29 Phase 4: rendered display-only upgrade guide (grounding D6).
+export interface GuidedRecipeStep {
+  order: number;
+  group: string;
+  action: string;
+  blocking: boolean;
+}
+
+export interface GuidedRecipe {
+  recipe_id: string;
+  title: string;
+  distro_label: string;
+  downgrade_unsafe: boolean;
+  config_paths: string[];
+  steps: GuidedRecipeStep[];
+}
+
+export interface ReleaseGuideResponse {
+  guide: GuidedRecipe | null;
+  reason?: string;
+  ready: boolean;
+  readiness_notes: string[];
+  distro_label: string;
+}
+
+export interface ClientUpdates {
+  security: number;
+  other: number;
+  total: number;
+  reported_at?: string;
+  distro: string;
+  distro_version: string;
+  /** Phase 4: presentation label — PVE hosts show "Proxmox VE", not debian. */
+  distro_label: string;
+  releases: OsReleaseUpgrade[];
+}
+
 export interface ClientInfo {
   id: string;
   hostname: string;
@@ -105,6 +150,8 @@ export interface ClientInfo {
   os_version?: string;
   registered_at: string;
   last_seen: string;
+  /** Sprint 29 B1: update counts + release rows; null until the client reports. */
+  updates?: ClientUpdates | null;
 }
 
 // ─── Shadow Context / Assign Recipe ────────────────────────────────

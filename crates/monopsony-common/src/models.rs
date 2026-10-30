@@ -93,6 +93,27 @@ pub struct Client {
     pub last_seen: DateTime<Utc>,
     pub registered_at: DateTime<Utc>,
     pub cert_serial: Option<String>,
+    /// Sprint 29 B1: last reported upgradable counts (0 / NULL until the
+    /// client sends an UpdateReport on its heartbeat).
+    #[serde(default)]
+    pub update_security: i32,
+    #[serde(default)]
+    pub update_other: i32,
+    #[serde(default)]
+    pub update_total: i32,
+    #[serde(default)]
+    pub update_reported_at: Option<DateTime<Utc>>,
+    /// Client-reported distro identity from /etc/os-release (Phase 2).
+    #[serde(default)]
+    pub reported_distro: Option<String>,
+    #[serde(default)]
+    pub reported_distro_version: Option<String>,
+    /// Sprint 29 Phase 3: client-reported vendor preflight verdict for its
+    /// own release (NULL until the client sends one).
+    #[serde(default)]
+    pub update_ready: Option<bool>,
+    #[serde(default)]
+    pub update_readiness_notes: Option<Vec<String>>,
 }
 
 /// A tracked client certificate, enabling per-cert revocation (red-team F3).
@@ -102,7 +123,7 @@ pub struct ClientCert {
     pub client_id: ClientId,
     pub issued_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
-    pub status: String,      // "active" | "revoked" | "expired"
+    pub status: String, // "active" | "revoked" | "expired"
     pub revoked_at: Option<DateTime<Utc>>,
 }
 

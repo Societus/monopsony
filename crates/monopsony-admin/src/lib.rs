@@ -9,6 +9,7 @@ pub mod cache;
 pub mod clients;
 pub mod enrollment;
 pub mod features;
+pub mod guided;
 pub mod health;
 pub mod help;
 pub mod language_pms;
@@ -202,7 +203,10 @@ pub fn admin_router(state: AdminState) -> Router {
         .route("/api/v1/auth/login", post(auth::handle_login))
         .route("/api/v1/auth/logout", post(auth::handle_logout))
         // Pairing v2 intake — unauthenticated, rate-limited (client initiates).
-        .route("/api/v1/pair/request", post(pairing::handle_pair_request_v2))
+        .route(
+            "/api/v1/pair/request",
+            post(pairing::handle_pair_request_v2),
+        )
         .route(
             "/api/v1/pair/request/:request_id/status",
             get(pairing::handle_pair_request_status),
@@ -277,6 +281,10 @@ pub fn admin_router(state: AdminState) -> Router {
             get(clients::handle_client_inventory),
         )
         .route(
+            "/api/v1/clients/:id/release-guide",
+            get(clients::handle_client_release_guide),
+        )
+        .route(
             "/api/v1/clients/:id/certs/:serial/revoke",
             post(clients::handle_revoke_client_cert),
         )
@@ -319,7 +327,10 @@ pub fn admin_router(state: AdminState) -> Router {
         // Pairing v2 admin endpoints (auth required — dashboard approve/deny).
         .route("/api/v1/pair/pending", get(pairing::handle_pair_pending))
         .route("/api/v1/pair/approve", post(pairing::handle_pair_approve))
-        .route("/api/v1/pair/deny/:request_id", post(pairing::handle_pair_deny))
+        .route(
+            "/api/v1/pair/deny/:request_id",
+            post(pairing::handle_pair_deny),
+        )
         // Pairing v2 approval audit — auth-gated, lists approve/deny history (P4).
         .route("/api/v1/pair/audit", get(pairing::handle_pair_audit))
         // Enrollment keys (P5) — auth-gated dashboard key manager.

@@ -1,5 +1,6 @@
 //! DNF package manager backend implementation
 
+use super::upgradable::{parse_dnf_list, UpgradableReport};
 use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -120,6 +121,47 @@ impl PackageManagerBackend for DnfBackend {
         }
 
         Ok(packages)
+    }
+
+    /// Slow: `dnf list` hits repo metadata. Call at inventory cadence only,
+    /// never per heartbeat tick (grounding D3).
+    async fn list_upgradable(&self) -> crate::Result<UpgradableReport> {
+        let run_dnf = |args: &[&str]| tokio::process::Command::new("dnf").args(args).output();
+
+        let total_output = run_dnf(&["-q", "list", "--updatable"]).await.map_err(|_| {
+            crate::Error::CommandFailed {
+                command: "dnf -q list --updatable".to_string(),
+                exit_code: None,
+            }
+        })?;
+        if !total_output.status.success() {
+            return Err(crate::Error::CommandFailed {
+                command: "dnf -q list --updatable".to_string(),
+                exit_code: total_output.status.code(),
+            });
+        }
+        let total = parse_dnf_list(&String::from_utf8_lossy(&total_output.stdout));
+
+        // dnf exposes a dedicated security listing (grounding D4). A failure
+        // here degrades to zero security visibility, never to no data.
+        let security_note;
+        let security = match run_dnf(&["-q", "--security", "list", "updates"]).await {
+            Ok(out) if out.status.success() => {
+                security_note = "security = separate `dnf --security list updates` listing";
+                parse_dnf_list(&String::from_utf8_lossy(&out.stdout)).min(total)
+            }
+            _ => {
+                security_note = "security listing unavailable; all counts reported as other";
+                0
+            }
+        };
+
+        Ok(UpgradableReport {
+            security,
+            other: total.saturating_sub(security),
+            supported: true,
+            note: security_note.to_string(),
+        })
     }
 
     fn upstream_url_patterns(&self) -> Vec<UrlPattern> {

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+toml = { workspace = true }
 monopsony-common = { path = "../monopsony-common" }
 monopsony-db = { path = "../monopsony-db" }
 monopsony-mirror = { path = "../monopsony-mirror" }

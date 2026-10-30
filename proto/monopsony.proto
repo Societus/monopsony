@@ -29,6 +29,10 @@ service MonopsonyControl {
     // Server-global recipe catalog (Sprint 22 Phase C, tracker-shaped edges)
     rpc ListShadowCatalog(ListShadowCatalogRequest) returns (ShadowCatalog);
     rpc ReportShadowScan(ShadowScanReport) returns (ShadowScanAck);
+
+    // Shadow package staging (client approval workflow)
+    rpc ListShadowStaging(ListShadowStagingRequest) returns (ShadowStagingList);
+    rpc ResolveShadowStaging(ResolveShadowStagingRequest) returns (ResolveShadowStagingResponse);
 }
 
 // Client -> Server messages (for streaming)
@@ -76,6 +80,54 @@ message TamperAlert {
     int64 observed_at = 5;          // unix seconds
 }
 
+// Client -> Server: update counts + reported distro identity (Sprint 29 B1).
+// Rides the periodic heartbeat as an optional field (grounding D3) — counts
+// change without a full inventory rescan, but the upgradable listing is slow
+// so clients compute it at inventory cadence and attach when fresh.
+// `releases`/`selected_release`/`readiness_notes` are Phase 3 fields: the
+// server curates availability (Phase 2), the client adds vendor-preflight
+// verdicts later.
+message UpdateReport {
+    string client_id = 1;
+    int32 total_updates = 2;   // from apt/dnf upgradable listing
+    int32 security_updates = 3;
+    int32 other_updates = 4;
+
+    // OS-release availability (server-merged with local version):
+    repeated OsReleaseUpgrade releases = 5;
+
+    // Readiness verdict + vendor-parsed reasons:
+    OsReleaseUpgrade selected_release = 6;   // the one we'd recommend, or "" if none
+    repeated string readiness_notes = 7;     // e.g. "in cluster: yes (review)", "free space: 82%"
+
+    // Client-reported distro identity from /etc/os-release (Phase 2):
+    string distro = 8;          // ID, e.g. "debian"
+    string distro_version = 9;  // VERSION_ID, e.g. "12"
+}
+
+message OsReleaseUpgrade {
+    string distro = 1;         // e.g. "debian"
+    string from_version = 2;   // client's current, e.g. "12"
+    string to_version = 3;     // available, e.g. "13"
+    bool ready = 4;            // true only if vendor preflight WARN/FAIL all clean
+    repeated string readiness_notes = 5;
+}
+
+// Server -> Client: rendered guided-recipe steps (display only, Sprint 29
+// Phase 4 / grounding D6). The server renders these from authored recipe
+// data + the client's persisted verdict; NOTHING ever executes them —
+// they are rendered checklists for the dashboard, nothing more.
+message GuidedRecipeStep {
+    int32 order = 1;
+    string group = 2;         // "package", "sources", "services", "reboot"
+    string action = 3;        // e.g. "apt update && apt full-upgrade -y"
+    bool blocking = 4;        // true notes that must be reviewed/cleared first
+}
+
+message GuidedRecipe {
+    repeated GuidedRecipeStep steps = 1;
+}
+
 message HeartbeatRequest {
     string client_id = 1;
     int64 timestamp = 2;
@@ -84,6 +136,9 @@ message HeartbeatRequest {
     uint32 failed_updates_window = 3; // failures within [window_start_ts, now]
     int64 last_update_attempt_ts = 4; // unix seconds; 0 = no attempt recorded
     int64 window_start_ts = 5;        // unix seconds; 0 = legacy client, no data
+    // Sprint 29 B1 (grounding D3): update counts + reported distro/version,
+    // attached when the client's local cache is fresh (absent = no data).
+    UpdateReport update_report = 6;
 }
 
 message HeartbeatResponse {
@@ -494,5 +549,54 @@ message ShadowScanFinding {
 
 message ShadowScanAck {
     bool accepted = 1;
+    string message = 2;
+}
+
+// ── Shadow package staging (client approval workflow) ──
+
+message FirewallRuleInfo {
+    uint32 port = 1;
+    string protocol = 2; // "tcp" | "udp"
+    string direction = 3; // "inbound" | "outbound" | "both"
+    string description = 4;
+}
+
+message ShadowStagingInfo {
+    string id = 1;
+    string recipe_name = 2;
+    string status = 3; // "pending" | "approved" | "rejected"
+    string suggested_target_dir = 4;
+    repeated string suggested_accessory_dirs = 5;
+    repeated FirewallRuleInfo suggested_firewall_rules = 6;
+    string suggested_health_check = 7; // serialized HealthCheck JSON
+    string client_target_dir = 8;
+    repeated string client_accessory_dirs = 9;
+    repeated FirewallRuleInfo client_firewall_rules = 10;
+    string client_health_check = 11; // serialized HealthCheck JSON
+    int64 created_at = 12;
+    int64 reviewed_at = 13;
+    int64 resolved_at = 14;
+}
+
+message ShadowStagingList {
+    repeated ShadowStagingInfo items = 1;
+}
+
+message ListShadowStagingRequest {
+    string client_id = 1;
+}
+
+message ResolveShadowStagingRequest {
+    string client_id = 1;
+    string recipe_name = 2;
+    string status = 3; // "approved" | "rejected"
+    string client_target_dir = 4;
+    repeated string client_accessory_dirs = 5;
+    repeated FirewallRuleInfo client_firewall_rules = 6;
+    string client_health_check = 7; // serialized HealthCheck JSON
+}
+
+message ResolveShadowStagingResponse {
+    bool resolved = 1;
     string message = 2;
 }

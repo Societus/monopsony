@@ -1,16 +1,16 @@
+use anyhow::Context;
 use monopsony_common::package_manager::PackageRef;
 use monopsony_common::proto::monopsony::monopsony_control_client::MonopsonyControlClient;
 use monopsony_common::proto::monopsony::{
     client_message, ApplyShadowUpdateRequest, CheckShadowUpdatesRequest,
-    DownloadShadowAssetRequest, GetShadowRecipeRequest, HeartbeatRequest, InventoryReport,
-    ListShadowCatalogRequest, ListShadowPackagesRequest, PackageEntry, PairRequest, PairResponse,
-    RegisterRequest, RegisterShadowPackageRequest, QueryShadowRegistryRequest,
-    QueryShadowRegistryResponse, RenewClientCertRequest,
-    RollbackShadowUpdateRequest, ShadowCatalogEntry,
-    ShadowPackageInfo, ShadowScanFinding, ShadowScanReport, ShadowUpdateInfo,
-    UnregisterShadowPackageRequest,
+    DownloadShadowAssetRequest, FirewallRuleInfo, GetShadowRecipeRequest, HeartbeatRequest,
+    InventoryReport, ListShadowCatalogRequest, ListShadowPackagesRequest, ListShadowStagingRequest,
+    PackageEntry, PairRequest, PairResponse, QueryShadowRegistryRequest,
+    QueryShadowRegistryResponse, RegisterRequest, RegisterShadowPackageRequest,
+    RenewClientCertRequest, ResolveShadowStagingRequest, RollbackShadowUpdateRequest,
+    ShadowCatalogEntry, ShadowPackageInfo, ShadowScanFinding, ShadowScanReport, ShadowStagingInfo,
+    ShadowUpdateInfo, UnregisterShadowPackageRequest,
 };
-use anyhow::Context;
 use std::path::Path;
 use tonic::transport::Channel;
 use tracing::{debug, info};
@@ -122,10 +122,7 @@ impl ClientCerts {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                &entries[1].1,
-                std::fs::Permissions::from_mode(0o600),
-            )?;
+            std::fs::set_permissions(&entries[1].1, std::fs::Permissions::from_mode(0o600))?;
         }
 
         // Rename into place — each rename is atomic on the same filesystem.
@@ -133,7 +130,10 @@ impl ClientCerts {
             std::fs::rename(tmp, target)?;
         }
 
-        info!("Client certificates rotated atomically into {}", cert_dir.display());
+        info!(
+            "Client certificates rotated atomically into {}",
+            cert_dir.display()
+        );
         Ok(())
     }
 }
@@ -555,6 +555,7 @@ impl MonopsonyGrpcClient {
         &mut self,
         client_id: &str,
         health: &crate::update_health::UpdateHealthSnapshot,
+        update_report: Option<monopsony_common::proto::monopsony::UpdateReport>,
     ) -> anyhow::Result<i64> {
         let req = HeartbeatRequest {
             client_id: client_id.to_string(),
@@ -563,6 +564,9 @@ impl MonopsonyGrpcClient {
             failed_updates_window: health.failed_updates_window,
             last_update_attempt_ts: health.last_update_attempt_ts,
             window_start_ts: health.window_start_ts,
+            // Sprint 29 B1: update counts + reported distro identity, only
+            // while the client's local cache is fresh (grounding D3).
+            update_report,
         };
 
         debug!(client_id = client_id, "Sending heartbeat");
@@ -641,6 +645,9 @@ impl MonopsonyGrpcClient {
                 failed_updates_window: health.failed_updates_window,
                 last_update_attempt_ts: health.last_update_attempt_ts,
                 window_start_ts: health.window_start_ts,
+                // Command polling only: no UpdateReport here, the unary
+                // heartbeat carries it.
+                update_report: None,
             })),
         };
         let outbound = futures_util::stream::iter(vec![message]);
@@ -996,6 +1003,54 @@ impl MonopsonyGrpcClient {
         let packages = resp.into_inner().packages;
         debug!(count = packages.len(), "Shadow package list received");
         Ok(packages)
+    }
+
+    /// List shadow staging items awaiting client approval for this client.
+    #[allow(dead_code)]
+    pub async fn list_shadow_staging(
+        &mut self,
+        client_id: &str,
+    ) -> anyhow::Result<Vec<ShadowStagingInfo>> {
+        let req = ListShadowStagingRequest {
+            client_id: client_id.to_string(),
+        };
+        debug!(client_id = client_id, "Listing shadow staging items");
+        let resp = self.client.list_shadow_staging(req).await?;
+        let items = resp.into_inner().items;
+        debug!(count = items.len(), "Shadow staging list received");
+        Ok(items)
+    }
+
+    /// Resolve a shadow staging item: approve or reject with client overrides.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_shadow_staging(
+        &mut self,
+        client_id: &str,
+        recipe_name: &str,
+        status: &str,
+        client_target_dir: Option<&str>,
+        client_accessory_dirs: &[String],
+        client_firewall_rules: &[FirewallRuleInfo],
+        client_health_check: Option<&str>,
+    ) -> anyhow::Result<bool> {
+        let req = ResolveShadowStagingRequest {
+            client_id: client_id.to_string(),
+            recipe_name: recipe_name.to_string(),
+            status: status.to_string(),
+            client_target_dir: client_target_dir.unwrap_or_default().to_string(),
+            client_accessory_dirs: client_accessory_dirs.to_vec(),
+            client_firewall_rules: client_firewall_rules.to_vec(),
+            client_health_check: client_health_check.unwrap_or_default().to_string(),
+        };
+        debug!(
+            client_id = client_id,
+            recipe = recipe_name,
+            status = status,
+            "Resolving shadow staging item"
+        );
+        let resp = self.client.resolve_shadow_staging(req).await?;
+        Ok(resp.into_inner().resolved)
     }
 
     /// Register a shadow package from a recipe TOML.

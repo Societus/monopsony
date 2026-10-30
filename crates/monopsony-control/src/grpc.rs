@@ -1,10 +1,10 @@
 //! gRPC service implementation for Monopsony control plane
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
-use std::future::Future;
 
 use anyhow::{Context, Result};
 use futures::stream::{Stream, StreamExt};
@@ -21,16 +21,16 @@ use monopsony_common::proto::monopsony::monopsony_control_server::{
 };
 use monopsony_common::proto::monopsony::{
     client_message, command, server_message, ApplyShadowUpdateRequest, CheckShadowUpdatesRequest,
-    ClientMessage, Command, DownloadShadowAssetRequest, GetShadowRecipeRequest, HeartbeatRequest,
-    HeartbeatResponse, InventoryDelta, InventoryReport, InventoryResponse,
-    ListShadowCatalogRequest, ListShadowPackagesRequest, RegisterRequest, RegisterResponse,
-    RegisterShadowPackageRequest,
-    QueryShadowRegistryRequest, QueryShadowRegistryResponse, RenewClientCertRequest, RenewClientCertResponse,
-    RevokeClientCertRequest, RevokeClientCertResponse,
-    RollbackShadowUpdateRequest, ServerMessage, ShadowAssetChunk, FleetInstall,
-    ShadowCatalog, ShadowCatalogEntry, ShadowPackageInfo, ShadowPackageList, ShadowRegistryMatch,
-    ShadowScanAck,
-    ShadowScanReport, ShadowUpdateList, ShadowUpdateResult, SignedShadowRecipe, SyncRequest,
+    ClientMessage, Command, DownloadShadowAssetRequest, FirewallRuleInfo, FleetInstall,
+    GetShadowRecipeRequest, HeartbeatRequest, HeartbeatResponse, InventoryDelta, InventoryReport,
+    InventoryResponse, ListShadowCatalogRequest, ListShadowPackagesRequest,
+    ListShadowStagingRequest, QueryShadowRegistryRequest, QueryShadowRegistryResponse,
+    RegisterRequest, RegisterResponse, RegisterShadowPackageRequest, RenewClientCertRequest,
+    RenewClientCertResponse, ResolveShadowStagingRequest, ResolveShadowStagingResponse,
+    RevokeClientCertRequest, RevokeClientCertResponse, RollbackShadowUpdateRequest, ServerMessage,
+    ShadowAssetChunk, ShadowCatalog, ShadowCatalogEntry, ShadowPackageInfo, ShadowPackageList,
+    ShadowRegistryMatch, ShadowScanAck, ShadowScanReport, ShadowStagingInfo, ShadowStagingList,
+    ShadowUpdateList, ShadowUpdateResult, SignedShadowRecipe, SyncRequest,
     UnregisterShadowPackageRequest, UnregisterShadowPackageResponse,
 };
 
@@ -106,6 +106,52 @@ fn passes_id_filter(package_id: &str, filter: &[String]) -> bool {
     filter.is_empty() || filter.iter().any(|f| f == package_id)
 }
 
+/// Latest version for a `direct_url` recipe via its own discovery config.
+/// The GitHub-only source parser (`parse_github_repo`) cannot read these —
+/// found live during Sprint 29/32 fleet verification 2026-10-30.
+async fn direct_url_latest_version(
+    db: &monopsony_db::Database,
+    name: &str,
+    source_url: &str,
+    tag_pattern: &str,
+) -> Result<Option<String>, String> {
+    let Some(toml_str) = db
+        .get_shadow_recipe_toml(name)
+        .await
+        .map_err(|e| e.to_string())?
+    else {
+        return Err(format!("no catalog recipe for direct_url package {name}"));
+    };
+    let recipe: monopsony_common::shadow_types::ShadowRecipe =
+        toml::from_str(&toml_str).map_err(|e| format!("recipe {name} parse: {e}"))?;
+    let Some(du) = &recipe.direct_url else {
+        return Err(format!("recipe {name} has no [direct_url] section"));
+    };
+    if du.version_discovery != "scrape" {
+        // url_pattern discovery has no version path (matches DirectUrlSource).
+        return Ok(None);
+    }
+    let Some(scrape_url) = &du.scrape_url else {
+        return Err(format!("recipe {name} scrape discovery missing scrape_url"));
+    };
+    let pattern = du
+        .scrape_pattern
+        .clone()
+        .unwrap_or_else(|| r"([0-9]+\.[0-9]+\.[0-9]+)".to_string());
+    let src = monopsony_shadow::shadow_source::DirectUrlSource::new(
+        source_url.to_string(),
+        monopsony_shadow::shadow_source::VersionDiscovery::ScrapePage {
+            url: scrape_url.clone(),
+            pattern,
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    use monopsony_shadow::shadow_source::UpdateSource;
+    src.latest_version(tag_pattern)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 pub struct MonopsonyGrpc {
     db: Arc<Database>,
     tls_manager: Arc<TlsManager>,
@@ -173,11 +219,7 @@ impl MonopsonyGrpc {
         let client = match self.db.get_client(client_id).await {
             Ok(Some(client)) => client,
             Ok(None) => return Ok(()),
-            Err(e) => {
-                return Err(Status::internal(format!(
-                    "failed to look up client: {e}"
-                )))
-            }
+            Err(e) => return Err(Status::internal(format!("failed to look up client: {e}"))),
         };
 
         if let Some(serial) = client.cert_serial.as_deref() {
@@ -265,6 +307,39 @@ impl MonopsonyGrpc {
             ClientId::parse(&req.client_id).context("Invalid client ID in heartbeat request")?;
 
         self.db.heartbeat(&client_id).await?;
+
+        // Sprint 29 B1 (grounding D1/D3): optional UpdateReport on the
+        // heartbeat persists counts + reported distro identity as columns on
+        // the client row. Absent field = pre-S29 client, nothing to record.
+        // Sprint 29 B2 gap fix: non-Linux hosts send an UpdateReport with
+        // empty distro fields — persisting them would clobber a real
+        // identity with "". Skip persistence entirely for those.
+        if let Some(report) = req.update_report.as_ref() {
+            if !update_report_reportable(report) {
+                debug!(
+                    client_id = %req.client_id,
+                    "Skipping UpdateReport persistence: empty distro (non-Linux host)"
+                );
+            } else if let Err(e) = self
+                .db
+                .record_update_report(
+                    &client_id,
+                    report.security_updates,
+                    report.other_updates,
+                    report.total_updates,
+                    &report.distro,
+                    &report.distro_version,
+                    report.selected_release.as_ref().map(|r| r.ready),
+                    report
+                        .selected_release
+                        .as_ref()
+                        .map(|r| r.readiness_notes.as_slice()),
+                )
+                .await
+            {
+                warn!(client_id = %req.client_id, error = %e, "Failed to persist UpdateReport");
+            }
+        }
 
         // Sprint 27 Part A: heartbeat received → client is live. Pin the age
         // gauge to 0 and close any open stale episode immediately, so a
@@ -354,7 +429,10 @@ impl MonopsonyGrpc {
 
         Ok(RevokeClientCertResponse {
             revoked: true,
-            message: format!("Certificate serial {} revoked for client {}", serial, client_id),
+            message: format!(
+                "Certificate serial {} revoked for client {}",
+                serial, client_id
+            ),
         })
     }
 
@@ -369,9 +447,8 @@ impl MonopsonyGrpc {
         peer_serial: Option<&str>,
         req: RenewClientCertRequest,
     ) -> Result<RenewClientCertResponse> {
-        let peer_serial = peer_serial.context(
-            "RenewClientCert requires mTLS, but no peer certificate was presented",
-        )?;
+        let peer_serial = peer_serial
+            .context("RenewClientCert requires mTLS, but no peer certificate was presented")?;
 
         // Bind the call to the client owning the presented certificate: a
         // valid mTLS cert for client A cannot renew client B's certificate.
@@ -1265,6 +1342,34 @@ impl MonopsonyControl for MonopsonyGrpc {
                     .and_then(|x| x.as_str())
                     .unwrap_or(".*");
 
+                let source_type = v.get("source_type").and_then(|x| x.as_str()).unwrap_or("");
+                if source_type == "direct_url" {
+                    let pkg_name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
+                    match direct_url_latest_version(&self.db, pkg_name, source_url, tag_pattern)
+                        .await
+                    {
+                        Ok(Some(latest)) if latest != version => {
+                            updates.push(monopsony_common::proto::monopsony::ShadowUpdateInfo {
+                                package_id: pkg_id.to_string(),
+                                package_name: pkg_name.to_string(),
+                                current_version: version.to_string(),
+                                latest_version: latest,
+                                // Empty: the client rebuilds the asset URL from its
+                                // recipe's asset_url_template (update arm fallback).
+                                asset_url: String::new(),
+                                asset_name: String::new(),
+                                asset_size: 0,
+                                release_notes_url: String::new(),
+                            });
+                        }
+                        Ok(_) => { /* up to date or undiscoverable */ }
+                        Err(e) => {
+                            warn!(package_id = %pkg_id, error = %e, "direct_url update check failed");
+                        }
+                    }
+                    continue;
+                }
+
                 match mgr
                     .check_one(&pkg_id, source_url, tag_pattern, version)
                     .await
@@ -1597,6 +1702,77 @@ impl MonopsonyControl for MonopsonyGrpc {
             message: format!("Recorded {} shadow scan finding(s)", accepted),
         }))
     }
+
+    async fn list_shadow_staging(
+        &self,
+        request: Request<ListShadowStagingRequest>,
+    ) -> Result<Response<ShadowStagingList>, Status> {
+        let req = request.into_inner();
+        let client_id = ClientId::parse(&req.client_id)
+            .map_err(|e| Status::invalid_argument(format!("Invalid client ID: {e}")))?;
+
+        let rows = self
+            .db
+            .list_shadow_staging_for_client(client_id.0)
+            .await
+            .map_err(|e| Status::internal(format!("DB error listing shadow staging: {e}")))?;
+
+        let items: Vec<ShadowStagingInfo> = rows.into_iter().map(staging_row_to_info).collect();
+
+        Ok(Response::new(ShadowStagingList { items }))
+    }
+
+    async fn resolve_shadow_staging(
+        &self,
+        request: Request<ResolveShadowStagingRequest>,
+    ) -> Result<Response<ResolveShadowStagingResponse>, Status> {
+        let req = request.into_inner();
+        let client_id = ClientId::parse(&req.client_id)
+            .map_err(|e| Status::invalid_argument(format!("Invalid client ID: {e}")))?;
+
+        if !resolution_status_valid(&req.status) {
+            return Err(Status::invalid_argument(
+                "status must be 'approved' or 'rejected'",
+            ));
+        }
+
+        let fw_rules: Vec<(u16, String, String, String)> = req
+            .client_firewall_rules
+            .iter()
+            .map(fw_info_to_tuple)
+            .collect();
+
+        let hc = if req.client_health_check.is_empty() {
+            None
+        } else {
+            Some(req.client_health_check.as_str())
+        };
+
+        self.db
+            .resolve_shadow_staging(
+                client_id.0,
+                &req.recipe_name,
+                &req.status,
+                if req.client_target_dir.is_empty() {
+                    None
+                } else {
+                    Some(req.client_target_dir.as_str())
+                },
+                &req.client_accessory_dirs,
+                &fw_rules,
+                hc,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("DB error resolving shadow staging: {e}")))?;
+
+        Ok(Response::new(ResolveShadowStagingResponse {
+            resolved: true,
+            message: format!(
+                "Shadow staging {} for recipe {}",
+                req.status, req.recipe_name
+            ),
+        }))
+    }
 }
 
 // Thin orchestrator entrypoint — args mirror the wired subsystems (db, tls,
@@ -1630,8 +1806,8 @@ pub async fn start(
     // Build the tonic service router without TLS config — we handle TLS
     // ourselves with a custom rustls ServerConfig that includes the
     // RevocationCheckingVerifier (red-team F3).
-    let mut router = tonic::transport::Server::builder()
-        .add_service(MonopsonyControlServer::new(grpc));
+    let mut router =
+        tonic::transport::Server::builder().add_service(MonopsonyControlServer::new(grpc));
 
     if let Some(mm) = mirror_manager {
         let mirror_grpc = MirrorControlGrpc::new(mm);
@@ -1646,10 +1822,8 @@ pub async fn start(
     let svc = router.into_service();
 
     // Build rustls ServerConfig with revocation checking at the TLS accept path.
-    let rustls_config = tls_manager.rustls_server_config_with_revocation(
-        Some(addr.ip()),
-        additional_tls_sans,
-    )?;
+    let rustls_config =
+        tls_manager.rustls_server_config_with_revocation(Some(addr.ip()), additional_tls_sans)?;
     let tls_acceptor = tokio_rustls::server::TlsAcceptor::from(Arc::new(rustls_config));
 
     // Build the HTTP/2 connection builder.
@@ -1676,9 +1850,7 @@ pub async fn start(
 
         let acceptor = tls_acceptor.clone();
         let svc = svc.clone();
-        let mapped = svc.map_request(|req: http::Request<Incoming>| {
-            req.map(tonic::body::boxed)
-        });
+        let mapped = svc.map_request(|req: http::Request<Incoming>| req.map(tonic::body::boxed));
         let builder = conn_builder.clone();
 
         tokio::spawn(async move {
@@ -1691,10 +1863,11 @@ pub async fn start(
                     // the same mTLS handshake bytes to this accept path.
                     let peer_serial = peer_cert_serial_hex(&tls_stream);
                     let io = hyper_util::rt::TokioIo::new(tls_stream);
-                    let conn_svc =
-                        PeerSerialSvc { inner: mapped, peer_serial };
-                    let hyper_svc =
-                        hyper_util::service::TowerToHyperService::new(conn_svc);
+                    let conn_svc = PeerSerialSvc {
+                        inner: mapped,
+                        peer_serial,
+                    };
+                    let hyper_svc = hyper_util::service::TowerToHyperService::new(conn_svc);
                     if let Err(e) = builder.serve_connection(io, hyper_svc).await {
                         warn!(peer = %peer_addr, "gRPC connection error: {e}");
                     }
@@ -1900,6 +2073,69 @@ impl monopsony_common::proto::monopsony::mirror_control_server::MirrorControl
     }
 }
 
+/// Sprint 29 B2 gap fix: an UpdateReport with an empty distro comes from a
+/// non-Linux host — persisting it would overwrite a real identity with "".
+/// Such reports are never persisted.
+fn update_report_reportable(report: &monopsony_common::proto::monopsony::UpdateReport) -> bool {
+    !report.distro.is_empty()
+}
+
+use monopsony_db::db::ShadowStagingRow;
+
+/// Map a DB `shadow_staging` row to the wire representation. Pure —
+/// unit-tested below; the RPC handler is a thin wrapper around this.
+fn staging_row_to_info(row: ShadowStagingRow) -> ShadowStagingInfo {
+    ShadowStagingInfo {
+        id: row.id.to_string(),
+        recipe_name: row.recipe_name,
+        status: row.status,
+        suggested_target_dir: row.suggested_target_dir,
+        suggested_accessory_dirs: row.suggested_accessory_dirs,
+        suggested_firewall_rules: row
+            .suggested_firewall_rules
+            .iter()
+            .map(fw_tuple_to_info)
+            .collect(),
+        suggested_health_check: row.suggested_health_check.unwrap_or_default(),
+        client_target_dir: row.client_target_dir.unwrap_or_default(),
+        client_accessory_dirs: row.client_accessory_dirs,
+        client_firewall_rules: row
+            .client_firewall_rules
+            .iter()
+            .map(fw_tuple_to_info)
+            .collect(),
+        client_health_check: row.client_health_check.unwrap_or_default(),
+        created_at: row.created_at,
+        reviewed_at: row.reviewed_at.unwrap_or(0),
+        resolved_at: row.resolved_at.unwrap_or(0),
+    }
+}
+
+/// (port, protocol, direction, description) DB tuple → proto message.
+fn fw_tuple_to_info(r: &(u16, String, String, String)) -> FirewallRuleInfo {
+    FirewallRuleInfo {
+        port: r.0 as u32,
+        protocol: r.1.clone(),
+        direction: r.2.clone(),
+        description: r.3.clone(),
+    }
+}
+
+/// Proto message → (port, protocol, direction, description) DB tuple.
+fn fw_info_to_tuple(r: &FirewallRuleInfo) -> (u16, String, String, String) {
+    (
+        r.port as u16,
+        r.protocol.clone(),
+        r.direction.clone(),
+        r.description.clone(),
+    )
+}
+
+/// Resolution status gate: only "approved" | "rejected" are accepted.
+fn resolution_status_valid(status: &str) -> bool {
+    status == "approved" || status == "rejected"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1919,5 +2155,129 @@ mod tests {
     fn id_filter_rejects_non_member() {
         let filter = vec!["abc-123".to_string()];
         assert!(!passes_id_filter("other-id", &filter));
+    }
+
+    fn sample_report(distro: &str) -> monopsony_common::proto::monopsony::UpdateReport {
+        monopsony_common::proto::monopsony::UpdateReport {
+            client_id: "c1".into(),
+            total_updates: 0,
+            security_updates: 0,
+            other_updates: 0,
+            releases: Vec::new(),
+            selected_release: None,
+            readiness_notes: Vec::new(),
+            distro: distro.into(),
+            distro_version: "12".into(),
+        }
+    }
+
+    #[test]
+    fn update_report_with_distro_is_persistable() {
+        assert!(update_report_reportable(&sample_report("debian")));
+    }
+
+    #[test]
+    fn update_report_with_empty_distro_is_skipped() {
+        // Sprint 29 B2 gap fix: non-Linux hosts report empty distro fields;
+        // persistence must be skipped so "" never clobbers a real identity.
+        assert!(!update_report_reportable(&sample_report("")));
+    }
+
+    fn sample_staging_row() -> monopsony_db::db::ShadowStagingRow {
+        monopsony_db::db::ShadowStagingRow {
+            id: uuid::Uuid::nil(),
+            client_id: Some(uuid::Uuid::nil()),
+            recipe_name: "checkmk-server".to_string(),
+            status: "pending".to_string(),
+            suggested_target_dir: "/opt/checkmk".to_string(),
+            suggested_accessory_dirs: vec!["/etc/checkmk".to_string()],
+            suggested_firewall_rules: vec![(
+                8443,
+                "tcp".to_string(),
+                "inbound".to_string(),
+                "web UI".to_string(),
+            )],
+            suggested_health_check: Some(r#"{"type":"port","port":8443}"#.to_string()),
+            client_target_dir: None,
+            client_accessory_dirs: vec![],
+            client_firewall_rules: vec![],
+            client_health_check: None,
+            created_at: 1_760_000_000,
+            reviewed_at: None,
+            resolved_at: None,
+        }
+    }
+
+    #[test]
+    fn staging_row_maps_suggested_fields_to_wire() {
+        let info = staging_row_to_info(sample_staging_row());
+        assert_eq!(info.recipe_name, "checkmk-server");
+        assert_eq!(info.status, "pending");
+        assert_eq!(info.suggested_target_dir, "/opt/checkmk");
+        assert_eq!(info.suggested_accessory_dirs, vec!["/etc/checkmk"]);
+        assert_eq!(info.suggested_firewall_rules.len(), 1);
+        assert_eq!(info.suggested_firewall_rules[0].port, 8443);
+        assert_eq!(info.suggested_firewall_rules[0].protocol, "tcp");
+        assert_eq!(info.suggested_firewall_rules[0].direction, "inbound");
+        assert_eq!(info.suggested_firewall_rules[0].description, "web UI");
+        assert!(info.suggested_health_check.contains("8443"));
+        assert_eq!(info.created_at, 1_760_000_000);
+    }
+
+    #[test]
+    fn staging_row_pending_defaults_client_side_to_empty() {
+        // An unresolved (pending) row has no client overrides: Option::None
+        // columns must surface as empty strings / zero timestamps on the wire.
+        let info = staging_row_to_info(sample_staging_row());
+        assert_eq!(info.client_target_dir, "");
+        assert!(info.client_accessory_dirs.is_empty());
+        assert!(info.client_firewall_rules.is_empty());
+        assert_eq!(info.client_health_check, "");
+        assert_eq!(info.reviewed_at, 0);
+        assert_eq!(info.resolved_at, 0);
+    }
+
+    #[test]
+    fn staging_row_resolved_carries_client_overrides() {
+        let mut row = sample_staging_row();
+        row.status = "approved".to_string();
+        row.client_target_dir = Some("/srv/checkmk".to_string());
+        row.client_firewall_rules = vec![(
+            9000,
+            "tcp".to_string(),
+            "outbound".to_string(),
+            "agent".to_string(),
+        )];
+        row.reviewed_at = Some(1_760_000_100);
+        row.resolved_at = Some(1_760_000_200);
+        let info = staging_row_to_info(row);
+        assert_eq!(info.status, "approved");
+        assert_eq!(info.client_target_dir, "/srv/checkmk");
+        assert_eq!(info.client_firewall_rules[0].port, 9000);
+        assert_eq!(info.client_firewall_rules[0].direction, "outbound");
+        assert_eq!(info.reviewed_at, 1_760_000_100);
+        assert_eq!(info.resolved_at, 1_760_000_200);
+    }
+
+    #[test]
+    fn fw_tuple_and_info_round_trip() {
+        let tuple = (
+            80u16,
+            "udp".to_string(),
+            "both".to_string(),
+            "dns".to_string(),
+        );
+        let info = fw_tuple_to_info(&tuple);
+        assert_eq!(info.port, 80);
+        assert_eq!(fw_info_to_tuple(&info), tuple);
+    }
+
+    #[test]
+    fn resolution_status_gate_is_exact_match() {
+        assert!(resolution_status_valid("approved"));
+        assert!(resolution_status_valid("rejected"));
+        assert!(!resolution_status_valid("pending"));
+        assert!(!resolution_status_valid("Approved"));
+        assert!(!resolution_status_valid(""));
     }
 }

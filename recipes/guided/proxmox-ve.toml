@@ -1,0 +1,49 @@
+# Sprint 29 Phase 4 (grounding D6) — guided OS-release upgrade recipe,
+# DISPLAY ONLY. Parsed with the existing shadow RecipeScript/ShadowRecipe
+# schema (display-only repurpose, plan decision #4). The ordering below is
+# the plan's safe PVE ordering and is asserted verbatim by the renderer's
+# tests — a wrong sequence ("stop corosync before the first dist-upgrade")
+# must fail those tests, never ship. Nothing here is ever executed.
+# Placeholders {from_version}/{to_version}/{from_major}/{to_major} are
+# filled from the client's persisted verdict at render time.
+#
+# Plan Phase 4 example ordering (verbatim):
+#   1. apt update & dist-upgrade
+#   2. change apt sources to <new distro slug lines>
+#   3. stop corosync, pmxcfs, ceph services
+#   4. apt update & upgrade again
+#   5. confirm completion and reboot
+# An OS release has NO atomic rollback (plan §Proven-failure) — hence
+# downgrade_unsafe = true, surfaced as a "no rollback" warning.
+
+downgrade_unsafe = true
+
+[package]
+name = "proxmox-ve"
+description = "Proxmox VE release upgrade guide (display only — review before running, no rollback)"
+homepage = "https://pve.proxmox.com/wiki/Category:Upgrade"
+source_type = "direct_url"
+source_url = "https://pve.proxmox.com/wiki/Category:Upgrade"
+
+[install]
+method = "script"
+target_dir = "/"
+config_paths = ["/etc/apt/sources.list", "/etc/apt/sources.list.d/"]
+
+[script]
+update = """
+apt update && apt full-upgrade -y
+Change the apt sources to the new release slug lines: pve{from_major} -> pve{to_major} and the Debian {from_version} suite -> {to_version} suite in /etc/apt/sources.list and /etc/apt/sources.list.d/
+systemctl stop corosync pve-cluster ceph-mon ceph-mgr ceph-osd
+apt update && apt full-upgrade -y
+Confirm the upgrade completed, then reboot into the new {to_version} kernel
+"""
+
+[install.health_check]
+type = "port"
+port = 8006
+timeout_secs = 60
+
+[version]
+detect_command = "pveversion"
+detect_pattern = "pve-manager/([0-9]+)"

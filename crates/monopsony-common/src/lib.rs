@@ -6,6 +6,7 @@ pub mod config;
 pub mod error;
 pub mod metrics;
 pub mod models;
+pub mod os_release;
 pub mod package_manager;
 pub mod pin_store;
 pub mod proto;
@@ -20,5 +21,5 @@ pub use models::*;
 pub use package_manager::{
     PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern,
 };
-pub use shadow_diff::{ShadowDiffClass, ShadowDiffWarning, shadow_diff};
-pub use shadow_template::{StepContext, TemplateError, render_step};
+pub use shadow_diff::{shadow_diff, ShadowDiffClass, ShadowDiffWarning};
+pub use shadow_template::{render_step, StepContext, TemplateError};

@@ -11,3 +11,4 @@ pub mod oracle_update;
 pub mod pin_verify;
 pub mod proxy;
 pub mod self_update;
+pub mod staging_review;

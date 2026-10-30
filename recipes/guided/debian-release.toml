@@ -1,0 +1,37 @@
+# Sprint 29 Phase 4 (grounding D6) — guided OS-release upgrade recipe,
+# DISPLAY ONLY. Parsed with the existing shadow RecipeScript/ShadowRecipe
+# schema (display-only repurpose, plan decision #4): [script].update holds
+# the ordered checklist steps (one per line, in safe order — the ordering
+# below is asserted by the renderer's tests), [install].config_paths lists
+# the files the guide edits, and nothing here is ever executed.
+# Placeholders {from_version}/{to_version}/{from_major}/{to_major} are
+# filled from the client's persisted verdict at render time.
+#
+# Debian has no vendor dry-run tool in base (grounding D5); the canonical
+# oldstable -> stable path is: full upgrade on the current release, retarget
+# apt sources, full upgrade again, clean up, reboot.
+
+[package]
+name = "debian-release"
+description = "Debian release upgrade guide (display only — review before running)"
+homepage = "https://www.debian.org/releases/stable/releasenotes"
+source_type = "direct_url"
+source_url = "https://www.debian.org/releases/stable/releasenotes"
+
+[install]
+method = "script"
+target_dir = "/"
+config_paths = ["/etc/apt/sources.list", "/etc/apt/sources.list.d/"]
+
+[script]
+update = """
+apt update && apt full-upgrade -y
+Update /etc/apt/sources.list and /etc/apt/sources.list.d/: replace the current suite (Debian {from_version}) with the {to_version} suite per the release notes
+apt update && apt full-upgrade -y
+apt autoremove -y
+Review the release notes output, then reboot into the new {to_version} kernel
+"""
+
+[version]
+detect_command = ". /etc/os-release && echo \"$VERSION_ID\""
+detect_pattern = "([0-9]+)"

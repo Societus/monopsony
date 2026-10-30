@@ -1,0 +1,34 @@
+# Sprint 29 Phase 4 (grounding D6) — guided OS-release upgrade recipe,
+# DISPLAY ONLY. Parsed with the existing shadow RecipeScript/ShadowRecipe
+# schema (display-only repurpose, plan decision #4). The ordering below is
+# asserted by the renderer's tests; nothing here is ever executed.
+# Placeholders {from_version}/{to_version}/{from_major}/{to_major} are
+# filled from the client's persisted verdict at render time.
+#
+# Ubuntu path: settle updates on the current release first, then the vendor
+# front-end (do-release-upgrade) drives the upgrade itself.
+
+[package]
+name = "ubuntu-do-release-upgrade"
+description = "Ubuntu release upgrade guide via do-release-upgrade (display only — review before running)"
+homepage = "https://ubuntu.com/server/docs/upgrade-introduction"
+source_type = "direct_url"
+source_url = "https://ubuntu.com/server/docs/upgrade-introduction"
+
+[install]
+method = "script"
+target_dir = "/"
+config_paths = ["/etc/update-manager/release-upgrades"]
+
+[script]
+update = """
+apt update && apt full-upgrade -y
+Reboot first if the previous step installed a new kernel
+Confirm the vendor preflight verdict is ready and the target is Ubuntu {to_version}
+do-release-upgrade
+Follow the prompts to completion, then reboot when the upgrade finishes
+"""
+
+[version]
+detect_command = ". /etc/os-release && echo \"$VERSION_ID\""
+detect_pattern = "([0-9]+)"

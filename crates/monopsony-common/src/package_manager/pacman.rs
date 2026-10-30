@@ -1,5 +1,6 @@
 //! Pacman package manager backend implementation
 
+use super::upgradable::{parse_pacman_qu, UpgradableReport};
 use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -65,6 +66,37 @@ impl PackageManagerBackend for PacmanBackend {
         }
 
         Ok(packages)
+    }
+
+    /// Fast-ish but still hits repo state: call at inventory cadence only
+    /// (grounding D3).
+    async fn list_upgradable(&self) -> crate::Result<UpgradableReport> {
+        let output = tokio::process::Command::new("pacman")
+            .args(["-Qu"])
+            .output()
+            .await
+            .map_err(|_| crate::Error::CommandFailed {
+                command: "pacman -Qu".to_string(),
+                exit_code: None,
+            })?;
+
+        if !output.status.success() {
+            return Err(crate::Error::CommandFailed {
+                command: "pacman -Qu".to_string(),
+                exit_code: output.status.code(),
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Arch exposes no security channel in this listing — everything
+        // lands in "other" with a note (grounding D4).
+        let other = parse_pacman_qu(&stdout);
+        Ok(UpgradableReport {
+            security: 0,
+            other,
+            supported: true,
+            note: "pacman exposes no security channel; all counts are other".to_string(),
+        })
     }
 
     fn upstream_url_patterns(&self) -> Vec<UrlPattern> {

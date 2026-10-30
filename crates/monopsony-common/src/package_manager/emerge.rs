@@ -4,6 +4,7 @@
 //! binary packages — instead it caches source tarballs (distfiles) fetched
 //! from Gentoo mirrors. URL patterns match the distfile host URLs.
 
+use super::upgradable::{parse_emerge_pretend, UpgradableReport};
 use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -81,6 +82,36 @@ impl PackageManagerBackend for EmergeBackend {
         }
 
         Ok(packages)
+    }
+
+    /// Best-effort (grounding D4): a pretend world-upgrade run; Gentoo tags
+    /// no security channel in this listing, so all counts land in "other".
+    async fn list_upgradable(&self) -> crate::Result<UpgradableReport> {
+        let output = tokio::process::Command::new("emerge")
+            .args(["--pretend", "--update", "--newuse", "--deep", "@world"])
+            .output()
+            .await
+            .map_err(|_| crate::Error::CommandFailed {
+                command: "emerge --pretend --update --newuse --deep @world".to_string(),
+                exit_code: None,
+            })?;
+
+        if !output.status.success() {
+            return Err(crate::Error::CommandFailed {
+                command: "emerge --pretend --update --newuse --deep @world".to_string(),
+                exit_code: output.status.code(),
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let other = parse_emerge_pretend(&stdout);
+        Ok(UpgradableReport {
+            security: 0,
+            other,
+            supported: true,
+            note: "emerge pretend-run exposes no security channel; all counts are other"
+                .to_string(),
+        })
     }
 
     fn upstream_url_patterns(&self) -> Vec<UrlPattern> {

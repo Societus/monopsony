@@ -129,6 +129,23 @@ pub enum PackageCommand {
         /// Catalog package name to adopt
         name: String,
     },
+
+    /// View monopsony-managed shadow software: installed packages plus
+    /// packages staged for approval awaiting client review.
+    View,
+
+    /// Interactively review and accept a staged shadow package awaiting
+    /// approval. Walks through the recipe, install location, accessory
+    /// directories, firewall rules, and app health detection, then triggers
+    /// the install process for the accepted program.
+    Accept {
+        /// Package name or id to accept (omit to select from the pending list)
+        #[arg(long)]
+        name: Option<String>,
+        /// Non-interactive: accept with suggested values, no prompts
+        #[arg(long)]
+        non_interactive: bool,
+    },
 }
 
 /// Adopted-package recipe field extraction (Sprint 22 slice 22-D).
@@ -483,7 +500,10 @@ fn extract_install_fields_empty_when_missing() {
 #[test]
 fn extract_config_paths_parses_present() {
     let recipe = "[package]\nname = \"sonarr\"\n\n[install]\nconfig_paths = [\"/etc/systemd/system/sonarr.service.d\", \"/run/sonarr\"]\n";
-    assert_eq!(extract_config_paths(recipe), vec!["/etc/systemd/system/sonarr.service.d", "/run/sonarr"]);
+    assert_eq!(
+        extract_config_paths(recipe),
+        vec!["/etc/systemd/system/sonarr.service.d", "/run/sonarr"]
+    );
 }
 
 #[test]

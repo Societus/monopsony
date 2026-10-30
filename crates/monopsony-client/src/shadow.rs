@@ -923,6 +923,7 @@ mod tests {
                 on_failure: None,
                 max_backups: 3,
                 binaries: vec![],
+                firewall_rules: vec![],
             },
             asset_selector: None,
             build: None,

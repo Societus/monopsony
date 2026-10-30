@@ -179,6 +179,11 @@ pub struct RecipeInstall {
     pub backup_old: bool,
     #[serde(default)]
     pub health_check: Option<HealthCheck>,
+    /// Firewall rules required by this package: ports the installed software
+    /// needs open (inbound and/or outbound). Reviewed during client-side
+    /// staging approval before the package is accepted and installed.
+    #[serde(default)]
+    pub firewall_rules: Vec<FirewallRule>,
     /// Failure policy: "rollback" (restore backup on failure) or "hold"
     /// (keep the broken state and await operator intervention). Default: "rollback".
     #[serde(default = "default_failure_policy")]
@@ -287,6 +292,28 @@ pub struct StableCriterion {
     /// Max restarts allowed above baseline (mode=restarts).
     #[serde(default)]
     pub count: Option<u32>,
+}
+
+/// A single firewall rule required by a shadow package: a port (and protocol)
+/// the installed software needs reachable. Reviewed by the client during
+/// staging approval before the package is accepted and installed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FirewallRule {
+    pub port: u16,
+    #[serde(default = "default_firewall_protocol")]
+    pub protocol: String, // "tcp" | "udp"
+    #[serde(default = "default_firewall_direction")]
+    pub direction: String, // "inbound" | "outbound" | "both"
+    #[serde(default)]
+    pub description: String,
+}
+
+fn default_firewall_protocol() -> String {
+    "tcp".to_string()
+}
+
+fn default_firewall_direction() -> String {
+    "inbound".to_string()
 }
 
 fn default_stable_mode() -> StableMode {

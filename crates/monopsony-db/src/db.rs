@@ -147,6 +147,51 @@ impl Database {
         .await?;
         info!("Created clients table");
 
+        // Sprint 29 B1 (grounding D1): per-client update counts + reported
+        // distro identity, persisted as additive columns (NOT server_settings
+        // — that is for global flags, not per-client rows). Append-only
+        // ALTER converges pre-existing DBs; fresh CREATE TABLEs above have
+        // no such columns, so the ALTER is the single source.
+        sqlx::query(
+            "ALTER TABLE clients ADD COLUMN IF NOT EXISTS update_security INT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE clients ADD COLUMN IF NOT EXISTS update_other INT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE clients ADD COLUMN IF NOT EXISTS update_total INT NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "ALTER TABLE clients ADD COLUMN IF NOT EXISTS update_reported_at TIMESTAMPTZ NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS reported_distro TEXT NULL")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "ALTER TABLE clients ADD COLUMN IF NOT EXISTS reported_distro_version TEXT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+        // Sprint 29 Phase 3: client-reported vendor preflight verdict
+        // (ready flag + reasons, notes stored as a JSON array string).
+        sqlx::query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS update_ready BOOLEAN NULL")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query(
+            "ALTER TABLE clients ADD COLUMN IF NOT EXISTS update_readiness_notes TEXT NULL",
+        )
+        .execute(&self.pool)
+        .await?;
+        debug!("clients update-count columns ensured");
+
         // client_certs tracks every issued client certificate by serial so
         // individual certs can be revoked (red-team F3: short-lived certs
         // with revocation path, replacing the old 10-year un-revocable certs).
@@ -374,14 +419,15 @@ impl Database {
         // P4a: binary_sha256 content-address column. CREATE TABLE IF NOT EXISTS
         // does not add columns to a pre-existing table, so an additive ALTER
         // converges shadow_packages onto the new schema on every startup.
-        match sqlx::query(
-            "ALTER TABLE shadow_packages ADD COLUMN IF NOT EXISTS binary_sha256 TEXT",
-        )
-        .execute(&self.pool)
-        .await
+        match sqlx::query("ALTER TABLE shadow_packages ADD COLUMN IF NOT EXISTS binary_sha256 TEXT")
+            .execute(&self.pool)
+            .await
         {
             Ok(_) => debug!("shadow_packages.binary_sha256 column ensured"),
-            Err(e) => warn!("binary_sha256 column ensure failed (may already exist): {}", e),
+            Err(e) => warn!(
+                "binary_sha256 column ensure failed (may already exist): {}",
+                e
+            ),
         }
 
         sqlx::query(
@@ -610,6 +656,42 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Shadow staging: packages the server has staged to a client that await
+        // client-side approval (review of recipe, install location, accessory
+        // directories, firewall rules, health detection) before installation.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS shadow_staging (
+                id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                client_id            UUID REFERENCES clients(id) ON DELETE CASCADE,
+                recipe_name          TEXT NOT NULL,
+                status               TEXT NOT NULL DEFAULT 'pending',
+                suggested_target_dir TEXT NOT NULL,
+                suggested_accessory_dirs JSONB NOT NULL DEFAULT '[]',
+                suggested_firewall_rules JSONB NOT NULL DEFAULT '[]',
+                suggested_health_check JSONB,
+                client_target_dir    TEXT,
+                client_accessory_dirs JSONB DEFAULT '[]',
+                client_firewall_rules JSONB DEFAULT '[]',
+                client_health_check  JSONB,
+                created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+                reviewed_at          TIMESTAMPTZ,
+                resolved_at          TIMESTAMPTZ,
+                UNIQUE(client_id, recipe_name)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_shadow_staging_client ON shadow_staging(client_id)",
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_shadow_staging_status ON shadow_staging(status)",
+        )
+        .execute(&self.pool)
+        .await?;
+
         info!("Database migrations complete");
         Ok(())
     }
@@ -831,7 +913,10 @@ impl Database {
     #[allow(dead_code)] // Admin API query method
     pub async fn get_client(&self, client_id: &ClientId) -> Result<Option<Client>> {
         let row = sqlx::query(
-            "SELECT id, hostname, os, os_version, package_managers, last_seen, registered_at, cert_serial
+            "SELECT id, hostname, os, os_version, package_managers, last_seen, registered_at, cert_serial,
+                    update_security, update_other, update_total, update_reported_at,
+                    reported_distro, reported_distro_version,
+                    update_ready, update_readiness_notes
              FROM clients WHERE id = $1",
         )
         .bind(client_id.0)
@@ -842,25 +927,46 @@ impl Database {
             Some(row) => {
                 let pm_value: serde_json::Value = row.get("package_managers");
                 let package_managers: Vec<String> = serde_json::from_value(pm_value)?;
-                Ok(Some(Client {
-                    id: ClientId(row.get("id")),
-                    hostname: row.get("hostname"),
-                    os: row.get("os"),
-                    os_version: row.get("os_version"),
-                    package_managers,
-                    last_seen: row.get("last_seen"),
-                    registered_at: row.get("registered_at"),
-                    cert_serial: row.get("cert_serial"),
-                }))
+                Ok(Some(Self::client_from_row(row, package_managers)))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Map a `clients` row onto the shared Client model (Sprint 29 B1 added
+    /// the update-count / reported-distro columns).
+    fn client_from_row(row: sqlx::postgres::PgRow, package_managers: Vec<String>) -> Client {
+        Client {
+            id: ClientId(row.get("id")),
+            hostname: row.get("hostname"),
+            os: row.get("os"),
+            os_version: row.get("os_version"),
+            package_managers,
+            last_seen: row.get("last_seen"),
+            registered_at: row.get("registered_at"),
+            cert_serial: row.get("cert_serial"),
+            update_security: row.get("update_security"),
+            update_other: row.get("update_other"),
+            update_total: row.get("update_total"),
+            update_reported_at: row.get("update_reported_at"),
+            reported_distro: row.get("reported_distro"),
+            reported_distro_version: row.get("reported_distro_version"),
+            // Sprint 29 Phase 3: vendor preflight verdict (notes stored as
+            // a JSON array string; unparsable content degrades to None).
+            update_ready: row.get("update_ready"),
+            update_readiness_notes: row
+                .get::<Option<String>, _>("update_readiness_notes")
+                .and_then(|s| serde_json::from_str(&s).ok()),
         }
     }
 
     #[allow(dead_code)] // Admin API query method
     pub async fn list_clients(&self) -> Result<Vec<Client>> {
         let rows = sqlx::query(
-            "SELECT id, hostname, os, os_version, package_managers, last_seen, registered_at, cert_serial
+            "SELECT id, hostname, os, os_version, package_managers, last_seen, registered_at, cert_serial,
+                    update_security, update_other, update_total, update_reported_at,
+                    reported_distro, reported_distro_version,
+                    update_ready, update_readiness_notes
              FROM clients ORDER BY registered_at DESC",
         )
         .fetch_all(&self.pool)
@@ -870,20 +976,63 @@ impl Database {
         for row in rows {
             let pm_value: serde_json::Value = row.get("package_managers");
             let package_managers: Vec<String> = serde_json::from_value(pm_value)?;
-            clients.push(Client {
-                id: ClientId(row.get("id")),
-                hostname: row.get("hostname"),
-                os: row.get("os"),
-                os_version: row.get("os_version"),
-                package_managers,
-                last_seen: row.get("last_seen"),
-                registered_at: row.get("registered_at"),
-                cert_serial: row.get("cert_serial"),
-            });
+            clients.push(Self::client_from_row(row, package_managers));
         }
 
         debug!("Listed {} clients", clients.len());
         Ok(clients)
+    }
+
+    /// Persist an UpdateReport from a heartbeat (Sprint 29 B1, grounding D1):
+    /// counts + client-reported distro identity land as columns on the
+    /// client row, stamped with the report time. Phase 3 adds the optional
+    /// vendor-preflight verdict (ready flag + JSON-encoded reason notes).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_update_report(
+        &self,
+        client_id: &ClientId,
+        security: i32,
+        other: i32,
+        total: i32,
+        distro: &str,
+        distro_version: &str,
+        ready: Option<bool>,
+        readiness_notes: Option<&[String]>,
+    ) -> Result<()> {
+        let notes_json = readiness_notes
+            .map(|notes| serde_json::to_string(notes).unwrap_or_else(|_| "[]".to_string()));
+        let result = sqlx::query(
+            "UPDATE clients SET
+                 update_security = $1,
+                 update_other = $2,
+                 update_total = $3,
+                 update_reported_at = now(),
+                 reported_distro = $4,
+                 reported_distro_version = $5,
+                 update_ready = $6,
+                 update_readiness_notes = $7
+             WHERE id = $8",
+        )
+        .bind(security)
+        .bind(other)
+        .bind(total)
+        .bind(distro)
+        .bind(distro_version)
+        .bind(ready)
+        .bind(notes_json)
+        .bind(client_id.0)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            warn!("record_update_report: unknown client {}", client_id);
+        } else {
+            debug!(
+                "Recorded update report for client {}: security={} other={} distro={}:{}",
+                client_id, security, other, distro, distro_version
+            );
+        }
+        Ok(())
     }
 
     pub async fn count_clients(&self) -> Result<i64> {
@@ -896,7 +1045,11 @@ impl Database {
     /// Record the issued certificate serial on a client row (red-team F3:
     /// serial tracking enables per-cert revocation).
     #[allow(dead_code)] // Admin API / revocation path
-    pub async fn update_client_cert_serial(&self, client_id: &ClientId, serial: &str) -> Result<()> {
+    pub async fn update_client_cert_serial(
+        &self,
+        client_id: &ClientId,
+        serial: &str,
+    ) -> Result<()> {
         let result = sqlx::query("UPDATE clients SET cert_serial = $1 WHERE id = $2")
             .bind(serial)
             .bind(client_id.0)
@@ -1002,19 +1155,21 @@ impl Database {
                 revoked_at: r.get("revoked_at"),
             })
             .collect();
-        debug!("Listed {} client certs for client {}", certs.len(), client_id);
+        debug!(
+            "Listed {} client certs for client {}",
+            certs.len(),
+            client_id
+        );
         Ok(certs)
     }
 
     /// Check whether a certificate serial is revoked (TLS accept-path check).
     #[allow(dead_code)] // TLS accept-path revocation check
     pub async fn is_cert_revoked(&self, serial: &str) -> Result<bool> {
-        let row = sqlx::query(
-            "SELECT status FROM client_certs WHERE serial = $1",
-        )
-        .bind(serial)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT status FROM client_certs WHERE serial = $1")
+            .bind(serial)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.is_some_and(|r| r.get::<String, _>("status") == "revoked"))
     }
 
@@ -1071,10 +1226,7 @@ impl Database {
 
     /// List pairing approval audit entries, newest first (P4 approval audit view).
     #[allow(dead_code)] // Admin API / approval audit view
-    pub async fn list_pair_approval_audit(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<PairApprovalAuditRow>> {
+    pub async fn list_pair_approval_audit(&self, limit: i64) -> Result<Vec<PairApprovalAuditRow>> {
         let rows = sqlx::query(
             "SELECT request_id, action, approver, detail, created_at
              FROM pair_approval_audit
@@ -1092,7 +1244,9 @@ impl Database {
                 action: r.get("action"),
                 approver: r.get("approver"),
                 detail: r.get("detail"),
-                created_at: r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").timestamp(),
+                created_at: r
+                    .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                    .timestamp(),
             })
             .collect();
         Ok(out)
@@ -1122,7 +1276,10 @@ impl Database {
         .bind(expires_at)
         .execute(&self.pool)
         .await?;
-        info!("Created enrollment key {} (label={}, max_uses={})", id, label, max_uses);
+        info!(
+            "Created enrollment key {} (label={}, max_uses={})",
+            id, label, max_uses
+        );
         Ok(id)
     }
 
@@ -1180,7 +1337,10 @@ impl Database {
     /// Validate a presented enrollment key by hash. Returns the key row when
     /// it exists, is not revoked, is not expired, and has uses remaining.
     #[allow(dead_code)] // Enrollment pairing path
-    pub async fn validate_enrollment_key(&self, key_hash: &str) -> Result<Option<EnrollmentKeyRow>> {
+    pub async fn validate_enrollment_key(
+        &self,
+        key_hash: &str,
+    ) -> Result<Option<EnrollmentKeyRow>> {
         let row = sqlx::query(
             "SELECT id, key_hash, label, max_uses, use_count, created_at, expires_at, revoked_at
              FROM enrollment_keys
@@ -1965,6 +2125,17 @@ impl Database {
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
+    /// Recipe TOML for one catalog recipe, by name (update-check source dispatch).
+    pub async fn get_shadow_recipe_toml(&self, name: &str) -> Result<Option<String>> {
+        let row = sqlx::query_as::<_, (Option<String>,)>(
+            "SELECT recipe_toml FROM shadow_recipes WHERE name = $1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|r| r.0))
+    }
+
     pub async fn update_shadow_package_version(
         &self,
         id: &uuid::Uuid,
@@ -2015,10 +2186,12 @@ impl Database {
           LEFT JOIN clients c ON c.id = sp.client_id
           LEFT JOIN shadow_recipes sr ON sr.name = sp.name";
         let rows: Vec<_> = match (binary_sha256, name, source_url) {
-            (Some(hash), ..) => sqlx::query(&format!("{} WHERE sp.binary_sha256 = $1", base))
-                .bind(hash)
-                .fetch_all(&self.pool)
-                .await?,
+            (Some(hash), ..) => {
+                sqlx::query(&format!("{} WHERE sp.binary_sha256 = $1", base))
+                    .bind(hash)
+                    .fetch_all(&self.pool)
+                    .await?
+            }
             (None, Some(n), ..) => {
                 let svc = service_name.unwrap_or("");
                 sqlx::query(&format!(
@@ -2057,14 +2230,8 @@ impl Database {
                 last_seen: last_seen.map(|dt| dt.timestamp()).unwrap_or(0),
             };
 
-            let signed = signature
-                .as_deref()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false)
-                && key_id
-                    .as_deref()
-                    .map(|k| k != "unsigned")
-                    .unwrap_or(false);
+            let signed = signature.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
+                && key_id.as_deref().map(|k| k != "unsigned").unwrap_or(false);
 
             match matches
                 .iter_mut()
@@ -2718,6 +2885,197 @@ impl Database {
         );
         Ok(())
     }
+
+    /// Create a shadow staging row for a client, derived from a signed recipe.
+    /// Returns Err if a staging row already exists for this (client, recipe).
+    pub async fn create_shadow_staging(
+        &self,
+        client_id: Uuid,
+        recipe_name: &str,
+        suggested_target_dir: &str,
+        suggested_accessory_dirs: &[String],
+        suggested_firewall_rules: &[FirewallRuleRow],
+        suggested_health_check: Option<&str>,
+    ) -> Result<()> {
+        let acc_json = serde_json::to_value(suggested_accessory_dirs)
+            .map_err(|e| anyhow::anyhow!("serializing accessory dirs: {e}"))?;
+        let fw_json = serde_json::to_value(suggested_firewall_rules)
+            .map_err(|e| anyhow::anyhow!("serializing firewall rules: {e}"))?;
+        // suggested_health_check is a JSONB column: parse the string into a
+        // JSON value before binding (S30 live-bench fix — a plain &str bind
+        // fails against jsonb, and the old to_value(&str) double-encoded the
+        // payload as a JSON string scalar).
+        let hc_json: Option<serde_json::Value> =
+            suggested_health_check.and_then(|s| serde_json::from_str(s).ok());
+
+        sqlx::query(
+            "INSERT INTO shadow_staging (client_id, recipe_name, status, suggested_target_dir,
+                 suggested_accessory_dirs, suggested_firewall_rules, suggested_health_check)
+             VALUES ($1, $2, 'pending', $3, $4, $5, $6)
+             ON CONFLICT (client_id, recipe_name) DO NOTHING",
+        )
+        .bind(client_id)
+        .bind(recipe_name)
+        .bind(suggested_target_dir)
+        .bind(acc_json)
+        .bind(fw_json)
+        .bind(hc_json)
+        .execute(&self.pool)
+        .await?;
+
+        debug!(
+            "Shadow staging created: client={} recipe={} target={}",
+            client_id, recipe_name, suggested_target_dir
+        );
+        Ok(())
+    }
+
+    /// List all staging rows for a client, newest first.
+    pub async fn list_shadow_staging_for_client(
+        &self,
+        client_id: Uuid,
+    ) -> Result<Vec<ShadowStagingRow>> {
+        let rows = sqlx::query(
+            "SELECT id, client_id, recipe_name, status, suggested_target_dir,
+                    suggested_accessory_dirs, suggested_firewall_rules, suggested_health_check,
+                    client_target_dir, client_accessory_dirs, client_firewall_rules,
+                    client_health_check, created_at, reviewed_at, resolved_at
+             FROM shadow_staging
+             WHERE client_id = $1
+             ORDER BY created_at DESC",
+        )
+        .bind(client_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let out: Vec<ShadowStagingRow> = rows
+            .into_iter()
+            .map(|r| {
+                let acc: Vec<String> = r
+                    .try_get::<Option<serde_json::Value>, _>("suggested_accessory_dirs")
+                    .ok()
+                    .flatten()
+                    .map(|v| serde_json::from_value(v).unwrap_or_default())
+                    .unwrap_or_default();
+                let fw: Vec<(u16, String, String, String)> = r
+                    .try_get::<Option<serde_json::Value>, _>("suggested_firewall_rules")
+                    .ok()
+                    .flatten()
+                    .map(|v| {
+                        serde_json::from_value::<Vec<(u16, String, String, String)>>(v)
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                let client_acc: Vec<String> = r
+                    .try_get::<Option<serde_json::Value>, _>("client_accessory_dirs")
+                    .ok()
+                    .flatten()
+                    .map(|v| serde_json::from_value(v).unwrap_or_default())
+                    .unwrap_or_default();
+                let client_fw: Vec<(u16, String, String, String)> = r
+                    .try_get::<Option<serde_json::Value>, _>("client_firewall_rules")
+                    .ok()
+                    .flatten()
+                    .map(|v| {
+                        serde_json::from_value::<Vec<(u16, String, String, String)>>(v)
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default();
+                ShadowStagingRow {
+                    id: r.get("id"),
+                    client_id: r.try_get("client_id").ok().flatten(),
+                    recipe_name: r.get("recipe_name"),
+                    status: r.get("status"),
+                    suggested_target_dir: r.get("suggested_target_dir"),
+                    suggested_accessory_dirs: acc,
+                    suggested_firewall_rules: fw,
+                    suggested_health_check: r
+                        .try_get::<Option<serde_json::Value>, _>("suggested_health_check")
+                        .ok()
+                        .flatten()
+                        .map(|v| v.to_string()),
+                    client_target_dir: r
+                        .try_get::<Option<String>, _>("client_target_dir")
+                        .ok()
+                        .flatten(),
+                    client_accessory_dirs: client_acc,
+                    client_firewall_rules: client_fw,
+                    client_health_check: r
+                        .try_get::<Option<serde_json::Value>, _>("client_health_check")
+                        .ok()
+                        .flatten()
+                        .map(|v| v.to_string()),
+                    created_at: r
+                        .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
+                        .timestamp(),
+                    reviewed_at: r
+                        .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("reviewed_at")
+                        .ok()
+                        .flatten()
+                        .map(|t| t.timestamp()),
+                    resolved_at: r
+                        .try_get::<Option<chrono::DateTime<chrono::Utc>>, _>("resolved_at")
+                        .ok()
+                        .flatten()
+                        .map(|t| t.timestamp()),
+                }
+            })
+            .collect();
+        Ok(out)
+    }
+
+    /// Resolve a staging row: mark approved or rejected, store client overrides,
+    /// and record the resolution timestamp.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn resolve_shadow_staging(
+        &self,
+        client_id: Uuid,
+        recipe_name: &str,
+        status: &str,
+        client_target_dir: Option<&str>,
+        client_accessory_dirs: &[String],
+        client_firewall_rules: &[(u16, String, String, String)],
+        client_health_check: Option<&str>,
+    ) -> Result<()> {
+        debug_assert!(status == "approved" || status == "rejected");
+        let acc_json = serde_json::to_value(client_accessory_dirs)
+            .map_err(|e| anyhow::anyhow!("serializing accessory dirs: {e}"))?;
+        let fw_json: Vec<serde_json::Value> = client_firewall_rules
+            .iter()
+            .map(|(port, protocol, direction, description)| {
+                serde_json::json!({"port": port, "protocol": protocol, "direction": direction, "description": description})
+            })
+            .collect();
+        let fw_json = serde_json::to_value(&fw_json)
+            .map_err(|e| anyhow::anyhow!("serializing firewall rules: {e}"))?;
+        // client_health_check is a JSONB column: parse before binding (S30
+        // live-bench fix — binding &str against jsonb fails at runtime).
+        let hc_json: Option<serde_json::Value> =
+            client_health_check.and_then(|s| serde_json::from_str(s).ok());
+
+        sqlx::query(
+            "UPDATE shadow_staging
+             SET status = $3, reviewed_at = now(), resolved_at = now(),
+                 client_target_dir = $4, client_accessory_dirs = $5,
+                 client_firewall_rules = $6, client_health_check = $7
+             WHERE client_id = $1 AND recipe_name = $2",
+        )
+        .bind(client_id)
+        .bind(recipe_name)
+        .bind(status)
+        .bind(client_target_dir)
+        .bind(acc_json)
+        .bind(fw_json)
+        .bind(hc_json)
+        .execute(&self.pool)
+        .await?;
+
+        debug!(
+            "Shadow staging resolved: client={} recipe={} status={}",
+            client_id, recipe_name, status
+        );
+        Ok(())
+    }
 }
 
 /// Row from observations (Sprint 21 sourcedb observation log).
@@ -2781,28 +3139,60 @@ pub struct PendingAssignmentRow {
     pub resolved_at: Option<i64>,
 }
 
+/// Row from shadow_staging: a shadow recipe staged to a client that awaits
+/// client-side approval (review of recipe, install location, accessory
+/// directories, firewall rules, health detection) before installation.
+#[derive(Debug, Clone)]
+pub struct ShadowStagingRow {
+    pub id: Uuid,
+    pub client_id: Option<Uuid>,
+    pub recipe_name: String,
+    /// 'pending' | 'approved' | 'rejected'
+    pub status: String,
+    pub suggested_target_dir: String,
+    pub suggested_accessory_dirs: Vec<String>,
+    pub suggested_firewall_rules: Vec<(u16, String, String, String)>,
+    pub suggested_health_check: Option<String>, // serialized HealthCheck JSON
+    pub client_target_dir: Option<String>,
+    pub client_accessory_dirs: Vec<String>,
+    pub client_firewall_rules: Vec<(u16, String, String, String)>,
+    pub client_health_check: Option<String>,
+    pub created_at: i64,
+    pub reviewed_at: Option<i64>,
+    pub resolved_at: Option<i64>,
+}
+
+/// Serializable firewall rule for staging rows (JSONB round-trip).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FirewallRuleRow {
+    pub port: u16,
+    pub protocol: String,
+    pub direction: String,
+    pub description: String,
+}
+
 /// Row from pair_approval_audit: one approve/deny action on a v2 pairing
 /// request (P4 approval audit view).
 #[derive(Debug, Clone)]
 pub struct PairApprovalAuditRow {
     pub request_id: String,
-    pub action: String,      // "approved" | "denied"
-    pub approver: String,    // username or "system"
+    pub action: String,   // "approved" | "denied"
+    pub approver: String, // username or "system"
     pub detail: Option<String>,
-    pub created_at: i64,     // epoch seconds
+    pub created_at: i64, // epoch seconds
 }
 
 /// Row from enrollment_keys (P5): a fleet-scale pre-approval key.
 #[derive(Debug, Clone)]
 pub struct EnrollmentKeyRow {
     pub id: Uuid,
-    pub key_hash: String,    // hex SHA-256 of the plaintext key
+    pub key_hash: String, // hex SHA-256 of the plaintext key
     pub label: String,
     pub max_uses: i64,
     pub use_count: i64,
-    pub created_at: i64,             // epoch seconds
-    pub expires_at: Option<i64>,     // epoch seconds
-    pub revoked_at: Option<i64>,     // epoch seconds
+    pub created_at: i64,         // epoch seconds
+    pub expires_at: Option<i64>, // epoch seconds
+    pub revoked_at: Option<i64>, // epoch seconds
 }
 
 /// One fleet client install of a shadow package, for QueryShadowRegistry.

@@ -4,6 +4,7 @@
 //! It uses RPM packages and shares the underlying libzypp library with
 //! SUSE's enterprise tools. URL patterns match openSUSE download mirrors.
 
+use super::upgradable::{parse_zypper_lu, UpgradableReport};
 use crate::{PackageManagerBackend, PackageManagerKind, PackageRef, ProxyConfigAction, UrlPattern};
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -116,6 +117,35 @@ impl PackageManagerBackend for ZypperBackend {
         }
 
         Ok(packages)
+    }
+
+    /// Best-effort (grounding D4): zypper's update table exposes a Category
+    /// column, so the security split is parsed when present.
+    async fn list_upgradable(&self) -> crate::Result<UpgradableReport> {
+        let output = tokio::process::Command::new("zypper")
+            .args(["-q", "lu"])
+            .output()
+            .await
+            .map_err(|_| crate::Error::CommandFailed {
+                command: "zypper -q lu".to_string(),
+                exit_code: None,
+            })?;
+
+        if !output.status.success() {
+            return Err(crate::Error::CommandFailed {
+                command: "zypper -q lu".to_string(),
+                exit_code: output.status.code(),
+            });
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let (security, other) = parse_zypper_lu(&stdout);
+        Ok(UpgradableReport {
+            security,
+            other,
+            supported: true,
+            note: "security = zypper update-table Category column (best-effort)".to_string(),
+        })
     }
 
     fn upstream_url_patterns(&self) -> Vec<UrlPattern> {
