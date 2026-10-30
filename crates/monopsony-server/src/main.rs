@@ -1085,19 +1085,69 @@ async fn handle_pair_via_admin_api(
         server, admin_port
     );
 
-    let client = reqwest::Client::new();
-    let url = format!("http://{}:{}/api/v1/pair/init", server, admin_port);
-
-    let mut req = client
-        .post(&url)
-        .header("Content-Type", "application/json")
-        .body("{}");
+    // The dashboard auth is session-cookie based: credentials go to
+    // POST /api/v1/auth/login which sets a session cookie, and the auth
+    // middleware validates that cookie on /api/v1/pair/init. Basic auth on
+    // the pair endpoint gets a 401, so we log in first and reuse the
+    // cookie-carrying client for the pair call.
+    let client = reqwest::Client::builder()
+        .cookie_store(true)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP client: {}", e))?;
 
     if let (Some(user), Some(pass)) = (admin_user, admin_pass) {
-        req = req.basic_auth(user, Some(pass));
+        let (login_url, login_body) = build_login_request(server, admin_port, user, pass);
+        let login_resp = client
+            .post(&login_url)
+            .header("Content-Type", "application/json")
+            .body(login_body)
+            .send()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to reach login endpoint at {}: {}", login_url, e)
+            })?;
+
+        let login_status = login_resp.status();
+        let login_text = login_resp.text().await.unwrap_or_default();
+        let login_json: serde_json::Value = serde_json::from_str(&login_text).map_err(|e| {
+            anyhow::anyhow!(
+                "Dashboard login returned {}: failed to parse response: {}",
+                login_status,
+                e
+            )
+        })?;
+
+        // Invalid credentials come back as HTTP 200 with success:false, so
+        // check the body as well as the status.
+        let success = login_json
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !login_status.is_success() || !success {
+            let message = login_json
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            anyhow::bail!(
+                "Dashboard login failed (HTTP {}){}: check --admin-user/--admin-pass",
+                login_status,
+                if message.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", message)
+                }
+            );
+        }
+
+        info!("Authenticated with dashboard session");
     }
 
-    let resp = req
+    let url = format!("http://{}:{}/api/v1/pair/init", server, admin_port);
+
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .body("{}")
         .send()
         .await
         .map_err(|e| anyhow::anyhow!("Failed to reach admin API at {}: {}", url, e))?;
@@ -1157,6 +1207,24 @@ async fn handle_pair_via_admin_api(
     );
 
     Ok(())
+}
+
+/// Build the login endpoint URL and JSON body for the dashboard
+/// `POST /api/v1/auth/login` endpoint. Pure so it can be unit-tested
+/// without touching the network.
+fn build_login_request(
+    server: &str,
+    admin_port: u16,
+    admin_user: &str,
+    admin_pass: &str,
+) -> (String, String) {
+    let url = format!("http://{}:{}/api/v1/auth/login", server, admin_port);
+    let body = serde_json::json!({
+        "username": admin_user,
+        "password": admin_pass,
+    })
+    .to_string();
+    (url, body)
 }
 
 async fn handle_api_key_command(action: &ApiKeyCommands, database_url: &str) -> anyhow::Result<()> {
@@ -1303,4 +1371,26 @@ async fn handle_cache_stats_command(cache_dir: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_login_request_url_and_body() {
+        let (url, body) = build_login_request("10.0.0.5", 3130, "admin", "hunter2");
+        assert_eq!(url, "http://10.0.0.5:3130/api/v1/auth/login");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["username"], "admin");
+        assert_eq!(parsed["password"], "hunter2");
+    }
+
+    #[test]
+    fn test_build_login_request_escapes_credentials() {
+        let (_, body) = build_login_request("localhost", 3130, "ad\"min", "pass\\word");
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["username"], "ad\"min");
+        assert_eq!(parsed["password"], "pass\\word");
+    }
 }
