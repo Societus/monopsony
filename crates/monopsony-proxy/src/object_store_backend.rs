@@ -198,6 +198,14 @@ impl CacheStorage for ObjectStoreBackend {
         let meta = self.store.head(&path).await?;
         let total = meta.size;
 
+        if total == 0 {
+            // Empty object: no byte range can be out of bounds. Without this
+            // fast path a 0-byte blob (e.g. a pushed empty OCI layer) is
+            // unreadable through every `read_stream` consumer.
+            let empty: ByteStream = Box::pin(futures::stream::empty());
+            return Ok((empty, 0));
+        }
+
         if range.start >= total {
             anyhow::bail!("range start {} beyond object size {}", range.start, total);
         }

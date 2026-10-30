@@ -78,6 +78,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 regex = "1"
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
 serde_path_to_error = "0.1"
 async-stream = "0.3"
 futures = "0.3"

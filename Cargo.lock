@@ -2036,6 +2036,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "clamav-client",
@@ -2069,6 +2070,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
