@@ -2908,7 +2908,7 @@ impl Database {
         let hc_json: Option<serde_json::Value> =
             suggested_health_check.and_then(|s| serde_json::from_str(s).ok());
 
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO shadow_staging (client_id, recipe_name, status, suggested_target_dir,
                  suggested_accessory_dirs, suggested_firewall_rules, suggested_health_check)
              VALUES ($1, $2, 'pending', $3, $4, $5, $6)
@@ -2922,6 +2922,15 @@ impl Database {
         .bind(hc_json)
         .execute(&self.pool)
         .await?;
+        // ON CONFLICT DO NOTHING silently skips a duplicate (client, recipe)
+        // pair; rows_affected == 0 means the staging row already existed.
+        if result.rows_affected() == 0 {
+            anyhow::bail!(
+                "a shadow staging row already exists for client {} recipe {}",
+                client_id,
+                recipe_name
+            );
+        }
 
         debug!(
             "Shadow staging created: client={} recipe={} target={}",

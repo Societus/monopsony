@@ -250,6 +250,10 @@ pub fn admin_router(state: AdminState) -> Router {
             post(shadow::handle_rollback_update),
         )
         .route("/api/v1/shadow/history", get(shadow::handle_history))
+        .route(
+            "/api/v1/shadow/clients/:id/staging",
+            post(shadow::handle_create_staging),
+        )
         // Recipe
         .route(
             "/api/v1/shadow/recipe/validate",
