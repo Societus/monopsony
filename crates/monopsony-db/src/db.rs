@@ -1163,6 +1163,31 @@ impl Database {
         Ok(certs)
     }
 
+    /// List every revoked certificate fleet-wide (admin revocation audit
+    /// view), newest revocation first.
+    pub async fn list_revoked_client_certs(&self) -> Result<Vec<ClientCert>> {
+        let rows = sqlx::query(
+            "SELECT serial, client_id, issued_at, expires_at, status, revoked_at
+             FROM client_certs WHERE status = 'revoked' ORDER BY revoked_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let certs: Vec<ClientCert> = rows
+            .iter()
+            .map(|r| ClientCert {
+                serial: r.get("serial"),
+                client_id: ClientId(r.get("client_id")),
+                issued_at: r.get("issued_at"),
+                expires_at: r.get("expires_at"),
+                status: r.get("status"),
+                revoked_at: r.get("revoked_at"),
+            })
+            .collect();
+        debug!("Listed {} revoked client certs", certs.len());
+        Ok(certs)
+    }
+
     /// Check whether a certificate serial is revoked (TLS accept-path check).
     #[allow(dead_code)] // TLS accept-path revocation check
     pub async fn is_cert_revoked(&self, serial: &str) -> Result<bool> {

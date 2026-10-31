@@ -289,8 +289,16 @@ pub fn admin_router(state: AdminState) -> Router {
             get(clients::handle_client_release_guide),
         )
         .route(
+            "/api/v1/clients/:id/certs",
+            get(clients::handle_list_client_certs),
+        )
+        .route(
             "/api/v1/clients/:id/certs/:serial/revoke",
             post(clients::handle_revoke_client_cert),
+        )
+        .route(
+            "/api/v1/certs/revoked",
+            get(clients::handle_list_revoked_certs),
         )
         // Mirrors
         .route("/api/v1/mirrors", get(mirrors::handle_list_mirrors))
