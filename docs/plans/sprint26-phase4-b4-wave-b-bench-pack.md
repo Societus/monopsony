@@ -61,8 +61,12 @@ dashboard opens, scan button fires `softwareupdate --background` **without promp
 At the console, try:
 
 ```sh
-osascript -e 'do shell script "PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$PATH ~/.local/bin/monopsony-client setup mac --enable" with administrator privileges with prompt "Monopsony: enable Content Caching"'
+osascript -e 'do shell script "/Users/martin/.local/bin/monopsony-client setup mac --enable" with administrator privileges with prompt "Monopsony: enable Content Caching"'
 ```
+
+> **2026-10-31 correction:** the original sample used `~/.local/bin/monopsony-client` —
+> `~` inside `do shell script … with administrator privileges` expands in ROOT's context
+> (`/var/root`, verified via `dscl`) and would fail file-not-found. Absolute paths only.
 
 - Expected: ONE GUI password prompt at the console; `setup mac --enable` runs; CC activates
   (check `AssetCacheManagerUtil canActivate` / status row flips).
@@ -85,15 +89,56 @@ whether SUS traffic is observable through Monopsony. Observables, any one suffic
 **No observable routing → cut the button as cosmetic** (keep/cut rule from the review spec).
 **Verdict:** ☐ observable (keep) ☐ cosmetic (cut) — evidence line recorded below.
 
-## Verdict record (fill during the run, then paste into review-spec §10/§11)
+## Verdict record (2026-10-31 agent-assisted pass — nobody at console; details in
+## notes/2026-10-31-b4-cc-toggle-prototype.md + notes/2026-10-31-b4-scan-traffic-verdict.md)
 
 | Item | Verdict | Evidence (one line) |
 |---|---|---|
-| 2 status --quiet | | |
-| 3 HIT ratio | | |
-| 4 menu app | | |
-| 5 CC toggle action | | |
-| 6 scan button | | |
+| 2 status --quiet | pass | over ssh: `Server: 10.10.20.58:50051` from the real pairing file; HIT-ratio line absent (counters zero — daemon never ran) |
+| 3 HIT ratio | not run | server .58 DOWN (3130/9090/50051 refused) + daemon crash-loops on missing certs (`~/.config/monopsony`) — rerun after server is up |
+| 4 menu app | not run | needs GUI at console |
+| 5 CC toggle action | WIRE (one console approval pending) | ssh osascript admin fails instantly (-60007, no prompt); GUI-domain LaunchAgent presents the dialog; `~` pitfall found — use absolute paths |
+| 6 scan button | CUT (keep CLI verb) | routing PROVEN via system proxy (CONNECT swscan/gdmf/xp captured on 127.0.0.1:3129) but uncached tunnels only; `--background` throttle-gated (frequent no-op) |
+
+## Verdict record — completion pass (2026-10-31 18:05–18:25 MST; .58 back in service)
+
+Reattempt of the items the earlier pass could not run (server down). Method: fresh
+dashboard `pair/init` code → `pair --cert-dir ~/.monopsony-b4-certs` (dedup-replace,
+same client_id d1e8834e…) → `daemon --cert-dir`, traffic through 127.0.0.1:3129, server
+metrics delta on :9090. Full detail: review-spec §11.2 + the two notes files.
+
+| Item | Verdict | Evidence (one line) |
+|---|---|---|
+| 2 status --quiet | PASS | `Server: 10.10.20.58:50051` + `Cache HIT ratio: 50.0%` after 1 MISS + 1 HIT through the daemon |
+| 3 HIT ratio | PASS — moves correctly | `hello_2.10-3_arm64.deb`: `x-cache: MISS` → server journal `Cached: … (52308 bytes, sha256 f7b20d304db0)` → refetch `x-cache: HIT` (+ server `Joining in-flight fetch`); counters `{"hits":1,"misses":1,"stale":0}` → ratio 50.0% |
+| 6 scan button | CUT (strengthened) | both `softwareupdate -l` scans bypassed the just-enabled scutil proxy (0 CONNECTs at the daemon, counter flat) while Chrome tunnelled ~4 MB through the same chain (connect_bytes 5,372 → 4,016,228) — SUS proxy pickup is session-dependent; cache value still zero |
+| server-side CONNECT counters | CONFIRMED observable | controlled CONNECT swscan.apple.com:443 moved `monopsony_proxy_connect_bytes_total` 0 → 5372; journal logs per-target dial failures (`CONNECT upstream dial ingest:8006 failed: dial to 100.119.165.62:8006 timed out`) |
+| 4 menu app | not run (GUI) | still needs the console; the Oct 14 bench client must be redeployed first (gRPC transport dies vs Oct 30 server — TLS verify 0 (ok), post-handshake failure) |
+
+New findings (review-spec §11.2): root-owned bench state dirs (`~/.config/monopsony/`,
+`~/.local/state/monopsony/` — Oct 15 elevated run) freeze the HIT counters and block the
+LaunchAgent daemon; one-line console fix `sudo chown -R martin:staff ~/.config/monopsony
+~/.local/state/monopsony`; `monopsony-server pair` subcommand 401s against its own admin
+API while manual login→pair/init works (follow-up card).
+
+## Verdict record — close-out (2026-10-31 ~12:35–12:45 MST; rsync + chown landed, agent over ssh)
+
+Fresh-client redeploy per review-spec §11.3 (full detail there). The source sync
+included `clients/` this time; the console chown was applied before this pass — the
+LaunchAgent daemon has been crash-free since 12:32:45.
+
+| Item | Verdict | Evidence (one line) |
+|---|---|---|
+| 1 fresh client deploy | DONE | bench build (runbook env) 60 s clean; md5 `c34d2d6cfb70178106a7ab5060ce316f` replaces Oct 14 `701d71aa…`; KeepAlive relaunched daemon PID 72872 on the new binary |
+| gRPC transport failure | ROOT-CAUSED: version skew (closed) | same certs + server: Oct 14 binary dies ~11 ms post-TLS; fresh build connects instantly — heartbeat gauge `d1e8834e…` cycling 0→60 (was frozen), `failed_updates 0`, 0 new err-log lines since restart |
+| canonical certs | refreshed to Oct 31 pairing | copied from `~/.monopsony-b4-certs` (same client_id d1e8834e…, cert the server minted today); old set → `~/.config/monopsony.oct15.bak`; Cert Expiry 2027-01-29, renewal not-due |
+| 2 status --quiet | PASS | `Server: 10.10.20.58:50051` + Cert Expiry + **`Cache HIT ratio: 100.0%`** after 2× `x-cache: HIT` on hello_2.10-3_arm64.deb; counters `{"hits":2,"misses":0,"stale":0}` persisted (mtime advancing) |
+| chown fix | CONFIRMED effective | daemon healthy since 12:32:45 (was crash-looping on the root-owned 600 key); persist() writes the canonical state dir |
+| menu app build | DONE (staged for item 4) | `swift build` complete 43.64 s on synced tree; binary at `/tmp/monopsony-build/clients/macos/.build/debug/MonopsonyMenuBar` |
+| 4 menu app GUI + 5 CC approval | STILL OPEN (console) | the only items left; need martin at the m2mini console |
+
+Bench state left: daemon running healthy (steady state), 3129 listening, system
+proxy OFF (`HTTPEnable : 0`), CC unchanged, no reboots.
 
 ## Restore / cleanup
 

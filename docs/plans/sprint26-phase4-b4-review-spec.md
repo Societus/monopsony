@@ -296,6 +296,140 @@ Wave B files are committed; everything below needs martin at the m2mini console.
 5. **sudo elevation prototype (slice 1 action half):** try `osascript -e 'do shell script ... with administrator privileges'` wrapping `setup mac --enable`. If reliable → wire the menu button; if not → slice 1 stays status-only with a "run in Terminal" hint. Record the verdict here.
 6. **Scan-traffic experiment (slice 2 gate):** with system-proxy ON (or Content Caching active), trigger update-scan and check whether SUS traffic is observable through Monopsony (server logs / cache growth / Activity). No observable routing → cut the button as cosmetic, per the keep/cut rule.
 
+### 11.1 Agent-assisted partial Wave B run (2026-10-31 — over ssh; nobody at the console)
+
+Full evidence: `notes/2026-10-31-b4-cc-toggle-prototype.md` (§5) and
+`notes/2026-10-31-b4-scan-traffic-verdict.md` (§6); verdict table filled in the
+bench-pack doc.
+
+- **§5 CC-toggle prototype:** mechanism VERIFIED. `osascript … with administrator
+  privileges` cannot elevate from an ssh session (instant `-60007`, no prompt);
+  presented fine from a GUI-domain process (transient LaunchAgent, bootstrapped
+  gui/501, dialog waited 7.5 min unattended → torn down cleanly). **One in-person
+  approval at the console closes this item.** Found + fixed a tilde bug in the §5
+  sample (root HOME = `/var/root`). Headless no-prompt alternative documented
+  (sudoers NOPASSWD whitelist on a root-owned wrapper). CC on the bench was already
+  active + shared-scoped, so `--enable` is idempotent there.
+- **§6 scan-traffic gate:** routing through the system HTTP proxy is PROVEN (with
+  `proxy on --system`, CONNECT swscan/gdmf/xp.apple.com captured on the 127.0.0.1:3129
+  listener), but the traffic is uncached CONNECT tunnel (B3 architecture) and
+  `softwareupdate --background` is throttle-gated (frequent no-op). **Verdict: CUT the
+  menu scan button, keep the CLI verb**, keep system-proxy + CC as the real macOS
+  surfaces. Side-finding: system proxy ON transits ALL scutil clients incl. LAN
+  websockets (Chrome→Proxmox consoles observed) — LAN exceptions wanted if system
+  proxy ships broadly.
+- **Not run this pass:** §2/§3 (server .58 down + daemon crash-looping on missing
+  certs — `Error: No client certificates found in /Users/martin/.config/monopsony`),
+  §4 menu app connect (GUI at console). `status --quiet` itself passed over ssh
+  (`Server: 10.10.20.58:50051`).
+- Bench state restored: system proxy off (`HTTPEnable : 0`), CC unchanged
+  (activated, shared-only), probe LaunchAgent + plist removed, capture/listener
+  processes killed. Evidence files left in `/tmp/b4-*`.
+
+### 11.2 Completion pass (2026-10-31 ~18:05–18:25 MST — .58 back in service; agent over ssh)
+
+Reattempted the items §11.1 could not run (server was down). Fresh pairing via dashboard
+login → `POST /api/v1/pair/init` (code TTL ~8 min) → `monopsony-client pair --code …
+--cert-dir ~/.monopsony-b4-certs` (same client_id d1e8834e… — dedup-replace). Daemon run
+via the `--cert-dir` global flag; experiments through 127.0.0.1:3129; system proxy
+toggled on/off; server-side evidence from :9090 metrics + journal.
+
+- **Item 2 (status --quiet live): PASS.** `Server: 10.10.20.58:50051` plus
+  `Cache HIT ratio: 50.0%` after traffic.
+- **Item 3 (HIT-ratio meaning, slice-5 gate): PASS — the ratio moves correctly.**
+  `hello_2.10-3_arm64.deb` cold through the chain: `x-cache: MISS` (server journal
+  `Cached: … 52308 bytes, sha256 f7b20d304db0`), refetch `x-cache: HIT` with server-side
+  `Joining in-flight fetch` (single-flight); daemon counters `{"hits":1,"misses":1,"stale":0}`;
+  displayed ratio 50.0%. The slice-5 data source is correct in the field.
+  - **Bench-state finding (root cause of the frozen ratio):** the Oct 15 elevated run
+    created `~/.local/state/monopsony/` (and the `~/.config/monopsony/` cert files) as
+    ROOT. The daemon reads the zeroed `hit-counts.json` but persist() silently cannot
+    write a root-owned dir (fail-open by design) — the displayed ratio never moves — and
+    xnu refuses martin renaming a root-owned dir even inside a martin-owned parent
+    (rename requires write access on the renamed dir itself). Proven by re-running the
+    daemon under a fresh `HOME`: counters + ratio work immediately. **One-line console
+    fix: `sudo chown -R martin:staff ~/.config/monopsony ~/.local/state/monopsony`** —
+    also un-breaks the LaunchAgent daemon (it crash-loops only because client.key is
+    root-owned mode 600).
+- **Item 6 (scan-traffic): CUT verdict unchanged — strengthened.** Server-side CONNECT
+  counters are observable and move: one controlled CONNECT to swscan.apple.com:443 through
+  the real chain moved `monopsony_proxy_connect_bytes_total` 0 → 5372; in the same window
+  Chrome tunnelled ~4 MB through the chain (5372 → 4,016,228). BUT two `softwareupdate -l`
+  scans bypassed the just-enabled scutil proxy entirely (0 CONNECTs at the daemon, counter
+  flat) — Apple's proxy pickup is session-dependent (§11.1 captured swscan/gdmf/xp
+  CONNECTs under the identical setting). Cache value remains zero (B3 CONNECT-only).
+  Fresh evidence for the LAN-exceptions follow-up: the server journal logged real
+  per-target dial failures while the system proxy was on (`CONNECT upstream dial
+  ingest:8006 failed: dial to 100.119.165.62:8006 timed out`, same for conductor:8006 and
+  thequietbox.tail0964.ts.net:443) — the .58 server cannot reach tailnet/LAN hosts, so
+  scutil clients' LAN browsing breaks while system-proxy forwarding is on.
+- **New finding — bench client build too old for the current server.** The Oct 14 bench
+  binary (md5 701d71aa54af3c3bebf11e9a450fa907) completes mTLS against the Oct 30 server
+  (openssl s_client: `Verify return code: 0 (ok)`, TLSv1.3 CHACHA20-POLY1305) but every
+  daemon gRPC reconnect dies in ~11 ms (`transport error` client-side, `gRPC connection
+  error peer=10.10.20.120` server-side); the client's heartbeat age is frozen at pairing
+  time while LAN CT clients on newer builds report normally → version skew, not
+  cert/revocation. Item 1 (deploy a fresh bench client — the rsync leg is user-run per
+  gate rules) is required before daemon-mode GUI checks (item 4).
+- **New finding — `monopsony-server pair` subcommand 401s against its own admin API**
+  (`Admin API returned 401 … "auth_method":"none"`) while manual `POST /api/v1/auth/login`
+  (session cookie) → `POST /api/v1/pair/init` mints codes fine. Follow-up card created;
+  the manual curl recipe is the workaround today.
+- **Still open (GUI-only):** item 4 menu-app connect at the console; item 5's single
+  console approval for the CC dialog. Nobody at the bench today either.
+- Bench state restored: system proxy off (`HTTPEnable : 0`), b4 daemon killed, 3129 free,
+  CC unchanged (activated, shared-only). Left intentionally: `/tmp/b4-daemon*.log`,
+  `/tmp/b4-su-list4.log` (evidence), `~/.monopsony-b4-certs` (2 KB martin-owned paired
+  certs) and `/tmp/b4-home` (HOME skeleton used for the counter proof).
+
+### 11.3 Close-out (2026-10-31 ~12:35–12:45 MST — agent over ssh; rsync + console chown landed)
+
+The §11.2 unblock conditions arrived: the user ran the source sync (this time
+INCLUDING `clients/` so the menu app could rebuild — the §11 runbook line excludes
+it; use the run-24 variant if repeating) and the console chown. Both state dirs are
+`martin:staff` again; the LaunchAgent daemon has been crash-free since 12:32:45
+(before the chown it crash-looped "No client certificates found" on the root-owned
+600 key).
+
+- **Cert refresh (canonical dir):** `~/.config/monopsony` still held the Oct 15
+  pairing from the previous server life, while the cert the server knows for
+  d1e8834e… is the Oct 31 dedup-replace set. Copied the Oct 31 pairing from
+  `~/.monopsony-b4-certs` into the canonical dir (same client_id; old set backed up
+  to `~/.config/monopsony.oct15.bak`). `server.json`: grpc `10.10.20.58:50051`,
+  paired `50052`, `paired_at 2026-10-31`.
+- **Item 1 (fresh client deploy): DONE.** Bench build per the §11 runbook env
+  (martin-ci 1.94.1 toolchain PATH + `PROTOC`), `cargo build --release -p
+  monopsony-client` — 60 s clean (2 pre-existing dead_code warnings). Deployed md5
+  `c34d2d6cfb70178106a7ab5060ce316f` (replaces Oct 14
+  `701d71aa54af3c3bebf11e9a450fa907`); the LaunchAgent `KeepAlive` relaunched the
+  daemon (PID 72872) on the new binary within seconds of the kill.
+- **gRPC transport failure: ROOT-CAUSED — version skew, closed.** Same certs, same
+  server: the Oct 14 binary died ~11 ms post-TLS on every reconnect; the fresh build
+  connects instantly — `gRPC connection established` → `Heartbeat sent` on the 60 s
+  cycle, inventory accepted (`full_sync`), shadow catalog accepted (10 findings,
+  `catalog_hash 7d70cfb9…`). Server side:
+  `monopsony_client_last_heartbeat_age_seconds{client_id="d1e8834e…"}` cycling 0 → 60
+  (was frozen/absent), `monopsony_client_failed_updates 0`. Zero new err-log lines
+  since the restart (err log mtime 12:32:35 predates the 12:39:17 relaunch). Nothing
+  to file as a bug.
+- **Item 2 (`status --quiet` on canonical certs): PASS.** `Server:
+  10.10.20.58:50051`, `Cert Expiry 2027-01-29` (renewal not-due, 89 days), and after
+  two proxied fetches of `hello_2.10-3_arm64.deb` through 127.0.0.1:3129 (both
+  `x-cache: HIT` — the §11.2 server-side cache entry still serving) the counters
+  persisted as `{"hits":2,"misses":0,"stale":0}` and **`Cache HIT ratio: 100.0%`
+  renders**. Persist() on the canonical state dir confirmed live (hit-counts.json
+  mtime advancing under `martin:staff`). Field note: the ratio line only appears
+  once the persisted counters are non-zero — a 0/0 file suppresses it.
+- **Menu app rebuilt for item 4:** `swift build` on the synced tree — Build complete
+  (43.64 s), zero third-party deps (offline/CLT-safe). Binary staged at
+  `/tmp/monopsony-build/clients/macos/.build/debug/MonopsonyMenuBar`.
+- **Still open (console-only):** item 4 menu-app GUI connect; item 5 single CC
+  dialog approval. Everything agent-side is closed.
+- Bench state: LaunchAgent daemon running healthy on the fresh binary (steady state
+  — left running), proxy listener up on 127.0.0.1:3129, system proxy OFF
+  (`HTTPEnable : 0`), CC unchanged (activated, shared-only), no reboots. New on
+  disk: `~/.config/monopsony.oct15.bak` (pre-close-out cert set).
+
 ---
 
 **End of review spec.**
