@@ -104,10 +104,12 @@ struct MenuContentView: View {
                 set: { appState.setSystemProxy($0) }
             ))
 
-            // Slice 1 status half is live (from `setup mac --status`); the
-            // enable/disable action needs sudo via GUI elevation — banked
-            // for in-person bench verification (sudo cannot prompt through
-            // a menu-bar child process without an osascript wrapper).
+            // Slice 1: status is the unprivileged `setup mac --status` probe;
+            // the Enable/Disable action rides the bench-verified osascript
+            // admin wrapper (notes/2026-10-31-b4-cc-toggle-prototype.md) —
+            // exactly one password dialog per action, presented from this
+            // GUI-domain process. One console approval on the bench still
+            // pending; fallback (documented) is status-only + Terminal hint.
             HStack(spacing: 4) {
                 Image(systemName: appState.contentCacheOn ? "checkmark.circle.fill" : "xmark.circle")
                     .foregroundStyle(appState.contentCacheOn ? Color.green : Color.secondary)
@@ -118,19 +120,19 @@ struct MenuContentView: View {
                     .lineLimit(1)
                     .truncationMode(.tail)
                     .help(appState.contentCacheDetail)
-            }
-
-            // Slice 2 (reframed): the only live SUS scan verb on current
-            // macOS. Whether the scan's traffic routes through Monopsony is
-            // the bench experiment, not a code guarantee.
-            Button("Trigger Update Scan") {
-                appState.lastError = nil
-                let output = appState.runClient(["update-scan"])
-                if output.isEmpty {
-                    appState.lastError = "update-scan failed (see CLI)"
+                Spacer()
+                if appState.isTogglingContentCache {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    // Label mirrors current state; no keyboard shortcut — an
+                    // accidental keystroke must not pop a sudo dialog.
+                    Button(appState.contentCacheOn ? "Disable" : "Enable") {
+                        appState.setContentCaching(!appState.contentCacheOn)
+                    }
+                    .font(.caption)
                 }
             }
-            .keyboardShortcut("u")
 
             Divider()
 

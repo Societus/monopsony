@@ -31,6 +31,11 @@ enum SelfTest {
             ("contentCache.on", testContentCacheOn),
             ("contentCache.off", testContentCacheOff),
             ("contentCache.unparseable", testContentCacheUnparseable),
+            // MARK: Slice 1 action half — osascript admin wrapper (2026-10-31 bench verdict)
+            ("contentCache.toggleScript.enable", testCCToggleScriptEnable),
+            ("contentCache.toggleScript.disable", testCCToggleScriptDisable),
+            ("contentCache.toggleScript.rejectsNonAbsolute", testCCToggleScriptRejectsNonAbsolute),
+            ("contentCache.cancelIsNotError", testCancelIsNotError),
             // MARK: Slice 6 — icon mapping
             ("icon.mapping", testIconMapping),
             // MARK: parseStatus regression (existing contract, quiet shape)
@@ -186,6 +191,54 @@ enum SelfTest {
     static func testContentCacheUnparseable() -> String? {
         let (on, detail) = AppState.parseContentCacheStatus("garbage")
         guard !on, detail == "status unavailable" else { return "(\(on), \(detail))" }
+        return nil
+    }
+
+    // MARK: - Slice 1 action half (osascript admin wrapper)
+
+    static func testCCToggleScriptEnable() -> String? {
+        guard let s = AppState.contentCacheToggleScript(
+            enable: true, binaryPath: "/Users/martin/.local/bin/monopsony-client")
+        else { return "nil script" }
+        // Shape locked to the bench prototype note, verbatim.
+        guard s == "do shell script \"/Users/martin/.local/bin/monopsony-client setup mac --enable\""
+            + " with administrator privileges with prompt \"Monopsony: enable Content Caching (shared content only)\""
+        else { return s }
+        guard !s.lowercased().contains("password") else { return "embedded credential" }
+        return nil
+    }
+
+    static func testCCToggleScriptDisable() -> String? {
+        guard let s = AppState.contentCacheToggleScript(
+            enable: false, binaryPath: "/Users/martin/.local/bin/monopsony-client")
+        else { return "nil script" }
+        guard s.contains("setup mac --disable") else { return s }
+        guard s.contains("with administrator privileges") else { return "no admin clause" }
+        guard s.contains("with prompt \"Monopsony: disable Content Caching\"") else { return s }
+        return nil
+    }
+
+    static func testCCToggleScriptRejectsNonAbsolute() -> String? {
+        // Bench pitfall: `~` inside `do shell script … with administrator
+        // privileges` expands in root's context to /var/root — reject it and
+        // any other non-absolute path.
+        if AppState.contentCacheToggleScript(enable: true,
+            binaryPath: "~/.local/bin/monopsony-client") != nil { return "tilde accepted" }
+        if AppState.contentCacheToggleScript(enable: false,
+            binaryPath: "bin/monopsony-client") != nil { return "relative accepted" }
+        if AppState.contentCacheToggleScript(enable: true,
+            binaryPath: "") != nil { return "empty accepted" }
+        return nil
+    }
+
+    static func testCancelIsNotError() -> String? {
+        guard AppState.isAdminCancelled("execution error: User canceled. (-128)")
+        else { return "full cancel text not matched" }
+        guard AppState.isAdminCancelled("execution error: (-128)")
+        else { return "code-only cancel not matched" }
+        guard !AppState.isAdminCancelled(
+            "execution error: The administrator user name or password was incorrect. (-60007)")
+        else { return "-60007 misread as cancel" }
         return nil
     }
 

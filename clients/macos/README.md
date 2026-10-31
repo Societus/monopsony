@@ -78,12 +78,18 @@ launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.societus.monopsony-clien
   status line both use it. No more constant.
 * Menu icon (slice 6) — bolt.fill (green) when connected, bolt.slash when
   disconnected, warning triangle on errors.
-* Content Caching status (slice 1, status half) — from `setup mac --status`,
-  unprivileged. The enable/disable *action* needs GUI sudo elevation and is
-  pending bench verification (review spec §11).
-* Trigger Update Scan (slice 2, reframed) — `monopsony-client update-scan`
-  wraps `softwareupdate --background` (the only live SUS scan verb on
-  current macOS; `--clear-catalog` is gone on 26.3.1).
+* Content Caching status + toggle (slice 1) — status from `setup mac
+  --status`, unprivileged. Enable/Disable rides the bench-verified osascript
+  admin wrapper (exactly one password dialog per action, absolute binary
+  path, explicit `with prompt`, no embedded credentials — see
+  `notes/2026-10-31-b4-cc-toggle-prototype.md`; one console approval on the
+  bench still pending, fallback = status-only + "run in Terminal" hint).
+* Update scan — deliberately absent (bench verdict 2026-10-31,
+  `notes/2026-10-31-b4-scan-traffic-verdict.md`: SUS traffic through the
+  system proxy is an uncached CONNECT tunnel and `softwareupdate
+  --background` is throttle-gated, so the button frequently no-oped).
+  The `monopsony-client update-scan` CLI verb stays as the bench/diagnostic
+  primitive; `--clear-catalog` is gone on 26.3.1.
 * Connect / Disconnect — LaunchAgent bootstrap/bootout (above).
 * System proxy toggle — shells out to `monopsony-client proxy system on|off`
   (existing Sprint 26 Tier 1 CLI surface).

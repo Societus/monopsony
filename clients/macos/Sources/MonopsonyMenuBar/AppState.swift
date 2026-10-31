@@ -1,8 +1,9 @@
 // AppState.swift — ObservableObject bridging the menu bar UI to the Rust daemon.
 //
 // Thin shell, no new protocol work: everything goes through
-//   * `monopsony-client` CLI (status --quiet, proxy status, setup mac --status,
-//     update-scan; system-proxy subcommands)
+//   * `monopsony-client` CLI (status --quiet, proxy status, setup mac
+//     --status; system-proxy subcommands; setup mac --enable/--disable
+//     rides the osascript admin wrapper below)
 //   * `launchctl bootstrap/bootout gui/$UID` (modern syntax, macOS 10.11+;
 //     m2mini bench is 26.3.1 so no legacy load/unload fallback is needed)
 // using the LaunchAgent template in Resources/com.societus.monopsony-client.plist.
@@ -53,6 +54,9 @@ final class AppState: ObservableObject {
     /// Apple Content Caching state from `setup mac --status` (slice 1 status).
     @Published var contentCacheOn = false
     @Published var contentCacheDetail = ""
+    /// True while the Content Caching admin dialog is in flight — the menu
+    /// button hides so a second click cannot stack a second dialog.
+    @Published var isTogglingContentCache = false
 
     private var pollTimer: Timer?
 
@@ -275,6 +279,92 @@ final class AppState: ObservableObject {
         return output.lowercased().contains("forwarded") && !output.lowercased().contains("disabled")
     }
 
+    // MARK: - Content Caching toggle (osascript admin wrapper)
+
+    /// Toggle Apple Content Caching through the bench-verified osascript
+    /// admin wrapper (notes/2026-10-31-b4-cc-toggle-prototype.md): exactly
+    /// one password dialog per action, presented by this GUI-domain process
+    /// (an ssh-domain osascript cannot elevate — instant -60007). The script
+    /// never embeds `user`/`password` args (plaintext process arguments).
+    func setContentCaching(_ on: Bool) {
+        lastError = nil
+        guard !isTogglingContentCache else { return }
+        guard let script = AppState.contentCacheToggleScript(
+            enable: on, binaryPath: MonopsonyConfig.clientBinary)
+        else {
+            lastError = "Content Caching toggle needs an absolute client binary path"
+            return
+        }
+        isTogglingContentCache = true
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        proc.arguments = ["-e", script]
+        let stderrPipe = Pipe()
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = stderrPipe
+        let verb = on ? "enable" : "disable"
+        // The dialog can stay up for as long as the operator thinks — run the
+        // child off the main actor so the menu never wedges behind it.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var exitCode: Int32 = -1
+            var stderrText = ""
+            do {
+                try proc.run()
+                let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                proc.waitUntilExit()
+                exitCode = proc.terminationStatus
+                stderrText = String(data: errData, encoding: .utf8) ?? ""
+            } catch {
+                stderrText = error.localizedDescription
+            }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isTogglingContentCache = false
+                if exitCode == 0 {
+                    self.refresh()
+                } else if AppState.isAdminCancelled(stderrText) {
+                    // Deliberate Cancel in the admin dialog — no error row.
+                } else {
+                    self.lastError = "Content Caching \(verb) failed: \(AppState.shortReason(stderrText))"
+                }
+            }
+        }
+    }
+
+    /// Build the osascript wrapper for the Content Caching toggle. Returns
+    /// nil unless binaryPath is absolute: inside `do shell script … with
+    /// administrator privileges` a literal `~` expands in root's context to
+    /// /var/root (bench-verified) — only pre-expanded paths are accepted.
+    /// Shape fixed by the bench prototype: absolute binary path, explicit
+    /// `with prompt`, one dialog per action, no embedded credentials.
+    nonisolated static func contentCacheToggleScript(enable: Bool, binaryPath: String) -> String? {
+        guard binaryPath.hasPrefix("/"), !binaryPath.contains("~") else { return nil }
+        let verb = enable ? "enable" : "disable"
+        let prompt = enable
+            ? "Monopsony: enable Content Caching (shared content only)"
+            : "Monopsony: disable Content Caching"
+        return "do shell script \"\(binaryPath) setup mac --\(verb)\" "
+            + "with administrator privileges with prompt \"\(prompt)\""
+    }
+
+    /// osascript reports a deliberate Cancel in the admin dialog with error
+    /// code -128 ("User canceled") — the code is locale-independent.
+    nonisolated static func isAdminCancelled(_ stderr: String) -> Bool {
+        stderr.contains("-128") || stderr.lowercased().contains("cancel")
+    }
+
+    /// Last non-empty stderr line, truncated — enough for the menu error row.
+    nonisolated static func shortReason(_ stderr: String, limit: Int = 120) -> String {
+        let trimmed = stderr
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .last { !$0.isEmpty } ?? ""
+        if trimmed.count > limit {
+            return String(trimmed.prefix(limit)) + "…"
+        }
+        return trimmed
+    }
+
     // MARK: - Dashboard
 
     /// Open the server dashboard (slice 3: host from pairing state, not a
@@ -313,7 +403,8 @@ final class AppState: ObservableObject {
     }
 
     /// Shell out to the monopsony-client binary; returns combined stdout.
-    /// Internal: views call this directly for one-shot actions (update-scan).
+    /// Internal to AppState (status refresh, proxy toggles); elevated actions
+    /// go through dedicated wrappers (see setContentCaching).
     func runClient(_ args: [String]) -> String {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: MonopsonyConfig.clientBinary)
