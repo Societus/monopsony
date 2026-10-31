@@ -1,8 +1,9 @@
-# Sprint 27 — Client health & CheckMK integration (planned)
+# Sprint 27 — Client health & CheckMK integration (CLOSED 2026-10-31)
 
-**Status:** Part A LANDED (server-only staleness detection + metrics + config knob; 996 tests
-green on the 2026-10-16 tree, clippy clean). Part B APPROVED 2026-10-16 — Option A transport,
-counts-only v1; CheckMK wiring decided (§6). Implementation in flight.
+**Status:** CLOSED — Part A LANDED (server-only staleness detection + metrics + config knob; 996 tests
+green on the 2026-10-16 tree, clippy clean). Part B LANDED 2026-10-16 (e6cda8e — Option A transport,
+counts-only v1, CheckMK wiring per §6) and fleet bench-proven 2026-10-17 (§9 — all gates PROVEN).
+Close-out audit 2026-10-31: zero code gaps — every §8/Part A claim verified against the tree.
 
 **Part A as landed:**
 - `monopsony-control/src/client_health.rs` — pure drift decision (`is_stale`, boundary:
@@ -172,7 +173,7 @@ Consequences:
 - Workspace suite must stay green + clippy `-D warnings` clean; target ~950 tests maintained.
 - CheckMK edition check before choosing OVS-push vs active-check ingestion. ✓ resolved 2026-10-16 (§6).
 
-## 8. Part B implementation record (2026-10-16, in flight)
+## 8. Part B implementation record (landed 2026-10-16; audit-verified 2026-10-31)
 
 - `proto/monopsony.proto` — `HeartbeatRequest` fields 3-5 (windowed counters,
   counts-only). Backward compatible: legacy clients send zeros and
@@ -192,10 +193,9 @@ Consequences:
   checks, fleet stale aggregate + per-client age/failed service) and
   `monitoring/checkmk/README.md` (CRE site setup, host + active checks, cron).
 
-Remaining: fleet bench verification on .58/.20 per
-`references/fleet-bench-verification.md` rules (deploy new client binary,
-force a registration failure, observe gauge + CheckMK line; delete bench
-seeds after).
+Fleet bench verification: DONE 2026-10-17 — §9 below records all gates PROVEN on
+.58/.20 (fresh binaries by sha256, Part B gauges crossing the wire, policy refusal
+not counted, operational failure counted via forced rename, CheckMK line rendering).
 
 ## 9. Fleet bench record (2026-10-17, .58 server + .20 client — all PROVEN)
 
