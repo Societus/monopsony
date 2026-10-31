@@ -2212,27 +2212,36 @@ impl Database {
           LEFT JOIN shadow_recipes sr ON sr.name = sp.name";
         let rows: Vec<_> = match (binary_sha256, name, source_url) {
             (Some(hash), ..) => {
-                sqlx::query(&format!("{} WHERE sp.binary_sha256 = $1", base))
-                    .bind(hash)
-                    .fetch_all(&self.pool)
-                    .await?
+                // `base` is a code-controlled static SQL prefix; values are bound ($1).
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "{} WHERE sp.binary_sha256 = $1",
+                    base
+                )))
+                .bind(hash)
+                .fetch_all(&self.pool)
+                .await?
             }
             (None, Some(n), ..) => {
                 let svc = service_name.unwrap_or("");
-                sqlx::query(&format!(
+                // `base` is a code-controlled static SQL prefix; values are bound ($1, $2).
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "{} WHERE sp.name = $1 AND ($2 = '' OR sp.service_name = $2)",
                     base
-                ))
+                )))
                 .bind(n)
                 .bind(svc)
                 .fetch_all(&self.pool)
                 .await?
             }
             (None, None, Some(url)) => {
-                sqlx::query(&format!("{} WHERE sp.source_url = $1", base))
-                    .bind(url)
-                    .fetch_all(&self.pool)
-                    .await?
+                // `base` is a code-controlled static SQL prefix; values are bound ($1).
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "{} WHERE sp.source_url = $1",
+                    base
+                )))
+                .bind(url)
+                .fetch_all(&self.pool)
+                .await?
             }
             (None, None, None) => Vec::new(),
         };
@@ -2308,10 +2317,12 @@ impl Database {
     ) -> Result<uuid::Uuid> {
         let id = uuid::Uuid::new_v4();
         let applied_at = if status == "applied" { "now()" } else { "NULL" };
-        sqlx::query(&format!(
+        // `applied_at` is only ever the code-controlled literals "now()" or "NULL";
+        // all other values are bound ($1-$6).
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO shadow_update_history (id, package_id, from_version, to_version, status, backup_path, applied_at)
              VALUES ($1, $2, $3, $4, $5, $6, {applied_at})"
-        ))
+        )))
         .bind(id)
         .bind(package_id)
         .bind(from_version)
@@ -2339,9 +2350,11 @@ impl Database {
         } else {
             ""
         };
-        sqlx::query(&format!(
+        // `applied`/`rolled` are only ever the code-controlled fragments
+        // ", applied_at = now()" / ", rolled_back_at = now()" / ""; values are bound ($1-$3).
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE shadow_update_history SET status = $1, error_message = $2{applied}{rolled} WHERE id = $3"
-        ))
+        )))
         .bind(status)
         .bind(error)
         .bind(id)

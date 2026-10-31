@@ -291,15 +291,17 @@ mod tests {
         std::fs::write(dir.path().join("InRelease"), b"trusted bytes").unwrap();
         std::fs::write(dir.path().join("core.db"), b"database bytes").unwrap();
 
-        // Fake peer: an axum server serving the same paths — one matches,
-        // one diverges. Spin two servers: honest peer + poisoned peer.
+        // Fake peer: an axum server serving the same paths. The poisoned peer
+        // diverges on EVERY object, so the round-robin pairing in
+        // cross_check_distro (sample[i] -> peers[i % len]) yields exactly one
+        // match + one divergence regardless of mtime/readdir sample order.
         let honest = spawn_test_peer(vec![
             ("/mirror/testdistro/InRelease", "trusted bytes".to_string()),
             ("/mirror/testdistro/core.db", "database bytes".to_string()),
         ])
         .await;
         let poisoned = spawn_test_peer(vec![
-            ("/mirror/testdistro/InRelease", "trusted bytes".to_string()),
+            ("/mirror/testdistro/InRelease", "EVIL INRELEASE".to_string()),
             ("/mirror/testdistro/core.db", "EVIL DATABASE".to_string()),
         ])
         .await;
