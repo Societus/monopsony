@@ -7,7 +7,7 @@
 ```
 Monopsony is a centralized package caching proxy system - like Windows Update's LAN sharing but for all package managers across all OSes. A central server pre-fetches and caches packages from upstream repositories, and clients redirect their package managers through it via a local HTTP proxy.
 **Target scale:** SMB/office (20-200 clients, single server)
-**Git state:** Forgejo: base.societus.club/societus/monopsony.git. Local: ~/projects/monopsony. **v1.0.0-rc2. Sprint 26 Phase 1 (Homebrew) code complete — 950 tests passing, clippy clean. 16 PM backends (15 distro/language + Homebrew).**
+**Git state:** Forgejo: base.societus.club/societus/monopsony.git. Local: ~/projects/monopsony. **v1.0.0-rc2. Sprint 27 (client health & CheckMK) CLOSED 2026-10-31 — Part A+B landed 2026-10-16 (9b5337b/e6cda8e/82af381), fleet bench-proven 2026-10-17; sprints 29–33 landed in phases, per-sprint state in docs/sprint-roadmap.md. sqlx 0.9.0 + rusqlite 0.37 landed 2026-10-31 (libsqlite3-sys unified, future-incompat gone). 1348 workspace tests passing, clippy: 15 pre-existing warnings only (2026-10-31). 16 PM backends (15 distro/language + Homebrew).**
 ## Build & Run
 ```
 bash
@@ -38,7 +38,7 @@ cargo test                     # Run tests
 | `monopsony-tracker` | Compiles clean | HTTP API, recipe admin routes (quarantine reinstate/remove), graceful shutdown |
 
 Full workspace: `cargo check` passes, 0 errors, warnings only (dead_code in shadow modules -- not yet wired to gRPC handlers).
-Tests: 426 passed, 0 failed, 2 ignored. Clippy: clean on new crates (3 pre-existing dead_code warnings in shadow/db).
+Tests: 1348 passed, 0 failed, 3 ignored (workspace, 2026-10-31). Clippy: 15 pre-existing warnings (shadow_executor ×2, trust.rs, grpc_client ×4, control grpc.rs, tls.rs, pairing ×6) — new code stays clean.
 
 ## Release Status
 
@@ -255,7 +255,7 @@ The server's HTTP proxy is the most complete module. It:
 - **axum** 0.7, **tower** 0.5, **tower-http** 0.6 — HTTP server
 - **hyper** 1, **hyper-util** 0.1 — HTTP client for upstream fetch
 - **tonic** 0.12, **prost** 0.13 — gRPC (no `tls` feature enabled)
-- **sqlx** 0.8 (postgres, chrono, uuid) — Database
+- **sqlx** 0.9 (postgres, chrono, uuid) — Database (upgraded from 0.8.0, 2026-10-31; libsqlite3-sys/rusqlite conflict resolved: sqlx 0.9 + rusqlite 0.37 unify on libsqlite3-sys 0.35, owned solely by rusqlite; postgres-only, sqlite feature never enabled)
 - **rustls** 0.23, **rcgen** 0.13 (with x509-parser feature) — TLS/CA
 - **mdns-sd** 0.11 — mDNS discovery
 - **metrics** 0.24, **metrics-exporter-prometheus** 0.16 — Observability (wired into proxy/gRPC/prefetch/mirror; :9090 exporter)
@@ -280,7 +280,7 @@ The server's HTTP proxy is the most complete module. It:
 - Phase 3: Tor/I2P/GNUnet transport support
 - Configurable hash verification policy (fail-closed vs fail-open)
 - GPG signature verification for repo metadata (Release/InRelease files)
-- Resolve sqlx 0.8.6+ upgrade blocked by libsqlite3-sys link conflict with rusqlite 0.31 (needs sqlx 0.9 or matching libsqlite3-sys)
+- ~~Resolve sqlx 0.8.6+ upgrade blocked by libsqlite3-sys link conflict with rusqlite 0.31~~ — DONE 2026-10-31 (sqlx 0.9.0 + rusqlite 0.37; libsqlite3-sys unified at 0.35.0; sqlx-postgres 0.8.0's never-type-fallback future-incompat lint also fixed. Premise correction: sqlx-postgres never pulled libsqlite3-sys — the resolve-time conflict came from the sqlx facade's optional sqlx-sqlite dep (links = "sqlite3") whose libsqlite3-sys range >=0.30.1,<0.38.0 was disjoint from rusqlite 0.31's ^0.28.)
 - Dashboard SPA frontend for pairing approval + enrollment key manager (P4 UI — backend API complete)
 
 ## Pairing v2 (Sprint 28) — SECURITY-CRITICAL NOTES
