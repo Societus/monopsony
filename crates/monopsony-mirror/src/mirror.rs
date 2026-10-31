@@ -29,6 +29,8 @@ use tracing::{debug, error, info, trace, warn};
 use monopsony_db::db::UpstreamPackageRow;
 use monopsony_db::Database;
 
+use crate::integrity::{HashPolicy, TrustedKeys};
+
 /// Boxed body type for hyper client requests
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 
@@ -96,9 +98,23 @@ pub struct MirrorConfig {
     /// Total bytes synced
     #[serde(default)]
     pub total_bytes: u64,
-    /// Hash verification policy: "fail-closed" (reject on mismatch) or "fail-open" (log warning, serve anyway)
-    #[serde(default = "default_hash_policy")]
-    pub hash_policy: String,
+    /// Per-mirror hash-verification policy override: "fail-closed" (reject on
+    /// mismatch) or "fail-open" (log warning, serve anyway). None inherits the
+    /// server.toml [mirror] hash_policy default (itself fail-closed).
+    #[serde(default)]
+    pub hash_policy: Option<String>,
+    /// Pinned trust keys for metadata signature verification: inline armored
+    /// key text or paths to armored key files. OpenPGP public keys anchor
+    /// Debian/Ubuntu Release/InRelease; SPKI PEM RSA keys anchor Alpine
+    /// APKINDEX signatures. Empty = no signature verification (upstream
+    /// checksum sidecars still apply).
+    #[serde(default)]
+    pub trusted_keys: Vec<String>,
+    /// Release suite / Alpine branch to index (e.g. "stable",
+    /// "latest-stable"). None = per-distro default (debian/ubuntu "stable",
+    /// alpine "latest-stable").
+    #[serde(default)]
+    pub suite: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -111,10 +127,6 @@ fn default_sync_interval() -> u64 {
 
 fn default_sync_status() -> String {
     "idle".to_string()
-}
-
-fn default_hash_policy() -> String {
-    "fail-closed".to_string()
 }
 
 /// Wrapper for TOML serialization (TOML requires a table key for arrays)
@@ -138,6 +150,17 @@ mod path_serde {
     }
 }
 
+impl MirrorConfig {
+    /// Effective hash-verification policy: the per-mirror override when set,
+    /// otherwise the server-wide default from server.toml [mirror].
+    pub fn hash_policy_or(&self, default: HashPolicy) -> HashPolicy {
+        self.hash_policy
+            .as_deref()
+            .map(HashPolicy::parse)
+            .unwrap_or(default)
+    }
+}
+
 impl Default for MirrorConfig {
     fn default() -> Self {
         Self {
@@ -155,7 +178,9 @@ impl Default for MirrorConfig {
             last_sync: None,
             sync_status: "idle".to_string(),
             total_bytes: 0,
-            hash_policy: "fail-closed".to_string(),
+            hash_policy: None,
+            trusted_keys: Vec::new(),
+            suite: None,
         }
     }
 }
@@ -188,8 +213,23 @@ fn default_mirror_config_for_pm(pm: &str) -> Option<MirrorConfig> {
         last_sync: None,
         sync_status: "idle".to_string(),
         total_bytes: 0,
-        hash_policy: "fail-closed".to_string(),
+        hash_policy: None,
+        trusted_keys: Vec::new(),
+        suite: None,
     })
+}
+
+/// Server-wide mirror integrity settings, supplied from server.toml [mirror]
+/// + tracker CLI args at startup, before the sync task starts.
+#[derive(Debug, Clone)]
+pub struct IntegritySettings {
+    /// Default hash-verification policy for mirrors without an explicit
+    /// per-mirror override.
+    pub default_hash_policy: HashPolicy,
+    /// Cross-mirror comparison settings (None = disabled).
+    pub cross_check: Option<crate::cross_check::CrossCheckConfig>,
+    /// Tracker base URLs to query for peer mirrors.
+    pub tracker_urls: Vec<String>,
 }
 
 /// Manages all mirror configurations and sync tasks
@@ -198,6 +238,8 @@ pub struct MirrorManager {
     mirror_dir: PathBuf,
     configs: Arc<tokio::sync::RwLock<Vec<MirrorConfig>>>,
     db: Option<Arc<Database>>,
+    /// Integrity settings, set once at startup (None until then).
+    integrity: Arc<tokio::sync::RwLock<Option<IntegritySettings>>>,
 }
 
 impl MirrorManager {
@@ -206,7 +248,28 @@ impl MirrorManager {
             mirror_dir,
             configs: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             db,
+            integrity: Arc::new(tokio::sync::RwLock::new(None)),
         }
+    }
+
+    /// Install the server-wide integrity settings (server.toml [mirror] +
+    /// tracker URLs). Called once during startup before the sync task starts.
+    pub async fn set_integrity_settings(&self, settings: IntegritySettings) {
+        *self.integrity.write().await = Some(settings);
+    }
+
+    /// Snapshot of the integrity settings (or hardcoded fail-closed defaults
+    /// when the server hasn't installed any — tests, DB-less runs).
+    pub async fn integrity_settings(&self) -> IntegritySettings {
+        self.integrity
+            .read()
+            .await
+            .clone()
+            .unwrap_or(IntegritySettings {
+                default_hash_policy: HashPolicy::FailClosed,
+                cross_check: None,
+                tracker_urls: Vec::new(),
+            })
     }
 
     /// Get the max per-IP RPS across all configured mirrors (0 if none)
@@ -334,6 +397,8 @@ impl MirrorManager {
             let local = config.local_path.clone();
             let dir = mirror_dir.clone();
             let cfgs = configs.clone();
+            let settings = self.integrity_settings().await;
+            let policy = config.hash_policy_or(settings.default_hash_policy);
 
             // Update status
             {
@@ -345,11 +410,12 @@ impl MirrorManager {
 
             info!("Starting initial sync for mirror: {}", distro);
             match sync_mirror(
+                &distro,
                 &upstream,
                 &dir.join(&local),
                 &config.exclude_patterns,
                 config.bandwidth_limit_bps,
-                &config.hash_policy,
+                policy,
             )
             .await
             {
@@ -361,6 +427,8 @@ impl MirrorManager {
                         c.total_bytes = bytes;
                     }
                     info!("Mirror sync complete for {}: {} bytes", distro, bytes);
+                    drop(w);
+                    self.run_cross_check_after_sync(&distro).await;
                 }
                 Err(e) => {
                     let mut w = cfgs.write().await;
@@ -394,6 +462,8 @@ impl MirrorManager {
             for config in &due {
                 let distro = config.distro.clone();
                 let local_path = mirror_dir.join(&config.local_path);
+                let settings = self.integrity_settings().await;
+                let policy = config.hash_policy_or(settings.default_hash_policy);
 
                 // Mark syncing
                 {
@@ -405,11 +475,12 @@ impl MirrorManager {
 
                 info!("Periodic sync for mirror: {}", distro);
                 match sync_mirror(
+                    &distro,
                     &config.upstream_url,
                     &local_path,
                     &config.exclude_patterns,
                     config.bandwidth_limit_bps,
-                    &config.hash_policy,
+                    policy,
                 )
                 .await
                 {
@@ -421,6 +492,8 @@ impl MirrorManager {
                             c.total_bytes = bytes;
                         }
                         info!("Mirror sync complete for {}: {} bytes", distro, bytes);
+                        drop(w);
+                        self.run_cross_check_after_sync(&distro).await;
                     }
                     Err(e) => {
                         let mut w = configs.write().await;
@@ -566,16 +639,19 @@ impl MirrorManager {
         let local_path = self.mirror_dir.join(&config.local_path);
 
         // Try index+prefetch sync (requires DB). Fall back to legacy if no DB.
+        let settings = self.integrity_settings().await;
+        let policy = config.hash_policy_or(settings.default_hash_policy);
         let result = if self.db.is_some() {
             self.index_and_prefetch(distro, &config, &local_path).await
         } else {
             // Legacy: blind directory scrape
             sync_mirror(
+                distro,
                 &config.upstream_url,
                 &local_path,
                 &config.exclude_patterns,
                 config.bandwidth_limit_bps,
-                &config.hash_policy,
+                policy,
             )
             .await
         };
@@ -593,11 +669,14 @@ impl MirrorManager {
                     c.last_sync = Some(chrono::Utc::now().timestamp());
                     c.total_bytes = bytes;
                 }
+                drop(configs);
 
                 // Update DB sync status
                 if let Some(db) = &self.db {
                     let _ = db.update_mirror_last_sync(distro, bytes as i64).await;
                 }
+
+                self.run_cross_check_after_sync(distro).await;
 
                 Ok(())
             }
@@ -623,9 +702,20 @@ impl MirrorManager {
 
         // Detect arch from clients — default to x86_64
         let arch = "x86_64";
+        let settings = self.integrity_settings().await;
+        let policy = config.hash_policy_or(settings.default_hash_policy);
 
-        // ── Phase 1: Download and parse repo index files ──
-        let index_urls = crate::repo_index::repo_index_urls(distro, arch);
+        // Load pinned keys once. A malformed key config fails the sync —
+        // silently skipping verification would violate the pin trust model.
+        let keys = crate::integrity::load_trusted_keys(&config.trusted_keys)
+            .map_err(|e| format!("invalid trusted_keys for {}: {}", distro, e))?;
+
+        // ── Phase 1: Download, verify, and parse repo metadata ──
+        let suite = config
+            .suite
+            .clone()
+            .unwrap_or_else(|| default_suite_for(distro).to_string());
+        let index_urls = crate::repo_index::repo_index_urls(distro, arch, &suite);
         if index_urls.is_empty() {
             // Unknown distro format — fall back to legacy scrape
             info!(
@@ -633,11 +723,12 @@ impl MirrorManager {
                 "No known index format, falling back to directory scrape"
             );
             return sync_mirror(
+                distro,
                 &config.upstream_url,
                 local_path,
                 &config.exclude_patterns,
                 config.bandwidth_limit_bps,
-                &config.hash_policy,
+                policy,
             )
             .await;
         }
@@ -648,7 +739,16 @@ impl MirrorManager {
             index_urls.len()
         );
         let mut total_indexed = 0usize;
+        let mut total_bytes = 0u64;
 
+        // Metadata signature anchor (Debian/Ubuntu: verified Release text).
+        // Only a VERIFIED Release may anchor index/package checksums.
+        let mut release_anchor: Option<String> = None;
+        if distro == "debian" || distro == "ubuntu" {
+            release_anchor = verify_apt_release(distro, config, &keys, policy, &suite).await?;
+        }
+
+        let dists_prefix = format!("dists/{}/", suite);
         for (repo, index_path) in &index_urls {
             let url = format!(
                 "{}/{}",
@@ -659,12 +759,35 @@ impl MirrorManager {
 
             let bytes = download_file(&url).await?;
 
-            let mut packages = if distro == "archlinux" {
-                crate::repo_index::parse_pacman_db(&bytes)
-            } else if distro == "debian" || distro == "ubuntu" {
-                crate::repo_index::parse_debian_packages(&bytes)
-            } else {
-                Vec::new()
+            // Signature verification where the distro provides one; the
+            // Debian/Ubuntu index additionally gets anchor-hashed against
+            // the verified Release checksums.
+            let verified_apkindex = match distro {
+                "alpine" => Some(verify_alpine_index(distro, &bytes, &keys, policy).await?),
+                "archlinux" => {
+                    // Arch repo databases are UNSIGNED upstream (core.db.sig
+                    // 404s on every official mirror checked, 2026-10-31) —
+                    // package integrity comes from %CSHA256% db entries and
+                    // cross-mirror comparison, not database signatures.
+                    monopsony_common::metrics::mirror_signature_verify(distro, "unsupported");
+                    None
+                }
+                _ => {
+                    if let Some(anchor) = &release_anchor {
+                        let rel = index_path.strip_prefix(&dists_prefix).unwrap_or(index_path);
+                        check_against_anchor(distro, &bytes, anchor, rel, policy)?;
+                    }
+                    None
+                }
+            };
+
+            let mut packages = match distro {
+                "archlinux" => crate::repo_index::parse_pacman_db(&bytes),
+                "debian" | "ubuntu" => crate::repo_index::parse_debian_packages(&bytes),
+                "alpine" => {
+                    crate::repo_index::parse_apkindex(verified_apkindex.as_deref().unwrap_or(""))
+                }
+                _ => Vec::new(),
             };
 
             // Fill in download URLs
@@ -674,7 +797,14 @@ impl MirrorManager {
                 repo,
                 &config.upstream_url,
                 arch,
+                &suite,
             );
+
+            // Cache the metadata for clients: the served copy is the exact
+            // bytes that passed verification, not a second unverified fetch.
+            let meta_name = index_path.split('/').next_back().unwrap_or("index");
+            write_atomic(&local_path.join(meta_name), &bytes).await?;
+            total_bytes += bytes.len() as u64;
 
             // Persist to DB
             db.replace_upstream_packages(distro, repo, &packages)
@@ -729,7 +859,6 @@ impl MirrorManager {
         }
 
         // Download the packages that need updating
-        let mut total_bytes = 0u64;
         if !to_download.is_empty() {
             info!(
                 distro,
@@ -763,12 +892,21 @@ impl MirrorManager {
                     }
                 }
 
+                // Anchor hash from the (verified where possible) metadata —
+                // only a full 64-hex sha256 can be checked.
+                let expected = match pkg.sha256.as_deref() {
+                    Some(h) if h.len() == 64 => Some(h),
+                    _ => None,
+                };
+
                 match sync_single_file(
                     &client,
+                    distro,
                     url,
                     &dest,
                     config.bandwidth_limit_bps,
-                    &config.hash_policy,
+                    policy,
+                    expected,
                 )
                 .await
                 {
@@ -783,22 +921,48 @@ impl MirrorManager {
             );
         }
 
-        // Also download index files themselves (so they're cached for clients)
-        for (_repo, index_path) in &index_urls {
-            let url = format!(
-                "{}/{}",
-                config.upstream_url.trim_end_matches('/'),
-                index_path
-            );
-            let dest = local_path.join(index_path.split('/').next_back().unwrap_or("index"));
-            if let Ok(size) =
-                sync_single_file(&build_https_client(), &url, &dest, None, "fail-open").await
-            {
-                total_bytes += size;
-            }
-        }
-
         Ok(total_bytes)
+    }
+
+    /// Cross-mirror comparison after a successful sync (server.toml [mirror]).
+    /// Divergence is reported via metrics + error log; never auto-quarantines.
+    async fn run_cross_check_after_sync(&self, distro: &str) {
+        let settings = self.integrity_settings().await;
+        let Some(cfg) = settings.cross_check else {
+            return;
+        };
+        if settings.tracker_urls.is_empty() {
+            return;
+        }
+        let Some(config) = self.get_config(distro).await else {
+            return;
+        };
+        let local_dir = self.mirror_dir.join(&config.local_path);
+        let outcome = crate::cross_check::cross_check_distro(
+            distro,
+            &local_dir,
+            &settings.tracker_urls,
+            &cfg,
+        )
+        .await;
+        info!(
+            distro,
+            peers_seen = outcome.peers_seen,
+            compared = outcome.compared,
+            matched = outcome.matched,
+            diverged = outcome.diverged,
+            unreachable = outcome.unreachable,
+            "cross-mirror hash comparison complete"
+        );
+        if outcome.diverged > 0 {
+            error!(
+                distro,
+                diverged = outcome.diverged,
+                "CROSS-MIRROR HASH DIVERGENCE detected — upstream/peer objects \
+                 differ; possible mirror poisoning or lag. Reported only (no \
+                 auto-quarantine); inspect monopsony_mirror_cross_check_total."
+            );
+        }
     }
 }
 
@@ -988,11 +1152,17 @@ async fn serve_mirror_file(
         }
     };
 
+    // Serve-path hash policy: per-mirror override, else server-wide default.
+    let policy = {
+        let settings = state.manager.integrity_settings().await;
+        config.hash_policy_or(settings.default_hash_policy)
+    };
+
     let canonical_file = match local_file.canonicalize() {
         Ok(p) => p,
         Err(_) => {
             // File doesn't exist locally — proxy to upstream
-            return proxy_to_upstream(&config.upstream_url, &file_path).await;
+            return proxy_to_upstream(&config, policy, &file_path).await;
         }
     };
 
@@ -1023,13 +1193,23 @@ async fn serve_mirror_file(
                 });
             response.into_response()
         }
-        Err(_) => proxy_to_upstream(&config.upstream_url, &file_path).await,
+        Err(_) => {
+            let settings = state.manager.integrity_settings().await;
+            let policy = config.hash_policy_or(settings.default_hash_policy);
+            proxy_to_upstream(&config, policy, &file_path).await
+        }
     }
 }
 
-/// Proxy file request to upstream mirror
-async fn proxy_to_upstream(upstream_url: &str, file_path: &str) -> Response {
-    let url = format!("{}/{}", upstream_url.trim_end_matches('/'), file_path);
+/// Proxy file request to upstream mirror, with signature verification for
+/// metadata documents when the mirror pins keys (the client-visible
+/// enforcement point for on-miss upstream fetches).
+async fn proxy_to_upstream(config: &MirrorConfig, policy: HashPolicy, file_path: &str) -> Response {
+    let url = format!(
+        "{}/{}",
+        config.upstream_url.trim_end_matches('/'),
+        file_path
+    );
 
     // SSRF validation
     let parsed_url = match url::Url::parse(&url) {
@@ -1074,6 +1254,17 @@ async fn proxy_to_upstream(upstream_url: &str, file_path: &str) -> Response {
                 return (StatusCode::BAD_GATEWAY, "Response too large").into_response();
             }
 
+            // Metadata documents are signature-verified before serving when
+            // the mirror pins keys; sync-time verified copies bypass this via
+            // the local-hit path above.
+            if !config.trusted_keys.is_empty() {
+                if let Err(resp) =
+                    verify_metadata_before_serve(config, policy, file_path, &bytes).await
+                {
+                    return resp;
+                }
+            }
+
             let mut builder = Response::builder().status(status);
             for (name, value) in parts.headers.iter() {
                 if name != "transfer-encoding" {
@@ -1090,6 +1281,85 @@ async fn proxy_to_upstream(upstream_url: &str, file_path: &str) -> Response {
             error!("Mirror upstream fetch failed for {}: {}", file_path, e);
             (StatusCode::BAD_GATEWAY, "Upstream unavailable").into_response()
         }
+    }
+}
+
+/// Serve-path metadata verification: signature-check the fetched bytes per
+/// the mirror's pinned keys. Returns Err(refusal response) when the hash
+/// policy forbids serving unverified metadata.
+///
+/// Arch repo databases are excluded — they are unsigned upstream, so there
+/// is nothing to verify (metric `unsupported`, counted per occurrence).
+async fn verify_metadata_before_serve(
+    config: &MirrorConfig,
+    policy: HashPolicy,
+    file_path: &str,
+    bytes: &[u8],
+) -> Result<(), Response> {
+    let distro = &config.distro;
+    let keys = match crate::integrity::load_trusted_keys(&config.trusted_keys) {
+        Ok(k) => k,
+        Err(e) => {
+            warn!(
+                distro,
+                "trusted_keys failed to load ({}), serving metadata unverified", e
+            );
+            return Ok(());
+        }
+    };
+
+    // Failure detection + policy application in one place.
+    let outcome: Result<(), String> = if file_path.ends_with("InRelease") {
+        crate::integrity::verify_clearsigned_release(bytes, &keys)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else if file_path.ends_with("/Release") || file_path.ends_with("Release") {
+        // Detached signature: fetch Release.gpg alongside.
+        let gpg_url = format!(
+            "{}/{}.gpg",
+            config.upstream_url.trim_end_matches('/'),
+            file_path
+        );
+        match download_file(&gpg_url).await {
+            Ok(gpg) => crate::integrity::verify_detached_release(bytes, &gpg, &keys)
+                .map_err(|e| e.to_string()),
+            Err(e) => Err(format!("Release.gpg fetch failed: {}", e)),
+        }
+    } else if file_path.ends_with("APKINDEX.tar.gz") {
+        crate::integrity::verify_apkindex_tar_gz(bytes, &keys)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else if file_path.ends_with(".db") {
+        // Unsigned upstream — counted, never enforced.
+        monopsony_common::metrics::mirror_signature_verify(distro, "unsupported");
+        return Ok(());
+    } else {
+        return Ok(());
+    };
+
+    match outcome {
+        Ok(()) => {
+            monopsony_common::metrics::mirror_signature_verify(distro, "pass");
+            Ok(())
+        }
+        Err(detail) => match policy {
+            HashPolicy::FailClosed => {
+                monopsony_common::metrics::mirror_signature_verify(distro, "fail");
+                warn!(
+                    distro,
+                    "refusing to serve unverified metadata {}: {}", file_path, detail
+                );
+                Err((StatusCode::BAD_GATEWAY, "Metadata verification failed").into_response())
+            }
+            HashPolicy::FailOpen => {
+                monopsony_common::metrics::mirror_signature_verify(distro, "fail_open");
+                warn!(
+                    distro,
+                    "fail-open: serving unverified metadata {}: {}", file_path, detail
+                );
+                Ok(())
+            }
+        },
     }
 }
 
@@ -1127,11 +1397,12 @@ async fn download_file(url: &str) -> Result<Vec<u8>, String> {
 
 /// Sync files from upstream mirror to local directory
 async fn sync_mirror(
+    distro: &str,
     upstream_url: &str,
     local_path: &Path,
     exclude_patterns: &[String],
     bandwidth_limit_bps: Option<u64>,
-    hash_policy: &str,
+    hash_policy: HashPolicy,
 ) -> Result<u64, String> {
     info!(
         "Syncing mirror: {} -> {}",
@@ -1213,10 +1484,12 @@ async fn sync_mirror(
 
             match sync_single_file(
                 &client,
+                distro,
                 &child_url,
                 &child_local,
                 bandwidth_limit_bps,
                 hash_policy,
+                None,
             )
             .await
             {
@@ -1231,33 +1504,61 @@ async fn sync_mirror(
         let file_path = local_path.join(filename);
         sync_single_file(
             &client,
+            distro,
             upstream_url,
             &file_path,
             bandwidth_limit_bps,
             hash_policy,
+            None,
         )
         .await
     }
 }
 
-/// Verify a downloaded file against upstream SHA-256 checksum.
+/// Verify a downloaded file against its expected SHA-256 (from verified
+/// metadata or the repo database), falling back to upstream sidecar files.
 ///
-/// Tries fetching `{url}.sha256` and `{url}.sha256sum` from upstream.
-/// If neither exists, returns Ok(()) (no checksum available = pass).
-/// If a checksum is found and doesn't match, returns Err.
+/// Metric `monopsony_mirror_hash_verify_total{distro,result}` records every
+/// decision that had a verification basis. Returns Err on mismatch; the
+/// CALLER applies the hash policy (fail-closed rejects, fail-open warns).
 async fn verify_file_hash(
     client: &HttpClient,
+    distro: &str,
     original_url: &str,
     data: &[u8],
-    hash_policy: &str,
+    hash_policy: HashPolicy,
+    expected_sha256: Option<&str>,
 ) -> Result<(), String> {
     // Compute local SHA-256
     let mut hasher = Sha256::new();
     hasher.update(data);
     let local_hash = format!("{:x}", hasher.finalize());
 
-    // Try .sha256 first, then .sha256sum
-    for suffix in &[".sha256", ".sha256sum"] {
+    // 1. Anchor hash from verified metadata / repo database.
+    if let Some(expected) = expected_sha256 {
+        let expected = expected.trim().to_lowercase();
+        if !expected.is_empty() {
+            if local_hash == expected {
+                monopsony_common::metrics::mirror_hash_verify(distro, "pass");
+                return Ok(());
+            }
+            match hash_policy {
+                HashPolicy::FailOpen => {
+                    monopsony_common::metrics::mirror_hash_verify(distro, "mismatch_fail_open");
+                }
+                HashPolicy::FailClosed => {
+                    monopsony_common::metrics::mirror_hash_verify(distro, "mismatch_fail_closed");
+                }
+            }
+            return Err(format!(
+                "SHA-256 mismatch: expected {}, got {}",
+                expected, local_hash
+            ));
+        }
+    }
+
+    // 2. Upstream sidecar files (.sha256 / .sha256sum).
+    for suffix in [".sha256", ".sha256sum"] {
         let hash_url = format!("{}{}", original_url, suffix);
         let uri: hyper::Uri = match hash_url.parse() {
             Ok(u) => u,
@@ -1301,33 +1602,41 @@ async fn verify_file_hash(
         }
 
         if local_hash == expected_hash {
+            monopsony_common::metrics::mirror_hash_verify(distro, "pass");
             debug!("SHA-256 verified for {}", original_url);
             return Ok(());
-        } else if hash_policy == "fail-open" {
-            warn!(
-                "SHA-256 mismatch for {} (expected {}, got {}), serving anyway per fail-open policy",
-                original_url, expected_hash, local_hash
-            );
-            return Ok(());
-        } else {
-            return Err(format!(
-                "SHA-256 mismatch: expected {}, got {}",
-                expected_hash, local_hash
-            ));
         }
+        match hash_policy {
+            HashPolicy::FailOpen => {
+                monopsony_common::metrics::mirror_hash_verify(distro, "mismatch_fail_open");
+                warn!(
+                    "SHA-256 mismatch for {} (expected {}, got {}), fail-open policy",
+                    original_url, expected_hash, local_hash
+                );
+            }
+            HashPolicy::FailClosed => {
+                monopsony_common::metrics::mirror_hash_verify(distro, "mismatch_fail_closed");
+            }
+        }
+        return Err(format!(
+            "SHA-256 mismatch: expected {}, got {}",
+            expected_hash, local_hash
+        ));
     }
 
-    // No checksum file found upstream — pass silently
+    // No verification basis — nothing to assert either way.
     Ok(())
 }
 
 /// Download and save a single file
 async fn sync_single_file(
     client: &HttpClient,
+    distro: &str,
     url: &str,
     local_path: &Path,
     bandwidth_limit_bps: Option<u64>,
-    hash_policy: &str,
+    hash_policy: HashPolicy,
+    expected_sha256: Option<&str>,
 ) -> Result<u64, String> {
     // Skip if file exists and is recent (within 1 hour)
     if local_path.exists() {
@@ -1397,11 +1706,20 @@ async fn sync_single_file(
         ));
     }
 
-    // Hash verification: try to fetch .sha256 / .sha256sum from upstream
-    if let Err(e) = verify_file_hash(client, url, &bytes, hash_policy).await {
-        warn!("Hash verification failed for {}: {}", url, e);
-        // Don't delete — just warn. Admin can decide policy later.
-        // Future: make this configurable (fail-closed vs fail-open)
+    // Hash verification: anchor hash (verified metadata / repo db) first,
+    // then upstream sidecar files. Fail-closed policy rejects the object
+    // outright — nothing is written to the mirror.
+    if let Err(e) =
+        verify_file_hash(client, distro, url, &bytes, hash_policy, expected_sha256).await
+    {
+        match hash_policy {
+            HashPolicy::FailClosed => {
+                return Err(format!("hash verification failed for {}: {}", url, e));
+            }
+            HashPolicy::FailOpen => {
+                warn!("fail-open: accepting {} despite hash failure: {}", url, e);
+            }
+        }
     }
 
     // Apply bandwidth limiting (token bucket approximation)
@@ -1456,6 +1774,240 @@ async fn sync_single_file(
 
     debug!("Synced: {} ({} bytes)", local_path.display(), len);
     Ok(len)
+}
+
+/// Per-distro default metadata suite / Alpine branch.
+fn default_suite_for(distro: &str) -> &'static str {
+    match distro {
+        "alpine" => "latest-stable",
+        _ => "stable",
+    }
+}
+
+/// Fetch + signature-verify the Debian/Ubuntu Release metadata for a suite.
+///
+/// Prefers the self-contained clearsigned `InRelease`; falls back to
+/// `Release` + detached `Release.gpg`. Returns the VERIFIED Release text
+/// (usable as a checksum anchor) or None when the mirror pins no keys
+/// (metric `no_keys`) or upstream has no metadata at all.
+///
+/// A signature failure under fail-closed aborts the sync; under fail-open it
+/// is logged and counted (`fail_open`) and no anchor is installed.
+async fn verify_apt_release(
+    distro: &str,
+    config: &MirrorConfig,
+    keys: &TrustedKeys,
+    policy: HashPolicy,
+    suite: &str,
+) -> Result<Option<String>, String> {
+    let base = config.upstream_url.trim_end_matches('/');
+    let inrelease_url = format!("{}/dists/{}/InRelease", base, suite);
+    let release_url = format!("{}/dists/{}/Release", base, suite);
+    let release_gpg_url = format!("{}/dists/{}/Release.gpg", base, suite);
+
+    if let Ok(bytes) = download_file(&inrelease_url).await {
+        return verify_anchor_text(
+            distro,
+            policy,
+            keys,
+            &bytes,
+            crate::integrity::verify_clearsigned_release,
+            "InRelease",
+        )
+        .await;
+    }
+
+    // No InRelease — try the detached pair before giving up.
+    if let (Ok(release), Ok(gpg)) = (
+        download_file(&release_url).await,
+        download_file(&release_gpg_url).await,
+    ) {
+        return verify_anchor_text(
+            distro,
+            policy,
+            keys,
+            &release,
+            |text, pinned| {
+                crate::integrity::verify_detached_release(text, &gpg, pinned).map(|()| {
+                    crate::integrity::VerifiedRelease {
+                        release_text: String::from_utf8_lossy(text).to_string(),
+                    }
+                })
+            },
+            "Release+Release.gpg",
+        )
+        .await;
+    }
+
+    warn!(
+        distro,
+        "no InRelease or Release metadata found upstream for suite {}", suite
+    );
+    Ok(None)
+}
+
+/// Shared policy handling for a metadata document that yields a checksum
+/// anchor text on successful verification.
+async fn verify_anchor_text<F>(
+    distro: &str,
+    policy: HashPolicy,
+    keys: &TrustedKeys,
+    bytes: &[u8],
+    verify: F,
+    what: &'static str,
+) -> Result<Option<String>, String>
+where
+    F: Fn(
+        &[u8],
+        &TrustedKeys,
+    ) -> Result<crate::integrity::VerifiedRelease, crate::integrity::IntegrityError>,
+{
+    if keys.openpgp.is_empty() {
+        monopsony_common::metrics::mirror_signature_verify(distro, "no_keys");
+        warn!(
+            distro,
+            "no trusted_keys pinned — {} signature not verified (checksum anchoring disabled)",
+            what
+        );
+        return Ok(None);
+    }
+    match verify(bytes, keys) {
+        Ok(v) => {
+            monopsony_common::metrics::mirror_signature_verify(distro, "pass");
+            Ok(Some(v.release_text))
+        }
+        Err(e) => match policy {
+            HashPolicy::FailOpen => {
+                monopsony_common::metrics::mirror_signature_verify(distro, "fail_open");
+                warn!(distro, "fail-open: accepting unverified {}: {}", what, e);
+                Ok(None)
+            }
+            HashPolicy::FailClosed => {
+                monopsony_common::metrics::mirror_signature_verify(distro, "fail");
+                Err(format!("{} signature verification failed: {}", what, e))
+            }
+        },
+    }
+}
+
+/// Signature-verify an Alpine APKINDEX.tar.gz per the hash policy.
+///
+/// Returns the APKINDEX text; when the mirror pins no keys the index is
+/// parsed unverified (metric `no_keys`, logged) — the same fallback apk uses
+/// with `--allow-untrusted`.
+async fn verify_alpine_index(
+    distro: &str,
+    bytes: &[u8],
+    keys: &TrustedKeys,
+    policy: HashPolicy,
+) -> Result<String, String> {
+    if keys.rsa_spki.is_empty() {
+        monopsony_common::metrics::mirror_signature_verify(distro, "no_keys");
+        warn!(
+            distro,
+            "no trusted_keys pinned — APKINDEX signature not verified"
+        );
+        // Fall back to raw extraction without signature verification.
+        return extract_apkindex_unverified(bytes)
+            .map_err(|e| format!("APKINDEX extraction failed: {}", e));
+    }
+    match crate::integrity::verify_apkindex_tar_gz(bytes, keys) {
+        Ok(v) => {
+            monopsony_common::metrics::mirror_signature_verify(distro, "pass");
+            Ok(v.apkindex_text)
+        }
+        Err(e) => match policy {
+            HashPolicy::FailOpen => {
+                monopsony_common::metrics::mirror_signature_verify(distro, "fail_open");
+                warn!(distro, "fail-open: accepting unverified APKINDEX: {}", e);
+                extract_apkindex_unverified(bytes)
+                    .map_err(|_| format!("APKINDEX signature verification failed: {}", e))
+            }
+            HashPolicy::FailClosed => {
+                monopsony_common::metrics::mirror_signature_verify(distro, "fail");
+                Err(format!("APKINDEX signature verification failed: {}", e))
+            }
+        },
+    }
+}
+
+/// Extract the APKINDEX text from a bundle without signature checks.
+fn extract_apkindex_unverified(bytes: &[u8]) -> Result<String, String> {
+    crate::integrity::extract_apkindex_text(bytes).map_err(|e| e.to_string())
+}
+
+/// Check downloaded index bytes against a VERIFIED Release anchor.
+fn check_against_anchor(
+    distro: &str,
+    bytes: &[u8],
+    anchor: &str,
+    rel_path: &str,
+    policy: HashPolicy,
+) -> Result<(), String> {
+    let Some(expected) = crate::integrity::release_sha256_for(anchor, rel_path) else {
+        // Release does not declare this index (e.g. source-only entries) —
+        // nothing to check.
+        return Ok(());
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let local = format!("{:x}", hasher.finalize());
+    if local == expected {
+        monopsony_common::metrics::mirror_hash_verify(distro, "pass");
+        return Ok(());
+    }
+    match policy {
+        HashPolicy::FailOpen => {
+            monopsony_common::metrics::mirror_hash_verify(distro, "mismatch_fail_open");
+            warn!(
+                distro,
+                "fail-open: index {} does not match verified Release checksum (expected {}, got {})",
+                rel_path, expected, local
+            );
+            Ok(())
+        }
+        HashPolicy::FailClosed => {
+            monopsony_common::metrics::mirror_hash_verify(distro, "mismatch_fail_closed");
+            Err(format!(
+                "index {} does not match verified Release checksum (expected {}, got {})",
+                rel_path, expected, local
+            ))
+        }
+    }
+}
+
+/// Atomic file write (tmp + rename), mirroring sync_single_file's pattern.
+async fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+    }
+    let tmp_path = {
+        let mut p = path.to_path_buf();
+        let stem = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        p.set_file_name(format!("{}.tmp", stem));
+        p
+    };
+    let mut file = tokio::fs::File::create(&tmp_path)
+        .await
+        .map_err(|e| format!("Failed to create file: {}", e))?;
+    use tokio::io::AsyncWriteExt;
+    file.write_all(bytes)
+        .await
+        .map_err(|e| format!("Failed to write file: {}", e))?;
+    file.flush()
+        .await
+        .map_err(|e| format!("Failed to flush file: {}", e))?;
+    drop(file);
+    tokio::fs::rename(&tmp_path, path)
+        .await
+        .map_err(|e| format!("Failed to rename: {}", e))?;
+    Ok(())
 }
 
 /// Check if response is an HTML directory listing
@@ -1872,7 +2424,9 @@ sync_enabled = false
             last_sync: Some(1714000000),
             sync_status: "idle".to_string(),
             total_bytes: 1024,
-            hash_policy: "fail-closed".to_string(),
+            hash_policy: Some("fail-open".to_string()),
+            trusted_keys: Vec::new(),
+            suite: None,
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -1886,6 +2440,17 @@ sync_enabled = false
         assert_eq!(parsed.include_patterns.len(), 1);
         assert!(parsed.public);
         assert_eq!(parsed.total_bytes, 1024);
+        // Per-mirror override survives the roundtrip.
+        assert_eq!(
+            parsed.hash_policy_or(HashPolicy::FailClosed),
+            HashPolicy::FailOpen
+        );
+        // A config with no override inherits the server-wide default.
+        let inherited = MirrorConfig::default();
+        assert_eq!(
+            inherited.hash_policy_or(HashPolicy::FailClosed),
+            HashPolicy::FailClosed
+        );
     }
 
     #[test]

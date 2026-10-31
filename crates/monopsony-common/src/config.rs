@@ -70,6 +70,11 @@ pub struct ServerConfig {
     /// Package integrity pinning ([integrity] section). All fields default.
     #[serde(default)]
     pub integrity: IntegrityConfig,
+    /// Mirror sync integrity ([mirror] section): default hash-verification
+    /// policy + cross-mirror comparison knobs. All fields default so existing
+    /// TOMLs without the section still parse.
+    #[serde(default)]
+    pub mirror: MirrorIntegrityConfig,
 }
 
 /// Server-side HTTP CONNECT pass-through configuration.
@@ -141,6 +146,59 @@ impl Default for IntegrityConfig {
         Self {
             pinning_enabled: false,
             unverified_policy: default_unverified_policy(),
+        }
+    }
+}
+
+/// Mirror sync integrity ([mirror] section). Per-mirror `hash_policy` and
+/// `trusted_keys` live in mirrors.toml; this section supplies the server-wide
+/// defaults and the cross-mirror comparison knobs.
+///
+/// Manual Default (NOT derive) — derive(Default) bypasses per-field serde
+/// defaults when the whole [mirror] section is absent (see IntegrityConfig).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MirrorIntegrityConfig {
+    /// Default hash-verification policy for mirrors that do not set one in
+    /// mirrors.toml: "fail-closed" (reject on mismatch) or "fail-open" (log
+    /// warning, accept). Default: "fail-closed".
+    #[serde(default = "default_mirror_hash_policy")]
+    pub hash_policy: String,
+    /// Compare sampled mirror objects against tracker-listed peer mirrors
+    /// after each sync. Default: true.
+    #[serde(default = "default_mirror_cross_check_enabled")]
+    pub cross_check_enabled: bool,
+    /// Files sampled per sync for cross-mirror comparison (index files come
+    /// first, then newest synced objects). Default: 4.
+    #[serde(default = "default_mirror_cross_check_sample")]
+    pub cross_check_sample: usize,
+    /// Per-peer-fetch timeout in seconds. Default: 30.
+    #[serde(default = "default_mirror_cross_check_timeout")]
+    pub cross_check_timeout_secs: u64,
+}
+
+fn default_mirror_hash_policy() -> String {
+    "fail-closed".to_string()
+}
+
+fn default_mirror_cross_check_enabled() -> bool {
+    true
+}
+
+fn default_mirror_cross_check_sample() -> usize {
+    4
+}
+
+fn default_mirror_cross_check_timeout() -> u64 {
+    30
+}
+
+impl Default for MirrorIntegrityConfig {
+    fn default() -> Self {
+        Self {
+            hash_policy: default_mirror_hash_policy(),
+            cross_check_enabled: default_mirror_cross_check_enabled(),
+            cross_check_sample: default_mirror_cross_check_sample(),
+            cross_check_timeout_secs: default_mirror_cross_check_timeout(),
         }
     }
 }
@@ -1359,6 +1417,7 @@ mod tests {
             access_control: AccessControlConfig::default(),
             proxy: ProxyServerConfig::default(),
             integrity: IntegrityConfig::default(),
+            mirror: MirrorIntegrityConfig::default(),
         }
     }
 

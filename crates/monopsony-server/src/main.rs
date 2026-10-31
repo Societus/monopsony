@@ -9,8 +9,8 @@ use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 // Crate imports
-use monopsony_admin::DashboardConfig;
 use monopsony_admin::pairing;
+use monopsony_admin::DashboardConfig;
 use monopsony_control::{announce, discovery, grpc, metrics};
 use monopsony_db::Database;
 use monopsony_mirror::mirror;
@@ -505,6 +505,23 @@ async fn main() -> anyhow::Result<()> {
             Err(_) => monopsony_common::config::IntegrityConfig::default(),
         };
 
+    // Read mirror sync integrity config ([mirror] section) with the same
+    // fallback-to-defaults pattern: default hash policy + cross-mirror knobs.
+    let mirror_integrity_cfg: monopsony_common::config::MirrorIntegrityConfig =
+        match std::fs::read_to_string(&args.config) {
+            Ok(content) => {
+                #[derive(serde::Deserialize, Default)]
+                struct MirrorSectionWrapper {
+                    #[serde(default)]
+                    mirror: monopsony_common::config::MirrorIntegrityConfig,
+                }
+                toml::from_str::<MirrorSectionWrapper>(&content)
+                    .map(|w| w.mirror)
+                    .unwrap_or_default()
+            }
+            Err(_) => monopsony_common::config::MirrorIntegrityConfig::default(),
+        };
+
     // Read language-artifact cache config ([cache.language_artifacts] section,
     // Sprint 23) with the same fallback-to-defaults pattern.
     let language_artifacts_cfg: monopsony_common::config::LanguageArtifactConfig =
@@ -573,7 +590,10 @@ async fn main() -> anyhow::Result<()> {
     let storage_for_registry = storage.clone();
     let db_for_registry = db.clone();
     let auth_mode_for_registry = auth_mode.clone();
-    let registry_listen_addr: SocketAddr = args.registry_addr.parse().expect("Invalid registry address");
+    let registry_listen_addr: SocketAddr = args
+        .registry_addr
+        .parse()
+        .expect("Invalid registry address");
     let _registry_handle = tokio::spawn(async move {
         if let Err(e) = oci_registry::run_registry(
             registry_listen_addr,
@@ -620,6 +640,45 @@ async fn main() -> anyhow::Result<()> {
             if let Err(e) = mgr.load_from_db().await {
                 warn!("Could not load mirror configs from DB: {}", e);
             }
+            // Mirror sync integrity knobs (server.toml [mirror]) + tracker URLs
+            // for cross-mirror comparison. Must be set before the sync task
+            // starts.
+            let cross_check = if mirror_integrity_cfg.cross_check_enabled {
+                Some(monopsony_mirror::CrossCheckConfig {
+                    enabled: true,
+                    sample: mirror_integrity_cfg.cross_check_sample,
+                    timeout_secs: mirror_integrity_cfg.cross_check_timeout_secs,
+                })
+            } else {
+                None
+            };
+            let tracker_urls: Vec<String> = args
+                .tracker_url
+                .as_deref()
+                .map(|s| {
+                    s.split(',')
+                        .map(|u| u.trim().to_string())
+                        .filter(|u| !u.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            mgr.set_integrity_settings(mirror::IntegritySettings {
+                default_hash_policy: monopsony_mirror::HashPolicy::parse(
+                    &mirror_integrity_cfg.hash_policy,
+                ),
+                cross_check,
+                tracker_urls,
+            })
+            .await;
+            info!(
+                "Mirror integrity: default hash policy = {}, cross-check = {}",
+                mirror_integrity_cfg.hash_policy,
+                if mirror_integrity_cfg.cross_check_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
             info!("Mirror directory: {}", mirror_dir.display());
             Some(Arc::new(mgr))
         } else {
@@ -990,7 +1049,9 @@ async fn main() -> anyhow::Result<()> {
         pairing_task: Arc::new(tokio::sync::Mutex::new(None)),
         sessions: Arc::new(monopsony_admin::auth::SessionStore::new()),
         rate_limits,
-        trusted_proxies: monopsony_admin::auth::TrustedProxies::from_config(&dashboard_config.trusted_proxies),
+        trusted_proxies: monopsony_admin::auth::TrustedProxies::from_config(
+            &dashboard_config.trusted_proxies,
+        ),
         pending_pairs: Arc::new(tokio::sync::Mutex::new(pairing::PendingPairStore::new())),
     };
     let admin_router = monopsony_admin::admin_router(admin_state);
@@ -1392,5 +1453,112 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(parsed["username"], "ad\"min");
         assert_eq!(parsed["password"], "pass\\word");
+    }
+
+    /// Loopback regression for the `pair` subcommand 401: the CLI must log in
+    /// and then call /api/v1/pair/init with the SAME cookie-carrying client,
+    /// so the monopsony_session cookie minted by the login response reaches
+    /// the auth middleware. The mock mirrors the admin::auth mechanics
+    /// (tower-cookies Set-Cookie on login; store-validated session cookie on
+    /// the strictly-required pair/init POST).
+    #[tokio::test]
+    async fn test_pair_cli_flow_carries_login_session_cookie_to_pair_init() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::post;
+        use axum::{Json, Router};
+        use tower_cookies::{Cookie, CookieManagerLayer, Cookies};
+
+        const SESSION_COOKIE: &str = "monopsony_session";
+        type Sessions = Arc<std::sync::Mutex<HashSet<String>>>;
+
+        async fn handle_login(
+            State(sessions): State<Sessions>,
+            cookies: Cookies,
+        ) -> impl IntoResponse {
+            let token = "loopback-session-token-0123456789abcdef".to_string();
+            sessions.lock().unwrap().insert(token.clone());
+            // Same cookie attributes as admin::auth::handle_login.
+            let cookie = Cookie::build((SESSION_COOKIE, token.clone()))
+                .path("/")
+                .http_only(true)
+                .same_site(tower_cookies::cookie::SameSite::Lax)
+                .max_age(tower_cookies::cookie::time::Duration::hours(1))
+                .build();
+            cookies.add(cookie);
+            Json(serde_json::json!({
+                "success": true,
+                "message": null,
+                "session_token": token,
+            }))
+        }
+
+        async fn handle_pair_init(State(sessions): State<Sessions>, cookies: Cookies) -> Response {
+            // Auth middleware shape: the session cookie must exist in the
+            // store (pair/init is a POST, so auth is strictly required).
+            let valid = cookies
+                .get(SESSION_COOKIE)
+                .map(|c| sessions.lock().unwrap().contains(c.value()))
+                .unwrap_or(false);
+            if !valid {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "unauthorized",
+                        "message": "Authentication required",
+                        "auth_method": "none",
+                    })),
+                )
+                    .into_response();
+            }
+            Json(serde_json::json!({
+                "code": "TEST01",
+                "cli_command": "monopsony-client pair --server <SERVER_IP>:50052 --code TEST01",
+                "deadline_ms": 480_000,
+            }))
+            .into_response()
+        }
+
+        let sessions: Sessions = Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let app = Router::new()
+            .route("/api/v1/auth/login", post(handle_login))
+            .route("/api/v1/pair/init", post(handle_pair_init))
+            .layer(CookieManagerLayer::new())
+            .with_state(sessions.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        // Negative control: without the session cookie the mock must reject
+        // pair/init, otherwise the positive assertion below proves nothing.
+        let anon = reqwest::Client::new();
+        let resp = anon
+            .post(format!("http://127.0.0.1:{}/api/v1/pair/init", port))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // The real CLI flow: one client, login then pair/init.
+        let result =
+            handle_pair_via_admin_api("127.0.0.1", port, Some("admin"), Some("loopback-pass"))
+                .await;
+        // A lost cookie surfaces as the production 401 bail.
+        assert!(
+            result.is_ok(),
+            "pair flow must carry the login session cookie into pair/init, got: {:?}",
+            result.err()
+        );
+        assert!(
+            !sessions.lock().unwrap().is_empty(),
+            "login must create a server-side session"
+        );
     }
 }

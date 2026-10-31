@@ -3,6 +3,7 @@
 //! Supported formats:
 //! - Pacman `.db` (gzip-compressed tar with per-package `desc` files)
 //! - Debian `Packages.gz` (gzip-compressed plain text key-value pairs)
+//! - Alpine `APKINDEX` text (verified bundles decoded by `integrity.rs`)
 //!
 //! Returns `Vec<UpstreamPackage>` for storage in the `upstream_packages` table.
 
@@ -170,7 +171,10 @@ pub fn parse_debian_packages(gz_bytes: &[u8]) -> Vec<UpstreamPackage> {
 
 /// Known repo metadata index paths for each distro, relative to the upstream URL.
 /// Returns (repo_name, index_path) pairs. These are small files (~5-20MB total).
-pub fn repo_index_urls(distro: &str, arch: &str) -> Vec<(&'static str, String)> {
+///
+/// `suite` is the Debian/Ubuntu suite (default "stable") or Alpine branch
+/// (default "latest-stable"); it is ignored for pacman-style distros.
+pub fn repo_index_urls(distro: &str, arch: &str, suite: &str) -> Vec<(&'static str, String)> {
     match distro {
         "archlinux" => vec![
             ("core", format!("core/os/{}/core.db", arch)),
@@ -178,12 +182,13 @@ pub fn repo_index_urls(distro: &str, arch: &str) -> Vec<(&'static str, String)> 
         ],
         "debian" => vec![(
             "main",
-            format!("dists/stable/main/binary-{}/Packages.gz", arch),
+            format!("dists/{}/main/binary-{}/Packages.gz", suite, arch),
         )],
         "ubuntu" => vec![(
             "main",
-            format!("dists/stable/main/binary-{}/Packages.gz", arch),
+            format!("dists/{}/main/binary-{}/Packages.gz", suite, arch),
         )],
+        "alpine" => vec![("main", format!("{}/main/{}/APKINDEX.tar.gz", suite, arch))],
         _ => vec![],
     }
 }
@@ -193,12 +198,17 @@ pub fn repo_index_urls(distro: &str, arch: &str) -> Vec<(&'static str, String)> 
 /// For pacman:
 /// - `download_url` uses the original filename (e.g., https://mirror/core/os/x86_64/bash-5.3.15-1-x86_64.pkg.tar.zst)
 /// - `filename` is set to the repo-relative path for local storage (e.g., core/os/x86_64/bash-5.3.15-1-x86_64.pkg.tar.zst)
+///
+/// For alpine, APKINDEX carries no filename field — apk clients construct
+/// `{P}-{V}.apk` inside `{suite}/{repo}/{arch}/`; the same construction is
+/// used here (filename = repo-local storage path, minus the suite segment).
 pub fn resolve_download_urls(
     packages: &mut [UpstreamPackage],
     distro: &str,
     repo: &str,
     upstream_base: &str,
     arch: &str,
+    suite: &str,
 ) {
     let base = upstream_base.trim_end_matches('/');
     for pkg in packages.iter_mut() {
@@ -209,9 +219,118 @@ pub fn resolve_download_urls(
             pkg.filename = format!("{}/os/{}/{}", repo, arch, original_filename);
             // Construct download URL using original filename
             pkg.download_url = format!("{}/{}/os/{}/{}", base, repo, arch, original_filename);
+        } else if distro == "alpine" {
+            let apk_name = format!("{}-{}.apk", pkg.name, pkg.version);
+            pkg.filename = format!("{}/{}/{}", repo, arch, apk_name);
+            pkg.download_url = format!("{}/{}/{}/{}/{}", base, suite, repo, arch, apk_name);
         } else {
             // Debian: filename already contains pool/main/... path
             pkg.download_url = format!("{}/{}", base, pkg.filename);
         }
     }
+}
+
+/// Parse APKINDEX text (the verified payload extracted by integrity.rs):
+/// entries separated by blank lines, `key:value` fields per line. `P:` name,
+/// `V:` version, `A:` arch, `S:` size, `C:` checksum (sha256 when the value
+/// decodes to exactly 32 bytes — same convention as the client's
+/// index_parse.rs).
+pub fn parse_apkindex(text: &str) -> Vec<UpstreamPackage> {
+    let mut packages = Vec::new();
+    for block in text.split("\n\n") {
+        let mut name: Option<String> = None;
+        let mut version = String::new();
+        let mut arch = String::new();
+        let mut size: u64 = 0;
+        let mut sha256: Option<String> = None;
+        for line in block.lines() {
+            let line = line.trim_end_matches('\r');
+            if line.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            match key {
+                "P" => {
+                    if name.is_none() {
+                        name = Some(value.to_string());
+                    }
+                }
+                "V" => {
+                    if version.is_empty() {
+                        version = value.to_string();
+                    }
+                }
+                "A" => {
+                    if arch.is_empty() {
+                        arch = value.to_string();
+                    }
+                }
+                "S" => {
+                    if size == 0 {
+                        size = value.trim().parse().unwrap_or(0);
+                    }
+                }
+                "C" => {
+                    if sha256.is_none() {
+                        sha256 = apk_checksum_to_sha256(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(name) = name {
+            if name.is_empty() {
+                continue;
+            }
+            packages.push(UpstreamPackage {
+                name,
+                version,
+                architecture: arch,
+                // Filled in by resolve_download_urls (apk constructs {P}-{V}.apk)
+                filename: String::new(),
+                download_url: String::new(),
+                size_bytes: size,
+                sha256,
+            });
+        }
+    }
+
+    debug!("Parsed {} packages from APKINDEX", packages.len());
+    packages
+}
+
+/// Convert an apk `C:` checksum value to lowercase hex sha256. Only the
+/// `c:` prefix (sha256 family) is considered, and only when the remainder
+/// base64-decodes to exactly 32 bytes — otherwise None (do not guess).
+/// Mirrors the client crate's index_parse.rs decoding.
+fn apk_checksum_to_sha256(value: &str) -> Option<String> {
+    let encoded = value.strip_prefix("c:")?;
+    let decoded = base64_decode_lenient(encoded)?;
+    if decoded.len() == 32 {
+        Some(to_hex(&decoded))
+    } else {
+        None
+    }
+}
+
+/// Base64 decode tolerating both padded and unpadded encodings.
+fn base64_decode_lenient(encoded: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    let engine = base64::engine::general_purpose::STANDARD;
+    engine.decode(encoded).ok().or_else(|| {
+        base64::engine::general_purpose::STANDARD_NO_PAD
+            .decode(encoded.trim_end_matches('='))
+            .ok()
+    })
+}
+
+/// Lowercase hex encoding.
+fn to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{:02x}", byte));
+    }
+    out
 }

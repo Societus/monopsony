@@ -42,6 +42,15 @@ pub mod mirror {
     pub const SYNC_FILES: &str = "monopsony_mirror_sync_files_total";
     pub const SERVED_TOTAL: &str = "monopsony_mirror_served_total";
     pub const SERVED_BYTES: &str = "monopsony_mirror_served_bytes_total";
+    /// Sync-integrity outcomes: "pass" | "mismatch_fail_closed" |
+    /// "mismatch_fail_open" | "no_checksum".
+    pub const HASH_VERIFY_TOTAL: &str = "monopsony_mirror_hash_verify_total";
+    /// Metadata signature outcomes: "pass" | "fail" | "fail_open" |
+    /// "no_keys" | "unsupported".
+    pub const SIGNATURE_VERIFY_TOTAL: &str = "monopsony_mirror_signature_verify_total";
+    /// Cross-mirror comparison outcomes: "match" | "divergence" |
+    /// "unreachable" | "skipped".
+    pub const CROSS_CHECK_TOTAL: &str = "monopsony_mirror_cross_check_total";
 }
 
 /// Metric names for client
@@ -211,6 +220,24 @@ pub fn mirror_served(distro: &str) {
 /// Record mirror bytes served
 pub fn mirror_served_bytes(distro: &str, bytes: u64) {
     counter!(mirror::SERVED_BYTES, "distro" => distro.to_string()).increment(bytes);
+}
+
+/// Record one hash-verification outcome (sync or serve path).
+pub fn mirror_hash_verify(distro: &str, result: &'static str) {
+    counter!(mirror::HASH_VERIFY_TOTAL, "distro" => distro.to_string(), "result" => result)
+        .increment(1);
+}
+
+/// Record one metadata signature-verification outcome.
+pub fn mirror_signature_verify(distro: &str, result: &'static str) {
+    counter!(mirror::SIGNATURE_VERIFY_TOTAL, "distro" => distro.to_string(), "result" => result)
+        .increment(1);
+}
+
+/// Record one cross-mirror hash-comparison outcome.
+pub fn mirror_cross_check(distro: &str, result: &'static str) {
+    counter!(mirror::CROSS_CHECK_TOTAL, "distro" => distro.to_string(), "result" => result)
+        .increment(1);
 }
 
 // Scan metrics

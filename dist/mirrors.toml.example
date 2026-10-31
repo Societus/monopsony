@@ -53,6 +53,31 @@ per_ip_rps = 50
 # Max concurrent connections per IP. 0 = unlimited.
 max_concurrent_per_ip = 20
 
+# ── Sync integrity (see docs/plans/2026-10-31-mirror-sync-integrity.md) ──
+
+# Hash-verification policy for this mirror: "fail-closed" (reject objects
+# whose checksum verification fails; the file is NOT written) or "fail-open"
+# (log warning, serve anyway). Omitted = inherit the server-wide [mirror]
+# hash_policy from server.toml (default fail-closed).
+# hash_policy = "fail-closed"
+
+# Release suite / Alpine branch to index (debian/ubuntu "stable",
+# alpine "latest-stable"). Omitted = per-distro default.
+# suite = "stable"
+
+# Pinned trust keys for metadata signature verification. Each entry is
+# inline armored key text or a path to an armored key file:
+#   - Debian/Ubuntu: OpenPGP public keys anchoring InRelease/Release
+#     (export from debian-archive-keyring: gpg --export --armor)
+#   - Alpine: SPKI PEM RSA keys anchoring APKINDEX signatures
+#     (/etc/apk/keys/*.rsa.pub on any Alpine box, or the aports repo keys/)
+# With keys pinned, metadata is signature-verified before it is indexed,
+# cached, or served; without keys, verification is skipped (logged, counted
+# in monopsony_mirror_signature_verify_total) and checksum sidecars still
+# apply. Arch repo databases are unsigned upstream — package integrity comes
+# from the database checksums + cross-mirror comparison.
+# trusted_keys = ["/etc/monopsony/keys/debian-archive.asc"]
+
 
 # ============================================================================
 # Debian Mirror

@@ -80,6 +80,40 @@ bind = "0.0.0.0:3128"
 # unverified_policy = "flag"
 
 # ============================================================================
+# Mirror Sync Integrity
+# ============================================================================
+[mirror]
+# Default hash-verification policy for distribution mirrors that do not set
+# a per-mirror hash_policy in mirrors.toml:
+#   "fail-closed" — a failed checksum/signature verification REJECTS the
+#                   object: not indexed, not cached, not served (default)
+#   "fail-open"   — the failure is logged + counted, the object is accepted
+# RECOMMENDATION: keep fail-closed. A mirror's whole purpose is serving bytes
+# clients trust; failing open turns checksum mismatches into silent noise.
+# Per-mirror overrides and pinned trust keys live in mirrors.toml.
+# Default: "fail-closed"
+# Type: string
+# hash_policy = "fail-closed"
+
+# After each successful mirror sync, sample objects and compare their
+# SHA-256 against the same paths on tracker-listed peer mirrors
+# (monopsony_mirror_cross_check_total). Divergence is reported via metrics
+# + error log — never auto-quarantined.
+# Default: true
+# Type: bool
+# cross_check_enabled = true
+
+# Objects sampled per sync (newest-modified first).
+# Default: 4
+# Type: usize
+# cross_check_sample = 4
+
+# Per-peer-fetch timeout in seconds.
+# Default: 30
+# Type: u64
+# cross_check_timeout_secs = 30
+
+# ============================================================================
 # gRPC Control Plane
 # ============================================================================
 [grpc]

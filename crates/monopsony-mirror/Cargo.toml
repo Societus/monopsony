@@ -33,6 +33,11 @@ mime_guess = "2"
 toml = { workspace = true }
 ed25519-dalek = { version = "2", features = ["serde"] }
 rand = "0.8"
+pgp = "0.21"
+rsa = { version = "0.9", features = ["sha1", "sha2"] }
+base64 = { workspace = true }
+sha1 = { version = "0.10", features = ["oid"] }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

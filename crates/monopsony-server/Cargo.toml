@@ -42,3 +42,4 @@ reqwest = { workspace = true, features = ["cookies"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true }
+tower-cookies = { workspace = true }
