@@ -150,8 +150,31 @@ export interface ClientInfo {
   os_version?: string;
   registered_at: string;
   last_seen: string;
+  /** Serial of the client's current certificate; null until a cert is issued. */
+  cert_serial?: string | null;
   /** Sprint 29 B1: update counts + release rows; null until the client reports. */
   updates?: ClientUpdates | null;
+}
+
+/** One tracked client certificate (GET /clients/:id/certs, P4 cert status). */
+export interface ClientCertInfo {
+  serial: string;
+  /** Owning client's UUID — present on list + audit rows. */
+  client_id: string;
+  /** Raw DB status: "active" | "revoked" | "expired". */
+  status: string;
+  /** Derived dashboard state — revoked wins over expired. */
+  badge: 'valid' | 'expiring' | 'revoked' | 'expired';
+  issued_at: string;
+  expires_at: string;
+  revoked_at: string | null;
+  /** Whole days until expiry; null once expired. */
+  days_to_expiry: number | null;
+}
+
+export interface ClientCertsResponse {
+  certs: ClientCertInfo[];
+  count: number;
 }
 
 // ─── Shadow Context / Assign Recipe ────────────────────────────────
@@ -253,6 +276,36 @@ export interface PairAuditEntry {
   approver: string;
   detail: string | null;
   created_at: number;
+}
+
+// ─── Enrollment keys (pairing-v2 P5) ────────────────────────────────
+
+export interface EnrollmentKey {
+  key_id: string;
+  /** First 12 chars of the stored SHA-256 — identity hint, never the key. */
+  key_hash_prefix: string;
+  label: string;
+  max_uses: number;
+  use_count: number;
+  created_at: number;
+  expires_at: number | null;
+  revoked_at: number | null;
+}
+
+export interface CreateEnrollmentKeyRequest {
+  label: string;
+  max_uses: number;
+  /** Hours until expiry; omit/null = never expires. */
+  expires_in_hours?: number | null;
+}
+
+export interface CreateEnrollmentKeyResponse {
+  key_id: string;
+  /** Plaintext key (mopk-...) — shown exactly once, never recoverable. */
+  key: string;
+  label: string;
+  max_uses: number;
+  expires_at: number | null;
 }
 
 // ─── Feature / Monetization Types ──────────────────────────────────

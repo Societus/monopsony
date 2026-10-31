@@ -10,12 +10,14 @@ import type {
   ShadowPackage,
   RecipeValidationResult, EstimateResponse,
   ClientInfo, ConfigResponse,
+  ClientCertInfo, ClientCertsResponse,
   ShadowContext, AssignRecipeResponse,
   ReleaseGuideResponse,
   MirrorConfig, MirrorStatus,
   TrackerStatus,
   FeatureFlags, MonetizationConfig,
   PendingPairRequest, PairApproveResponse, PairAuditEntry,
+  EnrollmentKey, CreateEnrollmentKeyRequest, CreateEnrollmentKeyResponse,
 } from './types';
 
 const BASE = import.meta.env.VITE_API_BASE || '/api/v1';
@@ -110,6 +112,15 @@ export const api = {
     // Sprint 29 Phase 4: rendered display-only upgrade guide (server-rendered text; nothing executes).
     releaseGuide: (id: string) =>
       request<ReleaseGuideResponse>(`/clients/${encodeURIComponent(id)}/release-guide`),
+    revokeCert: (id: string, serial: string) =>
+      request<{ revoked: boolean; serial: string }>(
+        `/clients/${encodeURIComponent(id)}/certs/${encodeURIComponent(serial)}/revoke`,
+        { method: 'POST' },
+      ),
+    // P4 cert status: per-client cert list + fleet-wide revocation audit.
+    certs: (id: string) =>
+      request<ClientCertsResponse>(`/clients/${encodeURIComponent(id)}/certs`),
+    revokedCerts: () => request<ClientCertInfo[]>('/certs/revoked'),
     getShadowContext: (id: string) =>
       request<ShadowContext>(`/admin/clients/${encodeURIComponent(id)}/shadow-context`),
     assignRecipe: (id: string, recipeName: string) =>
@@ -130,6 +141,21 @@ export const api = {
     deny: (requestId: string) =>
       request<{ status: string }>(`/pair/deny/${encodeURIComponent(requestId)}`, { method: 'POST' }),
     audit: () => request<PairAuditEntry[]>('/pair/audit'),
+  },
+
+  // Enrollment keys (pairing-v2 P5 — auth-gated dashboard key manager).
+  enrollmentKeys: {
+    list: () => request<EnrollmentKey[]>('/enrollment-keys'),
+    create: (req: CreateEnrollmentKeyRequest) =>
+      request<CreateEnrollmentKeyResponse>('/enrollment-keys', {
+        method: 'POST',
+        body: JSON.stringify(req),
+      }),
+    revoke: (keyId: string) =>
+      request<{ revoked: boolean; key_id: string }>(
+        `/enrollment-keys/${encodeURIComponent(keyId)}`,
+        { method: 'DELETE' },
+      ),
   },
 
   mirrors: {
