@@ -10,23 +10,26 @@ pub enum ShadowSource {
     DirectUrl,
 }
 
-/// Default self-update recipe baked into every Monopsony install.
-/// This allows monopsony-server and monopsony-client to update themselves
-/// via the same shadow package system used for third-party software.
-pub const DEFAULT_MONOPSONY_RECIPE: &str = r#"
+/// Default self-update recipe for monopsony-server, baked into every install
+/// (binaries ship via scp, so recipes must not depend on runtime data files).
+/// Release assets are kind-prefixed per the release CI contract:
+/// `monopsony-server-v<VERSION>-{linux-x86_64,linux-aarch64,darwin-arm64,darwin-x86_64}.tar.gz`
+/// (linux assets are static musl builds serving both glibc and musl hosts, so
+/// rules carry no libc).
+pub const DEFAULT_MONOPSONY_SERVER_RECIPE: &str = r#"
 [package]
-name = "monopsony"
-description = "Monopsony self-update recipe"
+name = "monopsony-server"
+description = "Monopsony server self-update recipe"
 source_type = "github_release"
 source_url = "https://github.com/societus/monopsony"
 
 [install]
 method = "extract"
 target_dir = "/usr/local/bin"
-chmod = ["monopsony-server", "monopsony-client"]
+chmod = ["monopsony-server"]
 backup_old = true
 max_backups = 3
-config_paths = ["/etc/monopsony/server.toml", "/etc/monopsony/client.toml"]
+config_paths = ["/etc/monopsony/server.toml"]
 
 # Stop the service before swapping the binary
 pre_update = "systemctl stop monopsony-server 2>/dev/null; true"
@@ -37,53 +40,101 @@ post_update = "systemctl start monopsony-server 2>/dev/null; true"
 # On failure: ensure service is running with old binary
 on_failure = "systemctl start monopsony-server 2>/dev/null; true"
 
-# Health check: verify the server responds after update
+# Health check: verify the server control port responds after update
 [install.health_check]
 type = "port"
 port = 50051
 timeout_secs = 30
 
 [version]
-detect_command = "/usr/local/bin/monopsony-server --version 2>&1 || /usr/local/bin/monopsony-client --version 2>&1"
-detect_pattern = "(\\d+\\.\\d+\\.\\d+(?:-rc\\d+)?)"
+detect_command = "/usr/local/bin/monopsony-server --version"
+detect_pattern = '(\d+\.\d+\.\d+(?:-rc\d+)?)'
 
 [asset_selector]
-tag_pattern = "v(\\d+\\.\\d+\\.\\d+(?:-rc\\d+)?)$"
+tag_pattern = 'v(\d+\.\d+\.\d+(?:-rc\d+)?)$'
+# Rules match the real release contract (anchored, kind-prefixed, -rcN aware).
 [[asset_selector.rules]]
 os = "linux"
 arch = "x86_64"
-libc = "glibc"
-pattern = "monopsony-x86_64-unknown-linux-gnu.tar.gz$"
-
-[[asset_selector.rules]]
-os = "linux"
-arch = "aarch64"
-libc = "glibc"
-pattern = "monopsony-aarch64-unknown-linux-gnu.tar.gz$"
-
-[[asset_selector.rules]]
-os = "linux"
-arch = "x86_64"
-libc = "musl"
-pattern = "monopsony-x86_64-unknown-linux-musl.tar.gz$"
+pattern = '^monopsony-server-v\d+\.\d+\.\d+(?:-rc\d+)?-linux-x86_64\.tar\.gz$'
 
 [[asset_selector.rules]]
 os = "linux"
 arch = "aarch64"
-libc = "musl"
-pattern = "monopsony-aarch64-unknown-linux-musl.tar.gz$"
+pattern = '^monopsony-server-v\d+\.\d+\.\d+(?:-rc\d+)?-linux-aarch64\.tar\.gz$'
 
-# Windows builds (PE32+)
+# std reports aarch64 on Apple Silicon; release assets use Apple's "arm64".
 [[asset_selector.rules]]
-os = "windows"
-arch = "x86_64"
-pattern = "monopsony-x86_64-pc-windows-gnu.zip$"
+os = "darwin"
+arch = "aarch64"
+pattern = '^monopsony-server-v\d+\.\d+\.\d+(?:-rc\d+)?-darwin-arm64\.tar\.gz$'
 
-# FreeBSD (for MidnightBSD/mport)
 [[asset_selector.rules]]
-os = "freebsd"
+os = "darwin"
 arch = "x86_64"
-pattern = "monopsony-x86_64-unknown-freebsd.tar.gz$"
+pattern = '^monopsony-server-v\d+\.\d+\.\d+(?:-rc\d+)?-darwin-x86_64\.tar\.gz$'
+"#;
+
+/// Default self-update recipe for monopsony-client. Same contract as the
+/// server recipe with per-binary hooks (monopsony-client unit), a process
+/// health check (no listening port to probe), and client-only config/chmod.
+pub const DEFAULT_MONOPSONY_CLIENT_RECIPE: &str = r#"
+[package]
+name = "monopsony-client"
+description = "Monopsony client self-update recipe"
+source_type = "github_release"
+source_url = "https://github.com/societus/monopsony"
+
+[install]
+method = "extract"
+target_dir = "/usr/local/bin"
+chmod = ["monopsony-client"]
+backup_old = true
+max_backups = 3
+config_paths = ["/etc/monopsony/client.toml"]
+
+# Stop the daemon before swapping the binary
+pre_update = "systemctl stop monopsony-client 2>/dev/null; true"
+
+# Start the daemon after successful swap
+post_update = "systemctl start monopsony-client 2>/dev/null; true"
+
+# On failure: ensure daemon is running with old binary
+on_failure = "systemctl start monopsony-client 2>/dev/null; true"
+
+# Health check: the client has no listening port — verify the process runs
+[install.health_check]
+type = "process"
+process = "monopsony-client"
+timeout_secs = 30
+
+[version]
+detect_command = "/usr/local/bin/monopsony-client --version"
+detect_pattern = '(\d+\.\d+\.\d+(?:-rc\d+)?)'
+
+[asset_selector]
+tag_pattern = 'v(\d+\.\d+\.\d+(?:-rc\d+)?)$'
+# Rules match the real release contract (anchored, kind-prefixed, -rcN aware).
+[[asset_selector.rules]]
+os = "linux"
+arch = "x86_64"
+pattern = '^monopsony-client-v\d+\.\d+\.\d+(?:-rc\d+)?-linux-x86_64\.tar\.gz$'
+
+[[asset_selector.rules]]
+os = "linux"
+arch = "aarch64"
+pattern = '^monopsony-client-v\d+\.\d+\.\d+(?:-rc\d+)?-linux-aarch64\.tar\.gz$'
+
+# std reports aarch64 on Apple Silicon; release assets use Apple's "arm64".
+[[asset_selector.rules]]
+os = "darwin"
+arch = "aarch64"
+pattern = '^monopsony-client-v\d+\.\d+\.\d+(?:-rc\d+)?-darwin-arm64\.tar\.gz$'
+
+[[asset_selector.rules]]
+os = "darwin"
+arch = "x86_64"
+pattern = '^monopsony-client-v\d+\.\d+\.\d+(?:-rc\d+)?-darwin-x86_64\.tar\.gz$'
 "#;
 
 /// Install method defined in a recipe

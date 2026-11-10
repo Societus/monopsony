@@ -10,6 +10,35 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
+/// Which monopsony binary a self-update targets. Release assets are
+/// kind-prefixed (`monopsony-server-v...` / `monopsony-client-v...`) and each
+/// binary has its own default recipe, so selection and the managed pipeline
+/// both key off this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryKind {
+    Server,
+    Client,
+}
+
+impl BinaryKind {
+    /// Archive-name prefix of this binary's release assets.
+    fn asset_name_prefix(self) -> &'static str {
+        match self {
+            BinaryKind::Server => "monopsony-server",
+            BinaryKind::Client => "monopsony-client",
+        }
+    }
+
+    /// Map a `detect_binary_type()`-style string ("server"/"client"; unknown
+    /// argv0 defaults to client, matching the CLI's display behavior).
+    pub fn from_binary_type(binary_type: &str) -> Self {
+        match binary_type {
+            "server" => BinaryKind::Server,
+            _ => BinaryKind::Client,
+        }
+    }
+}
+
 // ─── Managed Update Pipeline Types ─────────────────────────────────
 
 /// Snapshot of a config file before update (for rollback).
@@ -341,10 +370,7 @@ pub async fn apply_update_managed(ctx: &mut UpdateContext) -> Result<UpdateOutco
     let bytes = response.bytes().await?;
 
     // Extract binary from archive if needed
-    let new_path = ctx.install_dir.join(format!(
-        "monopsony-server.new.{}",
-        Utc::now().format("%Y%m%d_%H%M%S")
-    ));
+    let new_path = sibling_update_path(&ctx.install_dir, &ctx.current_path, "new");
 
     if ctx.asset_url.ends_with(".tar.gz") || ctx.asset_url.ends_with(".zip") {
         extract_binary_from_archive(&bytes, &new_path, &ctx.asset_url)?;
@@ -465,8 +491,13 @@ pub struct UpdateCheckResult {
     pub changelog_url: Option<String>,
 }
 
-/// Check if an update is available and return version info
-pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckResult> {
+/// Check if an update is available and return version info. `binary_kind`
+/// selects which binary's assets to match (`monopsony-server-*` vs
+/// `monopsony-client-*`) — the two kinds publish separate archives.
+pub async fn check_for_update(
+    current_version: &str,
+    binary_kind: BinaryKind,
+) -> Result<UpdateCheckResult> {
     let client = Client::new();
 
     let response = client
@@ -506,10 +537,13 @@ pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckResult
                 "Update available: {} -> {}",
                 current_version, release.tag_name
             );
-            let (os, arch, libc) = detect_platform();
+            // libc is deliberately unused: linux release assets are static
+            // musl builds serving both glibc and musl hosts, so detect_platform's
+            // "glibc" never enters a match string.
+            let (os, arch, _libc) = detect_platform();
             let asset_names: Vec<String> = release.assets.iter().map(|a| a.name.clone()).collect();
 
-            let asset_url = select_asset_for_platform(&asset_names, &os, &arch, libc.as_deref())
+            let asset_url = select_asset_for_platform(&asset_names, binary_kind, &os, &arch)
                 .and_then(|name| {
                     release
                         .assets
@@ -549,52 +583,61 @@ pub async fn check_for_update(current_version: &str) -> Result<UpdateCheckResult
     }
 }
 
-/// Select the appropriate asset for the current platform
+/// Version component of a release asset name: three dot-separated numeric
+/// components with an optional `-rcN` suffix (e.g. `1.0.0`, `1.0.0-rc2`).
+const ASSET_VERSION_RE: &str = r"\d+\.\d+\.\d+(?:-rc\d+)?";
+
+/// Select the release asset for the current platform from the contract the
+/// release CI actually publishes:
+/// `monopsony-{server,client}-v<VERSION>-{linux-x86_64,linux-aarch64,darwin-arm64,darwin-x86_64}.tar.gz`.
+///
+/// Kind-aware: only archives prefixed with this binary's name are considered,
+/// so a client never downloads the server tarball (or vice versa). Linux
+/// assets are static musl builds serving both glibc and musl hosts — libc is
+/// not part of the name and never enters a match string. darwin: std reports
+/// ARCH "aarch64" on Apple Silicon while assets use Apple's "arm64"; remapped
+/// here, before matching. The version component is anchored to
+/// [`ASSET_VERSION_RE`] so malformed versions (two-component, non-rc
+/// pre-release suffixes, missing `v`) never match.
 fn select_asset_for_platform(
     asset_names: &[String],
+    binary_kind: BinaryKind,
     os: &str,
     arch: &str,
-    libc: Option<&str>,
 ) -> Option<String> {
-    let (target_os, target_arch, target_libc) = match (os, arch, libc) {
-        ("linux", "x86_64", Some("glibc")) => ("linux", "x86_64", Some("gnu")),
-        ("linux", "aarch64", Some("glibc")) => ("linux", "aarch64", Some("gnu")),
-        ("linux", "x86_64", Some("musl")) => ("linux", "x86_64", Some("musl")),
-        ("linux", "aarch64", Some("musl")) => ("linux", "aarch64", Some("musl")),
-        ("windows", "x86_64", _) => ("windows", "x86_64", None),
-        ("freebsd", "x86_64", _) => ("freebsd", "x86_64", None),
-        _ => (os, arch, libc),
+    let platform = match (os, arch) {
+        ("linux", "x86_64") => "linux-x86_64",
+        ("linux", "aarch64") => "linux-aarch64",
+        ("darwin", "aarch64") | ("darwin", "arm64") => "darwin-arm64",
+        ("darwin", "x86_64") => "darwin-x86_64",
+        // No assets are published for other platforms today (the legacy
+        // windows/freebsd patterns matched names release CI never produced).
+        _ => return None,
     };
+    let pattern = format!(
+        "^{}-v{}-{}\\.tar\\.gz$",
+        binary_kind.asset_name_prefix(),
+        ASSET_VERSION_RE,
+        platform
+    );
+    let re = regex::Regex::new(&pattern).ok()?;
+    asset_names.iter().find(|name| re.is_match(name)).cloned()
+}
 
-    let exact_pattern = if target_os == "windows" {
-        format!("monopsony-{}-pc-windows-gnu\\.zip$", target_arch)
-    } else if target_os == "freebsd" {
-        format!("monopsony-{}-unknown-freebsd\\.tar\\.gz$", target_arch)
-    } else {
-        let libc_str = target_libc.unwrap_or("gnu");
-        format!(
-            "monopsony-{}-unknown-linux-{}\\.tar\\.gz$",
-            target_arch, libc_str
-        )
-    };
-
-    for name in asset_names {
-        if regex::Regex::new(&exact_pattern).ok()?.is_match(name) {
-            return Some(name.clone());
-        }
-    }
-
-    // Fallback without libc suffix
-    if target_os == "linux" {
-        let fallback = format!("monopsony-{}-unknown-linux\\.(tar\\.gz|zip)$", target_arch);
-        for name in asset_names {
-            if regex::Regex::new(&fallback).ok()?.is_match(name) {
-                return Some(name.clone());
-            }
-        }
-    }
-
-    None
+/// Timestamped sibling path for update temp/backup files, named after the
+/// binary being replaced. Previously `monopsony-server.bak/new.*` was
+/// hardcoded for both binaries — client updates littered server-named files.
+fn sibling_update_path(target_dir: &Path, current_path: &Path, kind: &str) -> PathBuf {
+    let bin_name = current_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("monopsony");
+    target_dir.join(format!(
+        "{}.{}.{}",
+        bin_name,
+        kind,
+        Utc::now().format("%Y%m%d_%H%M%S")
+    ))
 }
 
 /// Download and apply update with atomic swap (raw, no safety pipeline)
@@ -620,10 +663,7 @@ pub async fn apply_update(
 
     // Backup current binary
     info!("Backing up current version...");
-    let backup_path = target_dir.join(format!(
-        "monopsony-server.bak.{}",
-        Utc::now().format("%Y%m%d_%H%M%S")
-    ));
+    let backup_path = sibling_update_path(target_dir, current_path, "bak");
     if current_path.exists() {
         std::fs::copy(current_path, &backup_path).context("Failed to backup current binary")?;
         info!(
@@ -634,10 +674,7 @@ pub async fn apply_update(
     }
 
     // Write new binary atomically
-    let temp_path = target_dir.join(format!(
-        "monopsony-server.new.{}",
-        Utc::now().format("%Y%m%d_%H%M%S")
-    ));
+    let temp_path = sibling_update_path(target_dir, current_path, "new");
 
     if asset_url.ends_with(".tar.gz") || asset_url.ends_with(".zip") {
         extract_binary_from_archive(&bytes, &temp_path, asset_url)?;
@@ -793,7 +830,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_for_update_current() {
-        let result = check_for_update("99.99.99").await;
+        let result = check_for_update("99.99.99", BinaryKind::Client).await;
         match result {
             Ok(check) => assert_eq!(check.latest_version, None),
             Err(e) => println!("Network error (expected in CI): {}", e),
@@ -802,7 +839,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_for_update_very_old() {
-        let result = check_for_update("0.0.1").await;
+        let result = check_for_update("0.0.1", BinaryKind::Client).await;
         match result {
             Ok(check) => {
                 if let Some(latest) = check.latest_version {
@@ -941,40 +978,93 @@ mod tests {
     // will hit: archive extraction, rollback on failed health check,
     // config preservation, recipe parsing, and platform asset matching.
 
-    /// Verify that the updated DEFAULT_MONOPSONY_RECIPE (with hooks,
-    /// health_check, config_paths, max_backups) deserializes correctly.
+    /// Verify that both split default recipes (per-binary hooks, health
+    /// check, config_paths, max_backups) deserialize correctly.
     #[test]
-    fn test_default_recipe_parses_with_hooks() {
+    fn test_default_server_recipe_parses_with_hooks() {
+        use monopsony_common::shadow_types::{HealthCheckType, DEFAULT_MONOPSONY_SERVER_RECIPE};
         let recipe: monopsony_common::shadow_types::ShadowRecipe =
-            toml::from_str(monopsony_common::shadow_types::DEFAULT_MONOPSONY_RECIPE)
-                .expect("DEFAULT_MONOPSONY_RECIPE must parse");
+            toml::from_str(DEFAULT_MONOPSONY_SERVER_RECIPE)
+                .expect("DEFAULT_MONOPSONY_SERVER_RECIPE must parse");
 
-        assert_eq!(recipe.package.name, "monopsony");
+        assert_eq!(recipe.package.name, "monopsony-server");
         assert!(recipe.install.backup_old);
         assert_eq!(recipe.install.max_backups, 3);
-        assert!(recipe.install.config_paths.is_some());
         assert_eq!(
-            recipe.install.config_paths.as_ref().unwrap().len(),
-            2,
-            "server.toml + client.toml"
+            recipe.install.config_paths,
+            Some(vec!["/etc/monopsony/server.toml".to_string()]),
+            "server recipe must manage the server config only"
+        );
+        assert_eq!(
+            recipe.install.chmod,
+            Some(vec!["monopsony-server".to_string()])
         );
 
-        // Hooks
-        assert!(recipe.install.pre_update.is_some());
-        assert!(recipe.install.post_update.is_some());
-        assert!(recipe.install.on_failure.is_some());
+        // Hooks stop/start the server unit — not the client unit.
+        let pre = recipe.install.pre_update.as_deref().unwrap();
+        let post = recipe.install.post_update.as_deref().unwrap();
+        assert!(pre.contains("systemctl stop monopsony-server"), "{}", pre);
+        assert!(post.contains("systemctl start monopsony-server"), "{}", post);
+        assert!(
+            !pre.contains("monopsony-client") && !post.contains("monopsony-client"),
+            "server hooks must not touch the client unit"
+        );
 
-        // Health check
+        // Health check: server control port.
         let hc = recipe
             .install
             .health_check
-            .expect("recipe must have health_check");
-        assert_eq!(
-            hc.check_type,
-            monopsony_common::shadow_types::HealthCheckType::Port
-        );
+            .expect("server recipe must have health_check");
+        assert_eq!(hc.check_type, HealthCheckType::Port);
         assert_eq!(hc.port, Some(50051));
         assert_eq!(hc.timeout_secs, 30);
+
+        // Asset rules match the real release contract for this kind.
+        let sel = recipe.asset_selector.expect("asset_selector");
+        assert_eq!(sel.rules.len(), 4, "linux×2 + darwin×2");
+    }
+
+    #[test]
+    fn test_default_client_recipe_parses_with_hooks() {
+        use monopsony_common::shadow_types::{HealthCheckType, DEFAULT_MONOPSONY_CLIENT_RECIPE};
+        let recipe: monopsony_common::shadow_types::ShadowRecipe =
+            toml::from_str(DEFAULT_MONOPSONY_CLIENT_RECIPE)
+                .expect("DEFAULT_MONOPSONY_CLIENT_RECIPE must parse");
+
+        assert_eq!(recipe.package.name, "monopsony-client");
+        assert!(recipe.install.backup_old);
+        assert_eq!(recipe.install.max_backups, 3);
+        assert_eq!(
+            recipe.install.config_paths,
+            Some(vec!["/etc/monopsony/client.toml".to_string()]),
+            "client recipe must manage the client config only"
+        );
+        assert_eq!(
+            recipe.install.chmod,
+            Some(vec!["monopsony-client".to_string()])
+        );
+
+        // Hooks stop/start the client unit — not the server unit.
+        let pre = recipe.install.pre_update.as_deref().unwrap();
+        let post = recipe.install.post_update.as_deref().unwrap();
+        assert!(pre.contains("systemctl stop monopsony-client"), "{}", pre);
+        assert!(post.contains("systemctl start monopsony-client"), "{}", post);
+        assert!(
+            !pre.contains("monopsony-server") && !post.contains("monopsony-server"),
+            "client hooks must not touch the server unit"
+        );
+
+        // Health check: process (the client has no listening port).
+        let hc = recipe
+            .install
+            .health_check
+            .expect("client recipe must have health_check");
+        assert_eq!(hc.check_type, HealthCheckType::Process);
+        assert_eq!(hc.process.as_deref(), Some("monopsony-client"));
+        assert_eq!(hc.timeout_secs, 30);
+
+        let sel = recipe.asset_selector.expect("asset_selector");
+        assert_eq!(sel.rules.len(), 4, "linux×2 + darwin×2");
     }
 
     /// Create a real tar.gz archive containing a monopsony-server binary,
@@ -1346,58 +1436,187 @@ detect_pattern = "(\\d+\\.\\d+\\.\\d+)"
         }
     }
 
-    /// Platform asset selection: verify all target triple combinations
-    /// produce the expected asset filename patterns.
-    #[test]
-    fn test_asset_selection_all_platforms() {
-        let linux_glibc = vec![
-            "monopsony-x86_64-unknown-linux-gnu.tar.gz".to_string(),
-            "monopsony-aarch64-unknown-linux-gnu.tar.gz".to_string(),
-        ];
-
-        let sel = select_asset_for_platform(&linux_glibc, "linux", "x86_64", Some("glibc"));
-        assert_eq!(
-            sel.as_deref(),
-            Some("monopsony-x86_64-unknown-linux-gnu.tar.gz")
-        );
-
-        let sel = select_asset_for_platform(&linux_glibc, "linux", "aarch64", Some("glibc"));
-        assert_eq!(
-            sel.as_deref(),
-            Some("monopsony-aarch64-unknown-linux-gnu.tar.gz")
-        );
-
-        // musl variants
-        let linux_musl = vec![
-            "monopsony-x86_64-unknown-linux-musl.tar.gz".to_string(),
-            "monopsony-aarch64-unknown-linux-musl.tar.gz".to_string(),
-        ];
-        let sel = select_asset_for_platform(&linux_musl, "linux", "x86_64", Some("musl"));
-        assert_eq!(
-            sel.as_deref(),
-            Some("monopsony-x86_64-unknown-linux-musl.tar.gz")
-        );
-
-        // Windows
-        let windows_assets = vec!["monopsony-x86_64-pc-windows-gnu.zip".to_string()];
-        let sel = select_asset_for_platform(&windows_assets, "windows", "x86_64", None);
-        assert_eq!(sel.as_deref(), Some("monopsony-x86_64-pc-windows-gnu.zip"));
-
-        // FreeBSD
-        let bsd_assets = vec!["monopsony-x86_64-unknown-freebsd.tar.gz".to_string()];
-        let sel = select_asset_for_platform(&bsd_assets, "freebsd", "x86_64", None);
-        assert_eq!(
-            sel.as_deref(),
-            Some("monopsony-x86_64-unknown-freebsd.tar.gz")
-        );
+    /// The exact asset list release CI publishes (.github/workflows/release.yml):
+    /// 8 kind-prefixed versioned tarballs + SHA256SUMS.
+    fn real_release_assets() -> Vec<String> {
+        [
+            "monopsony-server-v1.0.0-rc2-linux-x86_64.tar.gz",
+            "monopsony-server-v1.0.0-rc2-linux-aarch64.tar.gz",
+            "monopsony-server-v1.0.0-rc2-darwin-arm64.tar.gz",
+            "monopsony-server-v1.0.0-rc2-darwin-x86_64.tar.gz",
+            "monopsony-client-v1.0.0-rc2-linux-x86_64.tar.gz",
+            "monopsony-client-v1.0.0-rc2-linux-aarch64.tar.gz",
+            "monopsony-client-v1.0.0-rc2-darwin-arm64.tar.gz",
+            "monopsony-client-v1.0.0-rc2-darwin-x86_64.tar.gz",
+            "SHA256SUMS",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
     }
 
-    /// Asset selection: no match returns None.
+    /// Every (binary, platform) combination the release contract publishes
+    /// must select exactly its own archive from the real fixture list —
+    /// including the darwin aarch64→arm64 remap and -rcN versioned names.
     #[test]
-    fn test_asset_selection_no_match() {
-        let assets = vec!["monopsony-armv7-unknown-linux-gnu.tar.gz".to_string()];
-        let sel = select_asset_for_platform(&assets, "linux", "x86_64", Some("glibc"));
-        assert!(sel.is_none(), "should not find a match for wrong arch");
+    fn test_asset_selection_real_release_contract() {
+        let assets = real_release_assets();
+        let cases = [
+            (
+                BinaryKind::Server,
+                "linux",
+                "x86_64",
+                "monopsony-server-v1.0.0-rc2-linux-x86_64.tar.gz",
+            ),
+            (
+                BinaryKind::Server,
+                "linux",
+                "aarch64",
+                "monopsony-server-v1.0.0-rc2-linux-aarch64.tar.gz",
+            ),
+            // std ARCH is aarch64 on Apple Silicon; asset says darwin-arm64.
+            (
+                BinaryKind::Server,
+                "darwin",
+                "aarch64",
+                "monopsony-server-v1.0.0-rc2-darwin-arm64.tar.gz",
+            ),
+            (
+                BinaryKind::Server,
+                "darwin",
+                "x86_64",
+                "monopsony-server-v1.0.0-rc2-darwin-x86_64.tar.gz",
+            ),
+            (
+                BinaryKind::Client,
+                "linux",
+                "x86_64",
+                "monopsony-client-v1.0.0-rc2-linux-x86_64.tar.gz",
+            ),
+            (
+                BinaryKind::Client,
+                "linux",
+                "aarch64",
+                "monopsony-client-v1.0.0-rc2-linux-aarch64.tar.gz",
+            ),
+            (
+                BinaryKind::Client,
+                "darwin",
+                "aarch64",
+                "monopsony-client-v1.0.0-rc2-darwin-arm64.tar.gz",
+            ),
+            (
+                BinaryKind::Client,
+                "darwin",
+                "x86_64",
+                "monopsony-client-v1.0.0-rc2-darwin-x86_64.tar.gz",
+            ),
+        ];
+        for (kind, os, arch, expected) in cases {
+            let sel = select_asset_for_platform(&assets, kind, os, arch);
+            assert_eq!(
+                sel.as_deref(),
+                Some(expected),
+                "kind={:?} os={} arch={}",
+                kind,
+                os,
+                arch
+            );
+        }
+    }
+
+    /// Negative controls: glibc hosts still match (static musl assets, libc
+    /// never enters a match string); wrong binary kind, unpublished platforms,
+    /// SHA256SUMS, and malformed/non-rc versions never match.
+    #[test]
+    fn test_asset_selection_negative_controls() {
+        let assets = real_release_assets();
+
+        // A glibc host (detect_platform's "glibc") matches the static linux asset.
+        let sel = select_asset_for_platform(&assets, BinaryKind::Client, "linux", "x86_64");
+        assert_eq!(
+            sel.as_deref(),
+            Some("monopsony-client-v1.0.0-rc2-linux-x86_64.tar.gz")
+        );
+
+        // Wrong binary kind: a server-only release never satisfies the client.
+        let server_only: Vec<String> = assets
+            .iter()
+            .filter(|a| a.starts_with("monopsony-server"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            select_asset_for_platform(&server_only, BinaryKind::Client, "linux", "x86_64"),
+            None,
+            "client kind must not select a server archive"
+        );
+
+        // Platforms with no published assets.
+        assert_eq!(
+            select_asset_for_platform(&assets, BinaryKind::Client, "windows", "x86_64"),
+            None
+        );
+        assert_eq!(
+            select_asset_for_platform(&assets, BinaryKind::Client, "freebsd", "x86_64"),
+            None
+        );
+
+        // Checksum sidecars are never selected.
+        let sums_only = vec!["SHA256SUMS".to_string(), "SHA256SUMS.sig".to_string()];
+        assert_eq!(
+            select_asset_for_platform(&sums_only, BinaryKind::Server, "linux", "x86_64"),
+            None
+        );
+
+        // Version-shape negatives (contract: \d+\.\d+\.\d+ with optional -rcN).
+        let bad_versions = [
+            // Non-rc pre-release suffix.
+            "monopsony-server-v1.0.0-beta.1-linux-x86_64.tar.gz",
+            // Two-component version.
+            "monopsony-server-v1.0-linux-x86_64.tar.gz",
+            // Four components.
+            "monopsony-server-v1.0.0.1-linux-x86_64.tar.gz",
+            // Missing v prefix.
+            "monopsony-server-1.0.0-linux-x86_64.tar.gz",
+            // rc without a number.
+            "monopsony-server-v1.0.0-rc-linux-x86_64.tar.gz",
+            // Legacy triple-style names (the dead contract this fixes).
+            "monopsony-x86_64-unknown-linux-musl.tar.gz",
+            // Right kind+version, wrong platform in the name.
+            "monopsony-server-v1.0.0-rc2-linux-arm64.tar.gz",
+        ];
+        for name in bad_versions {
+            assert_eq!(
+                select_asset_for_platform(&[name.to_string()], BinaryKind::Server, "linux", "x86_64"),
+                None,
+                "{} must not match",
+                name
+            );
+        }
+    }
+
+    /// Backup/temp update file names derive from the binary being replaced —
+    /// client updates must not produce monopsony-server.bak litter.
+    #[test]
+    fn test_update_sibling_names_parametrized_by_binary() {
+        let dir = Path::new("/usr/local/bin");
+        let server_bak = sibling_update_path(dir, &dir.join("monopsony-server"), "bak");
+        let client_new = sibling_update_path(dir, &dir.join("monopsony-client"), "new");
+        let server_name = server_bak.file_name().unwrap().to_str().unwrap();
+        let client_name = client_new.file_name().unwrap().to_str().unwrap();
+        assert!(
+            server_name.starts_with("monopsony-server.bak."),
+            "{}",
+            server_name
+        );
+        assert!(
+            client_name.starts_with("monopsony-client.new."),
+            "{}",
+            client_name
+        );
+        // Both carry the timestamp component.
+        assert!(server_name.contains(".20"), "timestamped: {}", server_name);
+        assert!(client_name.contains(".20"), "timestamped: {}", client_name);
     }
 
     /// UpdateContext::new correctly extracts config_paths from a recipe.

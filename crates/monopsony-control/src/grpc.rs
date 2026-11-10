@@ -1375,14 +1375,25 @@ impl MonopsonyControl for MonopsonyGrpc {
                     .await
                 {
                     Ok(Some(info)) => {
+                        // Platform safety: check_one picks assets.first() (first upload
+                        // in the release), which can be a foreign-platform binary
+                        // (e.g. fosrl/newt 1.20.0 -> newt_darwin_amd64), and clients
+                        // trust a populated asset_url blindly. The server cannot know
+                        // the requesting client's OS/arch, so serve version info only
+                        // and leave the asset fields empty: the client rebuilds the URL
+                        // from its own recipe's [asset_selector] rules (same convention
+                        // as the direct_url branch above). Clients whose recipe has no
+                        // selector rules now fail loudly instead of silently receiving
+                        // a cross-platform binary.
+                        let pkg_name = v.get("name").and_then(|x| x.as_str()).unwrap_or("");
                         updates.push(monopsony_common::proto::monopsony::ShadowUpdateInfo {
                             package_id: info.package_id,
-                            package_name: info.package_name,
+                            package_name: pkg_name.to_string(),
                             current_version: info.current_version,
                             latest_version: info.latest_version,
-                            asset_url: info.asset_url.unwrap_or_default(),
-                            asset_name: info.asset_name.unwrap_or_default(),
-                            asset_size: info.asset_size.unwrap_or(0) as i64,
+                            asset_url: String::new(),
+                            asset_name: String::new(),
+                            asset_size: 0,
                             release_notes_url: info.release_notes_url.unwrap_or_default(),
                         });
                     }

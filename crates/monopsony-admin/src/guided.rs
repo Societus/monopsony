@@ -22,8 +22,9 @@ use serde::Serialize;
 use std::sync::OnceLock;
 
 /// Authored recipe data, baked into the binary (same embedding rationale as
-/// `DEFAULT_MONOPSONY_RECIPE`: fleet deploys ship binaries via scp, so the
-/// guides must not depend on runtime data files).
+/// the `DEFAULT_MONOPSONY_{SERVER,CLIENT}_RECIPE` constants: fleet deploys
+/// ship binaries via scp, so the guides must not depend on runtime data
+/// files).
 pub const DEBIAN_RELEASE_RECIPE: &str = include_str!("../../../recipes/guided/debian-release.toml");
 pub const UBUNTU_DO_RELEASE_UPGRADE_RECIPE: &str =
     include_str!("../../../recipes/guided/ubuntu-do-release-upgrade.toml");

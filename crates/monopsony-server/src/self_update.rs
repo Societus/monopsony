@@ -3,7 +3,7 @@
 //! Reuses the same infrastructure as the client binary.
 
 use anyhow::Context;
-use monopsony_client::self_update::{apply_update, check_for_update};
+use monopsony_client::self_update::{apply_update, check_for_update, BinaryKind};
 
 /// Run self-update check or apply for the server binary
 pub async fn run_self_update(cmd: crate::SelfUpdateMode) -> anyhow::Result<()> {
@@ -13,7 +13,7 @@ pub async fn run_self_update(cmd: crate::SelfUpdateMode) -> anyhow::Result<()> {
         crate::SelfUpdateMode::Check => {
             println!("Current server: {}", current_version);
 
-            let result = check_for_update(&current_version).await;
+            let result = check_for_update(&current_version, BinaryKind::Server).await;
 
             match result {
                 Ok(result) => {
@@ -35,7 +35,7 @@ pub async fn run_self_update(cmd: crate::SelfUpdateMode) -> anyhow::Result<()> {
         }
 
         crate::SelfUpdateMode::Apply => {
-            let result = check_for_update(&current_version).await;
+            let result = check_for_update(&current_version, BinaryKind::Server).await;
 
             match result {
                 Ok(result) => {
@@ -69,9 +69,9 @@ pub async fn run_self_update(cmd: crate::SelfUpdateMode) -> anyhow::Result<()> {
                     println!("Downloading update from: {}", asset_url);
                     println!("Installing to: {}", current_exe.display());
 
-                    // Try parsing the default recipe for the managed pipeline
+                    // Try parsing the server default recipe for the managed pipeline
                     let recipe = toml::from_str::<monopsony_common::shadow_types::ShadowRecipe>(
-                        monopsony_common::shadow_types::DEFAULT_MONOPSONY_RECIPE,
+                        monopsony_common::shadow_types::DEFAULT_MONOPSONY_SERVER_RECIPE,
                     )
                     .ok();
 
