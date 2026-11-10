@@ -51,6 +51,9 @@ pub mod mirror {
     /// Cross-mirror comparison outcomes: "match" | "divergence" |
     /// "unreachable" | "skipped".
     pub const CROSS_CHECK_TOTAL: &str = "monopsony_mirror_cross_check_total";
+    /// This mirror was banned by a trusted blacklist originator (own-ban
+    /// detection in the announce loop). Operator-visible warning accompanies.
+    pub const BLACKLIST_SELF_BAN: &str = "monopsony_mirror_blacklist_self_ban_total";
 }
 
 /// Metric names for client
@@ -240,6 +243,11 @@ pub fn mirror_cross_check(distro: &str, result: &'static str) {
         .increment(1);
 }
 
+/// Record detection of THIS mirror being blacklisted by a trusted originator.
+pub fn mirror_blacklist_self_ban() {
+    counter!(mirror::BLACKLIST_SELF_BAN).increment(1);
+}
+
 // Scan metrics
 
 /// Record scan outcome
@@ -258,4 +266,40 @@ pub fn scan_cve_lookup(cve_count: usize) {
 /// Record policy decision
 pub fn scan_policy_decision(decision: &str) {
     counter!(scan::POLICY_DECISIONS_TOTAL, "decision" => decision.to_string()).increment(1);
+}
+
+// Update-distribution metrics (Sprint 34 P1)
+
+/// Metric names for the server-side update distributor.
+pub mod update {
+    /// Release-poll outcomes: "new" | "already_cached" | "none".
+    pub const RELEASES_FETCHED_TOTAL: &str = "monopsony_update_releases_fetched_total";
+    /// Per-asset sha256 verification outcomes: "pass" | "mismatch_fail_closed"
+    /// | "unlisted_fail_closed".
+    pub const HASH_VERIFY_TOTAL: &str = "monopsony_update_hash_verify_total";
+    /// SHA256SUMS signature outcomes: "pass" | "fail_fail_closed" |
+    /// "missing_sig_fail_closed" | "no_key".
+    pub const SIGNATURE_VERIFY_TOTAL: &str = "monopsony_update_signature_verify_total";
+    /// Releases removed by retention (keep-N), after blob reclamation.
+    pub const RETENTION_PRUNED_TOTAL: &str = "monopsony_update_retention_pruned_total";
+}
+
+/// Record one update release-poll outcome.
+pub fn update_release_fetched(result: &'static str) {
+    counter!(update::RELEASES_FETCHED_TOTAL, "result" => result).increment(1);
+}
+
+/// Record one update asset sha256 verification outcome.
+pub fn update_hash_verify(result: &'static str) {
+    counter!(update::HASH_VERIFY_TOTAL, "result" => result).increment(1);
+}
+
+/// Record one SHA256SUMS signature verification outcome.
+pub fn update_signature_verify(result: &'static str) {
+    counter!(update::SIGNATURE_VERIFY_TOTAL, "result" => result).increment(1);
+}
+
+/// Record releases removed by retention.
+pub fn update_retention_pruned(count: u64) {
+    counter!(update::RETENTION_PRUNED_TOTAL).increment(count);
 }

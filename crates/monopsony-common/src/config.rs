@@ -75,6 +75,20 @@ pub struct ServerConfig {
     /// TOMLs without the section still parse.
     #[serde(default)]
     pub mirror: MirrorIntegrityConfig,
+    /// Peer-exchange blacklist propagation ([peer_blacklist] section):
+    /// pinned originator keys for signed blacklist entries carried on
+    /// `/.well-known/monopsony/peers`. All fields default.
+    #[serde(default)]
+    pub peer_blacklist: PeerBlacklistConfig,
+    /// Server-mediated self-update distribution ([update] section, Sprint 34
+    /// P1): the server polls GitHub Releases, verifies, and stores release
+    /// artifacts for LAN distribution. All fields default.
+    #[serde(default)]
+    pub update: UpdateConfig,
+    /// Personal OCI registry manifest-push policy ([registry] section,
+    /// Sprint 25 S3). All fields default.
+    #[serde(default)]
+    pub registry: RegistryConfig,
 }
 
 /// Server-side HTTP CONNECT pass-through configuration.
@@ -201,6 +215,122 @@ impl Default for MirrorIntegrityConfig {
             cross_check_timeout_secs: default_mirror_cross_check_timeout(),
         }
     }
+}
+
+/// Peer-exchange blacklist propagation ([peer_blacklist] section,
+/// server.toml). Pinned operator keys for signed blacklist entries carried
+/// on `/.well-known/monopsony/peers` (apt `signed-by` model: no keyserver,
+/// no TOFU). Manual Default (NOT derive) per the house rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerBlacklistConfig {
+    /// Hex Ed25519 public keys of blacklist originators to trust. EMPTY ⇒
+    /// remote entries are ignored entirely — never trust-by-default; the
+    /// system stays local-only until the operator pins at least one key.
+    #[serde(default)]
+    pub trusted_operators: Vec<String>,
+    /// Max blacklist entries accepted into / advertised in one peers
+    /// response (newest-seq first). Default: 64.
+    #[serde(default = "default_peer_blacklist_max_entries")]
+    pub max_entries: usize,
+    /// Days a retraction is retained as a tombstone so gossip lag cannot
+    /// resurrect a retracted ban. Default: 7.
+    #[serde(default = "default_peer_blacklist_tombstone_days")]
+    pub tombstone_days: i64,
+}
+
+fn default_peer_blacklist_max_entries() -> usize {
+    crate::peer_blacklist::DEFAULT_MAX_ENTRIES
+}
+
+fn default_peer_blacklist_tombstone_days() -> i64 {
+    crate::peer_blacklist::DEFAULT_TOMBSTONE_DAYS
+}
+
+impl Default for PeerBlacklistConfig {
+    fn default() -> Self {
+        Self {
+            trusted_operators: Vec::new(),
+            max_entries: default_peer_blacklist_max_entries(),
+            tombstone_days: default_peer_blacklist_tombstone_days(),
+        }
+    }
+}
+
+/// Server-mediated self-update distribution ([update] section, Sprint 34 P1).
+/// The server pulls each GitHub release once over the WAN, verifies it
+/// (SHA256SUMS + optional pinned GPG key), stores it content-addressed in the
+/// shadow cache, and serves clients over the LAN. Manual Default (NOT
+/// derive) — derive(Default) bypasses per-field serde defaults when the whole
+/// [update] section is absent, which would zero the timeout-class numerics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateConfig {
+    /// Poll GitHub Releases and store verified artifacts. Default: true.
+    #[serde(default = "default_update_enabled")]
+    pub enabled: bool,
+    /// GitHub repo to poll, `owner/name`. Default: "societus/monopsony".
+    #[serde(default = "default_update_repo")]
+    pub repo: String,
+    /// Poll interval in seconds. Default: 21600 (6 hours).
+    #[serde(default = "default_update_check_interval")]
+    pub check_interval: u64,
+    /// Consider pre-release tags (rc builds the fleet ships). Default: true.
+    #[serde(default = "default_update_include_prerelease")]
+    pub include_prerelease: bool,
+    /// Newest complete releases retained in the cache (older ones are
+    /// pruned, never including the server's own running version). Default: 3.
+    #[serde(default = "default_update_retain_versions")]
+    pub retain_versions: u32,
+    /// Armored GPG public key of the release signer — inline text starting
+    /// `-----BEGIN` or a path to such a file (mirrors.toml `trusted_keys`
+    /// precedent). When set, `SHA256SUMS.sig` is REQUIRED and must verify
+    /// (fail-closed); when absent, sha256-only with a warning metric.
+    #[serde(default)]
+    pub trusted_gpg_key: Option<String>,
+}
+
+fn default_update_enabled() -> bool {
+    true
+}
+
+fn default_update_repo() -> String {
+    "societus/monopsony".to_string()
+}
+
+fn default_update_check_interval() -> u64 {
+    21600
+}
+
+fn default_update_include_prerelease() -> bool {
+    true
+}
+
+fn default_update_retain_versions() -> u32 {
+    3
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_update_enabled(),
+            repo: default_update_repo(),
+            check_interval: default_update_check_interval(),
+            include_prerelease: default_update_include_prerelease(),
+            retain_versions: default_update_retain_versions(),
+            trusted_gpg_key: None,
+        }
+    }
+}
+
+/// Personal OCI registry manifest-push policy ([registry] section, Sprint 25
+/// S3). All fields default so TOMLs without the section still parse.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RegistryConfig {
+    /// Accept manifest pushes whose referenced blobs / child manifests are
+    /// not present yet (lazy pushes, some CI flows push manifests first).
+    /// Default false: such pushes are rejected with `MANIFEST_BLOB_UNKNOWN`.
+    /// `subject` (referrer) descriptors are exempt either way.
+    #[serde(default)]
+    pub allow_missing_blobs: bool,
 }
 
 /// Client monotonic ledger + downgrade enforcement ([ledger] section,
@@ -1418,6 +1548,9 @@ mod tests {
             proxy: ProxyServerConfig::default(),
             integrity: IntegrityConfig::default(),
             mirror: MirrorIntegrityConfig::default(),
+            peer_blacklist: PeerBlacklistConfig::default(),
+            update: UpdateConfig::default(),
+            registry: RegistryConfig::default(),
         }
     }
 

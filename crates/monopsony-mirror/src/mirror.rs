@@ -30,6 +30,11 @@ use monopsony_db::db::UpstreamPackageRow;
 use monopsony_db::Database;
 
 use crate::integrity::{HashPolicy, TrustedKeys};
+use monopsony_common::peer_blacklist::{
+    canonicalize_mirror_id, high_water_rejects, record_high_water, BlacklistAction, BlacklistEntry,
+    BlacklistHighWater,
+};
+use serde_json::Value;
 
 /// Boxed body type for hyper client requests
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
@@ -230,6 +235,38 @@ pub struct IntegritySettings {
     pub cross_check: Option<crate::cross_check::CrossCheckConfig>,
     /// Tracker base URLs to query for peer mirrors.
     pub tracker_urls: Vec<String>,
+    /// Peer-exchange blacklist policy ([peer_blacklist] section). Empty
+    /// trusted set ⇒ remote entries are never accepted (local-only).
+    pub peer_blacklist: PeerBlacklistPolicy,
+}
+
+/// Pinned-originator policy for signed blacklist entries (apt signed-by
+/// model). Entries whose `originator` is not pinned are dropped at merge.
+#[derive(Debug, Clone)]
+pub struct PeerBlacklistPolicy {
+    /// Hex Ed25519 public keys of trusted blacklist originators.
+    pub trusted_operators: Vec<String>,
+    /// Max entries merged into / advertised from one peers response.
+    pub max_entries: usize,
+    /// Days a retraction is retained as a tombstone.
+    pub tombstone_days: i64,
+}
+
+impl Default for PeerBlacklistPolicy {
+    fn default() -> Self {
+        Self {
+            trusted_operators: Vec::new(),
+            max_entries: monopsony_common::peer_blacklist::DEFAULT_MAX_ENTRIES,
+            tombstone_days: monopsony_common::peer_blacklist::DEFAULT_TOMBSTONE_DAYS,
+        }
+    }
+}
+
+impl PeerBlacklistPolicy {
+    /// True when ANY remote entry may be accepted.
+    pub fn ingest_enabled(&self) -> bool {
+        !self.trusted_operators.is_empty()
+    }
 }
 
 /// Manages all mirror configurations and sync tasks
@@ -240,6 +277,18 @@ pub struct MirrorManager {
     db: Option<Arc<Database>>,
     /// Integrity settings, set once at startup (None until then).
     integrity: Arc<tokio::sync::RwLock<Option<IntegritySettings>>>,
+    /// Merged signed blacklist entries keyed by (originator, subject),
+    /// highest-seq entry wins (Approach A peers-gossip store).
+    peer_blacklist: Arc<tokio::sync::RwLock<HashMap<(String, String), BlacklistEntry>>>,
+    /// High-water seq per (originator, subject) for every entry ever
+    /// ACCEPTED (A1 anti-resurrection fix). Unlike the tombstones in the
+    /// store, markers survive `prune_tombstones` and store-cap eviction, so
+    /// a replayed operator-signed ban with `seq <=` its key's marker stays a
+    /// stale replay forever (per process lifetime). Markers are exempt from
+    /// the store cap: they are not entries (never served, never advertised,
+    /// a u64 + key strings per key) and evicting one would re-open
+    /// resurrection. Key space is bounded by pinned originators × subjects.
+    peer_blacklist_high_water: Arc<tokio::sync::RwLock<BlacklistHighWater>>,
 }
 
 impl MirrorManager {
@@ -249,6 +298,8 @@ impl MirrorManager {
             configs: Arc::new(tokio::sync::RwLock::new(Vec::new())),
             db,
             integrity: Arc::new(tokio::sync::RwLock::new(None)),
+            peer_blacklist: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            peer_blacklist_high_water: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -269,7 +320,119 @@ impl MirrorManager {
                 default_hash_policy: HashPolicy::FailClosed,
                 cross_check: None,
                 tracker_urls: Vec::new(),
+                peer_blacklist: PeerBlacklistPolicy::default(),
             })
+    }
+
+    /// Merge signed blacklist entries into the store: signature verified
+    /// against the PINNED originator set (no TOFU — an empty pin set accepts
+    /// nothing), highest seq per (originator, subject) wins, stale replays
+    /// rejected. Returns (accepted, rejected).
+    ///
+    /// Staleness is judged against the per-(originator, subject) high-water
+    /// marker, not just the store: `prune_tombstones` drops retraction
+    /// tombstones after `tombstone_days` and the store cap can evict sooner,
+    /// so the store alone cannot prove an entry stale — the marker (max seq
+    /// ever accepted, survives pruning/cap eviction) can. This is the A1
+    /// fix: a replayed operator-signed ban must not resurrect a retracted
+    /// ban after the tombstone window.
+    ///
+    /// Restart residual: store and markers are both in-memory. Post-restart
+    /// they rebuild from gossip/tracker ingest — a stale ban can re-land on
+    /// a fresh store until a live source re-delivers the retract (which
+    /// re-establishes the marker); the tracker `/blacklist/signed` export
+    /// retains retractions, so tracker-fed mirrors re-acquire it at next
+    /// ingest.
+    pub async fn merge_peer_blacklist(&self, entries: Vec<BlacklistEntry>) -> (usize, usize) {
+        let policy = self.integrity_settings().await.peer_blacklist;
+        if !policy.ingest_enabled() {
+            return (0, entries.len());
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let mut accepted = 0usize;
+        let mut rejected = 0usize;
+        let mut store = self.peer_blacklist.write().await;
+        let mut high_water = self.peer_blacklist_high_water.write().await;
+        for entry in entries {
+            let verified = entry
+                .verify_trusted(&policy.trusted_operators)
+                .map_err(|e| {
+                    debug!(originator = %entry.originator, subject = %entry.subject, "{}", e);
+                    e
+                })
+                .is_ok();
+            if !verified {
+                rejected += 1;
+                continue;
+            }
+            let key = (entry.originator.clone(), entry.subject.clone());
+            if high_water_rejects(&high_water, &key, entry.seq) {
+                // Stale replay — seq at or below the max seq ever ACCEPTED
+                // for this key. Covers plain replays AND the A1 case: a ban
+                // replayed after its retracting tombstone was pruned (or the
+                // entry cap-evicted). TRUST INVARIANT: this gate only
+                // SUPPRESSES merges; it can never create, serve, or un-ban
+                // anything — markers are not entries and never reach the
+                // serving views (`active_blacklist`, `/peers`).
+                rejected += 1;
+                continue;
+            }
+            let seq = entry.seq;
+            store.insert(key.clone(), entry);
+            record_high_water(&mut high_water, &key, seq);
+            accepted += 1;
+        }
+        Self::prune_tombstones(&mut store, policy.tombstone_days, now);
+        // Bound the store at the configured cap (keep highest-seq entries).
+        // Markers are exempt by construction: they live outside `store`,
+        // are tiny (u64 + key strings per key), and dropping one would
+        // re-open stale-ban resurrection.
+        if store.len() > policy.max_entries * 4 {
+            let mut seqs: Vec<u64> = store.values().map(|e| e.seq).collect();
+            seqs.sort_unstable();
+            seqs.dedup();
+            if let Some(&cutoff) = seqs.iter().rev().nth(policy.max_entries * 4) {
+                store.retain(|_, e| e.seq >= cutoff);
+            }
+        }
+        (accepted, rejected)
+    }
+
+    /// Drop retraction tombstones older than the retention window so the
+    /// store does not grow forever. Anti-resurrection safety after the
+    /// window is carried by the high-water seq markers (raised at accept
+    /// time), which survive this prune: a stale ban replayed after its
+    /// retracting tombstone is dropped still loses at merge (`seq <=`
+    /// marker).
+    fn prune_tombstones(
+        store: &mut HashMap<(String, String), BlacklistEntry>,
+        tombstone_days: i64,
+        now: i64,
+    ) {
+        let cutoff = now - tombstone_days * 86400;
+        store.retain(|_, e| !(e.action == BlacklistAction::Retract && e.created_at < cutoff));
+    }
+
+    /// Serving/compacted view: active bans only, newest-seq first, capped at
+    /// the configured max_entries.
+    pub async fn active_blacklist(&self) -> Vec<BlacklistEntry> {
+        let policy = self.integrity_settings().await.peer_blacklist;
+        let store = self.peer_blacklist.read().await;
+        let mut bans: Vec<BlacklistEntry> =
+            monopsony_common::peer_blacklist::active_bans(&store, chrono::Utc::now().timestamp())
+                .into_iter()
+                .cloned()
+                .collect();
+        bans.truncate(policy.max_entries);
+        bans
+    }
+
+    /// Mirror IDs currently under an active ban (subject `mirror:<id>`).
+    pub async fn banned_mirror_ids(&self) -> std::collections::HashSet<String> {
+        let store = self.peer_blacklist.read().await;
+        let now = chrono::Utc::now().timestamp();
+        monopsony_common::peer_blacklist::banned_mirror_ids(&store, now)
     }
 
     /// Get the max per-IP RPS across all configured mirrors (0 if none)
@@ -926,6 +1089,9 @@ impl MirrorManager {
 
     /// Cross-mirror comparison after a successful sync (server.toml [mirror]).
     /// Divergence is reported via metrics + error log; never auto-quarantines.
+    /// Blacklisted peers are skipped as comparison anchors (a poisoned anchor
+    /// corrupts the divergence signal), and peers' `/peers` blacklist arrays
+    /// are ingested (mirror-to-mirror gossip hop).
     async fn run_cross_check_after_sync(&self, distro: &str) {
         let settings = self.integrity_settings().await;
         let Some(cfg) = settings.cross_check else {
@@ -938,13 +1104,24 @@ impl MirrorManager {
             return;
         };
         let local_dir = self.mirror_dir.join(&config.local_path);
+        let banned = self.banned_mirror_ids().await;
+        let banned_vec: Vec<String> = banned.into_iter().collect();
         let outcome = crate::cross_check::cross_check_distro(
             distro,
             &local_dir,
             &settings.tracker_urls,
             &cfg,
+            &banned_vec,
         )
         .await;
+        if !outcome.ingested_entries.is_empty() {
+            let ingested = outcome.ingested_entries.len();
+            let (accepted, _) = self.merge_peer_blacklist(outcome.ingested_entries).await;
+            debug!(
+                distro,
+                ingested, accepted, "ingested blacklist entries from peer /peers responses"
+            );
+        }
         info!(
             distro,
             peers_seen = outcome.peers_seen,
@@ -1009,13 +1186,27 @@ fn hostname() -> String {
 // Peer exchange types
 // ---------------------------------------------------------------------------
 
-/// Peer list served at /.well-known/monopsony/peers
+/// Peer list served at /.well-known/monopsony/peers. Under Approach A the
+/// response also carries the serving mirror's merged signed blacklist
+/// (size-capped, newest-seq first), plus an optional manifest.rs-style
+/// envelope signature over the whole document (transport integrity; entry
+/// trust travels per-entry via originator signatures).
 #[derive(Debug, Serialize)]
 struct PeerList {
     /// Mirrors this server knows about (from tracker + local config)
     peers: Vec<PeerEntry>,
     /// Where this peer list came from
     source: String,
+    /// Signed blacklist entries this server currently holds (active bans).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    blacklist: Vec<BlacklistEntry>,
+    /// Envelope signature over the canonical JSON of this document minus
+    /// signature/public_key (present when the server has an operator key).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
+    /// Envelope signing key (hex), embedded manifest.rs-style.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_key: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -1025,27 +1216,74 @@ struct PeerEntry {
     expires_at: String,
 }
 
+/// A6 (§9 fix #4): the peer-exchange mirror id is the CANONICAL form of
+/// `<hostname>-<distro>` — the same identity the tracker stores on announce
+/// and that signed ban subjects key on, so the `banned` exclusion below and
+/// client-side canonical matching agree. `None` when the construction falls
+/// outside the printable-ASCII allowlist: post-fix such a host could not
+/// announce to the tracker either, and advertising an unmatchable id would
+/// defeat ban exclusion.
+fn peer_mirror_id(hostname: &str, distro: &str) -> Option<String> {
+    canonicalize_mirror_id(&format!("{}-{}", hostname, distro)).ok()
+}
+
 /// GET /.well-known/monopsony/peers — peer exchange endpoint
 async fn get_peers(State(state): State<MirrorState>) -> impl IntoResponse {
     let configs = state.manager.list_configs().await;
+    let banned = state.manager.banned_mirror_ids().await;
 
-    // Build peer entries from local mirror configs
+    // Build peer entries from local mirror configs, excluding peers this
+    // server holds an active ban for (enforcement point: get_peers filter).
     let peers: Vec<PeerEntry> = configs
         .iter()
-        .map(|c| {
+        .filter_map(|c| {
+            let Some(mirror_id) = peer_mirror_id(&hostname(), &c.distro) else {
+                debug!(
+                    distro = c.distro,
+                    "excluding peer from peers response: id outside canonical allowlist"
+                );
+                return None;
+            };
+            if banned.contains(&mirror_id) {
+                debug!(mirror_id, "excluding blacklisted peer from peers response");
+                return None;
+            }
             let expires = chrono::Utc::now() + chrono::Duration::hours(1);
-            PeerEntry {
-                mirror_id: format!("{}-{}", hostname(), c.distro),
+            Some(PeerEntry {
+                mirror_id,
                 endpoint: format!("http://{}:3129/mirror/{}", hostname(), c.distro),
                 expires_at: expires.to_rfc3339(),
-            }
+            })
         })
         .collect();
 
-    Json(PeerList {
+    let peer_list = PeerList {
         source: "local".to_string(),
         peers,
-    })
+        blacklist: state.manager.active_blacklist().await,
+        signature: None,
+        public_key: None,
+    };
+
+    // Envelope-sign the document when the server has an operator key
+    // (manifest.rs style: canonical JSON minus signature/public_key).
+    if let Some(key) = &state.signing_key {
+        use ed25519_dalek::Signer;
+        if let Ok(mut value) = serde_json::to_value(&peer_list) {
+            if let Value::Object(map) = &mut value {
+                map.remove("signature");
+                map.remove("public_key");
+            }
+            let canonical = monopsony_common::peer_blacklist::canonical_json(&value);
+            let sig = key.sign(canonical.as_bytes());
+            let mut signed = peer_list;
+            signed.signature = Some(hex::encode(sig.to_bytes()));
+            signed.public_key = Some(hex::encode(key.verifying_key().as_bytes()));
+            return Json(signed).into_response();
+        }
+    }
+
+    Json(peer_list).into_response()
 }
 
 /// Axum state for mirror HTTP routes
@@ -1053,6 +1291,9 @@ async fn get_peers(State(state): State<MirrorState>) -> impl IntoResponse {
 pub struct MirrorState {
     pub manager: Arc<MirrorManager>,
     pub mirror_dir: PathBuf,
+    /// Operator Ed25519 key for the peers envelope signature (optional —
+    /// unsigned peers responses remain valid).
+    pub signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
 }
 
 impl MirrorState {
@@ -1060,7 +1301,14 @@ impl MirrorState {
         Self {
             manager: Arc::new(manager),
             mirror_dir,
+            signing_key: None,
         }
+    }
+
+    /// Attach the operator signing key for the peers envelope signature.
+    pub fn with_signing_key(mut self, key: Arc<ed25519_dalek::SigningKey>) -> Self {
+        self.signing_key = Some(key);
+        self
     }
 }
 
@@ -2378,6 +2626,437 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Approach A: peers endpoint blacklist propagation
+    // -----------------------------------------------------------------------
+
+    /// Deterministic test key (same pattern as peer_blacklist tests).
+    fn blacklist_test_key(seed: u8) -> ed25519_dalek::SigningKey {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        bytes[31] = seed.wrapping_mul(7);
+        ed25519_dalek::SigningKey::from_bytes(&bytes)
+    }
+
+    fn signed_ban(mirror_id: &str, seq: u64, key: &ed25519_dalek::SigningKey) -> BlacklistEntry {
+        use monopsony_common::peer_blacklist::BlacklistSubject;
+        let mut entry = BlacklistEntry {
+            subject: BlacklistSubject::mirror(mirror_id).as_subject(),
+            action: BlacklistAction::Ban,
+            reason: "test".to_string(),
+            originator: String::new(),
+            seq,
+            created_at: chrono::Utc::now().timestamp(),
+            expires_at: None,
+            signature: String::new(),
+        };
+        entry.sign(key);
+        entry
+    }
+
+    /// Manager with two configured mirrors (thishost-archlinux +
+    /// thishost-debian) and a pinned blacklist policy for `key`.
+    async fn peers_test_manager(dir: &Path, key: &ed25519_dalek::SigningKey) -> MirrorManager {
+        let mgr = MirrorManager::new(dir.to_path_buf(), None);
+        mgr.configs.write().await.push(MirrorConfig {
+            distro: "archlinux".to_string(),
+            ..MirrorConfig::default()
+        });
+        mgr.configs.write().await.push(MirrorConfig {
+            distro: "debian".to_string(),
+            ..MirrorConfig::default()
+        });
+        mgr.set_integrity_settings(IntegritySettings {
+            default_hash_policy: HashPolicy::FailClosed,
+            cross_check: None,
+            tracker_urls: Vec::new(),
+            peer_blacklist: PeerBlacklistPolicy {
+                trusted_operators: vec![hex::encode(key.verifying_key().as_bytes())],
+                max_entries: 64,
+                tombstone_days: 7,
+            },
+        })
+        .await;
+        mgr
+    }
+
+    async fn get_peers_response(state: MirrorState) -> serde_json::Value {
+        use axum::body::Body as AxumBody;
+        use tower::ServiceExt;
+
+        let app = create_mirror_router(state, 100, false);
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/.well-known/monopsony/peers")
+                    .body(AxumBody::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = http_body_util::BodyExt::collect(resp.into_body())
+            .await
+            .unwrap()
+            .to_bytes();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn peers_carries_signed_blacklist_and_envelope_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = blacklist_test_key(3);
+        let mgr = peers_test_manager(dir.path(), &key).await;
+        let ban = signed_ban("poisonedhost-archlinux", 1, &key);
+        let originator = ban.originator.clone();
+        let (_, rejected) = mgr.merge_peer_blacklist(vec![ban.clone()]).await;
+        assert_eq!(rejected, 0, "pinned originator entry must be accepted");
+        assert!(mgr
+            .banned_mirror_ids()
+            .await
+            .contains("poisonedhost-archlinux"));
+
+        let envelope_key = blacklist_test_key(4);
+        let state = MirrorState::new(mgr, dir.path().to_path_buf())
+            .with_signing_key(Arc::new(envelope_key.clone()));
+        let value = get_peers_response(state).await;
+
+        // Blacklist array carries the verified entry.
+        let entries: Vec<BlacklistEntry> =
+            serde_json::from_value(value["blacklist"].clone()).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0], ban);
+        assert_eq!(entries[0].originator, originator);
+
+        // Envelope: signature + public_key present, self-consistent verify
+        // over the canonical document minus the envelope fields.
+        let sig_hex = value["signature"].as_str().expect("envelope signature");
+        let pk_hex = value["public_key"].as_str().expect("envelope public_key");
+        let mut doc = value.clone();
+        doc.as_object_mut().unwrap().remove("signature");
+        doc.as_object_mut().unwrap().remove("public_key");
+        let canonical = monopsony_common::peer_blacklist::canonical_json(&doc);
+        let pk_bytes = hex::decode(pk_hex).unwrap();
+        let vk = ed25519_dalek::VerifyingKey::from_bytes(pk_bytes.as_slice().try_into().unwrap())
+            .unwrap();
+        let sig_bytes = hex::decode(sig_hex).unwrap();
+        let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).unwrap();
+        assert!(
+            ed25519_dalek::Verifier::verify(&vk, canonical.as_bytes(), &sig).is_ok(),
+            "envelope signature must verify over the canonical document"
+        );
+
+        // Peers list still present (both mirrors unbanned).
+        assert_eq!(value["peers"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn peers_excludes_banned_local_mirrors() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = blacklist_test_key(5);
+        let mgr = peers_test_manager(dir.path(), &key).await;
+        // Ban OUR OWN archlinux mirror (mirror_id = "{hostname}-archlinux").
+        let ban = signed_ban(&format!("{}-archlinux", hostname()), 1, &key);
+        mgr.merge_peer_blacklist(vec![ban]).await;
+
+        let state = MirrorState::new(mgr, dir.path().to_path_buf());
+        let value = get_peers_response(state).await;
+
+        let peers = value["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 1, "banned mirror excluded from served peers");
+        assert_eq!(peers[0]["mirror_id"], format!("{}-debian", hostname()));
+    }
+
+    #[tokio::test]
+    async fn peers_serving_view_is_capped_and_active_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = blacklist_test_key(6);
+        let mgr = MirrorManager::new(dir.path().to_path_buf(), None);
+        mgr.set_integrity_settings(IntegritySettings {
+            default_hash_policy: HashPolicy::FailClosed,
+            cross_check: None,
+            tracker_urls: Vec::new(),
+            peer_blacklist: PeerBlacklistPolicy {
+                trusted_operators: vec![hex::encode(key.verifying_key().as_bytes())],
+                max_entries: 2,
+                tombstone_days: 7,
+            },
+        })
+        .await;
+
+        // Three bans — serving view caps at max_entries = 2 (newest-seq first).
+        let mut bans = Vec::new();
+        for seq in 1..=3 {
+            bans.push(signed_ban(&format!("m{}-arch", seq), seq, &key));
+        }
+        // Plus a retraction — must NOT appear in the serving view.
+        let mut retract = signed_ban("retracted-arch", 10, &key);
+        retract.action = BlacklistAction::Retract;
+        retract.sign(&key);
+        bans.push(retract);
+
+        let (accepted, rejected) = mgr.merge_peer_blacklist(bans).await;
+        assert_eq!(accepted, 4);
+        assert_eq!(rejected, 0);
+
+        let active = mgr.active_blacklist().await;
+        assert_eq!(active.len(), 2, "serving view capped at max_entries");
+        assert!(
+            active.iter().all(|e| e.action == BlacklistAction::Ban),
+            "retractions are tombstones, never advertised"
+        );
+        assert_eq!(active[0].seq, 3, "newest-seq first");
+        assert_eq!(active[1].seq, 2);
+    }
+
+    #[tokio::test]
+    async fn merge_rejects_unpinned_originators_and_stale_seq() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = blacklist_test_key(7);
+        let other = blacklist_test_key(8);
+        let mgr = peers_test_manager(dir.path(), &key).await;
+
+        // Unpinned originator → rejected wholesale.
+        let (accepted, rejected) = mgr
+            .merge_peer_blacklist(vec![signed_ban("evil-arch", 1, &other)])
+            .await;
+        assert_eq!((accepted, rejected), (0, 1));
+        assert!(mgr.banned_mirror_ids().await.is_empty());
+
+        // Seq replay: higher wins, stale loses.
+        let (accepted, rejected) = mgr
+            .merge_peer_blacklist(vec![signed_ban("m-arch", 5, &key)])
+            .await;
+        assert_eq!((accepted, rejected), (1, 0));
+        let (accepted, rejected) = mgr
+            .merge_peer_blacklist(vec![signed_ban("m-arch", 4, &key)])
+            .await;
+        assert_eq!((accepted, rejected), (0, 1), "stale seq is a replay");
+        assert!(mgr.banned_mirror_ids().await.contains("m-arch"));
+    }
+
+    /// Clone of an entry with an overridden `created_at`, re-signed (the
+    /// timestamp is part of the signed payload).
+    fn signed_old_entry(
+        mut entry: BlacklistEntry,
+        created_at: i64,
+        key: &ed25519_dalek::SigningKey,
+    ) -> BlacklistEntry {
+        entry.created_at = created_at;
+        entry.sign(key);
+        entry
+    }
+
+    fn signed_retract(mirror_id: &str, seq: u64, key: &ed25519_dalek::SigningKey) -> BlacklistEntry {
+        let mut entry = signed_ban(mirror_id, seq, key);
+        entry.action = BlacklistAction::Retract;
+        entry.sign(key);
+        entry
+    }
+
+    #[tokio::test]
+    async fn stale_ban_replay_after_tombstone_prune_is_rejected() {
+        // THE A1 FIX. An operator bans seq=1 and retracts seq=2; after the
+        // 7-day tombstone window the retract is pruned. A peer still serving
+        // the old signed ban replays it — it must NOT merge unopposed. The
+        // high-water marker (max seq ever accepted) survives the prune.
+        let dir = tempfile::tempdir().unwrap();
+        let key = blacklist_test_key(20);
+        let mgr = peers_test_manager(dir.path(), &key).await;
+
+        let old = chrono::Utc::now().timestamp() - 30 * 86400;
+        let ban = signed_old_entry(signed_ban("resurrectable-arch", 1, &key), old, &key);
+        let retract = signed_old_entry(signed_retract("resurrectable-arch", 2, &key), old, &key);
+        let (accepted, _) = mgr.merge_peer_blacklist(vec![ban.clone(), retract]).await;
+        assert_eq!(accepted, 2);
+        assert!(!mgr.banned_mirror_ids().await.contains("resurrectable-arch"));
+
+        // The next merge prunes the aged tombstone from the store.
+        let (accepted, _) = mgr
+            .merge_peer_blacklist(vec![signed_ban("unrelated-arch", 50, &key)])
+            .await;
+        assert_eq!(accepted, 1);
+
+        // Attacker replays the stale signed ban via peers gossip.
+        let (accepted, rejected) = mgr.merge_peer_blacklist(vec![ban]).await;
+        assert_eq!(
+            (accepted, rejected),
+            (0, 1),
+            "stale ban replay after tombstone prune must be rejected"
+        );
+        assert!(!mgr.banned_mirror_ids().await.contains("resurrectable-arch"));
+        assert!(mgr
+            .active_blacklist()
+            .await
+            .iter()
+            .all(|e| e.subject != "mirror:resurrectable-arch"));
+    }
+
+    #[tokio::test]
+    async fn new_ban_after_retraction_still_lands() {
+        // Semantics preserved: the marker gates only seq <= marker. A
+        // genuine NEW ban from the same originator (seq above the retracted
+        // marker) lands even after the tombstone is gone, and the normal
+        // retract-then-replay flows still work.
+        let dir = tempfile::tempdir().unwrap();
+        let key = blacklist_test_key(21);
+        let mgr = peers_test_manager(dir.path(), &key).await;
+
+        let old = chrono::Utc::now().timestamp() - 30 * 86400;
+        let ban1 = signed_old_entry(signed_ban("reborn-arch", 1, &key), old, &key);
+        let retract2 = signed_old_entry(signed_retract("reborn-arch", 2, &key), old, &key);
+        mgr.merge_peer_blacklist(vec![ban1, retract2]).await;
+        // Force the prune; marker (seq 2) remains while the tombstone is gone.
+        mgr.merge_peer_blacklist(vec![signed_ban("warm-arch", 60, &key)])
+            .await;
+        assert!(
+            mgr.active_blacklist()
+                .await
+                .iter()
+                .all(|e| e.subject != "mirror:reborn-arch"),
+            "tombstone pruned: nothing serves for the retracted subject"
+        );
+
+        let ban3 = signed_ban("reborn-arch", 3, &key);
+        let (accepted, rejected) = mgr.merge_peer_blacklist(vec![ban3]).await;
+        assert_eq!(
+            (accepted, rejected),
+            (1, 0),
+            "new higher-seq ban must land past the marker"
+        );
+        assert!(mgr.banned_mirror_ids().await.contains("reborn-arch"));
+
+        // ...and can be retracted again by the normal flow.
+        let retract4 = signed_retract("reborn-arch", 4, &key);
+        let (accepted, rejected) = mgr.merge_peer_blacklist(vec![retract4]).await;
+        assert_eq!((accepted, rejected), (1, 0));
+        assert!(!mgr.banned_mirror_ids().await.contains("reborn-arch"));
+
+        // Replay of anything at or below the retracted seq stays rejected.
+        let replay = signed_old_entry(signed_retract("reborn-arch", 4, &key), old, &key);
+        let (accepted, rejected) = mgr.merge_peer_blacklist(vec![replay]).await;
+        assert_eq!((accepted, rejected), (0, 1));
+        assert!(!mgr.banned_mirror_ids().await.contains("reborn-arch"));
+    }
+
+    #[tokio::test]
+    async fn cap_eviction_does_not_lift_the_high_water_gate() {
+        // The OTHER eviction path: the store cap can drop a low-seq
+        // retraction long before its tombstone window. The marker (exempt
+        // from the cap) must keep gating stale replays, while new bans
+        // still land.
+        let dir = tempfile::tempdir().unwrap();
+        let key = blacklist_test_key(22);
+        let mgr = MirrorManager::new(dir.path().to_path_buf(), None);
+        mgr.set_integrity_settings(IntegritySettings {
+            default_hash_policy: HashPolicy::FailClosed,
+            cross_check: None,
+            tracker_urls: Vec::new(),
+            peer_blacklist: PeerBlacklistPolicy {
+                trusted_operators: vec![hex::encode(key.verifying_key().as_bytes())],
+                max_entries: 2, // store cap at max_entries * 4 = 8 entries
+                tombstone_days: 7,
+            },
+        })
+        .await;
+
+        let now = chrono::Utc::now().timestamp();
+        let ban1 = signed_old_entry(signed_ban("capped-arch", 1, &key), now, &key);
+        let retract2 = signed_old_entry(signed_retract("capped-arch", 2, &key), now, &key);
+        // Flood with 9 high-seq bans (recent, so the tombstone prune does
+        // not fire) at seqs 3..11 — the cap (max_entries * 4 = 8) cutoff
+        // lands at seq 3, evicting BOTH low-seq c-arch entries (1, 2) while
+        // later letting a fresh seq-3 ban survive the same cap.
+        let mut entries = vec![ban1, retract2];
+        for seq in 3..12u64 {
+            entries.push(signed_ban(&format!("flood{}-arch", seq), seq, &key));
+        }
+        let (accepted, _) = mgr.merge_peer_blacklist(entries).await;
+        assert_eq!(accepted, 11);
+        assert!(!mgr.banned_mirror_ids().await.contains("capped-arch"));
+        assert_eq!(
+            mgr.active_blacklist().await.len(),
+            2,
+            "serving view capped at max_entries"
+        );
+
+        // Replay the stale signed ban whose retraction was cap-evicted.
+        let replay = signed_old_entry(signed_ban("capped-arch", 1, &key), now, &key);
+        let (accepted, rejected) = mgr.merge_peer_blacklist(vec![replay]).await;
+        assert_eq!(
+            (accepted, rejected),
+            (0, 1),
+            "cap-evicted retraction must still gate stale-ban replay"
+        );
+        assert!(!mgr.banned_mirror_ids().await.contains("capped-arch"));
+
+        // Markers survive the cap: a new ban (seq > marker) still lands.
+        let (accepted, rejected) = mgr
+            .merge_peer_blacklist(vec![signed_ban("capped-arch", 3, &key)])
+            .await;
+        assert_eq!((accepted, rejected), (1, 0));
+        assert!(mgr.banned_mirror_ids().await.contains("capped-arch"));
+    }
+
+    #[tokio::test]
+    async fn marker_cannot_ban_and_cannot_unban() {
+        // TRUST INVARIANT: high-water markers only SUPPRESS stale merges.
+        // They are not entries: they never appear in any serving view,
+        // cannot create a ban from marker-only state, and cannot remove or
+        // weaken a live stored ban. A marker must never cause an un-ban or
+        // a trust grant.
+        let dir = tempfile::tempdir().unwrap();
+        let key = blacklist_test_key(23);
+        let mgr = peers_test_manager(dir.path(), &key).await;
+
+        // Marker-only state: ban seq=1 + retract seq=2 → a marker exists,
+        // nothing serves as banned.
+        let retract = signed_retract("guarded-arch", 2, &key);
+        mgr.merge_peer_blacklist(vec![signed_ban("guarded-arch", 1, &key), retract])
+            .await;
+        assert!(!mgr.banned_mirror_ids().await.contains("guarded-arch"));
+        assert!(mgr
+            .active_blacklist()
+            .await
+            .iter()
+            .all(|e| e.subject != "mirror:guarded-arch"));
+
+        // A live ban ABOVE the marker still serves — the marker cannot
+        // un-ban it.
+        let ban3 = signed_ban("guarded-arch", 3, &key);
+        mgr.merge_peer_blacklist(vec![ban3.clone()]).await;
+        assert!(mgr.banned_mirror_ids().await.contains("guarded-arch"));
+        assert!(
+            mgr.active_blacklist().await.contains(&ban3),
+            "live ban must survive the marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_interplay_unchanged_by_markers() {
+        // Expiry semantics untouched: an expired TTL ban never serves, and
+        // replaying it stays rejected (store keeps non-retract entries, so
+        // this held pre-fix via seq; post-fix the marker agrees).
+        let dir = tempfile::tempdir().unwrap();
+        let key = blacklist_test_key(24);
+        let mgr = peers_test_manager(dir.path(), &key).await;
+
+        let mut ttl_ban = signed_ban("ttl-arch", 1, &key);
+        ttl_ban.expires_at = Some(chrono::Utc::now().timestamp() - 3600);
+        ttl_ban.sign(&key);
+        mgr.merge_peer_blacklist(vec![ttl_ban.clone()]).await;
+        assert!(!mgr.banned_mirror_ids().await.contains("ttl-arch"));
+        assert!(mgr
+            .active_blacklist()
+            .await
+            .iter()
+            .all(|e| e.subject != "mirror:ttl-arch"));
+
+        let (accepted, rejected) = mgr.merge_peer_blacklist(vec![ttl_ban]).await;
+        assert_eq!((accepted, rejected), (0, 1));
+        assert!(!mgr.banned_mirror_ids().await.contains("ttl-arch"));
+    }
+
     #[test]
     fn test_mirror_config_deserialize() {
         let toml = r#"
@@ -2483,5 +3162,32 @@ sync_enabled = false
         assert!(!links
             .iter()
             .any(|l| l.starts_with('/') || l.starts_with('?') || l.starts_with("..")));
+    }
+
+    // -----------------------------------------------------------------------
+    // A6 mirror_id canonicalization (§9 fix #4)
+    // -----------------------------------------------------------------------
+
+    /// The peers-advert id is canonical: a mixed-case hostname advertises the
+    /// lowercase form the tracker stores on announce (and ban subjects key
+    /// on); a hostname outside the printable-ASCII allowlist yields no
+    /// advertisable id at all.
+    #[test]
+    fn peer_mirror_id_is_canonical() {
+        assert_eq!(
+            peer_mirror_id("BuildHost", "archlinux").as_deref(),
+            Some("buildhost-archlinux")
+        );
+        assert_eq!(
+            peer_mirror_id("buildhost", "archlinux").as_deref(),
+            Some("buildhost-archlinux")
+        );
+        // Outside the allowlist: unmatchable ids are never advertised.
+        assert_eq!(peer_mirror_id("build host", "archlinux"), None);
+        assert_eq!(peer_mirror_id("build\u{043e}st", "archlinux"), None);
+        // Empty hostname parity: canonicalization adds no hostname validation
+        // — same "-archlinux" the pre-fix format! produced (production
+        // hostname() falls back to "unknown", never "").
+        assert_eq!(peer_mirror_id("", "archlinux").as_deref(), Some("-archlinux"));
     }
 }
