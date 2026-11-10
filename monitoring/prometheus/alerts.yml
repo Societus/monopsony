@@ -1,0 +1,417 @@
+# Monopsony Prometheus alert rules — Sprint 24
+#
+# Every metric name and label value below is grounded against the metric
+# inventory actually exported by monopsony-server's Prometheus endpoint
+# (default 0.0.0.0:9090/metrics). The grounding table — metric -> labels ->
+# emitting source file — lives in monitoring/README.md.
+#
+# Conventions:
+#   * The scrape job label is assumed to be job="monopsony". Align
+#     MonopsonyTargetDown (and the scrape config in the README) if yours differs.
+#   * Fail-closed verification outcomes are page-worthy (content integrity);
+#     fail-open outcomes are ticket-worthy (policy permitted serving suspect
+#     content, so humans should review why the policy allowed it).
+#   * Thresholds marked [tunable] encode house defaults, not code constants:
+#     hit-rate SLO 50%, stale threshold 900s ([metrics].stale_threshold_secs),
+#     update poll 6h, mirror sync cadence daily. See README "Assumptions".
+
+groups:
+  - name: monopsony.availability
+    interval: 30s
+    rules:
+      - alert: MonopsonyTargetDown
+        expr: up{job="monopsony"} == 0
+        for: 3m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Monopsony metrics endpoint unreachable"
+          description: >-
+            Prometheus cannot scrape {{ $labels.instance }} (job={{ $labels.job }}).
+            The server process may be down, or the metrics listener
+            (--metrics-addr, default 0.0.0.0:9090) is blocked.
+          first_response: >-
+            Check `systemctl status monopsony-server` (or the matching init unit)
+            and curl http://<host>:9090/metrics from the Prometheus host.
+
+  - name: monopsony.cache
+    interval: 30s
+    rules:
+      # Hit-rate SLO burn, slow window. The traffic guard keeps an idle server
+      # from paging (a 0/0 ratio would otherwise read as 0% hit rate).
+      - alert: MonopsonyCacheHitRateLow
+        expr: |
+          (
+            sum(rate(monopsony_cache_requests_total{result="hit"}[30m]))
+            /
+            sum(rate(monopsony_cache_requests_total[30m]))
+          ) < 0.5
+          and
+          sum(rate(monopsony_cache_requests_total[30m])) > 0.02
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cache hit rate below 50% over 30m"
+          description: >-
+            Sustained hit-rate burn on the package cache ({{ $value | humanizePercentage }}).
+            Causes: new client cohort with cold cache, URL patterns not matching
+            a package manager, or upstream churn defeating caching.
+          first_response: >-
+            Compare `monopsony_cache_requests_total{result="miss"}` growth against
+            prefetch activity (`monopsony_packages_prefetched_total`); if misses
+            are un-prefetched managers, check their URL pattern coverage.
+
+      # Hit-rate SLO burn, fast window — page on the sharp drop.
+      - alert: MonopsonyCacheHitRateCritical
+        expr: |
+          (
+            sum(rate(monopsony_cache_requests_total{result="hit"}[5m]))
+            /
+            sum(rate(monopsony_cache_requests_total[5m]))
+          ) < 0.2
+          and
+          sum(rate(monopsony_cache_requests_total[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Cache hit rate below 20% over 5m"
+          description: >-
+            Sharp hit-rate collapse. Likely cache eviction (disk budget),
+            cache dir loss/migration, or a traffic pattern change.
+          first_response: >-
+            Check `increase(monopsony_cache_evicted_total[1h])` for retention
+            churn and `monopsony_cache_entries_current` for a collapsed cache.
+
+      - alert: MonopsonyCacheEvicting
+        expr: increase(monopsony_cache_evicted_total[30m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "Retention is evicting cached blobs"
+          description: >-
+            The disk-budget retention path deleted {{ $value }} blob(s) in 30m.
+            Occasional eviction is normal; sustained eviction means the cache
+            budget is undersized for the fleet's working set.
+          first_response: >-
+            Review cache disk usage vs the configured budget; resize or widen
+            the budget before hit rate degrades.
+
+  - name: monopsony.integrity
+    interval: 30s
+    rules:
+      # Tamper / quarantine. The scrubber verifies stored blobs against their
+      # recorded hashes; anything failing is quarantined and stops being served.
+      - alert: MonopsonyScrubQuarantine
+        expr: increase(monopsony_scrub_quarantined_total[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Scrubber quarantined blob(s) — hash mismatch"
+          description: >-
+            {{ $value }} cached blob(s) failed scrub verification and were
+            quarantined in the last 10m. Content no longer matches the hash
+            recorded at cache time: disk corruption, bad upstream write, or
+            tampering. Quarantined blobs are withheld from clients (fail-safe),
+            but the cause is unserved traffic until cleared.
+          first_response: >-
+            Identify affected blobs in server logs (scrub report), re-fetch from
+            upstream to restore service, then investigate the storage layer
+            (fsck/smart) before trusting the disk again.
+
+      # Mirror sync content verification — fail-closed mismatch.
+      - alert: MonopsonyMirrorHashMismatchFailClosed
+        expr: increase(monopsony_mirror_hash_verify_total{result="mismatch_fail_closed"}[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Mirror sync refused content — sha256 mismatch (fail-closed)"
+          description: >-
+            A synced file under {{ $labels.distro }} did not match its upstream
+            checksum and was rejected under fail-closed hash policy. Upstream
+            republish race, corrupted transfer, or a compromised/misbehaving
+            upstream path.
+          first_response: >-
+            Re-run the sync for {{ $labels.distro }}; if it persists, compare the
+            failing path against the upstream checksum file manually before
+            re-enabling.
+
+      # Mirror sync content verification — mismatch served under fail-open.
+      - alert: MonopsonyMirrorHashMismatchFailOpen
+        expr: increase(monopsony_mirror_hash_verify_total{result="mismatch_fail_open"}[10m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mirror served content with hash mismatch (fail-open policy)"
+          description: >-
+            A file under {{ $labels.distro }} mismatched its checksum but the
+            configured hash policy allowed serving it. Clients may receive
+            content that upstream would not attest to.
+          first_response: >-
+            Treat as tamper-adjacent: identify the file, verify against upstream
+            manually, and consider switching this distro to fail-closed policy
+            if the mismatch recurs.
+
+      # Mirror repo metadata signatures (Release/InRelease-class verification).
+      - alert: MonopsonyMirrorSignatureVerifyFailed
+        expr: increase(monopsony_mirror_signature_verify_total{result=~"fail|fail_open"}[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Mirror metadata signature verification failed"
+          description: >-
+            Metadata signature check failed for {{ $labels.distro }}
+            (result={{ $labels.result }}). Either the upstream metadata was
+            modified in transit, verification keys are stale, or the sync path
+            is being interfered with.
+          first_response: >-
+            Refresh trusted mirror keys and re-sync; compare metadata checksums
+            against a second upstream before re-trusting the path.
+
+      - alert: MonopsonyMirrorSignatureNoKeys
+        expr: increase(monopsony_mirror_signature_verify_total{result="no_keys"}[30m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mirror metadata unverifiable — no trusted keys configured"
+          description: >-
+            Signature verification for {{ $labels.distro }} was skipped because
+            no trusted keys are configured (result=no_keys). Metadata integrity
+            is unattested on this distro.
+          first_response: >-
+            Install the upstream signing keys for this distro in the mirror
+            trust config so verification stops no-oping.
+
+      # Cross-mirror consistency: two independent mirrors disagree.
+      - alert: MonopsonyCrossMirrorDivergence
+        expr: increase(monopsony_mirror_cross_check_total{result="divergence"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cross-mirror check found divergence"
+          description: >-
+            Independent cross-check against a peer mirror disagreed for
+            {{ $labels.distro }} (result=divergence). One of the two copies is
+            stale or tampered.
+          first_response: >-
+            Compare the disputed paths between both mirrors against upstream
+            checksums; the laggard needs a re-sync. Repeated divergence on the
+            same distro = investigate that mirror's sync path end-to-end.
+
+      # This mirror was banned by a trusted blacklist originator.
+      - alert: MonopsonyMirrorSelfBan
+        expr: increase(monopsony_mirror_blacklist_self_ban_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "This mirror was banned by a trusted blacklist originator"
+          description: >-
+            The tracker blacklist (owned by a trusted originator) now includes
+            this mirror. Peers will de-rank/avoid it. Cause: serving content
+            that failed peer verification, or a key/identity mixup.
+          first_response: >-
+            Stop serving, audit recently synced content against upstream, then
+            contact the blacklist originator to clear the ban once clean.
+
+  - name: monopsony.mirror.sync
+    interval: 1m
+    rules:
+      - alert: MonopsonyMirrorSyncFailure
+        expr: increase(monopsony_mirror_sync_total{result="error"}[15m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mirror sync failed"
+          description: >-
+            Sync for {{ $labels.distro }} errored in the last 15m. Clients keep
+            being served the previous good copy, but freshness is now bounded by
+            the last success.
+          first_response: >-
+            Check server logs for the sync error (upstream reachability, disk
+            space, bandwidth throttle); re-run TriggerMirrorSync after fixing.
+
+      - alert: MonopsonyMirrorSyncFailing
+        expr: increase(monopsony_mirror_sync_total{result="error"}[2h]) >= 5
+        labels:
+          severity: critical
+        annotations:
+          summary: "Mirror sync failing repeatedly"
+          description: >-
+            {{ $value }} sync failures in 2h for {{ $labels.distro }}. The mirror
+            is effectively not refreshing; stale-window alert will follow if the
+            cadence stays broken.
+          first_response: >-
+            Same triage as MonopsonyMirrorSyncFailure, but treat as an incident:
+            check upstream status page, disk capacity, and credential/key expiry.
+
+      # Index staleness, grounded on sync outcomes (no index-age gauge exists —
+      # see README metric gaps). Window 26h assumes a daily sync cadence; widen
+      # if a distro syncs less often. The 7d guard restricts the alert to
+      # distros that actually sync, so never-synced distros stay quiet.
+      - alert: MonopsonyMirrorSyncStalled
+        expr: |
+          increase(monopsony_mirror_sync_total{result="success"}[26h]) == 0
+          and
+          increase(monopsony_mirror_sync_total[7d]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Mirror index stale — no successful sync in 26h"
+          description: >-
+            {{ $labels.distro }} has not completed a sync in 26h (assumes daily
+            cadence). The served index is aging; clients may see missing
+            packages or expired metadata.
+          first_response: >-
+            Trigger a manual sync; if the schedule itself was changed, retune
+            this window to cover the new cadence.
+
+  - name: monopsony.clients
+    interval: 30s
+    rules:
+      - alert: MonopsonyClientsStale
+        expr: monopsony_clients_stale_current > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} client(s) past the staleness threshold"
+          description: >-
+            Client(s) have not heartbeated within
+            [metrics].stale_threshold_secs (default 900s) for 5m. Network
+            partition, powered-off host, or a hung/crashed daemon.
+          first_response: >-
+            List offenders with `topk(5, monopsony_client_last_heartbeat_age_seconds)`,
+            ping the hosts, check the client daemon unit status on the far end.
+
+      - alert: MonopsonyClientsStaleCritical
+        expr: >-
+          (monopsony_clients_stale_current >= 0.5 * monopsony_clients_connected_current)
+          and
+          (monopsony_clients_connected_current > 0)
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Over half of connected clients are stale"
+          description: >-
+            Majority-staleness points at a shared cause: server-side heartbeat
+            ingest, LAN segment failure, or a bad client rollout — not isolated
+            hosts.
+          first_response: >-
+            Check server gRPC logs and recent client-rollout changes before
+            walking the fleet; a server restart that fixes everyone points back
+            at the control plane, not the clients.
+
+      - alert: MonopsonyClientHeartbeatAgeHigh
+        expr: max(monopsony_client_last_heartbeat_age_seconds) > 1800
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A client heartbeat is > 30m old"
+          description: >-
+            Oldest heartbeat age exceeds 2x the default stale threshold
+            (900s). This is the 'silently gone' escalation past
+            MonopsonyClientsStale.
+          first_response: >-
+            `topk(5, monopsony_client_last_heartbeat_age_seconds)` names the
+            client; verify the host is up and the daemon unit is running.
+
+      - alert: MonopsonyClientUpdateFailures
+        expr: max by (client_id) (monopsony_client_failed_updates) >= 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Client {{ $labels.client_id }} accumulating update failures"
+          description: >-
+            Windowed update-failure gauge reached {{ $value }} for this client.
+            Repeated failed update attempts (download or apply stage).
+          first_response: >-
+            Check the client's update logs and
+            monopsony_client_last_update_attempt_age_seconds for whether attempts
+            still happen at all.
+
+      - alert: MonopsonyClientUpdateAttemptsStalled
+        expr: max by (client_id) (monopsony_client_last_update_attempt_age_seconds) > 172800
+        for: 30m
+        labels:
+          severity: info
+        annotations:
+          summary: "Client {{ $labels.client_id }} has not attempted an update in 48h"
+          description: >-
+            Per-client update-attempt age exceeded 48h. Depends on the client's
+            configured update policy — quiet by policy is fine; quiet by hang
+            is not.
+          first_response: >-
+            Confirm the client's [update] policy intends this cadence before
+            treating it as a fault.
+
+  - name: monopsony.updates
+    interval: 30s
+    rules:
+      # Update-distributor asset verification — fail-closed outcomes are the
+      # fail-safe path refusing content; any occurrence is page-worthy.
+      - alert: MonopsonyUpdateHashVerifyFailClosed
+        expr: increase(monopsony_update_hash_verify_total{result=~"mismatch_fail_closed|unlisted_fail_closed"}[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Update asset refused — sha256 verification failed (fail-closed)"
+          description: >-
+            A fetched release asset failed sha256 verification
+            (result={{ $labels.result }}): either the published checksums and
+            asset disagree, or an asset appeared that is not listed in
+            SHA256SUMS (unlisted). The distributor refused it.
+          first_response: >-
+            Compare the upstream release page against the distributor logs;
+            if upstream itself republished mid-fetch, retry; if unlisted assets
+            keep appearing, suspect the release channel and pin the version.
+
+      - alert: MonopsonyUpdateSignatureFailClosed
+        expr: increase(monopsony_update_signature_verify_total{result=~"fail_fail_closed|missing_sig_fail_closed"}[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Update SHA256SUMS signature refused (fail-closed)"
+          description: >-
+            The SHA256SUMS file failed signature verification
+            (result={{ $labels.result }}): signature mismatch, missing signature
+            file, or signing-key rotation not yet trusted locally.
+          first_response: >-
+            Check whether upstream rotated signing keys; refresh the trusted
+            update-signing key before re-attempting. Never bypass to 'get
+            unstuck'.
+
+      - alert: MonopsonyUpdateSignatureNoKey
+        expr: increase(monopsony_update_signature_verify_total{result="no_key"}[30m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Update signature unverifiable — no trusted key configured"
+          description: >-
+            Signature verification ran with no trusted key installed
+            (result=no_key). Updates are flowing unattested-by-signature.
+          first_response: >-
+            Install the update-signing public key on the server; until then
+            this distro's update channel has no signature gate.
+
+      # Update distributor loop health: with the default 6h poll, some poll
+      # outcome (new/already_cached/none) should land at least every 12h.
+      # See README assumptions if you changed check_interval.
+      - alert: MonopsonyUpdatePollStalled
+        expr: sum(increase(monopsony_update_releases_fetched_total[12h])) == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Update distributor has polled nothing in 12h"
+          description: >-
+            No release-poll outcomes at all in 12h (default poll is 6h). The
+            distributor loop is wedged, errored before emitting, or the poll
+            interval was raised above 12h.
+          first_response: >-
+            Check distributor logs for panics/loop exit; confirm the configured
+            poll interval; restart the server if the loop died.
