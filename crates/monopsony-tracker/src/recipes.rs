@@ -890,7 +890,9 @@ mod tests {
                 auth_mode: TrackerAuthMode::Open,
                 valid_keys: vec![],
                 jwt_config: None,
+                pinned_originators: vec![],
             }),
+            allow_open_blacklist: false,
         })
     }
 

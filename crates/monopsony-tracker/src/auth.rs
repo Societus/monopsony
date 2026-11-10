@@ -60,13 +60,28 @@ pub struct JwtConfig {
     pub trusted_issuers: Vec<String>,
     /// Minimum remaining TTL on JWT (seconds)
     pub min_ttl_secs: i64,
+    /// HS256 shared secret used to verify minted tokens. Configurable via
+    /// `--jwt-secret` / `MONOPSONY_TRACKER_JWT_SECRET`; when unset the
+    /// tracker falls back to [`DEV_JWT_SECRET`] with a loud startup warning
+    /// (that fallback is forgeable by anyone who reads the source and must
+    /// never be considered a production authority).
+    pub jwt_secret: String,
 }
+
+/// Well-known development secret. Compile-time constant shared by the
+/// production fallback and the test-token encoder so tests and the fallback
+/// path always agree.
+pub const DEV_JWT_SECRET: &str = "tracker-dev-secret";
 
 #[derive(Debug, Clone)]
 pub struct AuthState {
     pub auth_mode: TrackerAuthMode,
     pub valid_keys: Vec<String>,
     pub jwt_config: Option<JwtConfig>,
+    /// Operator Ed25519 public keys (64-char hex) allowed to originate SIGNED
+    /// blacklist entries. Empty = fail closed: no signed adds are accepted.
+    /// Configured via `--pinned-originators` / `MONOPSONY_TRACKER_PINNED_ORIGINATORS`.
+    pub pinned_originators: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,10 +96,22 @@ pub struct JwtClaims {
     pub entitlements: Option<Vec<String>>,
 }
 
-/// Extension carrying the authenticated operator npub (set by JWT/token middleware)
+/// Extension carrying the authenticated operator identity, set by the
+/// auth middleware. JWT mode: the token subject npub. Token mode: the API
+/// key (opaque reporter identity — there is no npub behind a static key).
+/// Absent in open mode, where requests are unauthenticated.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub struct OperatorNpub(pub String);
+
+/// Opaque authenticated-caller identity for generic authorization decisions
+/// (e.g. the /report auto-blacklist gate). JWT mode: token subject npub.
+/// Token mode: the API key. Deliberately distinct from [`OperatorNpub`],
+/// which carries JWT-subject semantics the announce signature check relies
+/// on; absent in open mode.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub struct AuthenticatedIdentity(pub String);
 
 // ---------------------------------------------------------------------------
 // Middleware
@@ -104,9 +131,15 @@ pub async fn auth_middleware(
             let key = req
                 .headers()
                 .get("X-Monopsony-Key")
-                .and_then(|v| v.to_str().ok());
+                .and_then(|v| v.to_str().ok())
+                .map(|k| k.to_string());
             match key {
-                Some(k) if auth.valid_keys.iter().any(|vk| vk == k) => next.run(req).await,
+                // Token mode carries the key itself as the authenticated
+                // identity (no npub exists behind a static key).
+                Some(k) if auth.valid_keys.iter().any(|vk| vk == &k) => {
+                    req.extensions_mut().insert(AuthenticatedIdentity(k));
+                    next.run(req).await
+                }
                 _ => (StatusCode::UNAUTHORIZED, "Unauthorized").into_response(),
             }
         }
@@ -120,7 +153,8 @@ pub async fn auth_middleware(
             match token {
                 Some(t) => match validate_jwt(t, &auth.jwt_config) {
                     Ok(claims) => {
-                        req.extensions_mut().insert(OperatorNpub(claims.sub));
+                        req.extensions_mut().insert(OperatorNpub(claims.sub.clone()));
+                        req.extensions_mut().insert(AuthenticatedIdentity(claims.sub));
                         next.run(req).await
                     }
                     Err(e) => {
@@ -147,11 +181,11 @@ fn validate_jwt(token: &str, config: &Option<JwtConfig>) -> Result<JwtClaims, St
     validation.validate_exp = true;
     validation.leeway = 60;
 
-    // Decode with shared secret for now.
+    // Decode with the configured HS256 shared secret.
     // Production Ed25519 JWT verification will be wired when the trust broker exists.
     let token_data = jsonwebtoken::decode::<JwtClaims>(
         token,
-        &jsonwebtoken::DecodingKey::from_secret(b"tracker-dev-secret"),
+        &jsonwebtoken::DecodingKey::from_secret(cfg.jwt_secret.as_bytes()),
         &validation,
     )
     .map_err(|e| format!("JWT decode error: {}", e))?;
@@ -174,7 +208,7 @@ pub fn encode_test_jwt(claims: &JwtClaims) -> Result<String, String> {
     jsonwebtoken::encode(
         &header,
         claims,
-        &jsonwebtoken::EncodingKey::from_secret(b"tracker-dev-secret"),
+        &jsonwebtoken::EncodingKey::from_secret(DEV_JWT_SECRET.as_bytes()),
     )
     .map_err(|e| format!("JWT encode error: {}", e))
 }
@@ -219,6 +253,7 @@ mod tests {
         let config = Some(JwtConfig {
             trusted_issuers: vec!["trustbroker".to_string()],
             min_ttl_secs: 0,
+            jwt_secret: DEV_JWT_SECRET.to_string(),
         });
         let result = validate_jwt(&token, &config);
         assert!(result.is_ok(), "valid JWT should decode: {:?}", result);
@@ -239,6 +274,7 @@ mod tests {
         let config = Some(JwtConfig {
             trusted_issuers: vec![],
             min_ttl_secs: 0,
+            jwt_secret: DEV_JWT_SECRET.to_string(),
         });
         let result = validate_jwt(&token, &config);
         assert!(result.is_err(), "expired JWT should fail");
@@ -258,6 +294,7 @@ mod tests {
         let config = Some(JwtConfig {
             trusted_issuers: vec!["trustbroker".to_string()],
             min_ttl_secs: 0,
+            jwt_secret: DEV_JWT_SECRET.to_string(),
         });
         let result = validate_jwt(&token, &config);
         assert!(result.is_err(), "untrusted issuer should fail");
