@@ -1,9 +1,12 @@
-//! Personal OCI registry — Sprint 25 Slice 1: pull-back (read-only).
+//! Personal OCI registry — Sprint 25: pull-back (S1), blob uploads (S2),
+//! manifests + tag index + tagless auto-version (S3).
 //!
 //! Serves pushed content from CacheStorage over the OCI distribution-spec
 //! end-points this slice implements: version check (end-1), blob GET/HEAD
-//! (end-2), manifest GET/HEAD (end-3), tags list (end-8a). The write path
-//! (upload sessions, manifest push, tagless auto-version) lands in S2/S3.
+//! (end-2), manifest GET/HEAD (end-3), tags list (end-8a/8b), blob upload
+//! sessions (end-4a/4b/5/6/13/14), and manifest push (end-7a/7b: byte-exact
+//! store, referenced-descriptor validation, tag index, tagless pushes
+//! auto-versioned `YYYYMMDD-HHMMSS`).
 //!
 //! Runs on its OWN listener (`--registry-bind`, default :3131): the `/v2`
 //! route namespace collides head-on with `docker.rs` pull-through routes and
@@ -33,6 +36,57 @@ use crate::proxy::ProxyState;
 /// the registry as its own class (S4 wires its budget).
 const REGISTRY_PREFIX: &str = "registry";
 
+/// Maximum accepted manifest size (S3). The spec says a registry SHOULD
+/// enforce a limit (oversize → `413`) and SHOULD accept pushes of at least
+/// 4 MiB, so the floor IS the limit: larger manifests are rejected with
+/// `413`, exactly-4-MiB manifests are accepted.
+const MAX_MANIFEST_SIZE: usize = 4 * 1024 * 1024;
+
+/// Auto-version tag format for tagless pushes (kickoff decision 2026-10-19:
+/// `YYYYMMDD-HHMMSS`, UTC, no shorthash suffix — OCI-only scope).
+const AUTO_VERSION_FORMAT: &str = "%Y%m%d-%H%M%S";
+
+/// Manifest-push policy knobs (S3), threaded from the `[registry]` config
+/// section through `run_registry`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RegistrySettings {
+    /// Accept manifest pushes whose referenced blobs / child manifests are
+    /// not present yet (lazy pushes). Default `false`: the push is rejected
+    /// with `404 MANIFEST_BLOB_UNKNOWN` — the simplest spec-conformant
+    /// default (spec: a registry MAY reject such manifests). `subject`
+    /// descriptors are exempt either way (spec: referrers may be pushed in
+    /// either order).
+    pub allow_missing_blobs: bool,
+}
+
+/// Storage keys for the registry namespace.
+fn blob_key(repo: &str, digest: &str) -> String {
+    format!("{REGISTRY_PREFIX}/{repo}/blobs/{digest}")
+}
+
+fn manifest_key(repo: &str, digest: &str) -> String {
+    format!("{REGISTRY_PREFIX}/{repo}/manifests/{digest}")
+}
+
+fn tags_key(repo: &str) -> String {
+    format!("{REGISTRY_PREFIX}/{repo}/tags.json")
+}
+
+/// Sidecar marking auto-versioned tags (S4's never-auto-delete contract
+/// reads this; written by every tagless push in S3).
+fn autotags_key(repo: &str) -> String {
+    format!("{REGISTRY_PREFIX}/{repo}/autotags.json")
+}
+
+/// SHA-256 of `bytes` as lowercase hex — the manifest digest is computed
+/// from the received bytes and doubles as the storage key component.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points (construction site — called from monopsony-server)
 // ---------------------------------------------------------------------------
@@ -45,6 +99,7 @@ pub async fn run_registry(
     storage: Arc<dyn CacheStorage>,
     db: Option<Arc<Database>>,
     auth_mode: monopsony_common::config::AuthMode,
+    settings: RegistrySettings,
 ) -> anyhow::Result<()> {
     let state = Arc::new(ProxyState::new(storage, db.clone()));
     let auth_state = Arc::new(monopsony_control::auth::AuthState { auth_mode, db });
@@ -60,7 +115,7 @@ pub async fn run_registry(
             sweeper.sweep(UPLOAD_SESSION_TTL).await;
         }
     });
-    let app = create_registry_router_with_sessions(state, auth_state, uploads);
+    let app = create_registry_router_with_settings(state, auth_state, uploads, settings);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("OCI registry listening on {}", addr);
     axum::serve(listener, app.into_make_service()).await?;
@@ -78,11 +133,23 @@ pub fn create_registry_router(
 }
 
 /// As `create_registry_router`, but with a caller-owned session store —
-/// `run_registry` passes the same store its TTL sweeper walks.
+/// `run_registry` passes the same store its TTL sweeper walks. Default
+/// manifest-push settings.
 pub fn create_registry_router_with_sessions(
     state: Arc<ProxyState>,
     auth_state: Arc<monopsony_control::auth::AuthState>,
     uploads: Arc<UploadSessions>,
+) -> Router {
+    create_registry_router_with_settings(state, auth_state, uploads, RegistrySettings::default())
+}
+
+/// As `create_registry_router_with_sessions`, with explicit manifest-push
+/// settings (S3 test seam; `run_registry` threads the `[registry]` config).
+pub fn create_registry_router_with_settings(
+    state: Arc<ProxyState>,
+    auth_state: Arc<monopsony_control::auth::AuthState>,
+    uploads: Arc<UploadSessions>,
+    settings: RegistrySettings,
 ) -> Router {
     Router::new()
         .route("/v2", axum::routing::any(handle_v2))
@@ -95,7 +162,12 @@ pub fn create_registry_router_with_sessions(
         // Outermost: rewrite docker-client Basic credentials to the native
         // key header BEFORE the shared middleware validates them.
         .layer(axum::middleware::from_fn(basic_auth_to_key))
-        .with_state(RegistryState { proxy: state, uploads })
+        .with_state(RegistryState {
+            proxy: state,
+            uploads,
+            tags_lock: Arc::new(tokio::sync::Mutex::new(())),
+            settings,
+        })
 }
 
 /// Router state: shared proxy state plus the registry-owned upload-session
@@ -104,6 +176,11 @@ pub fn create_registry_router_with_sessions(
 struct RegistryState {
     proxy: Arc<ProxyState>,
     uploads: Arc<UploadSessions>,
+    /// Serializes tag-index read-modify-write cycles across concurrent
+    /// manifest pushes (tokio mutex: the guard is held across storage
+    /// awaits; a std/parking-lot guard would make the future `!Send`).
+    tags_lock: Arc<tokio::sync::Mutex<()>>,
+    settings: RegistrySettings,
 }
 
 impl FromRef<RegistryState> for Arc<ProxyState> {
@@ -285,7 +362,7 @@ async fn handle_v2(
     };
 
     match (kind, ref_raw) {
-        ("tags", "list") => tags_list(&state, &repo).await,
+        ("tags", "list") => tags_list(&state, &repo, &uri).await,
         ("blobs", digest_raw) => {
             let Ok(digest) = percent_decode_str(digest_raw).decode_utf8() else {
                 return oci_error(StatusCode::BAD_REQUEST, "DIGEST_INVALID", "malformed digest");
@@ -296,6 +373,17 @@ async fn handle_v2(
             let Ok(reference) = percent_decode_str(reference_raw).decode_utf8() else {
                 return oci_error(StatusCode::BAD_REQUEST, "MANIFEST_UNKNOWN", "malformed reference");
             };
+            if method == Method::PUT {
+                return put_manifest(&registry, &headers, &uri, body, &repo, &reference).await;
+            }
+            if method != Method::GET && method != Method::HEAD {
+                // end-9 DELETE is S4; until then the spec sanctions 405.
+                return oci_error(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "UNSUPPORTED",
+                    "manifests support GET, HEAD, and PUT",
+                );
+            }
             serve_manifest(&state, &method, &repo, &reference).await
         }
         _ => unsupported(),
@@ -348,6 +436,22 @@ fn query_param<'a>(uri: &'a Uri, name: &str) -> Option<&'a str> {
             (k == name).then_some(v)
         })
     })
+}
+
+/// All values of a repeated query parameter (`?tag=a&tag=b`, end-7b), in
+/// request order. Values are NOT percent-decoded — tags are validated
+/// against the tag grammar, which contains no characters needing escapes.
+fn query_params<'a>(uri: &'a Uri, name: &str) -> Vec<&'a str> {
+    uri.query()
+        .map(|q| {
+            q.split('&')
+                .filter_map(|kv| {
+                    let (k, v) = kv.split_once('=')?;
+                    (k == name).then_some(v)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Validate a `?digest=` param strictly for finalize: `sha256:<64 lowercase
@@ -883,6 +987,287 @@ async fn finalize_spool(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Manifest push (end-7a/7b) — byte-exact store, tag index, tagless
+// auto-version
+// ---------------------------------------------------------------------------
+
+/// end-7a: `PUT /v2/<repo>/manifests/<tag-or-digest>`. The manifest is stored
+/// byte-exact under its content digest; a tag reference (plus the `?tag=`
+/// extras) is recorded in the tag-index sidecar. A digest reference is a
+/// TAGLESS push: it additionally receives an auto-version tag
+/// `YYYYMMDD-HHMMSS` (UTC) so every push is addressable without tag
+/// discipline at build time.
+async fn put_manifest(
+    registry: &RegistryState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    body: axum::body::Body,
+    repo: &str,
+    reference: &str,
+) -> Response {
+    let state = &registry.proxy;
+
+    // Reference form: a digest reference is a tagless push; anything else
+    // must be a syntactically valid tag.
+    let ref_is_digest = reference.contains(':');
+    if ref_is_digest {
+        if declared_digest_hex(reference).is_none() {
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "DIGEST_INVALID",
+                "unsupported or malformed digest",
+            );
+        }
+    } else if !is_valid_tag(reference) {
+        return oci_error(StatusCode::BAD_REQUEST, "TAG_INVALID", "invalid tag");
+    }
+
+    // Extra tags (end-7b) are validated BEFORE anything is stored so a bad
+    // request cannot leave a half-pushed manifest behind.
+    let mut extra_tags: Vec<String> = Vec::new();
+    for tag in query_params(uri, "tag") {
+        if !is_valid_tag(tag) {
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "TAG_INVALID",
+                "invalid tag query parameter",
+            );
+        }
+        extra_tags.push(tag.to_string());
+    }
+
+    // Manifests are small JSON documents: buffered whole under the size cap,
+    // never spooled. An over-limit body is rejected before any storage I/O.
+    let bytes = match axum::body::to_bytes(body, MAX_MANIFEST_SIZE).await {
+        Ok(b) => b,
+        Err(_) => {
+            return oci_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "MANIFEST_INVALID",
+                "manifest exceeds maximum size",
+            );
+        }
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(v) => v,
+        Err(_) => {
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "MANIFEST_INVALID",
+                "manifest is not valid JSON",
+            );
+        }
+    };
+    let media_type = parsed
+        .get("mediaType")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+
+    // The Content-Type header must equal the manifest's declared mediaType
+    // when one is present (header parameters ignored per spec / RFC 9110).
+    if let Some(mt) = &media_type {
+        let declared = headers
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|ct| ct.split(';').next().unwrap_or("").trim())
+            .unwrap_or("");
+        if !declared.is_empty() && declared != mt {
+            return oci_error(
+                StatusCode::BAD_REQUEST,
+                "MANIFEST_INVALID",
+                "Content-Type does not match the manifest mediaType",
+            );
+        }
+    }
+
+    // The manifest's own digest, computed from the exact bytes received.
+    let digest_hex = sha256_hex(&bytes);
+    let digest = format!("sha256:{digest_hex}");
+    if ref_is_digest && reference != digest {
+        return oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            "manifest does not match the reference digest",
+        );
+    }
+
+    // Referenced-descriptor validation (skipped under
+    // [registry] allow_missing_blobs — the lazy-push escape hatch).
+    if !registry.settings.allow_missing_blobs {
+        if let Some(resp) = validate_manifest_references(state, repo, &parsed).await {
+            return resp;
+        }
+    }
+
+    // Byte-exact store, plus a media-type sidecar so GET/HEAD can echo the
+    // pushed Content-Type instead of assuming OCI JSON.
+    let key = manifest_key(repo, &digest);
+    if let Err(e) = state.storage.write(&key, &bytes).await {
+        tracing::error!("registry: manifest write failed for {key}: {e}");
+        return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", "storage unavailable");
+    }
+    if let Some(mt) = &media_type {
+        let sidecar = serde_json::json!({ "media_type": mt });
+        if let Err(e) = state.storage.save_meta_json(&key, sidecar.to_string().as_bytes()).await {
+            tracing::warn!("registry: manifest meta sidecar write failed for {key}: {e}");
+        }
+    }
+
+    // Tag index update, serialized against concurrent pushes. Auto-version
+    // assignment happens here for tagless pushes and is recorded in the
+    // autotags sidecar — S4's GC reads that sidecar for its
+    // never-auto-delete exemption.
+    let applied_tags: Vec<String> = {
+        let _guard = registry.tags_lock.lock().await;
+        let mut tags: HashMap<String, String> = match state.storage.read(&tags_key(repo)).await {
+            // An unreadable index is treated as empty and rewritten: the
+            // next write self-heals it (reads treat corrupt as missing too).
+            Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
+            Err(_) => HashMap::new(),
+        };
+        let mut applied: Vec<String> = Vec::new();
+        let mut auto_tag: Option<String> = None;
+        if ref_is_digest {
+            let tag = chrono::Utc::now().format(AUTO_VERSION_FORMAT).to_string();
+            tags.insert(tag.clone(), digest.clone());
+            applied.push(tag.clone());
+            auto_tag = Some(tag);
+        } else {
+            tags.insert(reference.to_string(), digest.clone());
+            applied.push(reference.to_string());
+        }
+        for tag in &extra_tags {
+            tags.insert(tag.clone(), digest.clone());
+            applied.push(tag.clone());
+        }
+        let Ok(payload) = serde_json::to_vec(&tags) else {
+            tracing::error!("registry: tag index serialize failed for {repo}");
+            return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", "tag index update failed");
+        };
+        if let Err(e) = state.storage.write(&tags_key(repo), &payload).await {
+            tracing::error!("registry: tag index write failed for {}: {e}", tags_key(repo));
+            return oci_error(StatusCode::INTERNAL_SERVER_ERROR, "UNKNOWN", "tag index update failed");
+        }
+        if let Some(tag) = &auto_tag {
+            record_auto_tag(state, repo, tag).await;
+        }
+        applied
+    };
+
+    let mut builder = axum::http::response::Response::builder()
+        .status(StatusCode::CREATED)
+        .header("Location", format!("/v2/{repo}/manifests/{digest}"))
+        .header(
+            "Docker-Content-Digest",
+            HeaderValue::from_str(&digest).unwrap_or(HeaderValue::from_static("")),
+        );
+    // One OCI-Tag header per accepted tag (spec end-7b: MUST, for each).
+    for tag in &applied_tags {
+        if let Ok(v) = HeaderValue::from_str(tag) {
+            builder = builder.header("OCI-Tag", v);
+        }
+    }
+    finish(builder, axum::body::Body::empty())
+}
+
+/// Append an auto-versioned tag to the autotags sidecar. Best-effort: the
+/// tag itself is already committed to the index, so a sidecar write failure
+/// is logged, never fatal.
+async fn record_auto_tag(state: &ProxyState, repo: &str, tag: &str) {
+    let mut autos: Vec<String> = match state.storage.read(&autotags_key(repo)).await {
+        Ok(b) => serde_json::from_slice(&b).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    if !autos.iter().any(|t| t == tag) {
+        autos.push(tag.to_string());
+        autos.sort();
+    }
+    if let Ok(payload) = serde_json::to_vec(&autos) {
+        if let Err(e) = state.storage.write(&autotags_key(repo), &payload).await {
+            tracing::warn!(
+                "registry: autotags sidecar write failed for {}: {e}",
+                autotags_key(repo)
+            );
+        }
+    }
+}
+
+/// Validate the descriptors a manifest references against local storage
+/// (skipped when `allow_missing_blobs` is set). `config` + `layers[]` must
+/// exist in the blob namespace; `manifests[]` children (image index) must
+/// exist in the manifest namespace. `subject` is NEVER validated: the spec
+/// REQUIRES accepting referrer manifests whose subject does not exist yet
+/// (manifest and referrers push in either order). Returns the error
+/// response, or `None` when every reference checks out.
+async fn validate_manifest_references(
+    state: &ProxyState,
+    repo: &str,
+    manifest: &serde_json::Value,
+) -> Option<Response> {
+    if let Some(config) = manifest.get("config") {
+        if let Some(resp) = ensure_descriptor(state, repo, config, true).await {
+            return Some(resp);
+        }
+    }
+    if let Some(layers) = manifest.get("layers").and_then(|v| v.as_array()) {
+        for layer in layers {
+            if let Some(resp) = ensure_descriptor(state, repo, layer, true).await {
+                return Some(resp);
+            }
+        }
+    }
+    if let Some(children) = manifest.get("manifests").and_then(|v| v.as_array()) {
+        for child in children {
+            if let Some(resp) = ensure_descriptor(state, repo, child, false).await {
+                return Some(resp);
+            }
+        }
+    }
+    None
+}
+
+/// Check one descriptor. `blob_namespace` selects the storage namespace the
+/// referenced digest must exist in (blobs for image-manifest descriptors,
+/// manifests for index children). A descriptor without a digest is skipped.
+async fn ensure_descriptor(
+    state: &ProxyState,
+    repo: &str,
+    descriptor: &serde_json::Value,
+    blob_namespace: bool,
+) -> Option<Response> {
+    let digest = descriptor.get("digest").and_then(|v| v.as_str())?;
+    if !is_valid_digest(digest) {
+        return Some(oci_error(
+            StatusCode::BAD_REQUEST,
+            "MANIFEST_INVALID",
+            "descriptor digest is malformed",
+        ));
+    }
+    let key = if blob_namespace {
+        blob_key(repo, digest)
+    } else {
+        manifest_key(repo, digest)
+    };
+    match state.storage.exists(&key).await {
+        Ok(true) => None,
+        Ok(false) => Some(oci_error(
+            StatusCode::NOT_FOUND,
+            "MANIFEST_BLOB_UNKNOWN",
+            &format!("manifest references unknown content: {digest}"),
+        )),
+        Err(e) => {
+            tracing::error!("registry: existence check failed for {key}: {e}");
+            Some(oci_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "UNKNOWN",
+                "storage unavailable",
+            ))
+        }
+    }
+}
+
 fn version_check() -> Response {
     (
         StatusCode::OK,
@@ -1114,21 +1499,32 @@ async fn serve_manifest(
         }
     };
     let length = bytes.len() as u64;
+    // The persisted media type rides the push-time sidecar; manifests
+    // written outside the push path (and any unreadable sidecar) fall back
+    // to the OCI manifest media type.
+    let media_type = match state.storage.load_meta_json(&key).await {
+        Some(sidecar) => serde_json::from_slice::<serde_json::Value>(&sidecar)
+            .ok()
+            .and_then(|v| v.get("media_type").and_then(|m| m.as_str()).map(str::to_owned)),
+        None => None,
+    };
     if method == Method::HEAD {
-        return manifest_response(&digest, length, None);
+        return manifest_response(&digest, media_type.as_deref(), length, None);
     }
-    manifest_response(&digest, length, Some(bytes))
+    manifest_response(&digest, media_type.as_deref(), length, Some(bytes))
 }
 
-fn manifest_response(digest: &str, length: u64, body: Option<Vec<u8>>) -> Response {
+fn manifest_response(
+    digest: &str,
+    media_type: Option<&str>,
+    length: u64,
+    body: Option<Vec<u8>>,
+) -> Response {
     let builder = axum::http::response::Response::builder()
         .status(StatusCode::OK)
         .header(
             "Content-Type",
-            // S3 persists the real media type alongside the manifest; until
-            // then the OCI manifest media type is the correct default for
-            // everything the push path (S2/S3) will store.
-            "application/vnd.oci.image.manifest.v1+json",
+            media_type.unwrap_or("application/vnd.oci.image.manifest.v1+json"),
         )
         .header("Content-Length", length)
         .header(
@@ -1150,9 +1546,13 @@ async fn resolve_tag(state: &ProxyState, repo: &str, tag: &str) -> Option<String
     tags.get(tag).cloned()
 }
 
-async fn tags_list(state: &ProxyState, repo: &str) -> Response {
-    let key = format!("{REGISTRY_PREFIX}/{repo}/tags.json");
-    let bytes = match state.storage.read(&key).await {
+/// end-8a/8b: tag listing. Tags come from the index sidecar in lexical
+/// order; `n=<int>` limits the page size and `last=<tagname>` resumes
+/// non-inclusively after that tag. A `Link: <...>; rel="next"` header is
+/// returned when a full page was cut off and more tags remain; `n=0` MUST
+/// yield an empty list and no Link header.
+async fn tags_list(state: &ProxyState, repo: &str, uri: &Uri) -> Response {
+    let bytes = match state.storage.read(&tags_key(repo)).await {
         Ok(b) => b,
         Err(_) => return oci_error(StatusCode::NOT_FOUND, "NAME_UNKNOWN", "repository not found"),
     };
@@ -1162,11 +1562,47 @@ async fn tags_list(state: &ProxyState, repo: &str) -> Response {
     };
     let mut names: Vec<String> = tags.into_keys().collect();
     names.sort();
-    (
+
+    // `last` cuts everything at or before the named tag (non-inclusive).
+    if let Some(last) = query_param(uri, "last") {
+        names.retain(|name| name.as_str() > last);
+    }
+
+    // `n` caps the page. Non-numeric n is a bad request; n=0 is a legal
+    // empty page (and per spec MUST NOT carry a Link header).
+    let page_size = match query_param(uri, "n") {
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(n) => Some(n),
+            Err(_) => {
+                return oci_error(StatusCode::BAD_REQUEST, "UNSUPPORTED", "invalid n parameter")
+            }
+        },
+        None => None,
+    };
+    let mut link: Option<String> = None;
+    if let Some(n) = page_size {
+        if names.len() > n {
+            names.truncate(n);
+            if n > 0 {
+                let last_returned = names.last().map(String::as_str).unwrap_or("");
+                link = Some(format!(
+                    "</v2/{repo}/tags/list?n={n}&last={last_returned}>; rel=\"next\""
+                ));
+            }
+        }
+    }
+
+    let mut response = (
         StatusCode::OK,
         axum::Json(serde_json::json!({ "name": repo, "tags": names })),
     )
-        .into_response()
+        .into_response();
+    if let Some(link_value) = link {
+        if let Ok(v) = HeaderValue::from_str(&link_value) {
+            response.headers_mut().insert("Link", v);
+        }
+    }
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -1480,13 +1916,6 @@ mod tests {
     // S2: blob upload path
     // -----------------------------------------------------------------------
 
-    fn sha256_hex(bytes: &[u8]) -> String {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        format!("{:x}", hasher.finalize())
-    }
-
     async fn req_full(
         router: &Router,
         method: &str,
@@ -1792,5 +2221,510 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // -----------------------------------------------------------------------
+    // S3: manifest push (end-7a/7b), tag index, tagless auto-version
+    // -----------------------------------------------------------------------
+
+    /// A manifest body with deliberately irregular spacing — byte-exactness
+    /// means the GET must return THESE bytes, not a canonicalized form.
+    const S3_MANIFEST: &[u8] = b"{  \"mediaType\" : \"application/vnd.oci.image.manifest.v1+json\" , \"schemaVersion\": 2 , \"config\":{  } }";
+    const OCI_MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+    const DOCKER_MANIFEST_TYPE: &str = "application/vnd.docker.distribution.manifest.v2+json";
+
+    async fn push_manifest(
+        router: &Router,
+        uri: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> Response {
+        let headers = match content_type {
+            Some(ct) => vec![("Content-Type", ct.to_string())],
+            None => Vec::new(),
+        };
+        req_full(router, "PUT", uri, body.to_vec(), headers).await
+    }
+
+    #[tokio::test]
+    async fn manifest_put_by_tag_round_trips_byte_exact() {
+        let (router, _dir) = seeded_router().await;
+        let digest = sha256_hex(S3_MANIFEST);
+        let resp = push_manifest(
+            &router,
+            "/v2/test/app/manifests/v1.5",
+            S3_MANIFEST,
+            Some(OCI_MANIFEST_TYPE),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(
+            resp.headers()["location"],
+            format!("/v2/test/app/manifests/sha256:{digest}")
+        );
+        assert_eq!(resp.headers()["docker-content-digest"], format!("sha256:{digest}"));
+
+        // GET by tag AND by digest: exactly the pushed bytes, never
+        // re-serialized.
+        for reference in ["v1.5", &format!("sha256:{digest}")] {
+            let resp = req(&router, "GET", &format!("/v2/test/app/manifests/{reference}")).await;
+            assert_eq!(resp.status(), StatusCode::OK, "ref {reference}");
+            assert_eq!(body_bytes(resp).await, bytes::Bytes::from_static(S3_MANIFEST));
+        }
+        // HEAD carries the length of the exact bytes.
+        let resp = req(&router, "HEAD", "/v2/test/app/manifests/v1.5").await;
+        assert_eq!(resp.headers()["content-length"], S3_MANIFEST.len().to_string());
+
+        // The tag index lists the new tag.
+        let resp = req(&router, "GET", "/v2/test/app/tags/list").await;
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert!(parsed["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "v1.5"));
+    }
+
+    #[tokio::test]
+    async fn manifest_put_content_type_must_match_mediatype() {
+        let (router, _dir) = seeded_router().await;
+        let resp = push_manifest(
+            &router,
+            "/v2/test/app/manifests/v9",
+            S3_MANIFEST,
+            Some(DOCKER_MANIFEST_TYPE),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("MANIFEST_INVALID"));
+        // Nothing was stored or tagged.
+        let resp = req(&router, "GET", "/v2/test/app/manifests/v9").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn manifest_put_oversize_413_and_boundary_400() {
+        let (router, _dir) = seeded_router().await;
+        // One byte over the cap → 413 (rejected before JSON parsing).
+        let oversize = vec![b'x'; MAX_MANIFEST_SIZE + 1];
+        let resp = push_manifest(&router, "/v2/test/app/manifests/big", &oversize, None).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // Exactly the cap is ACCEPTED by the size check — a full-size
+        // non-JSON payload fails JSON parsing with 400, proving the size
+        // gate passed it through.
+        let boundary = vec![b'x'; MAX_MANIFEST_SIZE];
+        let resp = push_manifest(&router, "/v2/test/app/manifests/edge", &boundary, None).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("MANIFEST_INVALID"));
+    }
+
+    #[tokio::test]
+    async fn manifest_put_rejects_non_json() {
+        let (router, _dir) = seeded_router().await;
+        let resp = push_manifest(&router, "/v2/test/app/manifests/v1", b"not json", None).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("MANIFEST_INVALID"));
+    }
+
+    #[tokio::test]
+    async fn manifest_put_by_digest_mismatch_rejected_and_unstored() {
+        let (router, _dir) = seeded_router().await;
+        let real = sha256_hex(S3_MANIFEST);
+        let wrong = format!("sha256:{}", "0".repeat(64));
+        let resp = push_manifest(&router, &format!("/v2/test/app/manifests/{wrong}"), S3_MANIFEST, None)
+            .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("DIGEST_INVALID"));
+        // The correct digest was NOT stored — nothing published.
+        let resp = req(&router, "GET", &format!("/v2/test/app/manifests/sha256:{real}")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn manifest_put_unsupported_digest_algorithm_rejected() {
+        let (router, _dir) = seeded_router().await;
+        let sha512 = format!("sha512:{}", "a".repeat(128));
+        let resp =
+            push_manifest(&router, &format!("/v2/test/app/manifests/{sha512}"), S3_MANIFEST, None)
+                .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("DIGEST_INVALID"));
+    }
+
+    /// Image-manifest JSON referencing a config and one layer by digest.
+    fn image_manifest(config_hex: &str, layer_hex: &str) -> Vec<u8> {
+        serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_TYPE,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{config_hex}"),
+                "size": 12
+            },
+            "layers": [
+                { "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                  "digest": format!("sha256:{layer_hex}"), "size": 11 }
+            ]
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[tokio::test]
+    async fn manifest_put_tagless_push_auto_versions() {
+        let (state, _dir) = fresh_state().await;
+        let router = create_registry_router(state.clone(), open_auth());
+        let digest = sha256_hex(S3_MANIFEST);
+        let resp = push_manifest(
+            &router,
+            &format!("/v2/test/app/manifests/sha256:{digest}"),
+            S3_MANIFEST,
+            Some(OCI_MANIFEST_TYPE),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // The auto-version tag rides OCI-Tag: `YYYYMMDD-HHMMSS` (UTC).
+        let auto_tag = resp.headers()["oci-tag"].to_str().unwrap().to_string();
+        assert_eq!(auto_tag.len(), 15, "YYYYMMDD-HHMMSS shape");
+        assert_eq!(&auto_tag[8..9], "-", "date/time separator at index 8");
+        let (date, time) = auto_tag.split_once('-').unwrap();
+        assert_eq!(date.len(), 8, "YYYYMMDD");
+        assert_eq!(time.len(), 6, "HHMMSS");
+        assert!(date.bytes().all(|b| b.is_ascii_digit()));
+        assert!(time.bytes().all(|b| b.is_ascii_digit()));
+
+        // The tag listing has exactly the auto tag; resolving it serves the
+        // manifest bytes.
+        let resp = req(&router, "GET", "/v2/test/app/tags/list").await;
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(parsed["tags"], serde_json::json!([auto_tag]));
+        let resp = req(&router, "GET", &format!("/v2/test/app/manifests/{auto_tag}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await, bytes::Bytes::from_static(S3_MANIFEST));
+
+        // The autotags sidecar records it (S4 never-delete contract).
+        let autos: Vec<String> = serde_json::from_slice(
+            &state
+                .storage
+                .read(&autotags_key("test/app"))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(autos, vec![auto_tag]);
+    }
+
+    #[tokio::test]
+    async fn manifest_put_extra_tags_apply_and_echo() {
+        let (router, _dir) = seeded_router().await;
+        let digest = sha256_hex(S3_MANIFEST);
+        let uri = format!("/v2/test/app/manifests/sha256:{digest}?tag=rel1&tag=rel2");
+        let resp = push_manifest(&router, &uri, S3_MANIFEST, None).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        // One OCI-Tag header per accepted tag: the auto tag plus the extras.
+        let headers: Vec<String> = resp
+            .headers()
+            .get_all("oci-tag")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(headers.len(), 3);
+        assert!(headers.contains(&"rel1".to_string()));
+        assert!(headers.contains(&"rel2".to_string()));
+        for tag in ["rel1", "rel2"] {
+            let resp = req(&router, "GET", &format!("/v2/test/app/manifests/{tag}")).await;
+            assert_eq!(resp.status(), StatusCode::OK, "tag {tag}");
+            assert_eq!(body_bytes(resp).await, bytes::Bytes::from_static(S3_MANIFEST));
+        }
+    }
+
+    #[tokio::test]
+    async fn manifest_put_supports_at_least_ten_extra_tags() {
+        // Spec end-7b: at least 10 tags per request SHOULD be supported.
+        let (router, _dir) = seeded_router().await;
+        let digest = sha256_hex(S3_MANIFEST);
+        let query: Vec<String> = (0..11).map(|i| format!("tag=rel{i:02}")).collect();
+        let uri = format!("/v2/test/app/manifests/sha256:{digest}?{}", query.join("&"));
+        let resp = push_manifest(&router, &uri, S3_MANIFEST, None).await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "11 tags accepted");
+        // 11 extras + the auto tag.
+        assert_eq!(resp.headers().get_all("oci-tag").iter().count(), 12);
+        let resp = req(&router, "GET", "/v2/test/app/tags/list").await;
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        // The seeded index's two tags + the 12 just applied.
+        assert_eq!(parsed["tags"].as_array().unwrap().len(), 14);
+    }
+
+    #[tokio::test]
+    async fn manifest_put_rejects_invalid_extra_tag_before_storage() {
+        let (router, _dir) = seeded_router().await;
+        let digest = sha256_hex(S3_MANIFEST);
+        let uri = format!("/v2/test/app/manifests/sha256:{digest}?tag=bad~tag");
+        let resp = push_manifest(&router, &uri, S3_MANIFEST, None).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("TAG_INVALID"));
+        // Validated BEFORE anything is stored.
+        let resp = req(&router, "GET", &format!("/v2/test/app/manifests/sha256:{digest}")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn manifest_put_missing_blob_rejected() {
+        let (router, _dir) = seeded_router().await;
+        let cfg = sha256_hex(b"config-bytes");
+        let layer = sha256_hex(b"layer-bytes");
+        let body = image_manifest(&cfg, &layer);
+        let resp = push_manifest(
+            &router,
+            "/v2/test/app/manifests/v1",
+            &body,
+            Some(OCI_MANIFEST_TYPE),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_bytes(resp).await;
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains("MANIFEST_BLOB_UNKNOWN"));
+        assert!(text.contains(&cfg), "error names the missing digest");
+        // The rejected push stored nothing and tagged nothing new (the
+        // seeded router already carries `v1`, so a fresh name is asserted).
+        let resp = req(&router, "GET", "/v2/test/app/manifests/fresh").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = req(&router, "GET", "/v2/test/app/tags/list").await;
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let listed = parsed["tags"].as_array().unwrap();
+        assert!(
+            !listed.iter().any(|t| t == "fresh"),
+            "rejected push tagged nothing new"
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_put_succeeds_when_referenced_blobs_present() {
+        let (state, _dir) = fresh_state().await;
+        let router = create_registry_router(state.clone(), open_auth());
+        let cfg = sha256_hex(b"config-bytes");
+        let layer = sha256_hex(b"layer-bytes");
+        state
+            .storage
+            .write(&blob_key("test/app", &format!("sha256:{cfg}")), b"config-bytes")
+            .await
+            .unwrap();
+        state
+            .storage
+            .write(&blob_key("test/app", &format!("sha256:{layer}")), b"layer-bytes")
+            .await
+            .unwrap();
+        let body = image_manifest(&cfg, &layer);
+        let resp = push_manifest(
+            &router,
+            "/v2/test/app/manifests/v1",
+            &body,
+            Some(OCI_MANIFEST_TYPE),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn manifest_put_index_children_validated() {
+        let (state, _dir) = fresh_state().await;
+        let router = create_registry_router(state.clone(), open_auth());
+        // The child manifest's bytes define its digest; the index must
+        // reference exactly that digest.
+        let child: Vec<u8> = b"{\"schemaVersion\": 2}".to_vec();
+        let child_hex = sha256_hex(&child);
+        let index_type = "application/vnd.oci.image.index.v1+json";
+        let index = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": index_type,
+            "manifests": [
+                { "mediaType": OCI_MANIFEST_TYPE,
+                  "digest": format!("sha256:{child_hex}"), "size": 20 }
+            ]
+        })
+        .to_string()
+        .into_bytes();
+        // Child absent → rejected.
+        let resp =
+            push_manifest(&router, "/v2/test/app/manifests/idx", &index, Some(index_type)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("MANIFEST_BLOB_UNKNOWN"));
+        // Push the child at its own digest, then the index succeeds.
+        let resp = push_manifest(
+            &router,
+            &format!("/v2/test/app/manifests/sha256:{child_hex}"),
+            &child,
+            None,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp =
+            push_manifest(&router, "/v2/test/app/manifests/idx", &index, Some(index_type)).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn manifest_put_subject_may_reference_missing_manifest() {
+        // Spec: referrer manifests MUST be accepted even when the subject
+        // does not exist yet (manifest and referrers push in either order).
+        let (router, _dir) = seeded_router().await;
+        let subject_hex = sha256_hex(b"subject-manifest");
+        let body = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_TYPE,
+            "subject": {
+                "mediaType": OCI_MANIFEST_TYPE,
+                "digest": format!("sha256:{subject_hex}"),
+                "size": 9
+            }
+        })
+        .to_string()
+        .into_bytes();
+        let resp = push_manifest(
+            &router,
+            "/v2/test/app/manifests/signature",
+            &body,
+            Some(OCI_MANIFEST_TYPE),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn allow_missing_blobs_knob_permits_lazy_push() {
+        let (state, _dir) = fresh_state().await;
+        let uploads = Arc::new(UploadSessions::new());
+        let router = create_registry_router_with_settings(
+            state,
+            open_auth(),
+            uploads,
+            RegistrySettings {
+                allow_missing_blobs: true,
+            },
+        );
+        let cfg = sha256_hex(b"absent-config");
+        let body = image_manifest(&cfg, &cfg);
+        let resp = push_manifest(
+            &router,
+            "/v2/test/app/manifests/lazy",
+            &body,
+            Some(OCI_MANIFEST_TYPE),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "lazy push accepted");
+    }
+
+    #[tokio::test]
+    async fn manifest_get_serves_persisted_media_type() {
+        let (router, _dir) = seeded_router().await;
+        let body = serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": DOCKER_MANIFEST_TYPE
+        })
+        .to_string()
+        .into_bytes();
+        let resp = push_manifest(
+            &router,
+            "/v2/test/app/manifests/docker",
+            &body,
+            Some(DOCKER_MANIFEST_TYPE),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        for method in ["GET", "HEAD"] {
+            let resp = req(&router, method, "/v2/test/app/manifests/docker").await;
+            assert_eq!(resp.headers()["content-type"], DOCKER_MANIFEST_TYPE, "{method}");
+        }
+        // A manifest written outside the push path (no sidecar) keeps the
+        // S1 default media type.
+        let resp = req(&router, "GET", "/v2/test/app/manifests/v1").await;
+        assert_eq!(resp.headers()["content-type"], OCI_MANIFEST_TYPE);
+    }
+
+    #[tokio::test]
+    async fn tags_list_pagination_n_and_last() {
+        let (state, _dir) = fresh_state().await;
+        // Lexical order: alpha, beta, delta, epsilon, gamma.
+        let tags: HashMap<String, String> = ["alpha", "beta", "gamma", "delta", "epsilon"]
+            .iter()
+            .map(|t| (t.to_string(), manifest_digest()))
+            .collect();
+        state
+            .storage
+            .write(&tags_key("test/app"), &serde_json::to_vec(&tags).unwrap())
+            .await
+            .unwrap();
+        let router = create_registry_router(state, open_auth());
+
+        // n=2: first two lexically + Link rel=next anchored at the last tag.
+        let resp = req(&router, "GET", "/v2/test/app/tags/list?n=2").await;
+        let link = resp.headers()["link"].to_str().unwrap().to_string();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(parsed["tags"], serde_json::json!(["alpha", "beta"]));
+        assert!(link.contains("rel=\"next\""), "link {link}");
+        assert!(link.contains("last=beta"), "link {link}");
+
+        // Resume non-inclusively after beta.
+        let resp = req(&router, "GET", "/v2/test/app/tags/list?n=2&last=beta").await;
+        let link = resp.headers()["link"].to_str().unwrap().to_string();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(parsed["tags"], serde_json::json!(["delta", "epsilon"]));
+        // gamma still remains → another Link.
+        assert!(link.contains("last=epsilon"), "link {link}");
+
+        // Final page: no Link header.
+        let resp = req(&router, "GET", "/v2/test/app/tags/list?n=2&last=epsilon").await;
+        assert!(resp.headers().get("link").is_none());
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(parsed["tags"], serde_json::json!(["gamma"]));
+
+        // n=0 → empty list, and per spec NO Link header.
+        let resp = req(&router, "GET", "/v2/test/app/tags/list?n=0").await;
+        assert!(resp.headers().get("link").is_none());
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(parsed["tags"], serde_json::json!([]));
+
+        // n larger than the repo: everything, no Link.
+        let resp = req(&router, "GET", "/v2/test/app/tags/list?n=99").await;
+        assert!(resp.headers().get("link").is_none());
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(parsed["tags"].as_array().unwrap().len(), 5);
+
+        // Non-numeric n → 400.
+        let resp = req(&router, "GET", "/v2/test/app/tags/list?n=abc").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn manifest_delete_not_allowed_until_s4() {
+        let (router, _dir) = seeded_router().await;
+        let resp = req(&router, "DELETE", "/v2/test/app/manifests/v1").await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[tokio::test]
+    async fn repush_same_tag_remaps_to_new_digest() {
+        let (router, _dir) = seeded_router().await;
+        let first: &[u8] = b"{\"v\": 1}";
+        let second: &[u8] = b"{\"v\": 2}";
+        let resp = push_manifest(&router, "/v2/test/app/manifests/rolling", first, None).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let resp = push_manifest(&router, "/v2/test/app/manifests/rolling", second, None).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        // The tag resolves to the newest push…
+        let resp = req(&router, "GET", "/v2/test/app/manifests/rolling").await;
+        assert_eq!(body_bytes(resp).await, bytes::Bytes::from_static(second));
+        // …while the first manifest stays addressable by digest.
+        let first_digest = sha256_hex(first);
+        let resp = req(
+            &router,
+            "GET",
+            &format!("/v2/test/app/manifests/sha256:{first_digest}"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
