@@ -1,0 +1,66 @@
+# Shadow package recipe: checkmk-server (CT 1933 "checkmk" on hypervisor ingest)
+# Debian 13 trixie, Checkmk Community (Raw) 2.5.0p16, OMD site "cmk".
+# Site data lives on the zfs dataset bind-mounted at /opt/omd
+# (z2pool/servers/docker/checkmk — covered by the scheduled z2pool backup).
+#
+# Upstream shape: checkmk.com hosts versioned .debs on download.checkmk.com
+# (plain versions only — the v-prefix form 404s). The GitHub mirror
+# Checkmk/checkmk publishes TAGS ONLY, NO releases, so server-side
+# GitHub-release update detection cannot see new checkmk versions and the
+# releases/latest page scrapes empty. The update script below therefore
+# self-discovers the latest version from the releases/latest redirect's
+# Location header and exits 0 when already current. Until upstream changes,
+# `monopsony-client package check` will not report checkmk updates — run
+# `monopsony-client package update checkmk-server` manually to update.
+
+[package]
+name = "checkmk-server"
+description = "Checkmk Community Edition monitoring server (OMD site cmk) on Debian 13"
+homepage = "https://checkmk.com"
+source_type = "direct_url"
+source_url = "https://github.com/Checkmk/checkmk"
+
+[install]
+method = "script"
+target_dir = "/opt/omd"
+config_paths = ["/opt/omd/sites/cmk/etc"]
+backup_old = true
+max_backups = 3
+pre_update = "omd stop cmk || true"
+post_update = "omd start cmk"
+
+[script]
+update = """
+LATEST=$(curl -fsSI https://github.com/Checkmk/checkmk/releases/latest | sed -n 's#[Ll]ocation: .*/tag/v##p' | tr -d '\r')
+CUR=$(omd version | sed -E 's/.*Version ([0-9.]+(p[0-9]+)?).*/\\1/')
+if [ -z "$LATEST" ] || [ "$LATEST" = "$CUR" ]; then exit 0; fi
+curl -fsSLo /tmp/checkmk-update.deb "https://download.checkmk.com/checkmk/$LATEST/check-mk-community-${LATEST}_0.trixie_amd64.deb"
+DEBIAN_FRONTEND=noninteractive apt-get install -y /tmp/checkmk-update.deb
+omd update cmk --force
+rm -f /tmp/checkmk-update.deb
+"""
+
+# Site Apache must answer after an update (binds 127.0.0.1:5000 inside the CT;
+# the system Apache proxies :80/cmk/ -> it). If this fails the executor rolls back.
+[install.health_check]
+type = "port"
+port = 5000
+timeout_secs = 120
+
+[direct_url]
+version_discovery = "scrape"
+scrape_url = "https://github.com/Checkmk/checkmk/releases/latest"
+# Capture EXCLUDES the v-prefix (download.checkmk.com URLs are plain: v-form 404s)
+# and stops before '+' so tags like v2.5.0p17+security yield the clean version.
+scrape_pattern = 'v(\d+\.\d+(\.\d+)*(p\d+)?)'
+asset_url_template = "https://download.checkmk.com/checkmk/{version}/check-mk-community-{version}_0.trixie_amd64.deb"
+
+[version]
+# `omd version` prints: OMD - Open Monitoring Distribution Version 2.5.0p16.community
+# The capture stops before the .community suffix and matches p-patch trains.
+detect_command = "omd version"
+detect_pattern = 'Version (\d+\.\d+(\.\d+)*(p\d+)?)'
+
+[notifications]
+changelog_url = "https://github.com/Checkmk/checkmk/releases/tag/v{version}"
+notes = "Updates via apt: downloads the new community .deb from download.checkmk.com, installs it (versions live side-by-side under /opt/omd/versions/), then `omd update cmk --force` migrates the site and `omd start cmk` brings it back. Site config (etc/) and monitored-host data on the zfs-backed /opt/omd are untouched by version installs. DNS caveat: technitium (10.3.0.11) SERVFAILs on download.checkmk.com; a /etc/hosts pin inside the CT currently covers it — remove the pin once technitium resolves the name."

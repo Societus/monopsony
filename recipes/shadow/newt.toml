@@ -1,0 +1,87 @@
+# Shadow package recipe: newt (Pangolin site tunnel client)
+#
+# Single static Go binary from GitHub releases (no archive, no build).
+# Deployed convention on our sites (e.g. plex CT 1950):
+#   binary:  /root/.local/bin/newt  (symlink -> /root/.local/lib/newt/newt)
+#   service: /etc/systemd/system/newt.service (operator-created; holds the
+#            site's NEWT id/secret on the ExecStart line)
+#
+# Deliberate choices:
+#   - method = "script": upstream ships a RAW binary asset, not a tarball,
+#     so extract's tar.gz path does not apply. The script stage receives the
+#     downloaded asset via {asset_path}.
+#   - service/exec_start are NOT declared: the unit file embeds the site's
+#     tunnel secret, so the executor must never manage or render it. Stop and
+#     start happen in the hooks; the post_update hook fails (triggering
+#     rollback) if the unit does not come back active.
+#   - pre_update seeds target_dir from the live binary (cp -n) so backup_old
+#     has something to restore even on the very first update run, when
+#     /root/.local/bin/newt is still a plain file rather than a symlink.
+#
+# Version floor: Pangolin 1.26 SSH session logs require newt >= 1.20.0
+# (and the server must be 1.26; pairing rules in the pangolin-ops skill).
+
+[package]
+name = "newt"
+description = "Fosrl Newt - Pangolin WireGuard tunnel client for sites"
+homepage = "https://github.com/fosrl/newt"
+source_type = "github_release"
+source_url = "https://github.com/fosrl/newt"
+
+[install]
+method = "script"
+target_dir = "/root/.local/lib/newt"
+backup_old = true
+max_backups = 3
+
+pre_update = "systemctl stop newt.service 2>/dev/null; mkdir -p /root/.local/lib/newt; cp -n /root/.local/bin/newt /root/.local/lib/newt/newt 2>/dev/null; true"
+post_update = "ln -sf /root/.local/lib/newt/newt /root/.local/bin/newt && systemctl start newt.service && sleep 2 && systemctl is-active --quiet newt.service"
+on_failure = "systemctl restart newt.service 2>/dev/null; true"
+
+# The downloaded asset is a single raw binary - install it directly.
+[script]
+update = "install -D -m0755 {asset_path} /root/.local/lib/newt/newt"
+
+[install.health_check]
+type = "process"
+process = "newt"
+timeout_secs = 30
+
+# Outbound-only; newt dials the edge, nothing listens inbound on the site.
+[[install.firewall_rules]]
+port = 443
+protocol = "tcp"
+direction = "outbound"
+description = "Newt control channel (WSS) to the Pangolin edge + release downloads"
+
+[[install.firewall_rules]]
+port = 51820
+protocol = "udp"
+direction = "outbound"
+description = "WireGuard data plane to Gerbil on the Pangolin edge"
+
+# Tags are plain semver: 1.19.0, 1.20.0, ...
+[asset_selector]
+tag_pattern = '^(\d+\.\d+\.\d+)$'
+
+[[asset_selector.rules]]
+os = "linux"
+arch = "x86_64"
+pattern = 'newt_linux_amd64$'
+
+[[asset_selector.rules]]
+os = "linux"
+arch = "aarch64"
+pattern = 'newt_linux_arm64$'
+
+[version]
+detect_command = "/root/.local/bin/newt --version"
+detect_pattern = 'version (\d+\.\d+\.\d+)'
+
+[notifications]
+changelog_url = "https://github.com/fosrl/newt/releases/tag/{version}"
+notes = """Fleet convention: systemd unit newt.service with id/secret on ExecStart (operator-managed, never touched by this recipe). Paths are overridable per host at `shadow accept` staging review.
+Gotchas:
+- plex CT 1950 also carries a STALE /root/newt.container quadlet (fosrl/newt:latest) registered with a DIFFERENT site id - it is not running; delete it or it can spawn a second registration if ever started.
+- newt >= 1.20.0 required before enabling SSH session logs on a Pangolin 1.26 server.
+- Sites installed via the Docker image instead of the binary need the compose-file update path, not this recipe."""
