@@ -8,6 +8,7 @@ pub mod metrics;
 pub mod models;
 pub mod os_release;
 pub mod package_manager;
+pub mod peer_blacklist;
 pub mod pin_store;
 pub mod proto;
 pub mod shadow_diff;
