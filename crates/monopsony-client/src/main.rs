@@ -15,7 +15,7 @@ use sha2::Digest;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tracing::{debug, info, warn, Level};
+use tracing::{debug, error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 // Platform-conditional default paths for config and certificate directories.
@@ -281,10 +281,30 @@ enum OverrideMode {
 
 #[derive(Subcommand, Debug)]
 enum SelfUpdateMode {
-    /// Check for available updates and show version info
+    /// Check for available updates and show version info (server channel
+    /// first when paired, then GitHub)
     Check,
-    /// Download and apply the latest update (atomic swap + health check)
-    Apply,
+    /// Download and apply the latest update (atomic swap + health check).
+    /// Default source is GitHub releases; `--from-server` pulls the asset
+    /// from the paired server's update store over mTLS instead.
+    Apply {
+        /// Fetch the asset from the paired Monopsony server (server-first
+        /// source; requires pairing)
+        #[arg(long)]
+        from_server: bool,
+    },
+    /// Internal phase 2 of the staged apply — run detached by the daemon;
+    /// performs the swap, service restart and health gate.
+    #[command(hide = true)]
+    Finalize {
+        /// Path to the finalize command JSON (passed by spawn_detached_finalize)
+        #[arg(long)]
+        command_file: PathBuf,
+    },
+    /// Restore the newest self-update backup over the current binary and
+    /// restart the service (operator recovery tool).
+    #[command(hide = true)]
+    Rollback,
 }
 
 /// Detect which binary we are by examining argv[0]
@@ -303,7 +323,153 @@ fn detect_binary_type() -> &'static str {
     }
 }
 
-async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
+/// Server-first staged self-update (Sprint 34 P3) — the shared routine for
+/// the daemon's rollout path, the `update_assign` push, and the CLI's
+/// `apply --from-server`. Checks the paired server, verifies the signed
+/// manifest against the locally configured operator key (fail closed),
+/// streams the asset (integrity-checked), stages it and spawns the
+/// detached finalize process.
+///
+/// Returns `Ok(Some(to_version))` when a finalize was spawned (the caller
+/// on the daemon path MUST exit so the finalize can swap the running
+/// binary), `Ok(None)` when there is nothing to do.
+///
+/// `require_rollout` gates on the server's rollout approval (daemon path:
+/// true — automatic updates ride assignments only); a manual CLI
+/// `--from-server` apply passes false (explicit operator intent).
+#[allow(clippy::too_many_arguments)]
+async fn apply_server_update_staged(
+    client: &mut grpc_client::MonopsonyGrpcClient,
+    client_id: &str,
+    trust_config: &monopsony_common::config::ShadowPackageTrustConfig,
+    require_rollout: bool,
+) -> anyhow::Result<Option<String>> {
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    // The wire contract names the binary being updated ("client"/"server");
+    // derive it from argv[0] so a server binary reusing this routine (P4)
+    // reports itself correctly.
+    let binary_kind = self_update::BinaryKind::from_binary_type(detect_binary_type());
+    let platform = match self_update::release_platform() {
+        Some(p) => p,
+        None => {
+            // Loud but non-fatal: the daemon keeps serving on this host.
+            warn!(
+                "self-update: no release asset contract for this platform ({}/{}) — skipping",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
+            return Ok(None);
+        }
+    };
+
+    let resp = client
+        .check_update(
+            client_id,
+            &current_version,
+            binary_kind.wire_name(),
+            &platform,
+        )
+        .await?;
+    if !resp.update_available {
+        debug!("self-update: server reports no update available");
+        return Ok(None);
+    }
+    if require_rollout && !resp.rollout_approved {
+        info!(
+            latest = %resp.latest_version,
+            "self-update: update available but rollout not approved for this client — waiting"
+        );
+        return Ok(None);
+    }
+
+    // Select the asset for this exact platform.
+    let asset = match resp.assets.iter().find(|a| a.platform == platform) {
+        Some(a) => a,
+        None => {
+            warn!(
+                latest = %resp.latest_version,
+                platform = %platform,
+                "self-update: update available but no asset for this platform — NOT applying"
+            );
+            return Ok(None);
+        }
+    };
+
+    // Verify the manifest signature against the REBUILT canonical payload
+    // (never a server-sent preimage). Fail closed per trust policy.
+    let operator_vk = load_operator_verifying_key(trust_config);
+    let rebuilt: Vec<self_update::ManifestAsset> = resp
+        .assets
+        .iter()
+        .map(self_update::ManifestAsset::from_proto)
+        .collect();
+    let payload = self_update::build_update_manifest_payload(
+        &resp.latest_version,
+        "client",
+        &platform,
+        &rebuilt,
+    );
+    match self_update::verify_update_manifest(&payload, &resp.manifest_sig, operator_vk.as_ref()) {
+        Ok(self_update::ManifestCheck::Verified) => {
+            info!("self-update: manifest signature verified (operator key)")
+        }
+        Ok(self_update::ManifestCheck::SkippedNoKey) => {
+            warn!(
+                "self-update: no operator verifying key configured — manifest signature NOT verified (D7 no-key posture); proceeding with sha256 verification only"
+            );
+        }
+        Err(e) => {
+            // Loud, fail-closed: no silent GitHub fallback from the daemon.
+            error!("MONOPSONY SELF-UPDATE: manifest verification failed — refusing server asset: {e:#}");
+            return Err(e.context("manifest verification failed"));
+        }
+    }
+
+    // Stream the asset (transport integrity checked inside).
+    let (blob, stream_sha) = client
+        .download_update_asset(
+            client_id,
+            binary_kind.wire_name(),
+            &resp.latest_version,
+            &platform,
+        )
+        .await?;
+    if !stream_sha.eq_ignore_ascii_case(&asset.sha256) {
+        anyhow::bail!(
+            "streamed asset digest {} does not match signed manifest asset digest {} — refusing",
+            stream_sha,
+            asset.sha256
+        );
+    }
+
+    // Stage + spawn the detached finalize.
+    let current_exe = std::env::current_exe().context("Failed to get current executable path")?;
+    let target_dir = current_exe
+        .parent()
+        .context("Failed to get parent directory of binary")?
+        .to_path_buf();
+    let (staged_path, staged_sha) =
+        self_update::stage_update_asset(&blob, &target_dir, &current_exe)
+            .context("Failed to stage update asset")?;
+    let cmd = self_update::FinalizeCommand {
+        staged_path,
+        staged_sha256: staged_sha,
+        from_version: current_version.clone(),
+        to_version: resp.latest_version.clone(),
+        binary: binary_kind.wire_name().to_string(),
+        created_at: chrono::Utc::now().timestamp(),
+    };
+    let command_file = self_update::write_finalize_command(&target_dir, &cmd)?;
+    self_update::spawn_detached_finalize(&current_exe, &command_file, &target_dir)?;
+    info!(
+        from = %current_version,
+        to = %resp.latest_version,
+        "self-update staged; detached finalize spawned (swap, restart, health gate)"
+    );
+    Ok(Some(resp.latest_version))
+}
+
+async fn run_self_update(cmd: SelfUpdateMode, cert_dir: &Path) -> anyhow::Result<()> {
     let binary_type = detect_binary_type();
     let binary_kind = self_update::BinaryKind::from_binary_type(binary_type);
 
@@ -315,31 +481,124 @@ async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
             let current_version = env!("CARGO_PKG_VERSION").to_string();
             println!("Current {}: {}", binary_type, current_version);
 
+            // ── Channel 1: paired server (best-effort; Sprint 34 P3) ──
+            let mut server_update_actionable = false;
+            if grpc_client::ClientCerts::load(cert_dir).is_some() {
+                match grpc_client::MonopsonyGrpcClient::connect(
+                    &resolve_server_addr(cert_dir).await?,
+                    None,
+                )
+                .await
+                {
+                    Ok(mut control) => {
+                        let client_id = std::fs::read_to_string(cert_dir.join("client_id"))
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_default();
+                        if let Some(platform) = self_update::release_platform() {
+                            match control
+                                .check_update(&client_id, &current_version, "client", &platform)
+                                .await
+                            {
+                                Ok(resp) if resp.update_available => {
+                                    println!(
+                                        "Server: update available -> {}{}",
+                                        resp.latest_version,
+                                        if resp.rollout_approved {
+                                            " (rollout approved)"
+                                        } else {
+                                            " (rollout NOT yet approved)"
+                                        }
+                                    );
+                                    server_update_actionable = resp.rollout_approved;
+                                }
+                                Ok(_) => println!("Server: running the latest servable version."),
+                                Err(e) => println!("Server channel check failed: {}", e),
+                            }
+                        } else {
+                            println!(
+                                "Server: no release asset contract for this platform ({}/{}).",
+                                std::env::consts::OS,
+                                std::env::consts::ARCH
+                            );
+                        }
+                    }
+                    Err(e) => println!("Server channel unreachable: {}", e),
+                }
+            } else {
+                println!("Server channel: not paired (no certificates) — GitHub only.");
+            }
+
+            // ── Channel 2: GitHub releases (historical source) ──
             let result = self_update::check_for_update(&current_version, binary_kind).await;
 
             match result {
                 Ok(result) => {
                     if let Some(latest) = &result.latest_version {
-                        println!("Update available: {} -> {}", result.current_version, latest);
+                        println!(
+                            "GitHub: update available: {} -> {}",
+                            result.current_version, latest
+                        );
                         if let Some(url) = &result.changelog_url {
                             println!("Changelog: {}", url);
                         }
                         std::process::exit(1); // Exit code 1 indicates update available
+                    } else if server_update_actionable {
+                        // The server channel has an approved update even
+                        // though GitHub shows none (e.g. private fleet
+                        // build) — still "update available".
+                        std::process::exit(1);
                     } else {
                         println!(
-                            "You are running the latest version of monopsony {}.",
+                            "GitHub: you are running the latest version of monopsony {}.",
                             binary_type
                         );
                     }
                 }
                 Err(e) => {
+                    if server_update_actionable {
+                        eprintln!("GitHub check failed: {}", e);
+                        std::process::exit(1);
+                    }
                     eprintln!("Failed to check for updates: {}", e);
                     std::process::exit(2);
                 }
             }
         }
 
-        SelfUpdateMode::Apply => {
+        SelfUpdateMode::Apply { from_server } if from_server => {
+            info!("Applying {} update from the paired server...", binary_type);
+            let current_version = env!("CARGO_PKG_VERSION").to_string();
+            println!("Current {}: {}", binary_type, current_version);
+
+            let (mut client, client_id) = match connect_shadow_client(None, cert_dir).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("Server source requires a paired client: {e:#}");
+                    std::process::exit(2);
+                }
+            };
+
+            // Trust config from the standard config file (section-lenient).
+            let trust_config = load_trust_config_lenient();
+
+            match apply_server_update_staged(&mut client, &client_id, &trust_config, false).await {
+                Ok(Some(to_version)) => {
+                    println!(
+                        "Update to {to_version} staged; detached finalize spawned — it will swap \
+                         the binary, restart the service via the detected init system, and roll \
+                         back automatically if the health gate fails. See \
+                         monopsony-self-update-finalize.log next to the binary."
+                    );
+                }
+                Ok(None) => println!("Server reports no update available. Nothing to do."),
+                Err(e) => {
+                    eprintln!("Failed to apply server update: {e:#}");
+                    std::process::exit(4);
+                }
+            }
+        }
+
+        SelfUpdateMode::Apply { from_server: _ } => {
             info!("Applying {} update...", binary_type);
 
             let current_version = env!("CARGO_PKG_VERSION").to_string();
@@ -388,11 +647,10 @@ async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
                             monopsony_common::shadow_types::DEFAULT_MONOPSONY_CLIENT_RECIPE
                         }
                     };
-                    let recipe =
-                        toml::from_str::<monopsony_common::shadow_types::ShadowRecipe>(
-                            default_recipe,
-                        )
-                        .ok();
+                    let recipe = toml::from_str::<monopsony_common::shadow_types::ShadowRecipe>(
+                        default_recipe,
+                    )
+                    .ok();
 
                     if recipe.is_some() {
                         // Managed update with full safety pipeline
@@ -449,9 +707,130 @@ async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
                 }
             }
         }
+
+        SelfUpdateMode::Finalize { command_file } => {
+            // Phase 2 of the staged apply — spawned detached by the daemon
+            // (or by `apply --from-server`); PID-guarded so a second
+            // finalize cannot race the first.
+            let current_exe =
+                std::env::current_exe().context("Failed to get current executable path")?;
+            let install_dir = current_exe
+                .parent()
+                .context("Failed to get parent directory of binary")?
+                .to_path_buf();
+
+            let _guard = match self_update::acquire_finalize_guard(&install_dir) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("MONOPSONY SELF-UPDATE FINALIZE: {e:#}");
+                    std::process::exit(4);
+                }
+            };
+
+            let cmd = match self_update::read_finalize_command(&command_file) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "MONOPSONY SELF-UPDATE FINALIZE: cannot read {}: {e:#}",
+                        command_file.display()
+                    );
+                    std::process::exit(4);
+                }
+            };
+
+            match self_update::run_finalize(
+                &cmd,
+                &current_exe,
+                self_update::RestartAction::DetectedInit,
+            )
+            .await
+            {
+                Ok(self_update::UpdateOutcome::Success) => {
+                    println!(
+                        "Finalize committed: {} -> {} — service restarted and healthy.",
+                        cmd.from_version, cmd.to_version
+                    );
+                    let _ = std::fs::remove_file(&command_file);
+                }
+                Ok(self_update::UpdateOutcome::RolledBack(reason)) => {
+                    eprintln!(
+                        "MONOPSONY SELF-UPDATE FINALIZE ROLLED BACK: {reason} — previous \
+                         binary restored and service restarted."
+                    );
+                    let _ = std::fs::remove_file(&command_file);
+                    std::process::exit(5);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "MONOPSONY SELF-UPDATE FINALIZE FAILED: {e:#} — the previous binary \
+                         is untouched on disk; inspect monopsony-self-update-finalize.log"
+                    );
+                    std::process::exit(4);
+                }
+            }
+        }
+
+        SelfUpdateMode::Rollback => {
+            let current_exe =
+                std::env::current_exe().context("Failed to get current executable path")?;
+            let install_dir = current_exe
+                .parent()
+                .context("Failed to get parent directory of binary")?
+                .to_path_buf();
+            match self_update::rollback_latest_backup(&current_exe, &install_dir) {
+                Ok(backup) => {
+                    println!(
+                        "Restored {} over {} — restarting service via {}.",
+                        backup.display(),
+                        current_exe.display(),
+                        self_update::detect_init_system().label()
+                    );
+                    let kind = self_update::BinaryKind::from_binary_type(binary_type);
+                    let unit = self_update::unit_for(self_update::detect_init_system(), kind);
+                    if let Err(e) = self_update::restart_service_unit(unit) {
+                        eprintln!(
+                            "MONOPSONY SELF-UPDATE: rollback restore succeeded but the service \
+                             restart failed: {e:#} — restart {unit} MANUALLY"
+                        );
+                        std::process::exit(4);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("MONOPSONY SELF-UPDATE ROLLBACK FAILED: {e:#}");
+                    std::process::exit(4);
+                }
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Load only the `[shadow_trust]` section from the standard client config
+/// (a minimal client.toml may lack the other required sections — same
+/// leniency as the recipe-update arm).
+fn load_trust_config_lenient() -> monopsony_common::config::ShadowPackageTrustConfig {
+    let config_path =
+        std::env::var("MONOPSONY_CLIENT_CONFIG").unwrap_or_else(|_| default_config_path());
+    std::fs::read_to_string(&config_path)
+        .ok()
+        .and_then(|content| toml::from_str::<toml::Value>(&content).ok())
+        .and_then(|value| value.get("shadow_trust").cloned())
+        .map(|table| monopsony_common::config::ShadowPackageTrustConfig {
+            policy: table
+                .get("policy")
+                .and_then(|v| v.as_str())
+                .unwrap_or("trusted_server_only")
+                .to_string(),
+            trusted_author_keys: vec![],
+            trusted_operator_keys: vec![],
+            operator_verifying_key_path: table
+                .get("operator_verifying_key_path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string()),
+            accept_remote_assignment: false,
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Subcommand, Debug)]
@@ -617,7 +996,7 @@ async fn main() -> anyhow::Result<()> {
             run_shadow_package(cmd, &cert_dir).await?;
         }
         Some(Commands::SelfUpdate { cmd }) => {
-            run_self_update(cmd).await?;
+            run_self_update(cmd, &cert_dir).await?;
         }
         Some(Commands::Proxy { cmd }) => {
             run_proxy_command(cmd, &cert_dir).await?;
@@ -684,8 +1063,8 @@ async fn resolve_server_addr(cert_dir: &Path) -> anyhow::Result<String> {
     // Fall back to the client config's [server] section. Lenient extraction
     // (toml::Value, server table only): a minimal client.toml may omit
     // sections the full ClientConfig struct requires.
-    let config_path = std::env::var("MONOPSONY_CLIENT_CONFIG")
-        .unwrap_or_else(|_| default_config_path());
+    let config_path =
+        std::env::var("MONOPSONY_CLIENT_CONFIG").unwrap_or_else(|_| default_config_path());
     if let Some(addr) = server_addr_from_config(&config_path) {
         info!("Using server from config {}: {}", config_path, addr);
         return Ok(addr);
@@ -761,8 +1140,8 @@ fn persist_server_to_config_at(config_path: &str, server: &str) -> anyhow::Resul
         }
         Some((h.to_string(), port))
     });
-    let (host, port) = explicit
-        .unwrap_or_else(|| (server.to_string(), existing_port.unwrap_or(50051)));
+    let (host, port) =
+        explicit.unwrap_or_else(|| (server.to_string(), existing_port.unwrap_or(50051)));
 
     {
         let table = value
@@ -1325,10 +1704,12 @@ async fn handle_remote_assignment(
     }
 }
 
-/// Handle a Command yielded alongside a heartbeat (Sprint 22 slice 22-E2b).
-/// Currently the only consumer is the `shadow_assign` UPDATE_CONFIG command;
-/// anything else is logged at debug and ignored. Never propagates errors to
-/// the heartbeat loop.
+/// Handle a Command yielded alongside a heartbeat (Sprint 22 slice 22-E2b;
+/// Sprint 34 P3 adds the update_assign arm). Consumers are the
+/// `shadow_assign` and `update_assign` UPDATE_CONFIG commands; anything
+/// else is logged at debug and ignored. Never propagates errors to the
+/// heartbeat loop.
+#[allow(clippy::too_many_arguments)]
 async fn handle_heartbeat_command(
     client: &mut grpc_client::MonopsonyGrpcClient,
     client_id: &str,
@@ -1337,6 +1718,7 @@ async fn handle_heartbeat_command(
     trust_config: &monopsony_common::config::ShadowPackageTrustConfig,
     mirror_verify_key: Option<[u8; 32]>,
     update_health: &update_health::UpdateHealthTracker,
+    update_policy: &monopsony_common::config::SelfUpdatePolicyConfig,
 ) {
     use monopsony_common::proto::monopsony::command::CommandType;
 
@@ -1350,6 +1732,32 @@ async fn handle_heartbeat_command(
         .get("operation")
         .map(|s| s.as_str())
         .unwrap_or("");
+    if operation == "update_assign" {
+        // Sprint 34 P2 push-once rollout signal: the server created an
+        // assignment for this client — trigger the server-first staged
+        // apply immediately instead of waiting for the periodic check.
+        let version = command.params.get("version").cloned().unwrap_or_default();
+        info!(%version, "Server pushed an update assignment");
+        if !update_policy.server_first {
+            info!(policy = "server_first=false", "Ignoring update assignment");
+            return;
+        }
+        match apply_server_update_staged(client, client_id, trust_config, true).await {
+            Ok(Some(to)) => {
+                // The staged finalize owns the swap/restart from here; this
+                // process must exit so the binary can be replaced.
+                info!(to = %to, "Update staged — daemon exiting for finalize");
+                eprintln!(
+                    "MONOPSONY: self-update to {to} staged; exiting for finalize \
+                     (swap, restart, health gate, auto-rollback on failure)"
+                );
+                std::process::exit(0);
+            }
+            Ok(None) => {}
+            Err(e) => warn!("update assignment apply failed (daemon continues): {e:#}"),
+        }
+        return;
+    }
     if operation != "shadow_assign" {
         debug!(operation, "Ignoring UPDATE_CONFIG command");
         return;
@@ -1553,6 +1961,12 @@ async fn run_daemon(
     let update_health_for_task = update_health.clone();
     let mut catalog_scan_guard = catalog_scan::ScanGuard::new(Duration::from_secs(600));
     let trust_config_for_task = trust_config.clone();
+    // Sprint 34 P3: self-update policy drives the periodic server-first
+    // update check and the update_assign push handling.
+    let update_policy_for_task = client_config
+        .as_ref()
+        .map(|c| c.update.clone())
+        .unwrap_or_default();
     let heartbeat_handle = tokio::spawn(async move {
         let mut last_inventory = std::time::Instant::now();
         let mut backoff: std::time::Duration = Duration::from_secs(1);
@@ -1823,11 +2237,43 @@ async fn run_daemon(
                                     &trust_config_for_task,
                                     mirror_key_for_task,
                                     &update_health_for_task,
+                                    &update_policy_for_task,
                                 )
                                 .await;
                             }
                             Ok(None) => {}
                             Err(e) => warn!("command poll failed (ignored): {}", e),
+                        }
+                        // Sprint 34 P3: periodic server-first update check,
+                        // piggybacking the heartbeat (CheckUpdate is two
+                        // server-side SELECTs). Applies only on an approved
+                        // rollout (D3); the GitHub fallback is a CLI-apply
+                        // concept, never a daemon one.
+                        if update_policy_for_task.server_first
+                            && update_policy_for_task.rollout_enabled()
+                        {
+                            match apply_server_update_staged(
+                                &mut client,
+                                &client_id_for_task,
+                                &trust_config_for_task,
+                                true,
+                            )
+                            .await
+                            {
+                                Ok(Some(to)) => {
+                                    info!(to = %to, "Update staged — daemon exiting for finalize");
+                                    eprintln!(
+                                        "MONOPSONY: self-update to {to} staged; exiting for \
+                                         finalize (swap, restart, health gate, auto-rollback on \
+                                         failure)"
+                                    );
+                                    std::process::exit(0);
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    warn!("periodic self-update check failed (ignored): {e:#}")
+                                }
+                            }
                         }
                         // Drain spooled tamper events (Sprint 20 Phase 3):
                         // forward to the server as TamperAlerts; re-append on
@@ -4810,8 +5256,8 @@ mod client_config_server_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.toml").to_str().unwrap().to_string();
         for url in ["wss://tunnel.example.com", "ws://10.0.0.1:80"] {
-            let err = persist_server_to_config_at(&path, url)
-                .expect_err("tunnel URL must be refused");
+            let err =
+                persist_server_to_config_at(&path, url).expect_err("tunnel URL must be refused");
             assert!(format!("{err:#}").contains("server.json"));
         }
         assert!(

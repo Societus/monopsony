@@ -1059,6 +1059,10 @@ pub struct ClientConfig {
     /// Monotonic ledger + downgrade enforcement (Sprint 20 Phase 4).
     #[serde(default)]
     pub ledger: LedgerConfig,
+    /// Self-update source policy (Sprint 34 P3): server-first channel
+    /// preference + daemon rollout participation.
+    #[serde(default)]
+    pub update: SelfUpdatePolicyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1217,6 +1221,59 @@ impl Default for AutoUpdateConfig {
             max_severity: default_auto_update_severity(),
             notify_before_secs: None,
         }
+    }
+}
+
+fn default_update_policy() -> String {
+    "rollout".to_string()
+}
+
+/// Self-update source policy (Sprint 34 P3): which channel the client
+/// prefers for its own binary updates, and whether the daemon participates
+/// in server-approved rollouts at all.
+///
+/// ```toml
+/// [update]
+/// server_first = true            # ask the paired server (CheckUpdate) before GitHub
+/// allow_github_fallback = true   # fall back to GitHub direct when unpaired/unreachable
+/// policy = "rollout"             # "rollout" (apply admin-approved rollouts) | "manual"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfUpdatePolicyConfig {
+    /// Prefer the server's stored artifacts (LAN, one WAN fetch) over
+    /// GitHub-direct when paired. Default true.
+    #[serde(default = "default_true")]
+    pub server_first: bool,
+    /// Allow falling back to GitHub-direct when unpaired or the server is
+    /// unreachable. Default true; false pins updates to the server
+    /// (fail closed instead of WAN fetch).
+    #[serde(default = "default_true")]
+    pub allow_github_fallback: bool,
+    /// `"rollout"` (default): the daemon applies server-approved rollouts
+    /// (pending assignment + rollout_approved) via the staged two-phase
+    /// apply. `"manual"`: per-client opt-out — the daemon never self-applies;
+    /// `self-update apply` remains available; the dashboard shows the client
+    /// as opted out.
+    #[serde(default = "default_update_policy")]
+    pub policy: String,
+}
+
+impl Default for SelfUpdatePolicyConfig {
+    fn default() -> Self {
+        Self {
+            server_first: true,
+            allow_github_fallback: true,
+            policy: default_update_policy(),
+        }
+    }
+}
+
+impl SelfUpdatePolicyConfig {
+    /// Whether the daemon may apply server-approved rollouts. Only the two
+    /// documented values are honored; anything else fails safe to manual
+    /// (never self-apply on a typo).
+    pub fn rollout_enabled(&self) -> bool {
+        self.policy == "rollout"
     }
 }
 

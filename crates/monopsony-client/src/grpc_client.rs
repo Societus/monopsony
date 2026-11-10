@@ -567,6 +567,10 @@ impl MonopsonyGrpcClient {
             // Sprint 29 B1: update counts + reported distro identity, only
             // while the client's local cache is fresh (grounding D3).
             update_report,
+            // Sprint 34 P2: report our own binary version on every heartbeat
+            // (fleet-skew visibility is the server's P4). Empty would mean a
+            // legacy client; we always know our own version.
+            monopsony_version: env!("CARGO_PKG_VERSION").to_string(),
         };
 
         debug!(client_id = client_id, "Sending heartbeat");
@@ -648,6 +652,9 @@ impl MonopsonyGrpcClient {
                 // Command polling only: no UpdateReport here, the unary
                 // heartbeat carries it.
                 update_report: None,
+                // Sprint 34 P2: same version report as the unary heartbeat —
+                // this hits handle_heartbeat too.
+                monopsony_version: env!("CARGO_PKG_VERSION").to_string(),
             })),
         };
         let outbound = futures_util::stream::iter(vec![message]);
@@ -1330,6 +1337,126 @@ impl MonopsonyGrpcClient {
         Ok(blob)
     }
 
+    // ── Self-update RPCs (Sprint 34 P2 serving surface, P3 client calls) ──
+
+    /// Ask the paired server whether a newer servable binary exists (P2
+    /// CheckUpdate over the existing mTLS control plane — D1/D9). The
+    /// response's `manifest_sig` is Ed25519 over the canonical manifest
+    /// built from (latest_version, binary, platform, assets); the caller
+    /// verifies it against its trust key (`self_update::verify_update_manifest`).
+    pub async fn check_update(
+        &mut self,
+        client_id: &str,
+        current_version: &str,
+        binary: &str,
+        platform: &str,
+    ) -> anyhow::Result<monopsony_common::proto::monopsony::CheckUpdateResponse> {
+        use monopsony_common::proto::monopsony::CheckUpdateRequest;
+
+        let req = CheckUpdateRequest {
+            client_id: client_id.to_string(),
+            current_version: current_version.to_string(),
+            binary: binary.to_string(),
+            platform: platform.to_string(),
+        };
+        debug!(
+            client_id = client_id,
+            binary = binary,
+            platform = platform,
+            current_version = current_version,
+            "Checking for updates via server"
+        );
+        let resp = self.client.check_update(req).await?;
+        let resp = resp.into_inner();
+        debug!(
+            latest = %resp.latest_version,
+            available = resp.update_available,
+            rollout_approved = resp.rollout_approved,
+            assets = resp.assets.len(),
+            "CheckUpdate response"
+        );
+        Ok(resp)
+    }
+
+    /// Stream a stored release tarball (P2 DownloadUpdateAsset). Chunks are
+    /// reassembled strictly in order (offset-checked); every chunk repeats
+    /// the FULL blob sha256, and the reassembled bytes are verified against
+    /// it (plus total_size when carried) before returning. The caller still
+    /// compares the digest against the signed manifest's asset sha256 —
+    /// this stream check proves transport integrity, the manifest check
+    /// proves provenance.
+    ///
+    /// Returns (bytes, full_blob_sha256_from_stream).
+    pub async fn download_update_asset(
+        &mut self,
+        client_id: &str,
+        binary: &str,
+        version: &str,
+        platform: &str,
+    ) -> anyhow::Result<(Vec<u8>, String)> {
+        use futures_util::StreamExt;
+        use sha2::{Digest, Sha256};
+
+        let req = monopsony_common::proto::monopsony::DownloadUpdateAssetRequest {
+            client_id: client_id.to_string(),
+            binary: binary.to_string(),
+            version: version.to_string(),
+            platform: platform.to_string(),
+        };
+        info!(
+            client_id = client_id,
+            binary = binary,
+            version = version,
+            platform = platform,
+            "Downloading update asset from server"
+        );
+
+        let mut inbound = self.client.download_update_asset(req).await?.into_inner();
+
+        let mut blob: Vec<u8> = Vec::new();
+        let mut expected_total: i64 = 0;
+        let mut full_sha = String::new();
+        while let Some(chunk) = inbound.next().await {
+            let chunk = chunk.map_err(|e| anyhow::anyhow!("update asset stream failed: {}", e))?;
+
+            if chunk.offset != blob.len() as i64 {
+                anyhow::bail!(
+                    "update asset chunk out of order: expected offset {}, got {}",
+                    blob.len(),
+                    chunk.offset
+                );
+            }
+            if !chunk.sha256.is_empty() {
+                full_sha = chunk.sha256.clone();
+            }
+            blob.extend_from_slice(&chunk.data);
+            if chunk.total_size > 0 {
+                expected_total = chunk.total_size;
+            }
+        }
+
+        if expected_total > 0 && blob.len() as i64 != expected_total {
+            anyhow::bail!(
+                "update asset size mismatch: expected {} bytes, received {}",
+                expected_total,
+                blob.len()
+            );
+        }
+        if !full_sha.is_empty() {
+            let actual = hex::encode(Sha256::digest(&blob));
+            if !actual.eq_ignore_ascii_case(&full_sha) {
+                anyhow::bail!(
+                    "update asset hash mismatch: stream says {}, reassembled bytes hash to {}",
+                    full_sha,
+                    actual
+                );
+            }
+        }
+
+        info!(bytes = blob.len(), "Update asset download complete");
+        Ok((blob, full_sha))
+    }
+
     // ── Shadow recipe catalog RPCs (Sprint 22 slice 22-C2) ──
 
     /// Pull the server's shadow recipe catalog. `known_hash` is the client's
@@ -1487,6 +1614,507 @@ mod tests {
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "client.key must be 0600");
+        }
+    }
+
+    // ─── Sprint 34 P3: mock-driven update flow tests ───
+
+    use super::update_mock::MockUpdateControl;
+    use base64::Engine;
+    use ed25519_dalek::Signer;
+    use monopsony_common::proto::monopsony::monopsony_control_server::MonopsonyControlServer;
+    use monopsony_common::proto::monopsony::UpdateAssetInfo;
+
+    /// Build a release tarball containing a fake `monopsony-client`
+    /// binary; returns (tarball_bytes, inner_binary_bytes).
+    fn test_release_tarball() -> (Vec<u8>, Vec<u8>) {
+        let inner = b"\x7fELF-fake-monopsony-client-2.0.0".to_vec();
+        let temp = tempfile::tempdir().unwrap();
+        let pkg = temp.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("monopsony-client"), &inner).unwrap();
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            builder.append_dir_all("monopsony-2.0.0", &pkg).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = Vec::new();
+        {
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            std::io::Write::write_all(&mut enc, &tar_buf).unwrap();
+            enc.finish().unwrap();
+        }
+        (gz, inner)
+    }
+
+    async fn spawn_mock_control(mock: MockUpdateControl) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let incoming = futures_util::stream::unfold(listener, |l| async move {
+            match l.accept().await {
+                Ok((stream, _)) => Some((Ok::<_, std::io::Error>(stream), l)),
+                Err(_) => None,
+            }
+        });
+        tokio::spawn(async move {
+            let _ = tonic::transport::Server::builder()
+                .add_service(MonopsonyControlServer::new(mock))
+                .serve_with_incoming(incoming)
+                .await;
+        });
+        addr.to_string()
+    }
+
+    fn signed_manifest_setup(
+        tarball: &[u8],
+        platform: &str,
+        version: &str,
+    ) -> (
+        ed25519_dalek::VerifyingKey,
+        String,
+        monopsony_common::proto::monopsony::UpdateAssetInfo,
+    ) {
+        use crate::self_update::{build_update_manifest_payload, sha256_hex, ManifestAsset};
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let digest = sha256_hex(tarball);
+        let manifest_asset = ManifestAsset {
+            name: format!("monopsony-client-v{version}-{platform}.tar.gz"),
+            platform: platform.to_string(),
+            sha256: digest.clone(),
+            size: tarball.len() as i64,
+        };
+        let payload =
+            build_update_manifest_payload(version, "client", platform, std::slice::from_ref(&manifest_asset));
+        let sig = base64::engine::general_purpose::STANDARD.encode(sk.sign(&payload).to_bytes());
+        let wire = UpdateAssetInfo {
+            name: manifest_asset.name,
+            platform: manifest_asset.platform,
+            sha256: manifest_asset.sha256,
+            size: manifest_asset.size,
+        };
+        (sk.verifying_key(), sig, wire)
+    }
+
+    /// Happy path over a real in-proc gRPC hop: CheckUpdate → verify the
+    /// Ed25519 manifest signature against the rebuilt canonical payload →
+    /// DownloadUpdateAsset (stream integrity) → stage the asset.
+    #[tokio::test]
+    async fn server_update_flow_check_verify_download_stage() {
+        let (tarball, inner) = test_release_tarball();
+        let platform = crate::self_update::release_platform()
+            .expect("host platform must map to a release contract platform")
+            .to_string();
+        let (vk, sig, asset) = signed_manifest_setup(&tarball, &platform, "2.0.0");
+
+        let addr = spawn_mock_control(MockUpdateControl {
+            asset,
+            manifest_sig: sig,
+            blob: tarball.clone(),
+            ..Default::default()
+        })
+        .await;
+
+        let mut client = MonopsonyGrpcClient::connect(&addr, None)
+            .await
+            .expect("connect to mock");
+
+        // 1. CheckUpdate
+        let resp = client
+            .check_update("test-client-1", "1.0.0", "client", &platform)
+            .await
+            .unwrap();
+        assert_eq!(resp.latest_version, "2.0.0");
+        assert!(resp.update_available);
+        assert!(resp.rollout_approved);
+        assert_eq!(resp.assets.len(), 1);
+
+        // 2. Rebuild the canonical payload from WIRE fields (never trust a
+        //    server-sent preimage) and verify the signature.
+        use crate::self_update::{
+            build_update_manifest_payload, verify_update_manifest, ManifestAsset, ManifestCheck,
+        };
+        let rebuilt: Vec<ManifestAsset> =
+            resp.assets.iter().map(ManifestAsset::from_proto).collect();
+        let payload =
+            build_update_manifest_payload(&resp.latest_version, "client", &platform, &rebuilt);
+        assert_eq!(
+            verify_update_manifest(&payload, &resp.manifest_sig, Some(&vk)).unwrap(),
+            ManifestCheck::Verified
+        );
+
+        // 3. Download + stream-integrity check.
+        let (blob, stream_sha) = client
+            .download_update_asset("test-client-1", "client", "2.0.0", &platform)
+            .await
+            .unwrap();
+        assert_eq!(blob, tarball);
+        assert_eq!(stream_sha, crate::self_update::sha256_hex(&tarball));
+
+        // 4. Stage: extraction produces the inner binary, executable.
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("monopsony-client");
+        std::fs::write(&current, b"old").unwrap();
+        let (staged, staged_sha) =
+            crate::self_update::stage_update_asset(&blob, temp.path(), &current).unwrap();
+        assert_eq!(std::fs::read(&staged).unwrap(), inner);
+        assert_eq!(staged_sha, crate::self_update::sha256_hex(&inner));
+    }
+
+    /// A signature computed over a DIFFERENT manifest than the one the
+    /// response carries must fail closed on the client side.
+    #[tokio::test]
+    async fn server_update_flow_manifest_negative_fails_closed() {
+        let (tarball, _) = test_release_tarball();
+        let platform = crate::self_update::release_platform().unwrap().to_string();
+        // Signature over version 9.9.9 while the response claims 2.0.0.
+        let (vk, sig, asset) = signed_manifest_setup(&tarball, &platform, "9.9.9");
+
+        let addr = spawn_mock_control(MockUpdateControl {
+            asset,
+            manifest_sig: sig,
+            blob: tarball,
+            ..Default::default()
+        })
+        .await;
+        let mut client = MonopsonyGrpcClient::connect(&addr, None).await.unwrap();
+
+        let resp = client
+            .check_update("test-client-2", "1.0.0", "client", &platform)
+            .await
+            .unwrap();
+        use crate::self_update::{
+            build_update_manifest_payload, verify_update_manifest, ManifestAsset,
+        };
+        let rebuilt: Vec<ManifestAsset> =
+            resp.assets.iter().map(ManifestAsset::from_proto).collect();
+        let payload =
+            build_update_manifest_payload(&resp.latest_version, "client", &platform, &rebuilt);
+        let err = verify_update_manifest(&payload, &resp.manifest_sig, Some(&vk)).unwrap_err();
+        assert!(
+            err.to_string().contains("fail-closed") || err.to_string().contains("signature"),
+            "{}",
+            err
+        );
+    }
+
+    /// Chunks carrying a wrong full-blob digest make the reassembly fail.
+    #[tokio::test]
+    async fn server_update_flow_corrupt_stream_digest_detected() {
+        let (tarball, _) = test_release_tarball();
+        let platform = crate::self_update::release_platform().unwrap().to_string();
+        let (_vk, sig, asset) = signed_manifest_setup(&tarball, &platform, "2.0.0");
+
+        let addr = spawn_mock_control(MockUpdateControl {
+            asset,
+            manifest_sig: sig,
+            blob: tarball,
+            chunk_sha_override: "deadbeefdeadbeef".to_string(),
+            ..Default::default()
+        })
+        .await;
+        let mut client = MonopsonyGrpcClient::connect(&addr, None).await.unwrap();
+
+        let err = client
+            .download_update_asset("test-client-3", "client", "2.0.0", &platform)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("hash mismatch"), "{}", err);
+    }
+
+    /// A chunk whose offset does not match the reassembled length aborts
+    /// the download (strict ordering — no silent gap-fill).
+    #[tokio::test]
+    async fn server_update_flow_out_of_order_chunk_rejected() {
+        // Blob > 1 chunk (1.5 MiB) so offsets matter.
+        let mut tarball = test_release_tarball().0;
+        tarball.extend_from_slice(&vec![0u8; 1024 * 1024]);
+        let platform = crate::self_update::release_platform().unwrap().to_string();
+        let (_vk, sig, asset) = signed_manifest_setup(&tarball, &platform, "2.0.0");
+
+        let addr = spawn_mock_control(MockUpdateControl {
+            asset,
+            manifest_sig: sig,
+            blob: tarball,
+            second_chunk_offset: Some(424_242),
+            ..Default::default()
+        })
+        .await;
+        let mut client = MonopsonyGrpcClient::connect(&addr, None).await.unwrap();
+
+        let err = client
+            .download_update_asset("test-client-4", "client", "2.0.0", &platform)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("out of order"), "{}", err);
+    }
+
+    /// Multi-chunk reassembly: 1.5 MiB across two chunks round-trips with
+    /// the full digest verified.
+    #[tokio::test]
+    async fn server_update_flow_multichunk_reassembly() {
+        let mut tarball = test_release_tarball().0;
+        tarball.extend_from_slice(&vec![7u8; 1024 * 1024]);
+        let platform = crate::self_update::release_platform().unwrap().to_string();
+        let (_vk, sig, asset) = signed_manifest_setup(&tarball, &platform, "2.0.0");
+
+        let addr = spawn_mock_control(MockUpdateControl {
+            asset,
+            manifest_sig: sig,
+            blob: tarball.clone(),
+            ..Default::default()
+        })
+        .await;
+        let mut client = MonopsonyGrpcClient::connect(&addr, None).await.unwrap();
+
+        let (blob, stream_sha) = client
+            .download_update_asset("test-client-5", "client", "2.0.0", &platform)
+            .await
+            .unwrap();
+        assert_eq!(blob.len(), tarball.len());
+        assert_eq!(blob, tarball);
+        assert_eq!(stream_sha, crate::self_update::sha256_hex(&tarball));
+    }
+}
+
+// ─── Sprint 34 P3: in-proc mock control server + update flow tests ───
+
+#[cfg(test)]
+mod update_mock {
+    use monopsony_common::proto::monopsony::monopsony_control_server::MonopsonyControl;
+    use monopsony_common::proto::monopsony::*;
+    use std::pin::Pin;
+    use tonic::{Request, Response, Status};
+
+    /// In-proc MonopsonyControl implementing ONLY the P2 update RPCs;
+    /// every other method is Unimplemented (the client under test never
+    /// calls them). Fields configure per-test behavior.
+    pub struct MockUpdateControl {
+        pub latest_version: String,
+        pub update_available: bool,
+        pub rollout_approved: bool,
+        pub asset: UpdateAssetInfo,
+        pub manifest_sig: String,
+        pub blob: Vec<u8>,
+        /// Forced sha256 carried on chunks ("" = the real digest).
+        pub chunk_sha_override: String,
+        /// Forced offset for the SECOND chunk (None = honest offsets).
+        pub second_chunk_offset: Option<i64>,
+    }
+
+    impl Default for MockUpdateControl {
+        fn default() -> Self {
+            Self {
+                latest_version: "2.0.0".to_string(),
+                update_available: true,
+                rollout_approved: true,
+                asset: UpdateAssetInfo::default(),
+                manifest_sig: String::new(),
+                blob: Vec::new(),
+                chunk_sha_override: String::new(),
+                second_chunk_offset: None,
+            }
+        }
+    }
+
+    type ChunkStream =
+        Pin<Box<dyn futures_util::Stream<Item = Result<UpdateAssetChunk, Status>> + Send>>;
+    type ShadowChunkStream =
+        Pin<Box<dyn futures_util::Stream<Item = Result<ShadowAssetChunk, Status>> + Send>>;
+    type ServerMsgStream =
+        Pin<Box<dyn futures_util::Stream<Item = Result<ServerMessage, Status>> + Send>>;
+
+    /// Mirror the server's 1 MiB asset chunk size.
+    const CHUNK_SIZE: usize = 1024 * 1024;
+
+    #[tonic::async_trait]
+    impl MonopsonyControl for MockUpdateControl {
+        type DownloadUpdateAssetStream = ChunkStream;
+
+        async fn check_update(
+            &self,
+            _request: Request<CheckUpdateRequest>,
+        ) -> Result<Response<CheckUpdateResponse>, Status> {
+            Ok(Response::new(CheckUpdateResponse {
+                latest_version: self.latest_version.clone(),
+                update_available: self.update_available,
+                rollout_approved: self.rollout_approved,
+                assets: if self.update_available {
+                    vec![self.asset.clone()]
+                } else {
+                    Vec::new()
+                },
+                changelog_url: String::new(),
+                manifest_sig: self.manifest_sig.clone(),
+                manifest_key_id: String::new(),
+            }))
+        }
+
+        async fn download_update_asset(
+            &self,
+            _request: Request<DownloadUpdateAssetRequest>,
+        ) -> Result<Response<Self::DownloadUpdateAssetStream>, Status> {
+            let digest = if self.chunk_sha_override.is_empty() {
+                crate::self_update::sha256_hex(&self.blob)
+            } else {
+                self.chunk_sha_override.clone()
+            };
+            let mut offset_override: Option<i64> = None;
+            let mut chunks: Vec<Result<UpdateAssetChunk, Status>> = Vec::new();
+            for (i, c) in self.blob.chunks(CHUNK_SIZE).enumerate() {
+                chunks.push(Ok(UpdateAssetChunk {
+                    data: c.to_vec(),
+                    offset: (i * CHUNK_SIZE) as i64,
+                    total_size: self.blob.len() as i64,
+                    sha256: digest.clone(),
+                }));
+            }
+            if let Some(forced) = self.second_chunk_offset {
+                offset_override = Some(forced);
+            }
+            if let (Some(forced), Some(Ok(first))) = (offset_override, chunks.first_mut()) {
+                first.offset = forced;
+            }
+            Ok(Response::new(
+                Box::pin(futures_util::stream::iter(chunks)) as Self::DownloadUpdateAssetStream
+            ))
+        }
+
+        async fn register(
+            &self,
+            _request: Request<RegisterRequest>,
+        ) -> Result<Response<RegisterResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn heartbeat(
+            &self,
+            _request: Request<HeartbeatRequest>,
+        ) -> Result<Response<HeartbeatResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn revoke_client_cert(
+            &self,
+            _request: Request<RevokeClientCertRequest>,
+        ) -> Result<Response<RevokeClientCertResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn renew_client_cert(
+            &self,
+            _request: Request<RenewClientCertRequest>,
+        ) -> Result<Response<RenewClientCertResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn report_inventory(
+            &self,
+            _request: Request<InventoryReport>,
+        ) -> Result<Response<InventoryResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        type ControlStreamStream = ServerMsgStream;
+
+        async fn control_stream(
+            &self,
+            _request: Request<tonic::Streaming<ClientMessage>>,
+        ) -> Result<Response<Self::ControlStreamStream>, Status> {
+            Ok(Response::new(Box::pin(futures_util::stream::empty())))
+        }
+
+        async fn list_shadow_packages(
+            &self,
+            _request: Request<ListShadowPackagesRequest>,
+        ) -> Result<Response<ShadowPackageList>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn register_shadow_package(
+            &self,
+            _request: Request<RegisterShadowPackageRequest>,
+        ) -> Result<Response<ShadowPackageInfo>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn query_shadow_registry(
+            &self,
+            _request: Request<QueryShadowRegistryRequest>,
+        ) -> Result<Response<QueryShadowRegistryResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn unregister_shadow_package(
+            &self,
+            _request: Request<UnregisterShadowPackageRequest>,
+        ) -> Result<Response<UnregisterShadowPackageResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn check_shadow_updates(
+            &self,
+            _request: Request<CheckShadowUpdatesRequest>,
+        ) -> Result<Response<ShadowUpdateList>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn apply_shadow_update(
+            &self,
+            _request: Request<ApplyShadowUpdateRequest>,
+        ) -> Result<Response<ShadowUpdateResult>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn rollback_shadow_update(
+            &self,
+            _request: Request<RollbackShadowUpdateRequest>,
+        ) -> Result<Response<ShadowUpdateResult>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn get_shadow_recipe(
+            &self,
+            _request: Request<GetShadowRecipeRequest>,
+        ) -> Result<Response<SignedShadowRecipe>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        type DownloadShadowAssetStream = ShadowChunkStream;
+
+        async fn download_shadow_asset(
+            &self,
+            _request: Request<DownloadShadowAssetRequest>,
+        ) -> Result<Response<Self::DownloadShadowAssetStream>, Status> {
+            Ok(Response::new(Box::pin(futures_util::stream::empty())))
+        }
+
+        async fn list_shadow_catalog(
+            &self,
+            _request: Request<ListShadowCatalogRequest>,
+        ) -> Result<Response<ShadowCatalog>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn report_shadow_scan(
+            &self,
+            _request: Request<ShadowScanReport>,
+        ) -> Result<Response<ShadowScanAck>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn list_shadow_staging(
+            &self,
+            _request: Request<ListShadowStagingRequest>,
+        ) -> Result<Response<ShadowStagingList>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        async fn resolve_shadow_staging(
+            &self,
+            _request: Request<ResolveShadowStagingRequest>,
+        ) -> Result<Response<ResolveShadowStagingResponse>, Status> {
+            Err(Status::unimplemented("mock"))
         }
     }
 }

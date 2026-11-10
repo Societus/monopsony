@@ -6,9 +6,9 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Which monopsony binary a self-update targets. Release assets are
 /// kind-prefixed (`monopsony-server-v...` / `monopsony-client-v...`) and each
@@ -37,9 +37,182 @@ impl BinaryKind {
             _ => BinaryKind::Client,
         }
     }
+
+    /// Wire name for the P2 `CheckUpdate`/`DownloadUpdateAsset` RPCs
+    /// (release-contract kind; the server validates `client` | `server`).
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            BinaryKind::Server => "server",
+            BinaryKind::Client => "client",
+        }
+    }
+}
+
+/// Map (os, arch) onto the release-asset contract platform token
+/// (`linux-x86_64` | `linux-aarch64` | `darwin-arm64` | `darwin-x86_64`).
+/// std reports `aarch64` on Apple Silicon while assets use Apple's `arm64`;
+/// remapped here. `None` = no assets are published for this platform.
+fn contract_platform(os: &str, arch: &str) -> Option<&'static str> {
+    match (os, arch) {
+        ("linux", "x86_64") => Some("linux-x86_64"),
+        ("linux", "aarch64") => Some("linux-aarch64"),
+        ("darwin", "aarch64") | ("darwin", "arm64") => Some("darwin-arm64"),
+        ("darwin", "x86_64") => Some("darwin-x86_64"),
+        _ => None,
+    }
+}
+
+/// This host's release-contract platform token, for the CheckUpdate /
+/// DownloadUpdateAsset RPCs. `None` on platforms with no published assets.
+pub fn release_platform() -> Option<String> {
+    let (os, arch, _libc) = detect_platform();
+    contract_platform(&os, &arch).map(str::to_string)
 }
 
 // ─── Managed Update Pipeline Types ─────────────────────────────────
+
+/// Where a self-update asset comes from (Sprint 34 P3). The managed
+/// pipeline consumes this instead of downloading from a URL inside phase 1;
+/// the pipeline phases, snapshot and rollback logic are unchanged.
+#[derive(Debug, Clone)]
+pub enum AssetProvider {
+    /// Direct URL download — today's behavior (GitHub-direct path). The
+    /// URL suffix still drives the archive-vs-raw decision.
+    Url(String),
+    /// Bytes already fetched over the P2 gRPC stream (DownloadUpdateAsset).
+    /// Archive-vs-raw is decided by magic-byte sniffing. (Sprint 34 P4
+    /// consumes this for the server's own self-apply.)
+    #[allow(dead_code)] // P4 wiring; exercised in tests today
+    ServerStream(Vec<u8>),
+    /// Already-stored local artifact: the staged finalize file, and (P4)
+    /// the server's own self-apply from its ShadowCache blob. Sniffed like
+    /// [`AssetProvider::ServerStream`].
+    LocalBlob(PathBuf),
+}
+
+impl AssetProvider {
+    /// URL suffix hint for archive detection. Only the [`AssetProvider::Url`]
+    /// variant carries one — byte providers are sniffed by content.
+    fn url_hint(&self) -> Option<&str> {
+        match self {
+            AssetProvider::Url(url) => Some(url.as_str()),
+            _ => None,
+        }
+    }
+}
+
+/// Archive container of an update asset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchiveKind {
+    TarGz,
+    Zip,
+    Raw,
+}
+
+/// Decide archive-vs-raw for asset bytes. URL providers keep the historical
+/// suffix-driven behavior; byte providers (ServerStream/LocalBlob) carry no
+/// reliable name and are sniffed by magic — gzip (`1f 8b`) and zip (`PK`)
+/// headers. Released monopsony binaries are ELF/Mach-O and never start with
+/// either magic, so the sniff cannot misclassify a real binary.
+fn archive_kind(bytes: &[u8], url_hint: Option<&str>) -> ArchiveKind {
+    if let Some(url) = url_hint {
+        if url.ends_with(".tar.gz") {
+            return ArchiveKind::TarGz;
+        }
+        if url.ends_with(".zip") {
+            return ArchiveKind::Zip;
+        }
+    }
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        return ArchiveKind::TarGz;
+    }
+    if bytes.starts_with(b"PK") {
+        return ArchiveKind::Zip;
+    }
+    ArchiveKind::Raw
+}
+
+/// Write asset bytes to `new_path`, extracting the monopsony binary when
+/// the bytes are an archive. `url_hint` carries the URL suffix for
+/// [`AssetProvider::Url`]; `None` means sniff.
+fn stage_asset_bytes(bytes: &[u8], new_path: &Path, url_hint: Option<&str>) -> Result<()> {
+    // extract_binary_from_archive predates P3 and takes &PathBuf.
+    let out_path = new_path.to_path_buf();
+    match archive_kind(bytes, url_hint) {
+        ArchiveKind::TarGz => {
+            extract_binary_from_archive(bytes, &out_path, "asset.tar.gz")?;
+        }
+        ArchiveKind::Zip => {
+            extract_binary_from_archive(bytes, &out_path, "asset.zip")?;
+        }
+        ArchiveKind::Raw => {
+            std::fs::write(new_path, bytes).context("Failed to write new binary")?;
+        }
+    }
+    Ok(())
+}
+
+/// Mark a path executable (0755) on Unix; no-op on Windows.
+fn set_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(path, perms)?;
+    }
+    #[cfg(windows)]
+    let _ = path;
+    Ok(())
+}
+
+/// Atomically move `new_path` over `current_path`. On Windows the running
+/// file cannot be renamed over, so it is removed first (the historical
+/// behavior of both call sites).
+fn swap_binary(new_path: &Path, current_path: &Path) -> Result<()> {
+    info!("Swapping binary...");
+    #[cfg(unix)]
+    {
+        std::fs::rename(new_path, current_path).context("Failed to atomically swap binary")?;
+    }
+    #[cfg(windows)]
+    {
+        if current_path.exists() {
+            std::fs::remove_file(current_path)?;
+        }
+        std::fs::rename(new_path, current_path).context("Failed to atomically swap binary")?;
+    }
+    Ok(())
+}
+
+/// Fetch the asset bytes for a provider. Only [`AssetProvider::Url`]
+/// performs I/O against the network; the other variants are already-local
+/// bytes (streamed earlier / staged on disk).
+async fn fetch_asset_bytes(asset: &AssetProvider) -> Result<Vec<u8>> {
+    match asset {
+        AssetProvider::Url(url) => {
+            let client = Client::new();
+            info!("Downloading {}...", url);
+            let response = client.get(url).send().await?;
+            if !response.status().is_success() {
+                anyhow::bail!("Download failed: status {} for {}", response.status(), url);
+            }
+            Ok(response.bytes().await?.to_vec())
+        }
+        AssetProvider::ServerStream(bytes) => {
+            info!(
+                "Using {} bytes fetched over the server update stream",
+                bytes.len()
+            );
+            Ok(bytes.clone())
+        }
+        AssetProvider::LocalBlob(path) => {
+            info!("Reading staged asset {}", path.display());
+            std::fs::read(path)
+                .with_context(|| format!("Failed to read staged asset {}", path.display()))
+        }
+    }
+}
 
 /// Snapshot of a config file before update (for rollback).
 #[derive(Debug)]
@@ -66,13 +239,20 @@ pub struct UpdateContext {
     pub backup_dir: PathBuf,
     pub from_version: String,
     pub to_version: String,
-    pub asset_url: String,
+    /// Where the asset comes from (P3). Historically a URL string; the
+    /// server-first path feeds [`AssetProvider::ServerStream`] bytes and the
+    /// finalize path feeds a [`AssetProvider::LocalBlob`] staged file.
+    pub asset: AssetProvider,
     pub config_paths: Vec<PathBuf>,
     config_snapshots: Vec<ConfigSnapshot>,
 }
 
 impl UpdateContext {
     /// Create a new UpdateContext with a versioned backup directory.
+    ///
+    /// Kept signature-compatible with the pre-P3 call sites (the server
+    /// wrapper passes a GitHub URL): the URL is wrapped into an
+    /// [`AssetProvider::Url`] provider.
     pub fn new(
         recipe: Option<monopsony_common::shadow_types::ShadowRecipe>,
         current_path: PathBuf,
@@ -80,6 +260,25 @@ impl UpdateContext {
         from_version: String,
         to_version: String,
         asset_url: String,
+    ) -> Self {
+        Self::with_provider(
+            recipe,
+            current_path,
+            install_dir,
+            from_version,
+            to_version,
+            AssetProvider::Url(asset_url),
+        )
+    }
+
+    /// Create an UpdateContext around an explicit asset provider.
+    pub fn with_provider(
+        recipe: Option<monopsony_common::shadow_types::ShadowRecipe>,
+        current_path: PathBuf,
+        install_dir: PathBuf,
+        from_version: String,
+        to_version: String,
+        asset: AssetProvider,
     ) -> Self {
         let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
         let backup_dir = install_dir.join(format!("update-backup-{}", timestamp));
@@ -97,7 +296,7 @@ impl UpdateContext {
             backup_dir,
             from_version,
             to_version,
-            asset_url,
+            asset,
             config_paths,
             config_snapshots: Vec::new(),
         }
@@ -272,6 +471,19 @@ fn run_hook(hook_name: &str, command: &str) -> Result<()> {
     }
 }
 
+/// pgrep -x matches against the kernel's `comm`, which is truncated to 15
+/// characters — procps ≥4 errors out ("pattern longer than 15 characters
+/// will result in zero matches") on longer patterns. Verified live
+/// (2026-11-10): `pgrep -x monopsony-client` matches NOTHING while the
+/// daemon runs with comm "monopsony-clien". Truncate to comm granularity
+/// so exact-match semantics work for real binary names.
+fn comm_name(process: &str) -> &str {
+    match process.char_indices().nth(15) {
+        Some((idx, _)) => &process[..idx],
+        None => process,
+    }
+}
+
 /// Run a health check with timeout polling.
 async fn run_health_check(check: &monopsony_common::shadow_types::HealthCheck) -> Result<()> {
     use monopsony_common::shadow_types::HealthCheckType;
@@ -319,11 +531,13 @@ async fn run_health_check(check: &monopsony_common::shadow_types::HealthCheck) -
                 .process
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("Process health check requires process name"))?;
+            // Match the kernel's comm granularity (15 chars) — see comm_name.
+            let comm = comm_name(process).to_string();
             let start = Instant::now();
             loop {
                 let output = std::process::Command::new("pgrep")
                     .arg("-x")
-                    .arg(process)
+                    .arg(&comm)
                     .output()?;
                 if output.status.success() {
                     return Ok(());
@@ -356,51 +570,19 @@ pub async fn apply_update_managed(ctx: &mut UpdateContext) -> Result<UpdateOutco
     ctx.create_snapshot()?;
     info!("Snapshot created at {}", ctx.backup_dir.display());
 
-    // Download new binary
-    let client = Client::new();
-    info!("Downloading {}...", ctx.asset_url);
-    let response = client.get(&ctx.asset_url).send().await?;
-    if !response.status().is_success() {
-        anyhow::bail!(
-            "Download failed: status {} for {}",
-            response.status(),
-            ctx.asset_url
-        );
-    }
-    let bytes = response.bytes().await?;
+    // Fetch the asset from the configured provider (P3): Url downloads as
+    // before; ServerStream/LocalBlob are already-local bytes.
+    let bytes = fetch_asset_bytes(&ctx.asset).await?;
 
-    // Extract binary from archive if needed
+    // Extract binary from archive if needed (Url: suffix-driven; byte
+    // providers: magic-sniffed).
     let new_path = sibling_update_path(&ctx.install_dir, &ctx.current_path, "new");
 
-    if ctx.asset_url.ends_with(".tar.gz") || ctx.asset_url.ends_with(".zip") {
-        extract_binary_from_archive(&bytes, &new_path, &ctx.asset_url)?;
-    } else {
-        std::fs::write(&new_path, &bytes).context("Failed to write new binary")?;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&new_path)?.permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&new_path, perms)?;
-    }
+    stage_asset_bytes(&bytes, &new_path, ctx.asset.url_hint())?;
+    set_executable(&new_path)?;
 
     // PHASE 2: APPLY — atomic swap
-    info!("Swapping binary...");
-    #[cfg(unix)]
-    {
-        std::fs::rename(&new_path, &ctx.current_path)
-            .context("Failed to atomically swap binary")?;
-    }
-    #[cfg(windows)]
-    {
-        if ctx.current_path.exists() {
-            std::fs::remove_file(&ctx.current_path)?;
-        }
-        std::fs::rename(&new_path, &ctx.current_path)
-            .context("Failed to atomically swap binary")?;
-    }
+    swap_binary(&new_path, &ctx.current_path)?;
     info!("Binary swapped to version {}", ctx.to_version);
 
     // PHASE 3: VALIDATE & COMMIT/ROLLBACK
@@ -605,15 +787,7 @@ fn select_asset_for_platform(
     os: &str,
     arch: &str,
 ) -> Option<String> {
-    let platform = match (os, arch) {
-        ("linux", "x86_64") => "linux-x86_64",
-        ("linux", "aarch64") => "linux-aarch64",
-        ("darwin", "aarch64") | ("darwin", "arm64") => "darwin-arm64",
-        ("darwin", "x86_64") => "darwin-x86_64",
-        // No assets are published for other platforms today (the legacy
-        // windows/freebsd patterns matched names release CI never produced).
-        _ => return None,
-    };
+    let platform = contract_platform(os, arch)?;
     let pattern = format!(
         "^{}-v{}-{}\\.tar\\.gz$",
         binary_kind.asset_name_prefix(),
@@ -638,6 +812,402 @@ fn sibling_update_path(target_dir: &Path, current_path: &Path, kind: &str) -> Pa
         kind,
         Utc::now().format("%Y%m%d_%H%M%S")
     ))
+}
+
+// ─── Server-mediated update manifest (Sprint 34 P3) ────────────────
+
+/// One servable asset as listed in a CheckUpdate response / manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestAsset {
+    pub name: String,
+    pub platform: String,
+    pub sha256: String,
+    pub size: i64,
+}
+
+impl ManifestAsset {
+    /// From the proto wire type of a CheckUpdate response entry.
+    pub fn from_proto(asset: &monopsony_common::proto::monopsony::UpdateAssetInfo) -> Self {
+        Self {
+            name: asset.name.clone(),
+            platform: asset.platform.clone(),
+            sha256: asset.sha256.clone(),
+            size: asset.size,
+        }
+    }
+}
+
+/// Rebuild the canonical manifest payload — byte-identical to the server's
+/// `build_update_manifest_payload` (control/grpc.rs, P2): serde_json `json!`
+/// with default features (BTreeMap → sorted keys, no whitespace). These are
+/// the exact bytes the Ed25519 manifest signature covers, so the client
+/// verifies against a rebuild from the wire fields, never trusting a
+/// server-sent preimage.
+pub fn build_update_manifest_payload(
+    version: &str,
+    binary: &str,
+    platform: &str,
+    assets: &[ManifestAsset],
+) -> Vec<u8> {
+    serde_json::json!({
+        "assets": assets
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "name": a.name,
+                    "platform": a.platform,
+                    "sha256": a.sha256,
+                    "size": a.size,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "binary": binary,
+        "platform": platform,
+        "version": version,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Outcome of manifest trust verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManifestCheck {
+    /// Signature present and verified against the configured trust key.
+    Verified,
+    /// No trust key configured — signature skipped (sha256-of-served-bytes
+    /// remains; D7 no-key posture). The caller surfaces a warning.
+    SkippedNoKey,
+}
+
+/// Verify a CheckUpdate manifest signature (D8: Ed25519 via the existing
+/// shadow trust key path). Fail-closed when a trust key is configured — an
+/// empty signature or a failed verification is an error, never a warning.
+pub fn verify_update_manifest(
+    payload: &[u8],
+    sig_b64: &str,
+    verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+) -> Result<ManifestCheck> {
+    use base64::Engine;
+    use ed25519_dalek::{Signature, Verifier};
+
+    let Some(vk) = verifying_key else {
+        return Ok(ManifestCheck::SkippedNoKey);
+    };
+    if sig_b64.is_empty() {
+        anyhow::bail!(
+            "update manifest is unsigned but a trust key is configured — refusing (fail-closed)"
+        );
+    }
+    let sig_bytes: Vec<u8> = base64::engine::general_purpose::STANDARD
+        .decode(sig_b64)
+        .context("update manifest signature: base64 decode failed")?;
+    let sig_bytes: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("update manifest signature: wrong length"))?;
+    vk.verify(payload, &Signature::from_bytes(&sig_bytes))
+        .context("update manifest signature verification failed — refusing (fail-closed)")?;
+    Ok(ManifestCheck::Verified)
+}
+
+/// SHA-256 of `bytes` as lowercase hex (manifest/stream digest comparisons
+/// are case-insensitive on the wire side).
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+// ─── Staged two-phase self-apply (Sprint 34 P3) ─────────────────────
+//
+// The daemon cannot health-check a swap of the *running* process from
+// inside itself, so the apply is split:
+//
+//   phase 1 (daemon):  download + verify (manifest sig + sha256) + stage
+//                      the extracted binary + drop a finalize command file,
+//                      spawn a detached finalize process, exit.
+//   phase 2 (finalize, fresh non-daemon process): PID-guarded; snapshot →
+//                      swap → restart via detected init → health gate →
+//                      commit/rollback, reusing the managed pipeline's
+//                      snapshot/rollback/hook machinery around a LocalBlob
+//                      provider.
+
+/// Finalize command file — the handoff from the staging daemon to the
+/// detached finalize process. JSON, written next to the staged binary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalizeCommand {
+    /// Staged (already extracted) binary path.
+    pub staged_path: PathBuf,
+    /// sha256 (hex) of the staged bytes — re-verified by the finalize
+    /// process before it touches anything.
+    pub staged_sha256: String,
+    pub from_version: String,
+    pub to_version: String,
+    /// Release-contract binary kind: "client" | "server".
+    pub binary: String,
+    pub created_at: i64,
+}
+
+/// The per-binary default recipe TOML (P0 split), by kind.
+pub fn default_recipe_for(kind: BinaryKind) -> &'static str {
+    match kind {
+        BinaryKind::Server => monopsony_common::shadow_types::DEFAULT_MONOPSONY_SERVER_RECIPE,
+        BinaryKind::Client => monopsony_common::shadow_types::DEFAULT_MONOPSONY_CLIENT_RECIPE,
+    }
+}
+
+/// Phase 1 staging: write the finalized (extracted, executable) binary as a
+/// timestamped sibling of the current binary and return its path + sha256.
+/// Sniffs archive-vs-raw, so both a raw tarball's bytes and an
+/// already-extracted binary work.
+pub fn stage_update_asset(
+    bytes: &[u8],
+    install_dir: &Path,
+    current_path: &Path,
+) -> Result<(PathBuf, String)> {
+    let staged = sibling_update_path(install_dir, current_path, "staged");
+    stage_asset_bytes(bytes, &staged, None)?;
+    set_executable(&staged)?;
+    let sha = sha256_hex(&std::fs::read(&staged)?);
+    info!(
+        "Staged update binary {} (sha256 {})",
+        staged.display(),
+        &sha[..12.min(sha.len())]
+    );
+    Ok((staged, sha))
+}
+
+/// Write the finalize command file next to the staged binary. Returns its
+/// path (the daemon passes it to the finalize process).
+pub fn write_finalize_command(install_dir: &Path, cmd: &FinalizeCommand) -> Result<PathBuf> {
+    let path = install_dir.join(format!(
+        "monopsony-self-update.finalize.{}.json",
+        cmd.created_at
+    ));
+    std::fs::write(&path, serde_json::to_string_pretty(cmd)?)?;
+    info!("Finalize command written to {}", path.display());
+    Ok(path)
+}
+
+/// Read + parse a finalize command file.
+pub fn read_finalize_command(path: &Path) -> Result<FinalizeCommand> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("Failed to read finalize command {}", path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse finalize command {}", path.display()))
+}
+
+/// PID-file guard: at most one finalize process per install directory.
+/// Stale files (dead PID or unparseable content) are taken over; a live
+/// second finalize refuses loudly. Note: liveness is probed with
+/// `kill -0`, which only distinguishes reliably between same-uid
+/// processes — both the daemon and the finalize run as the service user.
+#[derive(Debug)]
+pub struct FinalizeGuard {
+    path: PathBuf,
+}
+
+impl Drop for FinalizeGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+pub fn acquire_finalize_guard(install_dir: &Path) -> Result<FinalizeGuard> {
+    let path = install_dir.join("monopsony-self-update.pid");
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if let Ok(pid) = existing.trim().parse::<u32>() {
+            if process_alive(pid) {
+                anyhow::bail!(
+                    "another self-update finalize (PID {pid}) is already running — refusing \
+                     to start a second one; if this is wrong, remove {}",
+                    path.display()
+                );
+            }
+        }
+        // Stale guard (dead PID or unparseable) — take it over.
+        let _ = std::fs::remove_file(&path);
+    }
+    std::fs::write(&path, std::process::id().to_string())?;
+    Ok(FinalizeGuard { path })
+}
+
+/// Is a process with this PID alive? `kill -0` via sh — no libc dependency.
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("kill -0 {pid} 2>/dev/null"))
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Spawn `<exe> self-update finalize --command-file <file>` as a detached
+/// process that survives the parent's exit: a plain std process, its own
+/// process group on unix (no terminal HUP propagation, not reaped by the
+/// parent), stdio redirected to a log file so nothing holds the parent's
+/// pipes open.
+pub fn spawn_detached_finalize(exe: &Path, command_file: &Path, install_dir: &Path) -> Result<()> {
+    let log_path = install_dir.join("monopsony-self-update-finalize.log");
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("Failed to open finalize log {}", log_path.display()))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("self-update")
+        .arg("finalize")
+        .arg("--command-file")
+        .arg(command_file)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Own process group — survives the daemon's exit and any terminal
+        // signal group delivery.
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn()?;
+    info!(
+        "Detached finalize process spawned (pid {}, log {})",
+        child.id(),
+        log_path.display()
+    );
+    Ok(())
+}
+
+// ─── Init-system restart (Sprint 34 P3) ────────────────────────────
+//
+// Detection families mirror the installer's detect_init() (dist/install.sh):
+// strongest signals first. The bench fleet exercises all three (ct/1952
+// systemd, ct/1904 OpenRC, m2mini launchd).
+
+/// The init system that manages the monopsony unit on this host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitSystem {
+    Systemd,
+    OpenRc,
+    Launchd,
+    Unknown,
+}
+
+/// Pure decision core of [`detect_init_system`] — testable without touching
+/// the host. `os` is `std::env::consts::OS` ("linux" | "macos" | ...).
+fn decide_init_system(
+    os: &str,
+    systemd_run_dir: bool,
+    openrc_softlevel: bool,
+    rc_service_present: bool,
+    launchctl_present: bool,
+) -> InitSystem {
+    if os == "macos" && launchctl_present {
+        return InitSystem::Launchd;
+    }
+    if systemd_run_dir {
+        return InitSystem::Systemd;
+    }
+    if openrc_softlevel && rc_service_present {
+        return InitSystem::OpenRc;
+    }
+    InitSystem::Unknown
+}
+
+/// Detect the host's init system. `Unknown` hosts get a loud manual-restart
+/// instruction from the caller — never a silent skip.
+pub fn detect_init_system() -> InitSystem {
+    decide_init_system(
+        std::env::consts::OS,
+        Path::new("/run/systemd/system").exists(),
+        Path::new("/run/openrc/softlevel").exists(),
+        which_in_path("rc-service"),
+        which_in_path("launchctl"),
+    )
+}
+
+fn which_in_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|dir| dir.join(program).is_file()))
+        .unwrap_or(false)
+}
+
+/// The service unit name for a binary under an init system. systemd/OpenRC
+/// use the installed unit names (dist/init templates); launchd uses the
+/// reverse-DNS label. The client's launchd label follows the committed
+/// `com.monopsony.server.plist` convention.
+impl InitSystem {
+    /// Human-readable name for operator-facing messages.
+    pub fn label(&self) -> &'static str {
+        match self {
+            InitSystem::Systemd => "systemd",
+            InitSystem::OpenRc => "OpenRC",
+            InitSystem::Launchd => "launchd",
+            InitSystem::Unknown => "unknown init system",
+        }
+    }
+}
+
+pub fn unit_for(init: InitSystem, kind: BinaryKind) -> &'static str {
+    match (init, kind) {
+        (InitSystem::Launchd, BinaryKind::Client) => "com.monopsony.client",
+        (InitSystem::Launchd, BinaryKind::Server) => "com.monopsony.server",
+        (_, BinaryKind::Client) => "monopsony-client",
+        (_, BinaryKind::Server) => "monopsony-server",
+    }
+}
+
+/// The restart command for an init system + unit (pure — tests assert the
+/// argv map). `None` when no supported init was detected.
+pub fn restart_argv(init: InitSystem, unit: &str) -> Option<(String, Vec<String>)> {
+    match init {
+        InitSystem::Systemd => Some((
+            "systemctl".to_string(),
+            vec!["restart".to_string(), unit.to_string()],
+        )),
+        InitSystem::OpenRc => Some((
+            "rc-service".to_string(),
+            vec![unit.to_string(), "restart".to_string()],
+        )),
+        // -k: kill the running instance and restart it immediately.
+        InitSystem::Launchd => Some((
+            "launchctl".to_string(),
+            vec![
+                "kickstart".to_string(),
+                "-k".to_string(),
+                format!("system/{unit}"),
+            ],
+        )),
+        InitSystem::Unknown => None,
+    }
+}
+
+/// Restart the service unit via the detected init. Failure is returned as a
+/// loud operator-facing error (manual restart instructions travel in the
+/// message) — there is no silent fallback.
+pub fn restart_service_unit(unit: &str) -> Result<()> {
+    let init = detect_init_system();
+    let Some((program, args)) = restart_argv(init, unit) else {
+        anyhow::bail!(
+            "no supported init system detected (systemd/OpenRC/launchd) — \
+             restart {unit} MANUALLY; the swapped binary is already on disk"
+        );
+    };
+    let output = std::process::Command::new(&program)
+        .args(&args)
+        .output()
+        .with_context(|| format!("failed to execute {program} to restart {unit}"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "{} {} failed (exit {}): {} — restart {unit} MANUALLY; the swapped binary is already on disk",
+            program,
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    info!("Restarted service unit {unit} via {program}");
+    Ok(())
 }
 
 /// Download and apply update with atomic swap (raw, no safety pipeline)
@@ -706,6 +1276,255 @@ pub async fn apply_update(
 
     info!("Update applied successfully: {}", version);
     Ok(())
+}
+
+/// How [`run_finalize`] restarts the unit after the swap. `DetectedInit` is
+/// the production behavior; `Noop` is the test/simulation seam (house rule:
+/// tests never touch real services).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartAction {
+    DetectedInit,
+    /// Test/simulation seam — tests never touch real service units.
+    #[allow(dead_code)] // test seam
+    Noop,
+}
+
+/// Phase 2 of the staged apply — run by the detached `self-update finalize`
+/// process after the staging daemon exited. Reuses the managed pipeline's
+/// snapshot, hooks, health-check and rollback machinery around a
+/// [`AssetProvider::LocalBlob`] provider.
+///
+/// Order note (deliberate, recorded in the sprint progress doc): the plan
+/// architecture prose reads "swap → health check → restart", but the daemon
+/// has EXITED by the time this runs — a process health check before the
+/// restart can only ever match this finalize process itself (`pgrep -x
+/// monopsony-client` self-match = vacuous pass) while nothing else runs.
+/// The implementable order is: snapshot → swap → restart via detected init
+/// → health gate (recipe health_check, process checks exclude our own PID)
+/// → commit / rollback (rollback restarts again to bring the old binary
+/// up). Restart failure is LOUD, never silent — but it does not pre-empt
+/// the health gate (an operator's Restart=always may have covered for us).
+pub async fn run_finalize(
+    cmd: &FinalizeCommand,
+    current_path: &Path,
+    restart: RestartAction,
+) -> Result<UpdateOutcome> {
+    let kind = BinaryKind::from_binary_type(&cmd.binary);
+    let recipe =
+        toml::from_str::<monopsony_common::shadow_types::ShadowRecipe>(default_recipe_for(kind))
+            .ok();
+    run_finalize_with_recipe(cmd, current_path, restart, recipe).await
+}
+
+/// Recipe-injectable core of [`run_finalize`]; tests drive this with
+/// benign hooks and a unique health-check process name (the default recipe
+/// stops/starts real service units — house rule: tests never touch them).
+pub async fn run_finalize_with_recipe(
+    cmd: &FinalizeCommand,
+    current_path: &Path,
+    restart: RestartAction,
+    recipe: Option<monopsony_common::shadow_types::ShadowRecipe>,
+) -> Result<UpdateOutcome> {
+    let kind = BinaryKind::from_binary_type(&cmd.binary);
+    // 0. The staged bytes must still be exactly what phase 1 recorded.
+    let staged_bytes = std::fs::read(&cmd.staged_path)
+        .with_context(|| format!("staged binary missing: {}", cmd.staged_path.display()))?;
+    let staged_sha = sha256_hex(&staged_bytes);
+    if !staged_sha.eq_ignore_ascii_case(&cmd.staged_sha256) {
+        anyhow::bail!(
+            "staged binary hash mismatch: expected {}, found {} — refusing to finalize \
+             (the staged file was modified after staging)",
+            cmd.staged_sha256,
+            staged_sha
+        );
+    }
+
+    let install_dir = current_path
+        .parent()
+        .context("current binary has no parent directory")?
+        .to_path_buf();
+
+    let mut ctx = UpdateContext::with_provider(
+        recipe,
+        current_path.to_path_buf(),
+        install_dir,
+        cmd.from_version.clone(),
+        cmd.to_version.clone(),
+        AssetProvider::LocalBlob(cmd.staged_path.clone()),
+    );
+
+    // 1. pre_update hook — stops the unit; systemd Restart=always may have
+    //    already respawned the old daemon after phase 1's exit, and it must
+    //    be stopped before the swap lands.
+    if let Some(ref recipe) = ctx.recipe {
+        if let Some(ref pre) = recipe.install.pre_update {
+            run_hook("pre_update", pre).context("pre_update hook failed — aborting finalize")?;
+        }
+    }
+
+    // 2. Snapshot (managed pipeline machinery: binary + configs).
+    ctx.create_snapshot()?;
+
+    // 3. Swap: stage the staged bytes to a fresh sibling and rename over
+    //    the current binary (same mechanics as the managed pipeline).
+    let new_path = sibling_update_path(&ctx.install_dir, &ctx.current_path, "new");
+    stage_asset_bytes(&staged_bytes, &new_path, None)?;
+    set_executable(&new_path)?;
+    swap_binary(&new_path, &ctx.current_path)?;
+    info!(
+        "Finalize swapped binary: {} → {}",
+        cmd.from_version, cmd.to_version
+    );
+
+    // 4. Restart via the detected init — loud on failure, no silent path.
+    let init = detect_init_system();
+    let unit = unit_for(init, kind);
+    if restart == RestartAction::DetectedInit {
+        if let Err(e) = restart_service_unit(unit) {
+            error!("MONOPSONY SELF-UPDATE: {e:#}");
+            eprintln!("MONOPSONY SELF-UPDATE: {e:#}");
+        }
+    }
+
+    // 5. Health gate. Process checks exclude this finalize process's own
+    //    PID (it matches the unit's process name); port/http checks run
+    //    exactly as the managed pipeline's run_health_check.
+    let health_ok = match ctx
+        .recipe
+        .as_ref()
+        .and_then(|r| r.install.health_check.as_ref())
+    {
+        Some(check)
+            if matches!(
+                check.check_type,
+                monopsony_common::shadow_types::HealthCheckType::Process
+            ) =>
+        {
+            let name = check.process.clone().unwrap_or_default();
+            wait_for_process_excluding_self(
+                &name,
+                std::time::Duration::from_secs(check.timeout_secs.max(1)),
+            )
+            .await
+            .is_ok()
+        }
+        Some(check) => run_health_check(check).await.is_ok(),
+        None => true,
+    };
+
+    if !health_ok {
+        if let Some(ref recipe) = ctx.recipe {
+            if let Some(ref on_fail) = recipe.install.on_failure {
+                let _ = run_hook("on_failure", on_fail);
+            }
+        }
+        ctx.rollback("finalize health check failed")?;
+        if restart == RestartAction::DetectedInit {
+            if let Err(e) = restart_service_unit(unit) {
+                error!("MONOPSONY SELF-UPDATE: post-rollback restart failed: {e:#}");
+                eprintln!(
+                    "MONOPSONY SELF-UPDATE: post-rollback restart failed: {e:#} — the \
+                     previous binary is restored on disk; restart {unit} MANUALLY"
+                );
+            }
+        }
+        return Ok(UpdateOutcome::RolledBack(
+            "finalize health check failed — previous binary restored".to_string(),
+        ));
+    }
+
+    // 6. Commit.
+    ctx.restore_config_edits()?;
+    ctx.prune_backups()?;
+    if let Some(ref recipe) = ctx.recipe {
+        if let Some(ref post) = recipe.install.post_update {
+            if let Err(e) = run_hook("post_update", post) {
+                warn!("post_update hook failed: {}", e);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&cmd.staged_path);
+    info!(
+        "Finalize committed: {} → {} (unit {unit})",
+        cmd.from_version, cmd.to_version
+    );
+    Ok(UpdateOutcome::Success)
+}
+
+/// Process health gate for the finalize path: healthy only when a process
+/// OTHER than this one matches (`pgrep -x`). The finalize process is itself
+/// a monopsony binary, so an unfiltered self-match would be a vacuous pass.
+async fn wait_for_process_excluding_self(
+    process: &str,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    use std::time::Instant;
+
+    let start = Instant::now();
+    let my_pid = std::process::id();
+    // Match the kernel's comm granularity (15 chars) — see comm_name.
+    let comm = comm_name(process).to_string();
+    loop {
+        let output = std::process::Command::new("pgrep")
+            .arg("-x")
+            .arg(&comm)
+            .output()?;
+        if output.status.success() {
+            let others: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+                .split_whitespace()
+                .filter_map(|p| p.parse().ok())
+                .filter(|&pid| pid != my_pid)
+                .collect();
+            if !others.is_empty() {
+                info!("process '{process}' healthy (pid {})", others[0]);
+                return Ok(());
+            }
+        }
+        if start.elapsed() >= timeout {
+            anyhow::bail!(
+                "process '{}' (other than the finalize process) not running after {}s",
+                process,
+                timeout.as_secs()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
+
+/// `self-update rollback`: restore the newest `update-backup-*/binary.bak`
+/// (the managed pipeline's snapshot layout) over the current binary.
+/// Returns the backup path used.
+pub fn rollback_latest_backup(current_path: &Path, install_dir: &Path) -> Result<PathBuf> {
+    let mut backups: Vec<_> = std::fs::read_dir(install_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map(|n| n.starts_with("update-backup-"))
+                .unwrap_or(false)
+        })
+        .collect();
+    if backups.is_empty() {
+        anyhow::bail!(
+            "no update backups found under {} — nothing to roll back to",
+            install_dir.display()
+        );
+    }
+    backups.sort_by(|a, b| {
+        let a_t = a.metadata().and_then(|m| m.modified()).ok();
+        let b_t = b.metadata().and_then(|m| m.modified()).ok();
+        b_t.cmp(&a_t)
+    });
+    let backup_bin = backups[0].path().join("binary.bak");
+    if !backup_bin.exists() {
+        anyhow::bail!(
+            "newest backup {} has no binary.bak — nothing to roll back to",
+            backups[0].path().display()
+        );
+    }
+    std::fs::copy(&backup_bin, current_path).context("Failed to restore the backup binary")?;
+    set_executable(current_path)?;
+    Ok(backup_bin)
 }
 
 /// Extract the monopsony binary from a tar.gz or zip archive
@@ -815,10 +1634,7 @@ mod tests {
 
     #[test]
     fn test_parse_version_v_prefix() {
-        assert_eq!(
-            parse_version("v1.0.0"),
-            Some(semver::Version::new(1, 0, 0))
-        );
+        assert_eq!(parse_version("v1.0.0"), Some(semver::Version::new(1, 0, 0)));
     }
 
     #[test]
@@ -952,7 +1768,7 @@ mod tests {
             backup_dir: install_dir.join("update-backup-current"),
             from_version: "1.0.0".to_string(),
             to_version: "2.0.0".to_string(),
-            asset_url: String::new(),
+            asset: AssetProvider::Url(String::new()),
             config_paths: vec![],
             config_snapshots: vec![],
         };
@@ -1004,7 +1820,11 @@ mod tests {
         let pre = recipe.install.pre_update.as_deref().unwrap();
         let post = recipe.install.post_update.as_deref().unwrap();
         assert!(pre.contains("systemctl stop monopsony-server"), "{}", pre);
-        assert!(post.contains("systemctl start monopsony-server"), "{}", post);
+        assert!(
+            post.contains("systemctl start monopsony-server"),
+            "{}",
+            post
+        );
         assert!(
             !pre.contains("monopsony-client") && !post.contains("monopsony-client"),
             "server hooks must not touch the client unit"
@@ -1048,7 +1868,11 @@ mod tests {
         let pre = recipe.install.pre_update.as_deref().unwrap();
         let post = recipe.install.post_update.as_deref().unwrap();
         assert!(pre.contains("systemctl stop monopsony-client"), "{}", pre);
-        assert!(post.contains("systemctl start monopsony-client"), "{}", post);
+        assert!(
+            post.contains("systemctl start monopsony-client"),
+            "{}",
+            post
+        );
         assert!(
             !pre.contains("monopsony-server") && !post.contains("monopsony-server"),
             "client hooks must not touch the server unit"
@@ -1263,7 +2087,7 @@ mod tests {
             backup_dir: backup_dir.clone(),
             from_version: "1.0.0".to_string(),
             to_version: "2.0.0".to_string(),
-            asset_url: String::new(),
+            asset: AssetProvider::Url(String::new()),
             config_paths: vec![config_path.clone()],
             config_snapshots: vec![snapshot],
         };
@@ -1321,7 +2145,7 @@ mod tests {
             backup_dir: install_dir.join("backup"),
             from_version: "1.0.0".to_string(),
             to_version: "2.0.0".to_string(),
-            asset_url: String::new(),
+            asset: AssetProvider::Url(String::new()),
             config_paths: vec![config_path.clone()],
             config_snapshots: vec![snapshot],
         };
@@ -1383,7 +2207,7 @@ detect_pattern = "(\\d+\\.\\d+\\.\\d+)"
             backup_dir: install_dir.join("update-backup-current"),
             from_version: "1.0.0".to_string(),
             to_version: "2.0.0".to_string(),
-            asset_url: String::new(),
+            asset: AssetProvider::Url(String::new()),
             config_paths: vec![],
             config_snapshots: vec![],
         };
@@ -1587,7 +2411,12 @@ detect_pattern = "(\\d+\\.\\d+\\.\\d+)"
         ];
         for name in bad_versions {
             assert_eq!(
-                select_asset_for_platform(&[name.to_string()], BinaryKind::Server, "linux", "x86_64"),
+                select_asset_for_platform(
+                    &[name.to_string()],
+                    BinaryKind::Server,
+                    "linux",
+                    "x86_64"
+                ),
                 None,
                 "{} must not match",
                 name
@@ -1720,5 +2549,582 @@ detect_pattern = "(\\d+\\.\\d+\\.\\d+)"
             std::fs::read(ctx.backup_dir.join(&config_backup_name)).unwrap(),
             b"config-data"
         );
+    }
+
+    // ─── Sprint 34 P3: asset provider, manifest, staging, finalize ──
+
+    #[test]
+    fn archive_kind_url_suffix_and_magic_sniff() {
+        use super::{archive_kind, ArchiveKind};
+        // URL suffix drives the decision when a hint exists (historical
+        // behavior).
+        assert_eq!(
+            archive_kind(
+                b"raw",
+                Some("https://x/monopsony-client-v1.0.0-linux-x86_64.tar.gz")
+            ),
+            ArchiveKind::TarGz
+        );
+        assert_eq!(
+            archive_kind(b"raw", Some("https://x/asset.zip")),
+            ArchiveKind::Zip
+        );
+        // No hint: sniff gzip / zip magic; anything else is raw. Real
+        // monopsony binaries are ELF (\x7fELF) or Mach-O and never collide.
+        assert_eq!(archive_kind(&[0x1f, 0x8b, 8, 0], None), ArchiveKind::TarGz);
+        assert_eq!(archive_kind(b"PK\x03\x04rest", None), ArchiveKind::Zip);
+        assert_eq!(archive_kind(b"\x7fELF.fake", None), ArchiveKind::Raw);
+        assert_eq!(archive_kind(&[], None), ArchiveKind::Raw);
+    }
+
+    #[test]
+    fn stage_asset_bytes_sniffs_raw_and_archive() {
+        let temp = tempfile::tempdir().unwrap();
+        // Raw bytes (a fake ELF) are written verbatim.
+        let raw = b"\x7fELFnew-binary";
+        let out = temp.path().join("raw-out");
+        super::stage_asset_bytes(raw, &out, None).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), raw);
+
+        // A real tar.gz containing the binary is extracted (sniffed, no
+        // URL hint).
+        let binary_content = b"#!/bin/sh\nfake monopsony-client\n";
+        let staged_dir = temp.path().join("pkg");
+        std::fs::create_dir_all(&staged_dir).unwrap();
+        std::fs::write(staged_dir.join("monopsony-client"), binary_content).unwrap();
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            builder
+                .append_dir_all("monopsony-2.0.0", &staged_dir)
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz_buf = Vec::new();
+        {
+            let mut enc =
+                flate2::write::GzEncoder::new(&mut gz_buf, flate2::Compression::default());
+            std::io::Write::write_all(&mut enc, &tar_buf).unwrap();
+            enc.finish().unwrap();
+        }
+        let out2 = temp.path().join("archive-out");
+        super::stage_asset_bytes(&gz_buf, &out2, None).unwrap();
+        assert_eq!(std::fs::read(&out2).unwrap(), binary_content);
+    }
+
+    /// The canonical manifest payload must serialize to exactly the bytes
+    /// the server signs (control/grpc.rs build_update_manifest_payload):
+    /// sorted keys, no whitespace. Locked with a literal so any drift on
+    /// either side fails here.
+    #[test]
+    fn manifest_payload_is_canonical_json() {
+        use super::{build_update_manifest_payload, ManifestAsset};
+        let assets = vec![ManifestAsset {
+            name: "monopsony-client-v1.1.0-linux-x86_64.tar.gz".to_string(),
+            platform: "linux-x86_64".to_string(),
+            sha256: "abc123".to_string(),
+            size: 42,
+        }];
+        let payload = build_update_manifest_payload("1.1.0", "client", "linux-x86_64", &assets);
+        let payload_str = String::from_utf8(payload.clone()).unwrap();
+        assert_eq!(
+            payload_str,
+            "{\"assets\":[{\"name\":\"monopsony-client-v1.1.0-linux-x86_64.tar.gz\",\"platform\":\"linux-x86_64\",\"sha256\":\"abc123\",\"size\":42}],\"binary\":\"client\",\"platform\":\"linux-x86_64\",\"version\":\"1.1.0\"}"
+        );
+        // Deterministic: same inputs → identical bytes.
+        let again = build_update_manifest_payload("1.1.0", "client", "linux-x86_64", &assets);
+        assert_eq!(payload, again);
+        // Field order is sorted regardless of insertion: assets < binary <
+        // platform < version (multiple assets keep list order — both sides
+        // build from the same DB-ordered list).
+        let two = build_update_manifest_payload(
+            "1.1.0",
+            "client",
+            "linux-x86_64",
+            &[
+                ManifestAsset {
+                    name: "a".to_string(),
+                    platform: "p".to_string(),
+                    sha256: "x".to_string(),
+                    size: 1,
+                },
+                ManifestAsset {
+                    name: "b".to_string(),
+                    platform: "p".to_string(),
+                    sha256: "y".to_string(),
+                    size: 2,
+                },
+            ],
+        );
+        let two_str = String::from_utf8(two).unwrap();
+        assert!(two_str.contains("\"name\":\"a\""));
+        assert!(two_str.find("\"name\":\"a\"").unwrap() < two_str.find("\"name\":\"b\"").unwrap());
+    }
+
+    #[test]
+    fn manifest_signature_verified_tampered_and_fail_closed() {
+        use super::{
+            build_update_manifest_payload, verify_update_manifest, ManifestAsset, ManifestCheck,
+        };
+        use base64::Engine;
+        use ed25519_dalek::Signer;
+
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
+        let vk = sk.verifying_key();
+        let assets = vec![ManifestAsset {
+            name: "n".to_string(),
+            platform: "linux-x86_64".to_string(),
+            sha256: "deadbeef".to_string(),
+            size: 7,
+        }];
+        let payload = build_update_manifest_payload("2.0.0", "client", "linux-x86_64", &assets);
+        let sig = base64::engine::general_purpose::STANDARD.encode(sk.sign(&payload).to_bytes());
+
+        // Positive: correct key + signature over the rebuilt payload.
+        assert_eq!(
+            verify_update_manifest(&payload, &sig, Some(&vk)).unwrap(),
+            ManifestCheck::Verified
+        );
+
+        // Tampered payload (asset digest changed) must fail closed.
+        let tampered = build_update_manifest_payload(
+            "2.0.0",
+            "client",
+            "linux-x86_64",
+            &[ManifestAsset {
+                name: "n".to_string(),
+                platform: "linux-x86_64".to_string(),
+                sha256: "cafebabe".to_string(),
+                size: 7,
+            }],
+        );
+        let err = verify_update_manifest(&tampered, &sig, Some(&vk)).unwrap_err();
+        assert!(err.to_string().contains("fail-closed"), "{}", err);
+
+        // Empty signature with a configured key fails closed (unsigned
+        // manifest must not slip through when trust is configured).
+        let err = verify_update_manifest(&payload, "", Some(&vk)).unwrap_err();
+        assert!(err.to_string().contains("unsigned"), "{}", err);
+
+        // No key configured → skip (D7 no-key posture), never an error.
+        assert_eq!(
+            verify_update_manifest(&payload, &sig, None).unwrap(),
+            ManifestCheck::SkippedNoKey
+        );
+        assert_eq!(
+            verify_update_manifest(&payload, "", None).unwrap(),
+            ManifestCheck::SkippedNoKey
+        );
+    }
+
+    #[test]
+    fn contract_platform_maps_release_contract() {
+        use super::contract_platform;
+        assert_eq!(contract_platform("linux", "x86_64"), Some("linux-x86_64"));
+        assert_eq!(contract_platform("linux", "aarch64"), Some("linux-aarch64"));
+        // Apple Silicon: std reports aarch64, assets say arm64.
+        assert_eq!(contract_platform("darwin", "aarch64"), Some("darwin-arm64"));
+        assert_eq!(contract_platform("darwin", "arm64"), Some("darwin-arm64"));
+        assert_eq!(contract_platform("darwin", "x86_64"), Some("darwin-x86_64"));
+        // No published assets for other platforms.
+        assert_eq!(contract_platform("windows", "x86_64"), None);
+        assert_eq!(contract_platform("freebsd", "x86_64"), None);
+        // The live host helper agrees with the pure map on this machine.
+        let (os, arch, _libc) = super::detect_platform();
+        assert_eq!(
+            super::release_platform(),
+            super::contract_platform(&os, &arch).map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn binary_kind_wire_names() {
+        use super::BinaryKind;
+        assert_eq!(BinaryKind::Server.wire_name(), "server");
+        assert_eq!(BinaryKind::Client.wire_name(), "client");
+    }
+
+    /// pgrep -x matches the kernel's comm (15-char truncation). Verified
+    /// live: `pgrep -x monopsony-client` returns zero matches on procps ≥4
+    /// ("pattern longer than 15 characters"), so both health gates must
+    /// truncate to comm granularity.
+    #[test]
+    fn comm_name_truncates_to_kernel_comm_granularity() {
+        use super::comm_name;
+        assert_eq!(comm_name("monopsony-client"), "monopsony-clien");
+        assert_eq!(comm_name("monopsony-server"), "monopsony-serve");
+        assert_eq!(comm_name("nginx"), "nginx");
+        assert_eq!(comm_name("123456789012345"), "123456789012345");
+        assert_eq!(comm_name("1234567890123456"), "123456789012345");
+        // Multibyte-safe: cuts on a char boundary, never mid-byte.
+        assert_eq!(comm_name("ååååååååååååååååå"), "ååååååååååååååå");
+    }
+
+    #[test]
+    fn stage_update_asset_extracts_and_chmods() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("monopsony-client");
+        std::fs::write(&current, b"old").unwrap();
+
+        // Build a tar.gz asset carrying the new binary.
+        let new_binary = b"\x7fELF-new-monopsony-client-2.0.0";
+        let pkg = temp.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(pkg.join("monopsony-client"), new_binary).unwrap();
+        let mut tar_buf = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut tar_buf);
+            builder.append_dir_all("monopsony-2.0.0", &pkg).unwrap();
+            builder.finish().unwrap();
+        }
+        let mut gz = Vec::new();
+        {
+            let mut enc = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            std::io::Write::write_all(&mut enc, &tar_buf).unwrap();
+            enc.finish().unwrap();
+        }
+
+        let (staged, sha) = super::stage_update_asset(&gz, temp.path(), &current).expect("staging");
+        assert_eq!(std::fs::read(&staged).unwrap(), new_binary);
+        assert_eq!(sha, super::sha256_hex(new_binary));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&staged).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "staged binary must be executable");
+        }
+        let name = staged.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("monopsony-client.staged."), "{}", name);
+    }
+
+    #[test]
+    fn finalize_command_json_roundtrip_via_files() {
+        use super::{read_finalize_command, write_finalize_command, FinalizeCommand};
+        let temp = tempfile::tempdir().unwrap();
+        let cmd = FinalizeCommand {
+            staged_path: temp.path().join("monopsony-client.staged.20260101_000000"),
+            staged_sha256: "abc123".to_string(),
+            from_version: "1.0.0".to_string(),
+            to_version: "1.1.0".to_string(),
+            binary: "client".to_string(),
+            created_at: 1760000000,
+        };
+        let path = write_finalize_command(temp.path(), &cmd).unwrap();
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("1760000000"));
+        let back = read_finalize_command(&path).unwrap();
+        assert_eq!(back.staged_path, cmd.staged_path);
+        assert_eq!(back.staged_sha256, cmd.staged_sha256);
+        assert_eq!(back.to_version, "1.1.0");
+        assert_eq!(back.binary, "client");
+    }
+
+    #[test]
+    fn finalize_guard_refuses_live_pid_and_takes_over_stale() {
+        let temp = tempfile::tempdir().unwrap();
+        // Live PID (ourselves) → second acquire refuses.
+        let pid_path = temp.path().join("monopsony-self-update.pid");
+        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
+        let err = super::acquire_finalize_guard(temp.path()).unwrap_err();
+        assert!(err.to_string().contains("already running"), "{}", err);
+
+        // Stale (unparseable) guard is taken over.
+        std::fs::write(&pid_path, "not-a-pid").unwrap();
+        let guard = super::acquire_finalize_guard(temp.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&pid_path).unwrap(),
+            std::process::id().to_string()
+        );
+        // Drop removes the guard file.
+        drop(guard);
+        assert!(!pid_path.exists());
+    }
+
+    #[test]
+    fn decide_init_system_families() {
+        use super::decide_init_system;
+        use super::InitSystem;
+        // macOS → launchd (when launchctl exists).
+        assert_eq!(
+            decide_init_system("macos", false, false, false, true),
+            InitSystem::Launchd
+        );
+        // macOS without launchctl falls through to Unknown.
+        assert_eq!(
+            decide_init_system("macos", false, false, false, false),
+            InitSystem::Unknown
+        );
+        // systemd run-dir wins over the others (strongest signal first).
+        assert_eq!(
+            decide_init_system("linux", true, true, true, false),
+            InitSystem::Systemd
+        );
+        // OpenRC needs BOTH the softlevel marker and the binary.
+        assert_eq!(
+            decide_init_system("linux", false, true, true, false),
+            InitSystem::OpenRc
+        );
+        assert_eq!(
+            decide_init_system("linux", false, true, false, false),
+            InitSystem::Unknown
+        );
+        // Container/bare hosts with none of the markers.
+        assert_eq!(
+            decide_init_system("linux", false, false, false, false),
+            InitSystem::Unknown
+        );
+    }
+
+    #[test]
+    fn restart_argv_per_init() {
+        use super::restart_argv;
+        use super::InitSystem;
+
+        let (prog, args) = restart_argv(InitSystem::Systemd, "monopsony-client").unwrap();
+        assert_eq!(prog, "systemctl");
+        assert_eq!(args, vec!["restart", "monopsony-client"]);
+
+        let (prog, args) = restart_argv(InitSystem::OpenRc, "monopsony-client").unwrap();
+        assert_eq!(prog, "rc-service");
+        assert_eq!(args, vec!["monopsony-client", "restart"]);
+
+        let (prog, args) = restart_argv(InitSystem::Launchd, "com.monopsony.client").unwrap();
+        assert_eq!(prog, "launchctl");
+        assert_eq!(args, vec!["kickstart", "-k", "system/com.monopsony.client"]);
+
+        assert!(restart_argv(InitSystem::Unknown, "monopsony-client").is_none());
+    }
+
+    #[test]
+    fn unit_names_per_init_and_kind() {
+        use super::unit_for;
+        use super::{BinaryKind, InitSystem};
+        assert_eq!(
+            unit_for(InitSystem::Systemd, BinaryKind::Client),
+            "monopsony-client"
+        );
+        assert_eq!(
+            unit_for(InitSystem::OpenRc, BinaryKind::Server),
+            "monopsony-server"
+        );
+        assert_eq!(
+            unit_for(InitSystem::Launchd, BinaryKind::Client),
+            "com.monopsony.client"
+        );
+        assert_eq!(
+            unit_for(InitSystem::Launchd, BinaryKind::Server),
+            "com.monopsony.server"
+        );
+        assert_eq!(
+            unit_for(InitSystem::Unknown, BinaryKind::Client),
+            "monopsony-client"
+        );
+    }
+
+    /// A benign finalize-test recipe: hooks are `true`, the health gate is a
+    /// process check with a per-test unique name so parallel tests never
+    /// satisfy each other's gate via pgrep.
+    fn finalize_test_recipe(
+        process: &str,
+        timeout_secs: u32,
+    ) -> monopsony_common::shadow_types::ShadowRecipe {
+        let toml_str = format!(
+            r#"
+[package]
+name = "monopsony-client"
+source_type = "github_release"
+source_url = "https://example.com/test"
+
+[install]
+method = "extract"
+target_dir = "/tmp"
+backup_old = true
+max_backups = 3
+pre_update = "true"
+post_update = "true"
+on_failure = "true"
+
+[install.health_check]
+type = "process"
+process = "{process}"
+timeout_secs = {timeout_secs}
+
+[version]
+detect_command = "true"
+detect_pattern = "(.+)"
+"#
+        );
+        toml::from_str(&toml_str).expect("finalize test recipe must parse")
+    }
+
+    fn finalize_test_cmd(
+        temp: &tempfile::TempDir,
+        staged_name: &str,
+        content: &[u8],
+    ) -> super::FinalizeCommand {
+        let staged = temp.path().join(staged_name);
+        std::fs::write(&staged, content).unwrap();
+        super::FinalizeCommand {
+            staged_path: staged,
+            staged_sha256: super::sha256_hex(content),
+            from_version: "1.0.0".to_string(),
+            to_version: "2.0.0".to_string(),
+            binary: "client".to_string(),
+            created_at: 1760000000,
+        }
+    }
+
+    /// Tempdir finalize simulation — success path: staged binary swaps in,
+    /// health gate passes (renamed helper process), backup retained,
+    /// staged file consumed. Restart is Noop (tests never touch services).
+    #[tokio::test]
+    async fn run_finalize_success_commits_swap() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("monopsony-client");
+        let old_bytes = b"\x7fELF-old-daemon";
+        std::fs::write(&current, old_bytes).unwrap();
+
+        let new_bytes = b"\x7fELF-new-daemon-2.0.0";
+        let cmd = finalize_test_cmd(&temp, "staged.ok", new_bytes);
+
+        // Health gate target: a process whose comm is exactly the recipe's
+        // process name (copy a coreutils binary under that name).
+        let sleep_src = "/bin/sleep".to_string();
+        if !std::path::Path::new(&sleep_src).exists() {
+            eprintln!("skipping: no /bin/sleep on this host");
+            return;
+        }
+        let helper = temp.path().join("monop3fin-successhelper");
+        std::fs::copy(&sleep_src, &helper).unwrap();
+        let mut child = std::process::Command::new(&helper)
+            .arg("30")
+            .spawn()
+            .expect("helper process");
+
+        let outcome = super::run_finalize_with_recipe(
+            &cmd,
+            &current,
+            super::RestartAction::Noop,
+            Some(finalize_test_recipe("monop3fin-successhelper", 20)),
+        )
+        .await
+        .expect("finalize should succeed");
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(matches!(outcome, super::UpdateOutcome::Success));
+        assert_eq!(
+            std::fs::read(&current).unwrap(),
+            new_bytes,
+            "current binary must be the staged bytes"
+        );
+        // Backup of the old binary exists in a snapshot dir.
+        let backups: Vec<_> = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .unwrap_or("")
+                    .starts_with("update-backup-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1, "one snapshot dir");
+        assert_eq!(
+            std::fs::read(backups[0].path().join("binary.bak")).unwrap(),
+            old_bytes
+        );
+        assert!(!cmd.staged_path.exists(), "staged file consumed");
+    }
+
+    /// Tempdir finalize simulation — health failure: nothing matches the
+    /// gate name, so finalize rolls the old binary back and reports
+    /// RolledBack.
+    #[tokio::test]
+    async fn run_finalize_health_failure_rolls_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("monopsony-client");
+        let old_bytes = b"\x7fELF-old-daemon";
+        std::fs::write(&current, old_bytes).unwrap();
+
+        let cmd = finalize_test_cmd(&temp, "staged.rb", b"\x7fELF-broken-2.0.0");
+
+        // Gate name unique within the kernel's 15-char comm so the parallel
+        // success test's helper can never satisfy this gate.
+        let outcome = super::run_finalize_with_recipe(
+            &cmd,
+            &current,
+            super::RestartAction::Noop,
+            Some(finalize_test_recipe("monop3fin-failhelper-nope", 1)),
+        )
+        .await
+        .expect("rollback path returns Ok(RolledBack)");
+
+        match outcome {
+            super::UpdateOutcome::RolledBack(reason) => {
+                assert!(reason.contains("restored"), "{}", reason)
+            }
+            other => panic!("expected RolledBack, got {:?}", other),
+        }
+        assert_eq!(
+            std::fs::read(&current).unwrap(),
+            old_bytes,
+            "old binary must be restored"
+        );
+    }
+
+    /// Tampered staged bytes (hash no longer matches the command file)
+    /// refuse before anything is touched.
+    #[tokio::test]
+    async fn run_finalize_staged_hash_mismatch_refuses() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("monopsony-client");
+        std::fs::write(&current, b"old").unwrap();
+
+        let cmd = finalize_test_cmd(&temp, "staged.tamper", b"original-staged");
+        // Tamper AFTER recording the hash.
+        std::fs::write(&cmd.staged_path, b"evil-replaced").unwrap();
+
+        let err = super::run_finalize_with_recipe(
+            &cmd,
+            &current,
+            super::RestartAction::Noop,
+            Some(finalize_test_recipe("monopsony-p3-fin-any", 1)),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("hash mismatch"), "{}", err);
+        assert_eq!(std::fs::read(&current).unwrap(), b"old");
+    }
+
+    #[test]
+    fn rollback_latest_backup_restores_newest() {
+        let temp = tempfile::tempdir().unwrap();
+        let current = temp.path().join("monopsony-client");
+        std::fs::write(&current, b"current-v3").unwrap();
+
+        let older = temp.path().join("update-backup-20260101-000000");
+        let newer = temp.path().join("update-backup-20260102-000000");
+        std::fs::create_dir_all(&older).unwrap();
+        std::fs::create_dir_all(&newer).unwrap();
+        std::fs::write(older.join("binary.bak"), b"v1").unwrap();
+        // Ensure a strictly newer mtime for the newer backup.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(newer.join("binary.bak"), b"v2").unwrap();
+
+        let used = super::rollback_latest_backup(&current, temp.path()).unwrap();
+        assert_eq!(used, newer.join("binary.bak"));
+        assert_eq!(std::fs::read(&current).unwrap(), b"v2");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&current).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "restored binary must be executable");
+        }
     }
 }
