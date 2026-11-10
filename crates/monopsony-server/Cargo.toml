@@ -43,3 +43,7 @@ reqwest = { workspace = true, features = ["cookies"] }
 tempfile = "3"
 tokio = { workspace = true }
 tower-cookies = { workspace = true }
+# Synthetic PGP fixture keys for the D7 signature-policy tests (throwaway
+# keypairs; never trust anchors). Same lane as monopsony-mirror's fixtures.
+pgp = "0.21"
+rand = "0.8"

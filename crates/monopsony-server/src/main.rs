@@ -21,6 +21,7 @@ mod ca_guard;
 mod self_update;
 mod setup;
 mod sourcedb;
+mod update_distributor;
 
 pub use sourcedb::{package_key, ObservedVersion};
 
@@ -522,6 +523,33 @@ async fn main() -> anyhow::Result<()> {
             Err(_) => monopsony_common::config::MirrorIntegrityConfig::default(),
         };
 
+    // Peer-exchange blacklist policy ([peer_blacklist] section) — pinned
+    // originator keys for signed entries on /.well-known/monopsony/peers.
+    let peer_blacklist_cfg: monopsony_common::config::PeerBlacklistConfig =
+        match std::fs::read_to_string(&args.config) {
+            Ok(content) => {
+                #[derive(serde::Deserialize, Default)]
+                struct PeerBlacklistSectionWrapper {
+                    #[serde(default)]
+                    peer_blacklist: monopsony_common::config::PeerBlacklistConfig,
+                }
+                toml::from_str::<PeerBlacklistSectionWrapper>(&content)
+                    .map(|w| w.peer_blacklist)
+                    .unwrap_or_default()
+            }
+            Err(_) => monopsony_common::config::PeerBlacklistConfig::default(),
+        };
+    if peer_blacklist_cfg.trusted_operators.is_empty() {
+        info!("Peer blacklist: no pinned operators — remote entries ignored (local-only)");
+    } else {
+        info!(
+            "Peer blacklist: {} pinned operator key(s), max_entries={}, tombstone_days={}",
+            peer_blacklist_cfg.trusted_operators.len(),
+            peer_blacklist_cfg.max_entries,
+            peer_blacklist_cfg.tombstone_days
+        );
+    }
+
     // Read language-artifact cache config ([cache.language_artifacts] section,
     // Sprint 23) with the same fallback-to-defaults pattern.
     let language_artifacts_cfg: monopsony_common::config::LanguageArtifactConfig =
@@ -584,12 +612,28 @@ async fn main() -> anyhow::Result<()> {
 
     let pin_key_for_proxy = pin_key.clone();
 
-    // Spawn the personal OCI registry (Sprint 25 S1: pull-back) on its own
-    // listener. Same keyed auth model as the proxy router (AuthMode applies);
-    // plain axum::serve — registry traffic never uses CONNECT.
+    // Spawn the personal OCI registry (Sprint 25 S1: pull-back; S3: manifest
+    // push path) on its own listener. Same keyed auth model as the proxy
+    // router (AuthMode applies); plain axum::serve — registry traffic never
+    // uses CONNECT. Manifest-push policy comes from the [registry] section.
     let storage_for_registry = storage.clone();
     let db_for_registry = db.clone();
     let auth_mode_for_registry = auth_mode.clone();
+    let registry_settings: oci_registry::RegistrySettings = {
+        #[derive(serde::Deserialize, Default)]
+        struct RegistrySectionWrapper {
+            #[serde(default)]
+            registry: monopsony_common::config::RegistryConfig,
+        }
+        match std::fs::read_to_string(&args.config) {
+            Ok(content) => toml::from_str::<RegistrySectionWrapper>(&content)
+                .map(|w| oci_registry::RegistrySettings {
+                    allow_missing_blobs: w.registry.allow_missing_blobs,
+                })
+                .unwrap_or_default(),
+            Err(_) => Default::default(),
+        }
+    };
     let registry_listen_addr: SocketAddr = args
         .registry_addr
         .parse()
@@ -600,6 +644,7 @@ async fn main() -> anyhow::Result<()> {
             storage_for_registry,
             db_for_registry,
             auth_mode_for_registry,
+            registry_settings,
         )
         .await
         {
@@ -668,6 +713,11 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 cross_check,
                 tracker_urls,
+                peer_blacklist: mirror::PeerBlacklistPolicy {
+                    trusted_operators: peer_blacklist_cfg.trusted_operators.clone(),
+                    max_entries: peer_blacklist_cfg.max_entries,
+                    tombstone_days: peer_blacklist_cfg.tombstone_days,
+                },
             })
             .await;
             info!(
@@ -689,13 +739,23 @@ async fn main() -> anyhow::Result<()> {
     // Initialize shadow package manager
     let shadow_dir = PathBuf::from(&args.shadow_dir);
     let shadow_git_mirror_dir = PathBuf::from(&args.shadow_git_mirror_dir);
-    let shared_shadow_manager = if db.is_some() {
+    // Operator Ed25519 identity key (loaded/generated exactly once). The
+    // same key signs shadow recipes, tracker announces (prerequisite 2), and
+    // the peers envelope (Approach A).
+    let operator_signing_key: Option<Arc<ed25519_dalek::SigningKey>> = if db.is_some() {
         if let Err(e) = tokio::fs::create_dir_all(&shadow_dir).await {
             warn!("Could not create shadow directory: {}", e);
         }
-        let signing_key_path = shadow_dir.join("signing.key");
-        let signing_key =
-            monopsony_shadow::shadow_signing::load_or_generate_signing_key(Some(&signing_key_path));
+        Some(Arc::new(
+            monopsony_shadow::shadow_signing::load_or_generate_signing_key(Some(
+                &shadow_dir.join("signing.key"),
+            )),
+        ))
+    } else {
+        None
+    };
+    let shared_shadow_manager = if db.is_some() {
+        let signing_key = (**operator_signing_key.as_ref().expect("db.is_some()")).clone();
         let cache_dir = shadow_dir.join("cache");
         let poll_interval = std::time::Duration::from_secs(args.shadow_poll_interval);
 
@@ -718,6 +778,56 @@ async fn main() -> anyhow::Result<()> {
         Some(mgr_arc)
     } else {
         info!("Shadow package manager not started (requires database)");
+        None
+    };
+
+    // Sprint 34 P1: update distributor — poll GitHub releases once per
+    // release, verify (SHA256SUMS + pinned GPG per D7), store content-
+    // addressed in the shared shadow cache. The poll loop is spawned whenever
+    // a database exists; [update].enabled and the server_settings runtime
+    // toggle (`update_distributor_enabled`) gate each iteration, so the
+    // dashboard can enable/disable without a restart. The notify signal lets
+    // POST /api/v1/updates/check trigger an out-of-band poll.
+    let update_check_signal = if let Some(db) = db.clone() {
+        let update_cfg: monopsony_common::config::UpdateConfig = {
+            #[derive(serde::Deserialize, Default)]
+            struct UpdateWrapper {
+                #[serde(default)]
+                update: monopsony_common::config::UpdateConfig,
+            }
+            match std::fs::read_to_string(&args.config) {
+                Ok(content) => toml::from_str::<UpdateWrapper>(&content)
+                    .map(|w| w.update)
+                    .unwrap_or_default(),
+                Err(_) => Default::default(),
+            }
+        };
+        let signal = Arc::new(tokio::sync::Notify::new());
+        let distributor = Arc::new(update_distributor::UpdateDistributor::new(
+            db,
+            shadow_dir.join("cache"),
+            update_cfg.clone(),
+            args.github_token.clone(),
+        ));
+        info!(
+            "Update distributor config: repo {}, interval {}s, include_prerelease {}, retain_versions {}, gpg key {}",
+            update_cfg.repo,
+            update_cfg.check_interval,
+            update_cfg.include_prerelease,
+            update_cfg.retain_versions,
+            if update_cfg.trusted_gpg_key.is_some() {
+                "pinned"
+            } else {
+                "unpinned (sha256-only)"
+            }
+        );
+        tokio::spawn(update_distributor::run_poll_loop(
+            distributor,
+            signal.clone(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        ));
+        Some(signal)
+    } else {
         None
     };
 
@@ -848,7 +958,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Start mirror sync + HTTP router (using shared mirror manager)
     let mirror_handle = if let Some(ref mm) = shared_mirror_manager {
-        let mirror_state = mirror::MirrorState::new((**mm).clone(), mirror_dir.clone());
+        let mut mirror_state = mirror::MirrorState::new((**mm).clone(), mirror_dir.clone());
+        if let Some(key) = &operator_signing_key {
+            mirror_state = mirror_state.with_signing_key(key.clone());
+        }
 
         // Spawn sync task
         let sync_mgr = (**mm).clone();
@@ -892,12 +1005,16 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
             if !urls.is_empty() {
                 let url_count = urls.len();
-                let announcer = announce::TrackerAnnouncer::new(
+                let mut announcer = announce::TrackerAnnouncer::new(
                     mm.clone(),
                     urls,
                     args.mirror_addr.clone(),
                     args.tracker_interval,
-                );
+                )
+                .with_blacklist_trusted(peer_blacklist_cfg.trusted_operators.clone());
+                if let Some(key) = &operator_signing_key {
+                    announcer = announcer.with_signing_key(key.clone());
+                }
                 info!(
                     "Tracker announce task starting ({} tracker(s), interval={}s)",
                     url_count, args.tracker_interval
@@ -1053,6 +1170,7 @@ async fn main() -> anyhow::Result<()> {
             &dashboard_config.trusted_proxies,
         ),
         pending_pairs: Arc::new(tokio::sync::Mutex::new(pairing::PendingPairStore::new())),
+        update_check_signal,
     };
     let admin_router = monopsony_admin::admin_router(admin_state);
     let dashboard_handle = tokio::spawn(async move {

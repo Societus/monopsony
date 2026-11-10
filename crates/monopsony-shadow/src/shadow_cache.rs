@@ -141,6 +141,25 @@ impl ShadowCache {
         serde_json::from_str(&data).ok()
     }
 
+    /// Remove one platform index entry (update-distributor retention,
+    /// Sprint 34 P1). Removing the index entry unreferences the blob so the
+    /// next `gc` can reclaim it; missing entries are a no-op. Returns whether
+    /// an entry existed.
+    pub async fn remove_asset(
+        &self,
+        package: &str,
+        version: &str,
+        platform: &str,
+    ) -> Result<bool, CacheError> {
+        let path = self.index_path(package, version, platform);
+        if tokio::fs::metadata(&path).await.is_ok() {
+            fs::remove_file(&path).await.map_err(CacheError::Io)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Garbage collect: remove blobs with zero references, respecting disk budget.
     /// Returns number of bytes freed.
     pub async fn gc(&self, _disk_budget_pct: f64) -> Result<u64, CacheError> {

@@ -987,6 +987,7 @@ mod tests {
             mirror_verify_key: [0u8; 32],
             oracle_last_update: Arc::new(RwLock::new(None)),
             oracle_delta: Arc::new(RwLock::new(None)),
+            update_check_signal: None,
         };
 
         let router = Router::new()

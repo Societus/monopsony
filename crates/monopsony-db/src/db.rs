@@ -692,6 +692,47 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
+        // Sprint 34 P1: server-side update distribution. update_releases rows
+        // are the fleet-facing record of which GitHub releases have been
+        // pulled + verified; update_artifacts carries one row per stored
+        // tarball (content-addressed blob lives in the shadow cache). Rows
+        // are append-only until retention prunes whole releases (artifact
+        // rows cascade with the release row).
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS update_releases (
+                id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                version         TEXT NOT NULL UNIQUE,
+                prerelease      BOOLEAN NOT NULL DEFAULT false,
+                fetched_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+                changelog_url   TEXT NULL,
+                assets_complete BOOLEAN NOT NULL DEFAULT false
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("Created update_releases table");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS update_artifacts (
+                id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                release_id   UUID NOT NULL REFERENCES update_releases(id) ON DELETE CASCADE,
+                package      TEXT NOT NULL,
+                platform     TEXT NOT NULL,
+                asset_name   TEXT NOT NULL,
+                sha256       TEXT NOT NULL,
+                size         BIGINT NOT NULL,
+                blob_indexed BOOLEAN NOT NULL DEFAULT false,
+                UNIQUE(release_id, package, platform)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("Created update_artifacts table");
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_update_artifacts_release ON update_artifacts(release_id)")
+            .execute(&self.pool)
+            .await?;
+
         info!("Database migrations complete");
         Ok(())
     }
@@ -3260,4 +3301,156 @@ pub struct ShadowRegistryMatchRow {
     pub signed: bool,
     pub key_id: String,
     pub fleet_installs: Vec<FleetInstallRow>,
+}
+
+// ─── Update distribution (Sprint 34 P1) ────────────────────────────────────
+
+/// One GitHub release pulled by the update distributor.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UpdateReleaseRow {
+    pub id: Uuid,
+    pub version: String,
+    pub prerelease: bool,
+    pub fetched_at: chrono::DateTime<chrono::Utc>,
+    pub changelog_url: Option<String>,
+    pub assets_complete: bool,
+}
+
+/// One stored release artifact (tarball). The blob itself lives
+/// content-addressed in the shadow cache; this row is the lineage record.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UpdateArtifactRow {
+    pub id: Uuid,
+    pub release_id: Uuid,
+    pub package: String,
+    pub platform: String,
+    pub asset_name: String,
+    pub sha256: String,
+    pub size: i64,
+    pub blob_indexed: bool,
+}
+
+/// Input for recording one stored release artifact.
+#[derive(Debug, Clone)]
+pub struct UpdateArtifactInsert {
+    pub package: String,
+    pub platform: String,
+    pub asset_name: String,
+    pub sha256: String,
+    pub size: i64,
+    pub blob_indexed: bool,
+}
+
+impl Database {
+    /// Insert or refresh an update_releases row for `version`. Idempotent:
+    /// re-fetching the same version refreshes fetched_at + metadata and keeps
+    /// the row (assets stay keyed to it). Returns the row id.
+    pub async fn upsert_update_release(
+        &self,
+        version: &str,
+        prerelease: bool,
+        changelog_url: Option<&str>,
+    ) -> Result<Uuid> {
+        let row: (Uuid,) = sqlx::query_as(
+            "INSERT INTO update_releases (version, prerelease, changelog_url)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (version) DO UPDATE
+                SET prerelease = EXCLUDED.prerelease,
+                    changelog_url = EXCLUDED.changelog_url,
+                    fetched_at = now()
+             RETURNING id",
+        )
+        .bind(version)
+        .bind(prerelease)
+        .bind(changelog_url)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// Mark a release's artifact set complete (all 8 platform tarballs
+    /// verified + indexed). Only complete releases are distributable.
+    pub async fn set_update_release_complete(&self, release_id: &Uuid) -> Result<()> {
+        sqlx::query("UPDATE update_releases SET assets_complete = true WHERE id = $1")
+            .bind(release_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Fetch the update_releases row for a version, if present.
+    pub async fn get_update_release(&self, version: &str) -> Result<Option<UpdateReleaseRow>> {
+        let row = sqlx::query_as::<_, UpdateReleaseRow>(
+            "SELECT id, version, prerelease, fetched_at, changelog_url, assets_complete
+             FROM update_releases WHERE version = $1",
+        )
+        .bind(version)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Record one verified + stored artifact.
+    pub async fn insert_update_artifact(
+        &self,
+        release_id: &Uuid,
+        artifact: &UpdateArtifactInsert,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO update_artifacts
+                (release_id, package, platform, asset_name, sha256, size, blob_indexed)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (release_id, package, platform) DO UPDATE
+                SET asset_name = EXCLUDED.asset_name,
+                    sha256 = EXCLUDED.sha256,
+                    size = EXCLUDED.size,
+                    blob_indexed = EXCLUDED.blob_indexed",
+        )
+        .bind(release_id)
+        .bind(&artifact.package)
+        .bind(&artifact.platform)
+        .bind(&artifact.asset_name)
+        .bind(&artifact.sha256)
+        .bind(artifact.size)
+        .bind(artifact.blob_indexed)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// List update releases, newest fetch first. `limit` bounds the scan
+    /// (retention and the dashboard read bounded windows).
+    pub async fn list_update_releases(&self, limit: i64) -> Result<Vec<UpdateReleaseRow>> {
+        let rows = sqlx::query_as::<_, UpdateReleaseRow>(
+            "SELECT id, version, prerelease, fetched_at, changelog_url, assets_complete
+             FROM update_releases ORDER BY fetched_at DESC LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// List the artifacts of one release.
+    pub async fn list_update_artifacts(&self, release_id: &Uuid) -> Result<Vec<UpdateArtifactRow>> {
+        let rows = sqlx::query_as::<_, UpdateArtifactRow>(
+            "SELECT id, release_id, package, platform, asset_name, sha256, size, blob_indexed
+             FROM update_artifacts WHERE release_id = $1 ORDER BY package, platform",
+        )
+        .bind(release_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Delete one release row (artifact rows cascade). Returns whether a row
+    /// was removed. Retention deletes DB rows FIRST, then drops the cache
+    /// index entries, then sweeps unreferenced blobs (DB-row-first deletion).
+    pub async fn delete_update_release(&self, version: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM update_releases WHERE version = $1")
+            .bind(version)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
 }

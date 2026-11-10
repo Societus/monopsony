@@ -21,6 +21,7 @@ pub mod recipe;
 pub mod settings;
 pub mod shadow;
 pub mod tracker;
+pub mod updates;
 pub mod ws_tunnel;
 
 use std::net::IpAddr;
@@ -94,6 +95,11 @@ pub struct AdminState {
     /// Serialized signed oracle delta + verify-key pin for clients, refreshed
     /// periodically from the observations table. None = endpoint serves 404.
     pub oracle_delta: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    /// Update-distributor "check now" trigger (Sprint 34 P1). Some when the
+    /// poller task is running (database present); the distributor loop watches
+    /// it between interval ticks. Owned by the server binary — the admin crate
+    /// only sees the primitive, no monopsony-server types.
+    pub update_check_signal: Option<Arc<tokio::sync::Notify>>,
 }
 
 /// Dashboard configuration from `[dashboard]` in server.toml.
@@ -314,6 +320,12 @@ pub fn admin_router(state: AdminState) -> Router {
         .route(
             "/api/v1/mirrors/:distro/status",
             get(mirrors::handle_mirror_status),
+        )
+        // Update distribution (Sprint 34 P1)
+        .route("/api/v1/updates", get(updates::handle_list_updates))
+        .route(
+            "/api/v1/updates/check",
+            post(updates::handle_trigger_update_check),
         )
         // Tracker
         .route(

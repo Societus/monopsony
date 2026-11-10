@@ -114,6 +114,36 @@ bind = "0.0.0.0:3128"
 # cross_check_timeout_secs = 30
 
 # ============================================================================
+# Peer-exchange blacklist propagation
+# ============================================================================
+[peer_blacklist]
+# Signed blacklist entries (Approach A, peers-gossip) travel on
+# /.well-known/monopsony/peers and are merged into this server's enforcement:
+# banned peers are dropped from the served peers list and skipped as
+# cross-check anchors. Trust is PINNED-ORIGINATOR (apt signed-by model — no
+# keyserver, no TOFU): an entry is only accepted when its `originator` Ed25519
+# key is listed here AND its signature verifies.
+#
+# To pin the tracker operator's key, put its 64-char hex public key below.
+# EMPTY LIST (default) = remote entries are ignored entirely; the server
+# stays local-only until you pin at least one key. Never trust-by-default.
+# Default: []
+# Type: string[] (64-char hex Ed25519 public keys)
+# trusted_operators = ["<64-char-hex-operator-public-key>"]
+
+# Max blacklist entries merged into / advertised in one peers response
+# (newest-seq first).
+# Default: 64
+# Type: usize
+# max_entries = 64
+
+# Days a signed retraction is retained as a tombstone, so a peer re-syncing
+# from an old snapshot cannot resurrect a retracted ban.
+# Default: 7
+# Type: i64
+# tombstone_days = 7
+
+# ============================================================================
 # gRPC Control Plane
 # ============================================================================
 [grpc]
@@ -458,3 +488,77 @@ server_key_path = "/var/lib/monopsony/server.key"
 # Default: 15
 # Type: u64
 # login_lockout_minutes = 15
+
+# ============================================================================
+# Update Distribution (Sprint 34 P1)
+# ============================================================================
+[update]
+# Server-mediated self-update distribution: the server polls GitHub Releases
+# on the public mirror, downloads each release ONCE over the WAN, verifies
+# it (SHA256SUMS for every asset; GPG when a key is pinned below), and stores
+# it content-addressed in the shadow cache. Clients then fetch updates over
+# the LAN instead of each hitting GitHub (serving surface lands in P2).
+#
+# Runtime toggle: server_settings key `update_distributor_enabled` (JSON
+# bool) overrides `enabled` without a restart. Admin API:
+#   GET  /api/v1/updates         — stored releases + per-platform completeness
+#   POST /api/v1/updates/check   — trigger an out-of-band poll now
+#
+# Poll GitHub Releases and store verified artifacts.
+# Default: true
+# Type: bool
+# enabled = true
+
+# GitHub repo to poll (owner/name). Points at a scratch repo for bench runs.
+# Default: "societus/monopsony"
+# Type: string
+# repo = "societus/monopsony"
+
+# Poll interval in seconds.
+# Default: 21600 (6 hours)
+# Type: u64
+# check_interval = 21600
+
+# Consider pre-release tags (rc builds — the fleet ships rcs). Set false for
+# stable-only servers.
+# Default: true
+# Type: bool
+# include_prerelease = true
+
+# Newest COMPLETE releases retained in the cache; older ones are pruned
+# (DB rows, cache index entries, then blob gc). The server's own running
+# version is never pruned.
+# Default: 3
+# Type: u32
+# retain_versions = 3
+
+# Armored GPG public key of the release signer — inline text starting
+# "-----BEGIN" or a path to such a file (same model as mirrors.toml
+# trusted_keys). When set, SHA256SUMS.sig is REQUIRED on every release and
+# must verify against this key (fail-closed). When absent, the trust basis is
+# sha256-of-GitHub-served-bytes and a warning metric is emitted.
+# Default: unset
+# Type: string
+# trusted_gpg_key = "/etc/monopsony/monopsony-release.pubkey"
+#
+# GitHub API rate limits: pass MONOPSONY_GITHUB_TOKEN via the environment (or
+# `--github-token`) — the same secret path the shadow-package GitHub checks
+# use. There is deliberately no github_token key in this file; tokens never
+# live in server.toml.
+
+[registry]
+# Personal OCI registry (Sprint 25): the push/pull listener itself binds via
+# the `--registry-bind` CLI flag (default 0.0.0.0:3131 — dedicated port, the
+# /v2 namespace on the mirror router belongs to the docker.io pull-through).
+# All routes are keyed (the same auth as the proxy); docker clients use
+# `docker login <host>:3131 -u monopsony -p <api-key>`.
+#
+# Manifest-push policy. Default (false): a manifest push whose referenced
+# blobs or child manifests are not stored yet is rejected with
+# MANIFEST_BLOB_UNKNOWN — the simplest spec-conformant behavior. Set true to
+# allow lazy pushes (some CI flows push manifests before their blobs).
+# `subject` (referrers) descriptors are always accepted regardless.
+# Default: false
+# Type: bool
+# allow_missing_blobs = false
+
