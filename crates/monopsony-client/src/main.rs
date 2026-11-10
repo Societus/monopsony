@@ -130,6 +130,12 @@ enum Commands {
         /// Distro filter for tracker queries
         #[arg(long, default_value = "archlinux")]
         distro: String,
+
+        /// Pinned blacklist originator key(s) (hex Ed25519 public keys).
+        /// Repeatable. Without at least one pin, signed blacklist entries
+        /// seen in peers responses are ignored (never trust-by-default).
+        #[arg(long)]
+        trusted_operator: Vec<String>,
     },
     /// Show client status (certificates, detected package managers)
     Status {
@@ -299,6 +305,7 @@ fn detect_binary_type() -> &'static str {
 
 async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
     let binary_type = detect_binary_type();
+    let binary_kind = self_update::BinaryKind::from_binary_type(binary_type);
 
     match cmd {
         SelfUpdateMode::Check => {
@@ -308,7 +315,7 @@ async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
             let current_version = env!("CARGO_PKG_VERSION").to_string();
             println!("Current {}: {}", binary_type, current_version);
 
-            let result = self_update::check_for_update(&current_version).await;
+            let result = self_update::check_for_update(&current_version, binary_kind).await;
 
             match result {
                 Ok(result) => {
@@ -337,7 +344,7 @@ async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
 
             let current_version = env!("CARGO_PKG_VERSION").to_string();
 
-            let result = self_update::check_for_update(&current_version).await;
+            let result = self_update::check_for_update(&current_version, binary_kind).await;
 
             match result {
                 Ok(result) => {
@@ -371,11 +378,21 @@ async fn run_self_update(cmd: SelfUpdateMode) -> anyhow::Result<()> {
                     println!("Downloading update from: {}", asset_url);
                     println!("Installing to: {}", current_exe.display());
 
-                    // Try parsing the default recipe for the managed pipeline
-                    let recipe = toml::from_str::<monopsony_common::shadow_types::ShadowRecipe>(
-                        monopsony_common::shadow_types::DEFAULT_MONOPSONY_RECIPE,
-                    )
-                    .ok();
+                    // Try parsing the per-binary default recipe for the
+                    // managed pipeline
+                    let default_recipe = match binary_kind {
+                        self_update::BinaryKind::Server => {
+                            monopsony_common::shadow_types::DEFAULT_MONOPSONY_SERVER_RECIPE
+                        }
+                        self_update::BinaryKind::Client => {
+                            monopsony_common::shadow_types::DEFAULT_MONOPSONY_CLIENT_RECIPE
+                        }
+                    };
+                    let recipe =
+                        toml::from_str::<monopsony_common::shadow_types::ShadowRecipe>(
+                            default_recipe,
+                        )
+                        .ok();
 
                     if recipe.is_some() {
                         // Managed update with full safety pipeline
@@ -550,8 +567,16 @@ async fn main() -> anyhow::Result<()> {
             tracker_url,
             peer_url,
             distro,
+            trusted_operator,
         }) => {
-            run_discover(timeout_secs, tracker_url, peer_url, &distro).await?;
+            run_discover(
+                timeout_secs,
+                tracker_url,
+                peer_url,
+                &distro,
+                trusted_operator,
+            )
+            .await?;
         }
         Some(Commands::Status { quiet }) => {
             if quiet {
@@ -623,8 +648,9 @@ async fn main() -> anyhow::Result<()> {
 /// Resolve server address using the fallback chain:
 /// 1. cert_dir/server.json — ws_url field (from pairing, for CF tunnel deployments)
 /// 2. cert_dir/server.json — grpc_addr field (from pairing, for direct TCP)
-/// 3. mDNS discovery
-/// 4. Error if all fail
+/// 3. client.toml — [server] address + grpc_port (static config fallback)
+/// 4. mDNS discovery
+/// 5. Error if all fail
 async fn resolve_server_addr(cert_dir: &Path) -> anyhow::Result<String> {
     // Try server.json from pairing
     let server_json_path = cert_dir.join("server.json");
@@ -655,6 +681,16 @@ async fn resolve_server_addr(cert_dir: &Path) -> anyhow::Result<String> {
         }
     }
 
+    // Fall back to the client config's [server] section. Lenient extraction
+    // (toml::Value, server table only): a minimal client.toml may omit
+    // sections the full ClientConfig struct requires.
+    let config_path = std::env::var("MONOPSONY_CLIENT_CONFIG")
+        .unwrap_or_else(|_| default_config_path());
+    if let Some(addr) = server_addr_from_config(&config_path) {
+        info!("Using server from config {}: {}", config_path, addr);
+        return Ok(addr);
+    }
+
     // Fall back to mDNS
     info!("Discovering server via mDNS...");
     let disc = discovery::ClientDiscovery::new("monopsony");
@@ -670,6 +706,97 @@ async fn resolve_server_addr(cert_dir: &Path) -> anyhow::Result<String> {
     let addr = format!("{}:{}", found.address, found.grpc_port);
     info!("Discovered server at {}", addr);
     Ok(addr)
+}
+
+/// Extract `address:grpc_port` from a client config's `[server]` section.
+/// Returns None when the file is missing, unparsable, has no server table,
+/// or the address is empty/unset. Lenient by design: only the server table
+/// is decoded, so a minimal client.toml without the other ClientConfig
+/// sections still resolves.
+fn server_addr_from_config(config_path: &str) -> Option<String> {
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let value: toml::Value = toml::from_str(&content).ok()?;
+    let server = value
+        .get("server")?
+        .clone()
+        .try_into::<monopsony_common::config::ServerConnectionConfig>()
+        .ok()?;
+    let addr = server.address?;
+    if addr.is_empty() {
+        return None;
+    }
+    Some(format!("{}:{}", addr, server.grpc_port))
+}
+
+/// Write `[server] address` + `grpc_port` into a client config, preserving
+/// all other file content (unknown keys included). Accepts `host` or
+/// `host:port`; a bare host keeps an existing `[server].grpc_port` when one
+/// is already configured, otherwise the struct default (50051). Tunnel URLs
+/// (ws:// / wss://) are rejected — those belong in cert_dir/server.json from
+/// pairing, and the config read path formats `address:grpc_port`, which
+/// would corrupt a scheme'd address. Creates the file (and parent dirs)
+/// when absent.
+fn persist_server_to_config_at(config_path: &str, server: &str) -> anyhow::Result<()> {
+    if server.starts_with("ws://") || server.starts_with("wss://") {
+        anyhow::bail!(
+            "refusing to write tunnel URL to client config; ws:// addresses live in server.json from pairing"
+        );
+    }
+
+    let mut value: toml::Value = std::fs::read_to_string(config_path)
+        .ok()
+        .and_then(|content| toml::from_str(&content).ok())
+        .unwrap_or_else(|| toml::Value::Table(toml::map::Map::new()));
+
+    let existing_port = value
+        .get("server")
+        .and_then(|s| s.get("grpc_port"))
+        .and_then(|p| p.as_integer())
+        .map(|p| p as u16);
+    // host:port form wins; bare host falls back to the configured port.
+    let explicit = server.rsplit_once(':').and_then(|(h, p)| {
+        let port = p.parse::<u16>().ok()?;
+        if h.is_empty() {
+            return None;
+        }
+        Some((h.to_string(), port))
+    });
+    let (host, port) = explicit
+        .unwrap_or_else(|| (server.to_string(), existing_port.unwrap_or(50051)));
+
+    {
+        let table = value
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("config root is not a TOML table"))?;
+        let server_table = table
+            .entry("server")
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        if !server_table.is_table() {
+            *server_table = toml::Value::Table(toml::map::Map::new());
+        }
+        if let Some(st) = server_table.as_table_mut() {
+            st.insert("address".to_string(), toml::Value::String(host.clone()));
+            st.insert("grpc_port".to_string(), toml::Value::Integer(port as i64));
+        }
+    }
+
+    if let Some(parent) = Path::new(config_path).parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating config dir for {}", config_path))?;
+    }
+    let out = toml::to_string_pretty(&value).context("serializing client config")?;
+    std::fs::write(config_path, out)
+        .with_context(|| format!("writing client config {}", config_path))?;
+    info!("Recorded server {}:{} in {}", host, port, config_path);
+    Ok(())
+}
+
+/// Persist the server into the client config at the active config path
+/// (`MONOPSONY_CLIENT_CONFIG` override or the platform default).
+fn persist_server_to_config(server: &str) -> anyhow::Result<()> {
+    let config_path =
+        std::env::var("MONOPSONY_CLIENT_CONFIG").unwrap_or_else(|_| default_config_path());
+    persist_server_to_config_at(&config_path, server)
 }
 
 /// Build an mTLS-enabled connection to the server for shadow package
@@ -2010,12 +2137,14 @@ async fn run_discover(
     tracker_url: Option<String>,
     peer_url: Option<String>,
     distro: &str,
+    trusted_operators: Vec<String>,
 ) -> anyhow::Result<()> {
     info!(
         "Discovering Monopsony servers (timeout: {}s)...",
         timeout_secs
     );
-    let disc = discovery::ClientDiscovery::new("monopsony");
+    let disc = discovery::ClientDiscovery::new("monopsony")
+        .with_trusted_blacklist_operators(trusted_operators);
 
     let tracker_urls: Vec<String> = tracker_url
         .map(|s| {
@@ -2213,6 +2342,17 @@ fn hit_counter_state_path(_cert_dir: &Path) -> PathBuf {
 
 async fn run_configure(server: &str) -> anyhow::Result<()> {
     info!("Configuring package managers for server: {}", server);
+
+    // Record the server in client.toml so the daemon (and every
+    // resolve_server_addr caller) can resolve it without server.json or
+    // mDNS. Runs before the PM loop so a box with no detected package
+    // managers still records the server. Non-fatal: PM proxy config is
+    // configure's primary job, and a tunnel URL is simply refused by the
+    // write path.
+    if let Err(e) = persist_server_to_config(server) {
+        warn!("Could not record server in client config: {}", e);
+    }
+
     let backends = monopsony_common::package_manager::get_available_backends();
     if backends.is_empty() {
         warn!("No supported package managers detected on this system.");
@@ -2995,12 +3135,10 @@ async fn load_verified_recipe(
     // verify_recipe_trust enforces the policy (e.g. trusted_authors works
     // without the raw key, trusted_server_only fails closed without one).
     let operator_vk = load_operator_verifying_key(&trust_config);
-    trust::verify_recipe_trust(&signed, &trust_config, operator_vk.as_ref()).context(
-        format!(
-            "trust verification failed for recipe of '{}' (key_id: {})",
-            name, signed.operator_signature.key_id
-        ),
-    )?;
+    trust::verify_recipe_trust(&signed, &trust_config, operator_vk.as_ref()).context(format!(
+        "trust verification failed for recipe of '{}' (key_id: {})",
+        name, signed.operator_signature.key_id
+    ))?;
     Ok(recipe_toml)
 }
 
@@ -3582,10 +3720,12 @@ async fn run_shadow_package(
                         outcome.error.as_deref().unwrap_or("unknown error")
                     );
                 } else if outcome.held {
-                    // failure_policy=hold kept the failed state on purpose — a
-                    // backup exists but must not be restored without an operator.
+                    // Deliberate hold (Sprint 31 I3 convention — distinguish
+                    // from rollback): failure_policy=hold kept a failed state
+                    // on purpose, or the downgrade_unsafe gate refused before
+                    // any host change. Neither rolls back automatically.
                     eprintln!(
-                        "✗ Update FAILED (failure_policy=hold — kept failed state, awaiting operator): {}",
+                        "✗ Update FAILED (deliberately held, awaiting operator — no automatic rollback): {}",
                         outcome.error.as_deref().unwrap_or("unknown error")
                     );
                 } else {
@@ -3858,9 +3998,7 @@ async fn run_shadow_view(cert_dir: &Path) -> anyhow::Result<()> {
             }
         }
     }
-    println!(
-        "\nUse `monopsony-client package accept --name <package>` to review and approve."
-    );
+    println!("\nUse `monopsony-client package accept --name <package>` to review and approve.");
     Ok(())
 }
 
@@ -4054,7 +4192,14 @@ async fn run_shadow_accept(
         &asset_url,
         &http,
         current_version.as_deref(),
-        true,
+        // Honest interactivity: the accept flow prompts unless the operator
+        // passed --non_interactive. Hardcoding `true` here would keep the
+        // downgrade gate dead for scripted accepts — the same trap the Update
+        // arm caught live 2026-10-30. (Reachability today: this arm installs
+        // the version it just detected, so the gate cannot fire; this is
+        // wiring hygiene so the gate stays real if the flow ever targets a
+        // different version.)
+        !non_interactive,
     )
     .await;
     if outcome.success {
@@ -4532,5 +4677,161 @@ mod resolved_asset_url_tests {
             msg.contains("placeholder"),
             "error should mention the placeholder, got: {msg}"
         );
+    }
+}
+
+#[cfg(test)]
+mod client_config_server_tests {
+    use super::{persist_server_to_config_at, server_addr_from_config};
+
+    /// Write a temp config file and return its path as a str.
+    fn temp_config(dir: &tempfile::TempDir, content: &str) -> String {
+        let path = dir.path().join("client.toml");
+        std::fs::write(&path, content).expect("write temp config");
+        path.to_str().expect("temp path is utf8").to_string()
+    }
+
+    #[test]
+    fn config_server_section_resolves_addr_and_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_config(
+            &dir,
+            "[server]\naddress = \"10.10.20.58\"\ngrpc_port = 50051\n",
+        );
+        assert_eq!(
+            server_addr_from_config(&path),
+            Some("10.10.20.58:50051".to_string())
+        );
+    }
+
+    #[test]
+    fn minimal_server_only_config_parses() {
+        // A server-table-only file FAILS full ClientConfig parse
+        // ([client]/[tls]/[proxy]/[metrics]/[logging] lack serde defaults),
+        // which is exactly why extraction is lenient (toml::Value, server
+        // table only).
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_config(
+            &dir,
+            "[server]\naddress = \"10.10.20.58\"\ngrpc_port = 50051\n",
+        );
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            toml::from_str::<monopsony_common::config::ClientConfig>(&content).is_err(),
+            "minimal config must fail the full ClientConfig parse for this test to be meaningful"
+        );
+        assert_eq!(
+            server_addr_from_config(&path),
+            Some("10.10.20.58:50051".to_string())
+        );
+    }
+
+    #[test]
+    fn config_without_server_section_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_config(&dir, "[client]\nid = \"c1\"\n");
+        assert_eq!(server_addr_from_config(&path), None);
+    }
+
+    #[test]
+    fn missing_config_file_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.toml").to_str().unwrap().to_string();
+        assert_eq!(server_addr_from_config(&path), None);
+    }
+
+    #[test]
+    fn empty_address_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_config(&dir, "[server]\naddress = \"\"\n");
+        assert_eq!(server_addr_from_config(&path), None);
+    }
+
+    #[test]
+    fn omitted_fields_take_struct_defaults() {
+        // [server] with only an address: grpc_port falls back to the struct
+        // serde default (50051), matching config.rs default_grpc_port.
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_config(&dir, "[server]\naddress = \"srv\"\n");
+        assert_eq!(
+            server_addr_from_config(&path),
+            Some("srv:50051".to_string())
+        );
+    }
+
+    #[test]
+    fn default_grpc_port_literal_matches_serde_default() {
+        // Drift guard: persist_server_to_config_at's bare-host fallback port
+        // (50051) must equal ServerConnectionConfig's serde default.
+        let cfg: monopsony_common::config::ServerConnectionConfig =
+            toml::from_str("").expect("empty doc yields all serde defaults");
+        assert_eq!(cfg.grpc_port, 50051);
+        assert_eq!(cfg.http_port, 3142);
+    }
+
+    #[test]
+    fn persist_creates_config_with_server_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.toml").to_str().unwrap().to_string();
+        persist_server_to_config_at(&path, "10.10.20.58:50051").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("address = \"10.10.20.58\""));
+        assert!(content.contains("grpc_port = 50051"));
+    }
+
+    #[test]
+    fn persist_preserves_existing_content_and_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_config(
+            &dir,
+            "[client]\nid = \"c1\"\n\n[server]\naddress = \"old\"\ngrpc_port = 51000\n",
+        );
+        // Bare host: address updated, existing grpc_port preserved.
+        persist_server_to_config_at(&path, "10.10.20.58").unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("id = \"c1\""), "existing [client] kept");
+        assert!(content.contains("address = \"10.10.20.58\""));
+        assert!(content.contains("grpc_port = 51000"), "existing port kept");
+    }
+
+    #[test]
+    fn persist_host_port_form_overrides_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = temp_config(&dir, "[server]\naddress = \"old\"\ngrpc_port = 51000\n");
+        persist_server_to_config_at(&path, "1.2.3.4:6000").unwrap();
+        assert_eq!(
+            server_addr_from_config(&path),
+            Some("1.2.3.4:6000".to_string())
+        );
+    }
+
+    #[test]
+    fn persist_rejects_tunnel_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml").to_str().unwrap().to_string();
+        for url in ["wss://tunnel.example.com", "ws://10.0.0.1:80"] {
+            let err = persist_server_to_config_at(&path, url)
+                .expect_err("tunnel URL must be refused");
+            assert!(format!("{err:#}").contains("server.json"));
+        }
+        assert!(
+            !path_exists(&path),
+            "refused write must not create the file"
+        );
+    }
+
+    #[test]
+    fn persist_then_resolve_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rt.toml").to_str().unwrap().to_string();
+        persist_server_to_config_at(&path, "10.10.20.58:50051").unwrap();
+        assert_eq!(
+            server_addr_from_config(&path),
+            Some("10.10.20.58:50051".to_string())
+        );
+    }
+
+    fn path_exists(p: &str) -> bool {
+        std::path::Path::new(p).exists()
     }
 }

@@ -29,7 +29,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use monopsony_common::shadow_diff::shadow_diff;
 use monopsony_common::shadow_template::{render_step, StepContext};
 use monopsony_common::shadow_types::{
-    InstallMethod, ShadowRecipe, ShadowSource, DEFAULT_MONOPSONY_RECIPE,
+    InstallMethod, ShadowRecipe, ShadowSource, DEFAULT_MONOPSONY_CLIENT_RECIPE,
+    DEFAULT_MONOPSONY_SERVER_RECIPE,
 };
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
@@ -288,7 +289,9 @@ pub struct UpdateOutcome {
     pub log: Vec<String>,
     /// On failure: "<stage>: <message>".
     pub error: Option<String>,
-    /// True when failure_policy=hold deliberately kept the failed state, awaiting operator action.
+    /// True when the update awaits operator action: failure_policy=hold
+    /// deliberately kept a failed state, or the downgrade_unsafe gate refused
+    /// before any host change.
     pub held: bool,
 }
 
@@ -297,6 +300,9 @@ struct StageError {
     stage: &'static str,
     message: String,
     backup: Option<PathBuf>,
+    /// True when the abort is a DELIBERATE hold (downgrade_unsafe gate): no
+    /// host change was made and the update awaits operator action.
+    held: bool,
 }
 
 fn stage(stage: &'static str, e: impl std::fmt::Display) -> StageError {
@@ -304,6 +310,7 @@ fn stage(stage: &'static str, e: impl std::fmt::Display) -> StageError {
         stage,
         message: e.to_string(),
         backup: None,
+        held: false,
     }
 }
 
@@ -707,11 +714,16 @@ async fn install_service_script(
         .with_context(|| format!("writing {}", path.display()))
         .map_err(|e| stage("service", e))?;
     if init == InitSystem::OpenRC {
-        // OpenRC init scripts must be executable to be usable.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("chmod 755 {}", path.display()))
-            .map_err(|e| stage("service", e))?;
+        // OpenRC init scripts must be executable to be usable. OpenRC only
+        // exists on Unix; the cfg keeps the Unix-only PermissionsExt API out
+        // of Windows builds.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .with_context(|| format!("chmod 755 {}", path.display()))
+                .map_err(|e| stage("service", e))?;
+        }
     }
     log.push(format!("wrote {init} service script: {}", path.display()));
 
@@ -854,7 +866,9 @@ pub async fn execute_update(
                 backup_path: None,
                 log,
                 error: Some(format!("{}: {}", err.stage, err.message)),
-                held: hold,
+                // Deliberate holds: failure_policy=hold kept a failed state,
+                // or the downgrade gate refused before any host change.
+                held: hold || err.held,
             }
         }
     }
@@ -933,20 +947,26 @@ async fn execute_inner(
 
     // Downgrade gate: refuse to go OLDER unless the operator is interactive or
     // success is health-verifiable. Fail-open (return false) when current
-    // version can't be parsed so we never block a valid update.
+    // version can't be parsed so we never block a valid update. The refusal is
+    // a DELIBERATE hold (Sprint 31 I3 convention): it fires before any host
+    // change, changes nothing, and the update awaits operator action —
+    // distinct from a rollback in the outer failure line.
     if recipe.downgrade_unsafe
         && matches!(gate.current_version, Some(c) if is_downgrade(target_version, c))
         && !gate.interactive
         && install.health_check.is_none()
     {
-        return Err(stage(
-            "plan",
-            format!(
-                "downgrade refused: downgrade_unsafe set and target {} < current {}; interactive or health-verifiable update required",
-                target_version,
-                gate.current_version.unwrap_or("unknown"),
-            ),
-        ));
+        return Err(StageError {
+            held: true,
+            ..stage(
+                "plan",
+                format!(
+                    "downgrade refused: downgrade_unsafe set and target {} < current {}; held awaiting operator — interactive or health-verifiable update required",
+                    target_version,
+                    gate.current_version.unwrap_or("unknown"),
+                ),
+            )
+        });
     }
 
     // T3.2: capture pre-update systemd baseline before any changes are made,
@@ -1166,10 +1186,11 @@ async fn execute_inner(
     Ok(())
 }
 
-// Keep the default-recipe constant linked so the executor module documents
-// the canonical recipe shape it executes.
+// Keep the default-recipe constants linked so the executor module documents
+// the canonical recipe shapes it executes.
 const _: () = {
-    let _ = DEFAULT_MONOPSONY_RECIPE;
+    let _ = DEFAULT_MONOPSONY_SERVER_RECIPE;
+    let _ = DEFAULT_MONOPSONY_CLIENT_RECIPE;
 };
 
 #[cfg(test)]
@@ -1603,11 +1624,24 @@ detect_pattern = "([0-9.]+)"
         );
     }
 
+    /// Recipe TOML for the downgrade-gate matrix; `flag` prepends the
+    /// ROOT-LEVEL `downgrade_unsafe` key before the first section (under a
+    /// [table] header serde would silently drop it and the gate would never
+    /// see it). Fixtures always deserialize via the real schema.
+    fn matrix_recipe_toml(flag: bool, extra_install: &str) -> String {
+        let flag_line = if flag {
+            "downgrade_unsafe = true\n"
+        } else {
+            ""
+        };
+        format!(
+            "{flag_line}[package]\nname = \"dg\"\nsource_type = \"direct_url\"\nsource_url = \"https://example.com/dg.tar.gz\"\n\n[install]\nmethod = \"extract\"\ntarget_dir = \"/tmp/dg-test\"\n{extra_install}\n[direct_url]\nversion_discovery = \"scrape\"\nasset_url_template = \"https://example.com/dl/dg.tar.gz\"\n\n[version]\ndetect_command = \"echo 1.0.0\"\ndetect_pattern = \"([0-9]+\\\\.[0-9]+\\\\.[0-9]+)\"\n"
+        )
+    }
+
     /// Root-level `downgrade_unsafe = true` prepended before the first section.
     fn downgrade_unsafe_recipe_toml(extra_install: &str) -> String {
-        format!(
-            "downgrade_unsafe = true\n[package]\nname = \"dg\"\nsource_type = \"direct_url\"\nsource_url = \"https://example.com/dg.tar.gz\"\n\n[install]\nmethod = \"extract\"\ntarget_dir = \"/tmp/dg-test\"\n{extra_install}\n[direct_url]\nversion_discovery = \"scrape\"\nasset_url_template = \"https://example.com/dl/dg.tar.gz\"\n\n[version]\ndetect_command = \"echo 1.0.0\"\ndetect_pattern = \"([0-9]+\\\\.[0-9]+\\\\.[0-9]+)\"\n"
-        )
+        matrix_recipe_toml(true, extra_install)
     }
 
     #[tokio::test]
@@ -1625,6 +1659,10 @@ detect_pattern = "([0-9.]+)"
         .await;
         assert!(!outcome.success);
         assert!(!outcome.rolled_back, "refusal happens before any changes");
+        assert!(
+            outcome.held,
+            "refusal must report the deliberate hold (I3 held-state convention): {outcome:?}"
+        );
         assert!(
             outcome.error.unwrap().contains("downgrade refused"),
             "gate must refuse non-interactive downgrades"
@@ -1694,6 +1732,137 @@ detect_pattern = "([0-9.]+)"
         assert!(
             !err.contains("downgrade refused"),
             "upgrades must not be gated by downgrade_unsafe, got: {err}"
+        );
+    }
+
+    /// Assert the gate did NOT fire in a matrix cell: the update rode past it
+    /// to the dead asset URL (connection refused) with no "downgrade refused"
+    /// anywhere. Used for the proceed cells of the refusal matrix.
+    async fn assert_gate_did_not_fire(extra_install: &str, target: &str, interactive: bool) {
+        let toml = matrix_recipe_toml(false, extra_install);
+        let recipe: ShadowRecipe = toml::from_str(&toml).unwrap();
+        let outcome = execute_update(
+            &recipe,
+            target,
+            "https://127.0.0.1:1/dg.tar.gz",
+            &http_client(),
+            Some("2.0.0"),
+            interactive,
+        )
+        .await;
+        assert!(!outcome.success);
+        let err = outcome.error.unwrap();
+        assert!(
+            !err.contains("downgrade refused"),
+            "gate must not fire without downgrade_unsafe, got: {err}"
+        );
+    }
+
+    // ── Refusal matrix (P4): downgrade_unsafe × interactive × health- ──
+    // ── verifiable, every cell asserted. "Proceeds" cells ride to the   ──
+    // ── offline download failure; only the refusal cell reports "held". ──
+
+    #[tokio::test]
+    async fn matrix_without_flag_non_interactive_plain_proceeds() {
+        // No downgrade_unsafe + downgrade target + non-interactive + no health
+        // check: the flag is the only trigger, so the gate must stay shut.
+        assert_gate_did_not_fire("", "1.0.0", false).await;
+    }
+
+    #[tokio::test]
+    async fn matrix_without_flag_non_interactive_health_proceeds() {
+        assert_gate_did_not_fire(
+            "\n[install.health_check]\ntype = \"port\"\nport = 5380\ntimeout_secs = 3\n",
+            "1.0.0",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn matrix_without_flag_interactive_plain_proceeds() {
+        assert_gate_did_not_fire("", "1.0.0", true).await;
+    }
+
+    #[tokio::test]
+    async fn matrix_without_flag_interactive_health_proceeds() {
+        assert_gate_did_not_fire(
+            "\n[install.health_check]\ntype = \"port\"\nport = 5380\ntimeout_secs = 3\n",
+            "1.0.0",
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn matrix_with_flag_interactive_health_proceeds() {
+        // Flag set but BOTH escape hatches open (interactive + health check):
+        // gate must not fire.
+        let toml = downgrade_unsafe_recipe_toml(
+            "\n[install.health_check]\ntype = \"port\"\nport = 5380\ntimeout_secs = 3\n",
+        );
+        let recipe: ShadowRecipe = toml::from_str(&toml).unwrap();
+        let outcome = execute_update(
+            &recipe,
+            "1.0.0",
+            "https://127.0.0.1:1/dg.tar.gz",
+            &http_client(),
+            Some("2.0.0"),
+            true,
+        )
+        .await;
+        assert!(!outcome.success);
+        let err = outcome.error.unwrap();
+        assert!(
+            !err.contains("downgrade refused"),
+            "interactive + health-verifiable downgrade must not be gated, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_update_downgrade_gate_refusal_leaves_filesystem_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("app");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("marker.txt"), b"keep").unwrap();
+        let entries_before = std::fs::read_dir(tmp.path()).unwrap().count();
+        // backup_old = true would create a backup at the FIRST pipeline step
+        // that gets that far; the refusal must fire before even that.
+        let toml = downgrade_unsafe_recipe_toml("\nbackup_old = true\n")
+            .replace("/tmp/dg-test", target.to_str().unwrap());
+        let recipe: ShadowRecipe = toml::from_str(&toml).unwrap();
+        let outcome = execute_update(
+            &recipe,
+            "1.0.0",
+            "https://example.com/dg.tar.gz",
+            &http_client(),
+            Some("2.0.0"),
+            false,
+        )
+        .await;
+        assert!(!outcome.success);
+        assert!(outcome.held, "refusal is a deliberate hold: {outcome:?}");
+        assert!(!outcome.rolled_back);
+        assert!(
+            outcome.backup_path.is_none(),
+            "refusal must not create a backup: {outcome:?}"
+        );
+        // The log holds ONLY the plan-stage FAILED line: no download, no
+        // pre_update hook, no backup, no extract ever ran.
+        assert_eq!(outcome.log.len(), 1, "log: {:?}", outcome.log);
+        assert!(
+            outcome.log[0]
+                .starts_with("update FAILED at stage 'plan': downgrade refused:"),
+            "log: {:?}",
+            outcome.log
+        );
+        // Filesystem: the marker file is intact and no entry (backup sibling
+        // or otherwise) appeared beside the target dir.
+        assert_eq!(std::fs::read(target.join("marker.txt")).unwrap(), b"keep");
+        assert_eq!(
+            std::fs::read_dir(tmp.path()).unwrap().count(),
+            entries_before,
+            "refusal must not create any entry beside the target dir"
         );
     }
 
