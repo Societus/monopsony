@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 
 use anyhow::{Context, Result};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine as _;
 use futures::stream::{Stream, StreamExt};
 use http::Request as HttpRequest;
 use hyper::body::Incoming;
@@ -21,26 +23,30 @@ use monopsony_common::proto::monopsony::monopsony_control_server::{
 };
 use monopsony_common::proto::monopsony::{
     client_message, command, server_message, ApplyShadowUpdateRequest, CheckShadowUpdatesRequest,
-    ClientMessage, Command, DownloadShadowAssetRequest, FirewallRuleInfo, FleetInstall,
-    GetShadowRecipeRequest, HeartbeatRequest, HeartbeatResponse, InventoryDelta, InventoryReport,
-    InventoryResponse, ListShadowCatalogRequest, ListShadowPackagesRequest,
-    ListShadowStagingRequest, QueryShadowRegistryRequest, QueryShadowRegistryResponse,
-    RegisterRequest, RegisterResponse, RegisterShadowPackageRequest, RenewClientCertRequest,
-    RenewClientCertResponse, ResolveShadowStagingRequest, ResolveShadowStagingResponse,
-    RevokeClientCertRequest, RevokeClientCertResponse, RollbackShadowUpdateRequest, ServerMessage,
-    ShadowAssetChunk, ShadowCatalog, ShadowCatalogEntry, ShadowPackageInfo, ShadowPackageList,
-    ShadowRegistryMatch, ShadowScanAck, ShadowScanReport, ShadowStagingInfo, ShadowStagingList,
-    ShadowUpdateList, ShadowUpdateResult, SignedShadowRecipe, SyncRequest,
-    UnregisterShadowPackageRequest, UnregisterShadowPackageResponse,
+    CheckUpdateRequest, CheckUpdateResponse, ClientMessage, Command, DownloadShadowAssetRequest,
+    DownloadUpdateAssetRequest, FirewallRuleInfo, FleetInstall, GetShadowRecipeRequest,
+    HeartbeatRequest, HeartbeatResponse, InventoryDelta, InventoryReport, InventoryResponse,
+    ListShadowCatalogRequest, ListShadowPackagesRequest, ListShadowStagingRequest,
+    QueryShadowRegistryRequest, QueryShadowRegistryResponse, RegisterRequest, RegisterResponse,
+    RegisterShadowPackageRequest, RenewClientCertRequest, RenewClientCertResponse,
+    ResolveShadowStagingRequest, ResolveShadowStagingResponse, RevokeClientCertRequest,
+    RevokeClientCertResponse, RollbackShadowUpdateRequest, ServerMessage, ShadowAssetChunk,
+    ShadowCatalog, ShadowCatalogEntry, ShadowPackageInfo, ShadowPackageList, ShadowRegistryMatch,
+    ShadowScanAck, ShadowScanReport, ShadowStagingInfo, ShadowStagingList, ShadowUpdateList,
+    ShadowUpdateResult, SignedShadowRecipe, SyncRequest, UnregisterShadowPackageRequest,
+    UnregisterShadowPackageResponse, UpdateAssetChunk, UpdateAssetInfo,
 };
 
 use crate::client_health;
 use crate::tls::TlsManager;
-use monopsony_db::db::TamperAlertInsert;
+use monopsony_db::db::{
+    TamperAlertInsert, UpdateArtifactRow, UpdateAssignmentRow, UpdateReleaseRow,
+};
 use monopsony_db::Database;
 use monopsony_mirror::MirrorManager;
 use monopsony_shadow::catalog_hash::{catalog_hash, entry_hash, sign_entry};
 use monopsony_shadow::ShadowPackageManager;
+use sha2::{Digest, Sha256};
 use x509_parser::parse_x509_certificate;
 
 /// The presenting mTLS client certificate's serial (hex), injected into each
@@ -150,6 +156,257 @@ async fn direct_url_latest_version(
     src.latest_version(tag_pattern)
         .await
         .map_err(|e| e.to_string())
+}
+
+// ── Self-update serving (Sprint 34 P2, decisions D1/D5/D6/D8/D9) ───────────
+//
+// The distributor (monopsony-server) stores verified release blobs into the
+// shared ShadowCache with DB lineage in update_releases/update_artifacts.
+// This crate serves them: CheckUpdate answers a signed manifest, and
+// DownloadUpdateAsset streams the stored blob — both gated by per-client
+// rollout assignments (no broadcast-by-default). The handlers live here
+// because control cannot depend on monopsony-server; they use the Database +
+// ShadowPackageManager handles MonopsonyGrpc already holds.
+
+/// Release-contract binary kinds (the release CI's name prefixes; kept in
+/// step with update_distributor::BINARY_KINDS in the server crate).
+const UPDATE_BINARY_KINDS: [&str; 2] = ["server", "client"];
+
+/// ShadowCache index package name for one binary kind (the distributor's
+/// `kind_package` contract): "client" -> "monopsony-client".
+fn update_kind_package(kind: &str) -> String {
+    format!("monopsony-{kind}")
+}
+
+/// Acceptance gate for request `binary` fields: only release-contract kinds.
+fn valid_update_binary(kind: &str) -> bool {
+    UPDATE_BINARY_KINDS.contains(&kind)
+}
+
+/// One prerelease identifier (semver §11): numeric identifiers compare
+/// numerically and always sort BELOW alphanumeric ones. Derive does exactly
+/// this: variant order first (Num < Alph), then field order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PreReleaseId {
+    Num(u64),
+    Alph(String),
+}
+
+/// Semver-§11 precedence key for a release-contract version. Ordered by the
+/// derived Ord on the tuple: core numerics first, then the prerelease side —
+/// `None` prerelease (a plain release) must sort ABOVE any prerelease of the
+/// same core, so the prerelease is encoded as Some(list) and compared with
+/// an explicit branch (Option's derived Ord would put None first — the
+/// opposite of semver).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContractVersion {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    /// None = release (sorts above every prerelease of the same core).
+    prerelease: Option<Vec<PreReleaseId>>,
+}
+
+impl Ord for ContractVersion {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        (self.major, self.minor, self.patch)
+            .cmp(&(other.major, other.minor, other.patch))
+            .then_with(|| match (&self.prerelease, &other.prerelease) {
+                (None, None) => Ordering::Equal,
+                (Some(_), None) => Ordering::Less, // prerelease < release
+                (None, Some(_)) => Ordering::Greater,
+                (Some(a), Some(b)) => a.cmp(b), // Vec Ord: identifier-wise + shorter-prefix-below
+            })
+    }
+}
+
+impl PartialOrd for ContractVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Parse a version into a [`ContractVersion`] precedence key (see that
+/// struct's docs for the accepted subset). `None` = outside the subset.
+fn contract_version_precedence(version: &str) -> Option<ContractVersion> {
+    let clean = version.trim().trim_start_matches('v');
+    // Build metadata is ignored for precedence (semver §11.4).
+    let clean = clean.split('+').next().unwrap_or(clean);
+    let (core, prerelease) = match clean.split_once('-') {
+        Some((c, p)) => (c, Some(p)),
+        None => (clean, None),
+    };
+    let mut core_parts = core.split('.');
+    let major = core_parts.next()?.parse::<u64>().ok()?;
+    let minor = core_parts.next()?.parse::<u64>().ok()?;
+    let patch = core_parts.next()?.parse::<u64>().ok()?;
+    if core_parts.next().is_some() {
+        return None;
+    }
+    let prerelease = match prerelease {
+        Some(p) => {
+            let ids: Vec<PreReleaseId> = p
+                .split('.')
+                .map(|id| {
+                    if id.is_empty() {
+                        return None;
+                    }
+                    if id.bytes().all(|b| b.is_ascii_digit()) {
+                        id.parse::<u64>().ok().map(PreReleaseId::Num)
+                    } else {
+                        Some(PreReleaseId::Alph(id.to_string()))
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if ids.is_empty() {
+                return None;
+            }
+            Some(ids)
+        }
+        None => None,
+    };
+    Some(ContractVersion {
+        major,
+        minor,
+        patch,
+        prerelease,
+    })
+}
+
+/// True iff `candidate` is strictly newer than `current` under semver §11.
+/// Empty `current` (unknown/legacy client) is treated as 0.0.0 so any valid
+/// stored release qualifies. Unparseable candidates never qualify, and a
+/// garbage `current` only pairs against candidates when it parses —
+/// otherwise the comparison fails closed (no update reported).
+fn is_strictly_newer(candidate: &str, current: &str) -> bool {
+    let current_key = if current.is_empty() {
+        contract_version_precedence("0.0.0")
+    } else {
+        contract_version_precedence(current)
+    };
+    match (contract_version_precedence(candidate), current_key) {
+        (Some(a), Some(b)) => a > b,
+        _ => false,
+    }
+}
+
+/// The release to offer a client on `current_version`: the newest
+/// complete + semver-comparable stored release STRICTLY newer than current
+/// (the plan's version-order rule: the server never pushes a version older
+/// than — or equal to — a client's current). Unparseable stored versions
+/// are skipped, never selected.
+fn pick_distributable<'a>(
+    releases: &'a [UpdateReleaseRow],
+    current_version: &str,
+) -> Option<&'a UpdateReleaseRow> {
+    releases
+        .iter()
+        .filter(|r| r.assets_complete)
+        .filter(|r| is_strictly_newer(&r.version, current_version))
+        .max_by(|a, b| {
+            contract_version_precedence(&a.version).cmp(&contract_version_precedence(&b.version))
+        })
+}
+
+/// The newest complete stored release regardless of the caller's current
+/// version — reported as `latest_version`/`changelog_url` even when the
+/// caller is already up to date.
+fn newest_complete_release(releases: &[UpdateReleaseRow]) -> Option<&UpdateReleaseRow> {
+    releases
+        .iter()
+        .filter(|r| r.assets_complete)
+        .max_by(|a, b| {
+            contract_version_precedence(&a.version).cmp(&contract_version_precedence(&b.version))
+        })
+}
+
+/// Canonical update-manifest payload: the exact bytes the Ed25519 signature
+/// (D8) covers. Deterministic by construction — fixed field order via the
+/// json! macro over serde_json's map semantics, no whitespace. The response
+/// fields (latest_version/binary/platform/assets) are the only inputs, so a
+/// P3 verifier rebuilds the identical bytes from the wire and checks the
+/// signature.
+fn build_update_manifest_payload(
+    version: &str,
+    binary: &str,
+    platform: &str,
+    assets: &[UpdateAssetInfo],
+) -> Vec<u8> {
+    serde_json::json!({
+        "assets": assets
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "name": a.name,
+                    "platform": a.platform,
+                    "sha256": a.sha256,
+                    "size": a.size,
+                })
+            })
+            .collect::<Vec<_>>(),
+        "binary": binary,
+        "platform": platform,
+        "version": version,
+    })
+    .to_string()
+    .into_bytes()
+}
+
+/// Sign manifest bytes with the existing recipe-signing key path (D8):
+/// base64 Ed25519 + key id. No shadow manager (no key provisioned) →
+/// skip-and-log with empty outputs — the P1 D7 posture (serve the bytes,
+/// surface the unsigned state, don't invent a trust anchor).
+fn sign_update_manifest(
+    shadow_manager: Option<&ShadowPackageManager>,
+    payload: &[u8],
+) -> (String, String) {
+    match shadow_manager {
+        Some(mgr) => {
+            use ed25519_dalek::Signer;
+            use monopsony_shadow::shadow_signing::key_id;
+            let sk = mgr.signing_key_ref();
+            let sig = sk.sign(payload);
+            (B64.encode(sig.to_bytes()), key_id(&sk.verifying_key()))
+        }
+        None => {
+            warn!("no shadow signing key configured — update manifest served unsigned");
+            (String::new(), String::new())
+        }
+    }
+}
+
+/// 1 MiB serving chunks (the plan's P2 size; the shadow stream's 64 KiB
+/// precedent stays untouched). `sha256` is the FULL blob digest repeated on
+/// every chunk so the reassembling client can verify the whole stream.
+const UPDATE_ASSET_CHUNK_SIZE: usize = 1024 * 1024;
+
+fn update_asset_chunks(blob: &[u8], sha256: &str) -> Vec<UpdateAssetChunk> {
+    blob.chunks(UPDATE_ASSET_CHUNK_SIZE)
+        .enumerate()
+        .map(|(i, chunk)| UpdateAssetChunk {
+            data: chunk.to_vec(),
+            offset: (i * UPDATE_ASSET_CHUNK_SIZE) as i64,
+            total_size: blob.len() as i64,
+            sha256: sha256.to_string(),
+        })
+        .collect()
+}
+
+/// Build the push Command for one assignment row (pure — the push arm and
+/// the tests share this). Mirrors the shadow-assignment Command contract:
+/// UPDATE_CONFIG with an `operation` marker so the client's command loop
+/// can dispatch without string-guessing.
+fn update_assignment_command(row: &UpdateAssignmentRow) -> ServerMessage {
+    let mut params = std::collections::HashMap::new();
+    params.insert("operation".to_string(), "update_assign".to_string());
+    params.insert("version".to_string(), row.version.clone());
+    ServerMessage {
+        msg: Some(server_message::Msg::Command(Command {
+            r#type: command::CommandType::UpdateConfig as i32,
+            params,
+        })),
+    }
 }
 
 pub struct MonopsonyGrpc {
@@ -338,6 +595,25 @@ impl MonopsonyGrpc {
                 .await
             {
                 warn!(client_id = %req.client_id, error = %e, "Failed to persist UpdateReport");
+            }
+        }
+
+        // Sprint 34 P2: the client's own binary version. Empty = legacy
+        // pre-P2 client — skip persistence so "" never clobbers a recorded
+        // version (same rule as the S29 B2 empty-distro guard above). This
+        // funnel covers BOTH the unary Heartbeat RPC and the ControlStream
+        // heartbeat. Fleet-skew reporting is P4; P2 only stores the field.
+        if !req.monopsony_version.is_empty() {
+            if let Err(e) = self
+                .db
+                .set_client_monopsony_version(&client_id, &req.monopsony_version)
+                .await
+            {
+                warn!(
+                    client_id = %req.client_id,
+                    error = %e,
+                    "Failed to persist monopsony_version"
+                );
             }
         }
 
@@ -702,6 +978,13 @@ impl MonopsonyGrpc {
                 if let Some(cmd_msg) = self.take_pending_assignment_command(&client_id_str).await {
                     return Ok(cmd_msg);
                 }
+                // Sprint 34 P2: an approved update assignment rides the same
+                // slot — the shadow push wins when both are queued (one
+                // ServerMessage per ClientMessage); the update push surfaces
+                // on the next heartbeat.
+                if let Some(cmd_msg) = self.take_pending_update_command(&client_id_str).await {
+                    return Ok(cmd_msg);
+                }
                 // Heartbeat response goes via the unary RPC; for streaming, send a sync_request as ack
                 Ok(ServerMessage {
                     msg: Some(server_message::Msg::SyncRequest(SyncRequest {})),
@@ -848,6 +1131,40 @@ impl MonopsonyGrpc {
                 params,
             })),
         })
+    }
+
+    /// Sprint 34 P2: build the pending-update-assignment push Command for a
+    /// client, if one is queued (mirror of [`Self::take_pending_assignment_command`]
+    /// per plan D6). Marks the row delivered (the client's later
+    /// applied/refused report resolves it) and returns one
+    /// ServerMessage{ Command(UPDATE_CONFIG, update_assign params) }. The
+    /// assignment itself carries no per-version asset data — the client
+    /// follows up with CheckUpdate/DownloadUpdateAsset for the bytes.
+    async fn take_pending_update_command(&self, client_id_str: &str) -> Option<ServerMessage> {
+        let client_id = match monopsony_common::models::ClientId::parse(client_id_str) {
+            Ok(id) => id.0,
+            Err(e) => {
+                warn!(client_id = %client_id_str, error = %e, "Invalid client id for pending-update push");
+                return None;
+            }
+        };
+
+        let pending = match self.db.take_pending_update_assignments(client_id).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(error = %e, "Failed to query pending update assignments");
+                return None;
+            }
+        };
+        let first = pending.first()?;
+
+        info!(
+            client_id = %client_id_str,
+            version = %first.version,
+            "Pushing pending update assignment via control-stream Command"
+        );
+
+        Some(update_assignment_command(first))
     }
 }
 
@@ -1619,6 +1936,216 @@ impl MonopsonyControl for MonopsonyGrpc {
 
         Ok(Response::new(Box::pin(output)))
     }
+
+    // ── Self-update serving RPCs (Sprint 34 P2) ──
+
+    async fn check_update(
+        &self,
+        request: Request<CheckUpdateRequest>,
+    ) -> Result<Response<CheckUpdateResponse>, Status> {
+        let req = request.into_inner();
+        monopsony_common::metrics::grpc_request("check_update");
+        let client_id = ClientId::parse(&req.client_id)
+            .map_err(|e| Status::invalid_argument(format!("Invalid client ID: {e}")))?;
+        self.check_client_revoked(&client_id).await?;
+
+        if !valid_update_binary(&req.binary) {
+            return Err(Status::invalid_argument(format!(
+                "binary must be one of {UPDATE_BINARY_KINDS:?}, got {:?}",
+                req.binary
+            )));
+        }
+        if req.platform.is_empty() {
+            return Err(Status::invalid_argument("platform is required"));
+        }
+        // Empty current_version = unknown/legacy client — answered as 0.0.0
+        // (any stored release qualifies); garbage versions fail closed in
+        // is_strictly_newer.
+        let current = if req.current_version.is_empty() {
+            "0.0.0"
+        } else {
+            req.current_version.as_str()
+        };
+
+        let releases = self
+            .db
+            .list_update_releases(50)
+            .await
+            .map_err(|e| Status::internal(format!("DB error listing update releases: {e}")))?;
+
+        // Fleet-facing "latest known" is reported even when the caller is up
+        // to date (CheckUpdate is the version channel).
+        let latest = newest_complete_release(&releases);
+        let latest_version = latest.map(|r| r.version.clone()).unwrap_or_default();
+        let changelog_url = latest
+            .and_then(|r| r.changelog_url.clone())
+            .unwrap_or_default();
+
+        // Rollout gate (D3/D6): update_available reflects version order +
+        // storability; rollout_approved reflects the operator's per-client
+        // assignment. The two are independent signals — the client applies
+        // only when BOTH hold (P3 policy).
+        let rollout_approved = self
+            .db
+            .latest_open_update_assignment(client_id.0)
+            .await
+            .map_err(|e| Status::internal(format!("DB error reading update assignment: {e}")))?
+            .is_some();
+
+        let chosen = pick_distributable(&releases, current);
+        let mut assets: Vec<UpdateAssetInfo> = Vec::new();
+        if let Some(release) = chosen {
+            let rows = self
+                .db
+                .list_update_artifacts(&release.id)
+                .await
+                .map_err(|e| Status::internal(format!("DB error listing update artifacts: {e}")))?;
+            assets = rows
+                .iter()
+                .filter(|a| {
+                    a.package == update_kind_package(&req.binary)
+                        && a.platform == req.platform
+                        && a.blob_indexed
+                })
+                .map(|a| UpdateAssetInfo {
+                    platform: a.platform.clone(),
+                    name: a.asset_name.clone(),
+                    sha256: a.sha256.clone(),
+                    size: a.size,
+                })
+                .collect();
+        }
+
+        // Manifest signature covers exactly what the client is told to
+        // download: version + the servable asset list for its platform (D8).
+        // Nothing servable → nothing signed (skip-and-log posture for the
+        // no-key case lives in sign_update_manifest).
+        let (manifest_sig, manifest_key_id) = match chosen {
+            Some(release) if !assets.is_empty() => {
+                let payload = build_update_manifest_payload(
+                    &release.version,
+                    &req.binary,
+                    &req.platform,
+                    &assets,
+                );
+                sign_update_manifest(self.shadow_manager.as_deref(), &payload)
+            }
+            _ => (String::new(), String::new()),
+        };
+
+        let update_available = chosen.is_some() && !assets.is_empty();
+        Ok(Response::new(CheckUpdateResponse {
+            latest_version,
+            update_available,
+            rollout_approved,
+            assets: if update_available { assets } else { Vec::new() },
+            changelog_url,
+            manifest_sig,
+            manifest_key_id,
+        }))
+    }
+
+    type DownloadUpdateAssetStream =
+        Pin<Box<dyn Stream<Item = Result<UpdateAssetChunk, Status>> + Send>>;
+
+    async fn download_update_asset(
+        &self,
+        request: Request<DownloadUpdateAssetRequest>,
+    ) -> Result<Response<Self::DownloadUpdateAssetStream>, Status> {
+        let req = request.into_inner();
+        monopsony_common::metrics::grpc_request("download_update_asset");
+        let client_id = ClientId::parse(&req.client_id)
+            .map_err(|e| Status::invalid_argument(format!("Invalid client ID: {e}")))?;
+        self.check_client_revoked(&client_id).await?;
+
+        if !valid_update_binary(&req.binary) {
+            return Err(Status::invalid_argument(format!(
+                "binary must be one of {UPDATE_BINARY_KINDS:?}, got {:?}",
+                req.binary
+            )));
+        }
+        if req.version.is_empty() || req.platform.is_empty() {
+            return Err(Status::invalid_argument(
+                "version and platform are required",
+            ));
+        }
+
+        // Lineage check first (DB), then the blob (cache): a release that is
+        // not complete, or an artifact row not marked indexed, is not
+        // servable — the DB row is the completeness gate for serving (P1).
+        let release = self
+            .db
+            .get_update_release(&req.version)
+            .await
+            .map_err(|e| Status::internal(format!("DB error reading update release: {e}")))?
+            .filter(|r| r.assets_complete)
+            .ok_or_else(|| {
+                Status::not_found(format!("no complete stored release {}", req.version))
+            })?;
+
+        let package = update_kind_package(&req.binary);
+        let artifact: UpdateArtifactRow = self
+            .db
+            .list_update_artifacts(&release.id)
+            .await
+            .map_err(|e| Status::internal(format!("DB error listing update artifacts: {e}")))?
+            .into_iter()
+            .find(|a| a.package == package && a.platform == req.platform && a.blob_indexed)
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "no stored asset for {package} {} on {}",
+                    req.version, req.platform
+                ))
+            })?;
+
+        let mgr = self.shadow_manager.as_ref().ok_or_else(|| {
+            Status::unimplemented("Shadow manager not available for update asset serving")
+        })?;
+        let cache = mgr.cache_ref();
+        let entry = cache
+            .lookup_asset(&package, &req.version, &req.platform)
+            .await
+            .ok_or_else(|| {
+                Status::not_found(format!(
+                    "asset {package}/{} on {} missing from the cache index",
+                    req.version, req.platform
+                ))
+            })?;
+        let blob = cache
+            .read_blob(&entry.blob_hash)
+            .await
+            .map_err(|e| Status::internal(format!("Cache read error: {e}")))?;
+
+        // Defense in depth: re-verify the stored bytes against the DB
+        // lineage digest before streaming. The blob is content-addressed by
+        // the same sha256, so a mismatch means store corruption — fail
+        // closed rather than serve unverified bytes.
+        let actual = hex::encode(Sha256::digest(&blob));
+        if actual != artifact.sha256 {
+            monopsony_common::metrics::update_hash_verify("serve_mismatch_fail_closed");
+            error!(
+                version = %req.version,
+                package = %package,
+                platform = %req.platform,
+                expected = %artifact.sha256,
+                actual = %actual,
+                "Stored update blob no longer matches its lineage digest — refusing to serve"
+            );
+            return Err(Status::internal(
+                "stored update blob failed integrity re-verification",
+            ));
+        }
+        monopsony_common::metrics::update_hash_verify("pass");
+
+        let chunks = update_asset_chunks(&blob, &artifact.sha256);
+        let output = async_stream::stream! {
+            for chunk in chunks {
+                yield Ok(chunk);
+            }
+        };
+
+        Ok(Response::new(Box::pin(output)))
+    }
     async fn list_shadow_catalog(
         &self,
         request: Request<ListShadowCatalogRequest>,
@@ -2290,5 +2817,260 @@ mod tests {
         assert!(!resolution_status_valid("pending"));
         assert!(!resolution_status_valid("Approved"));
         assert!(!resolution_status_valid(""));
+    }
+
+    // ── Sprint 34 P2: self-update serving ──
+
+    /// SYNTHETIC release fixtures (throwaway URLs/versions), per house
+    /// convention.
+    fn release_row(version: &str, complete: bool) -> UpdateReleaseRow {
+        UpdateReleaseRow {
+            id: uuid::Uuid::new_v4(),
+            version: version.to_string(),
+            prerelease: version.contains('-'),
+            fetched_at: chrono::Utc::now(),
+            changelog_url: Some(format!("https://example.invalid/rel/{version}")),
+            assets_complete: complete,
+        }
+    }
+
+    #[test]
+    fn contract_version_ordering_matches_semver_11() {
+        // Full precedence chain across the release-contract shapes.
+        let ascending = [
+            "0.9.9",
+            "1.0.0-rc.1",
+            "1.0.0-rc.2",
+            "1.0.0-rc.10", // numeric identifiers compare numerically
+            "1.0.0-rc2",   // alphanumeric single id sorts above the "rc" prefix
+            "1.0.0",
+            "v1.1.0", // leading v tolerated
+            "2.0.0",
+        ];
+        for pair in ascending.windows(2) {
+            let a = contract_version_precedence(pair[0]).expect(pair[0]);
+            let b = contract_version_precedence(pair[1]).expect(pair[1]);
+            assert!(
+                a < b,
+                "expected {} < {} (got {:?} vs {:?})",
+                pair[0],
+                pair[1],
+                a,
+                b
+            );
+        }
+    }
+
+    #[test]
+    fn contract_version_release_beats_prerelease_of_same_core() {
+        let release = contract_version_precedence("1.0.0").expect("parse");
+        let rc = contract_version_precedence("1.0.0-rc.2").expect("parse");
+        assert!(rc < release);
+        // Build metadata ignored (semver §11.4).
+        assert_eq!(
+            contract_version_precedence("1.0.0+build.7"),
+            contract_version_precedence("1.0.0")
+        );
+    }
+
+    #[test]
+    fn contract_version_rejects_out_of_subset_inputs() {
+        for garbage in [
+            "",
+            "1.2",
+            "release-1",
+            "1.0.0-",
+            "1.0.0-rc.",
+            "not-a-version",
+        ] {
+            assert!(
+                contract_version_precedence(garbage).is_none(),
+                "{garbage:?} must be unparseable"
+            );
+        }
+    }
+
+    #[test]
+    fn is_strictly_newer_semantics() {
+        assert!(is_strictly_newer("1.1.0", "1.0.0"));
+        assert!(is_strictly_newer("1.0.0-rc.2", "1.0.0-rc.1"));
+        assert!(!is_strictly_newer("1.0.0", "1.0.0")); // equal: no update
+        assert!(!is_strictly_newer("1.0.0-rc.1", "1.0.0")); // never downgrade
+                                                            // Unknown client (empty current): any valid release qualifies.
+        assert!(is_strictly_newer("0.0.1", ""));
+        // Garbage current fails closed (no update reported).
+        assert!(!is_strictly_newer("1.2.0", "garbage"));
+        // Garbage candidate never qualifies.
+        assert!(!is_strictly_newer("garbage", "1.0.0"));
+    }
+
+    #[test]
+    fn pick_distributable_skips_incomplete_and_older() {
+        let releases = vec![
+            release_row("0.9.9", true),
+            release_row("1.0.0", false), // incomplete fetch: never distributable
+            release_row("1.1.0", true),
+        ];
+        let picked = pick_distributable(&releases, "1.0.0").expect("update exists");
+        assert_eq!(picked.version, "1.1.0");
+        // Up to date: nothing chosen even though 1.1.0 is stored.
+        assert!(pick_distributable(&releases, "1.1.0").is_none());
+        // Client ahead of the fleet (dev build): never pushed back.
+        assert!(pick_distributable(&releases, "9.9.9").is_none());
+        // Unknown client: newest complete wins.
+        let picked = pick_distributable(&releases, "").expect("update exists");
+        assert_eq!(picked.version, "1.1.0");
+    }
+
+    #[test]
+    fn newest_complete_release_reports_latest_known() {
+        let releases = vec![
+            release_row("1.0.0", true),
+            release_row("1.2.0", false),
+            release_row("1.1.0", true),
+        ];
+        let latest = newest_complete_release(&releases).expect("some complete");
+        assert_eq!(latest.version, "1.1.0"); // 1.2.0 incomplete: not latest known
+        assert!(newest_complete_release(&[]).is_none());
+    }
+
+    #[test]
+    fn valid_update_binary_gate() {
+        assert!(valid_update_binary("client"));
+        assert!(valid_update_binary("server"));
+        assert!(!valid_update_binary("monopsony-client"));
+        assert!(!valid_update_binary(""));
+        assert!(!valid_update_binary("Client"));
+    }
+
+    #[test]
+    fn update_kind_package_matches_distributor_contract() {
+        assert_eq!(update_kind_package("client"), "monopsony-client");
+        assert_eq!(update_kind_package("server"), "monopsony-server");
+    }
+
+    #[test]
+    fn update_assignment_command_carries_operation_and_version() {
+        let row = monopsony_db::db::UpdateAssignmentRow {
+            id: uuid::Uuid::nil(),
+            client_id: uuid::Uuid::nil(),
+            version: "1.1.0".to_string(),
+            status: "pending".to_string(),
+            created_at: 1,
+            delivered_at: None,
+            resolved_at: None,
+        };
+        let msg = update_assignment_command(&row);
+        let Some(server_message::Msg::Command(cmd)) = msg.msg else {
+            panic!("expected Command");
+        };
+        assert_eq!(cmd.r#type, command::CommandType::UpdateConfig as i32);
+        assert_eq!(
+            cmd.params.get("operation").map(String::as_str),
+            Some("update_assign")
+        );
+        assert_eq!(cmd.params.get("version").map(String::as_str), Some("1.1.0"));
+    }
+
+    #[test]
+    fn update_manifest_payload_is_deterministic_and_complete() {
+        let assets = vec![UpdateAssetInfo {
+            platform: "linux-x86_64".to_string(),
+            name: "monopsony-client-v1.1.0-linux-x86_64.tar.gz".to_string(),
+            sha256: "a".repeat(64),
+            size: 123_456,
+        }];
+        let a = build_update_manifest_payload("1.1.0", "client", "linux-x86_64", &assets);
+        let b = build_update_manifest_payload("1.1.0", "client", "linux-x86_64", &assets);
+        assert_eq!(a, b, "same inputs must produce byte-identical manifests");
+        let text = String::from_utf8_lossy(&a).into_owned();
+        // Every signed element present exactly once.
+        assert!(text.contains("\"version\":\"1.1.0\""));
+        assert!(text.contains("\"binary\":\"client\""));
+        assert!(text.contains("\"platform\":\"linux-x86_64\""));
+        assert!(text.contains(&format!("\"sha256\":\"{}\"", "a".repeat(64))));
+        // Changing any input changes the bytes (what the signature covers).
+        let other = build_update_manifest_payload("1.1.1", "client", "linux-x86_64", &assets);
+        assert_ne!(a, other);
+    }
+
+    #[test]
+    fn update_manifest_signature_round_trips_and_detects_tamper() {
+        use ed25519_dalek::Verifier;
+        use monopsony_shadow::shadow_signing::generate_signing_key;
+        // SYNTHETIC throwaway key — never a trust anchor.
+        let sk = generate_signing_key();
+        let assets = vec![UpdateAssetInfo {
+            platform: "darwin-arm64".to_string(),
+            name: "monopsony-client-v1.2.0-darwin-arm64.tar.gz".to_string(),
+            sha256: "b".repeat(64),
+            size: 42,
+        }];
+        let payload = build_update_manifest_payload("1.2.0", "client", "darwin-arm64", &assets);
+        // Round-trip through the same b64/encoding the handler serves.
+        let (sig_b64, key_id) = {
+            use ed25519_dalek::Signer;
+            let sig = sk.sign(&payload);
+            (
+                B64.encode(sig.to_bytes()),
+                monopsony_shadow::shadow_signing::key_id(&sk.verifying_key()),
+            )
+        };
+        assert!(!sig_b64.is_empty());
+        assert_eq!(key_id.len(), 16); // key_id = first 16 hex of sha256(pk)
+
+        let sig_bytes: [u8; 64] = B64
+            .decode(&sig_b64)
+            .expect("b64")
+            .try_into()
+            .expect("64-byte Ed25519 signature");
+        sk.verifying_key()
+            .verify(&payload, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
+            .expect("signature must verify over the exact served bytes");
+
+        // Tampered manifest (different asset digest) must NOT verify.
+        let mut tampered_assets = assets.clone();
+        tampered_assets[0].sha256 = "c".repeat(64);
+        let tampered =
+            build_update_manifest_payload("1.2.0", "client", "darwin-arm64", &tampered_assets);
+        sk.verifying_key()
+            .verify(&tampered, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
+            .expect_err("tampered manifest must fail verification");
+    }
+
+    #[test]
+    fn update_asset_chunks_stream_round_trip_sha256() {
+        // 2.5 MiB synthetic blob → 3 chunks (2 full + tail), byte offsets
+        // monotonic, total_size constant, and the reassembled bytes hash to
+        // the digest every chunk carried (the P2 streaming gate).
+        let blob: Vec<u8> = (0..2_500_000usize).map(|i| (i % 251) as u8).collect();
+        let sha = hex::encode(Sha256::digest(&blob));
+        let chunks = update_asset_chunks(&blob, &sha);
+        assert!(chunks.len() == 3, "2.5MiB → 3 chunks, got {}", chunks.len());
+
+        let mut reassembled: Vec<u8> = Vec::with_capacity(blob.len());
+        let mut expected_offset: i64 = 0;
+        for chunk in &chunks {
+            assert_eq!(chunk.offset, expected_offset);
+            assert_eq!(chunk.sha256, sha);
+            assert_eq!(chunk.total_size, blob.len() as i64);
+            reassembled.extend_from_slice(&chunk.data);
+            expected_offset += chunk.data.len() as i64;
+        }
+        assert_eq!(reassembled.len(), blob.len());
+        assert_eq!(hex::encode(Sha256::digest(&reassembled)), sha);
+        // The 1 MiB serving size is the plan's choice (NOT the shadow 64 KiB).
+        assert_eq!(chunks[0].data.len(), 1024 * 1024);
+    }
+
+    #[test]
+    fn update_asset_chunks_empty_and_single_chunk_shapes() {
+        let blob = b"tiny";
+        let sha = hex::encode(Sha256::digest(blob));
+        let chunks = update_asset_chunks(blob, &sha);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].offset, 0);
+        assert_eq!(chunks[0].data, blob);
+        assert_eq!(chunks[0].total_size, 4);
     }
 }

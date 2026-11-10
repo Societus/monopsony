@@ -1,3 +1,5 @@
 pub mod db;
 
-pub use db::{Database, UpdateArtifactInsert, UpdateArtifactRow, UpdateReleaseRow};
+pub use db::{
+    Database, UpdateArtifactInsert, UpdateArtifactRow, UpdateAssignmentRow, UpdateReleaseRow,
+};

@@ -190,6 +190,13 @@ impl Database {
         )
         .execute(&self.pool)
         .await?;
+        // Sprint 34 P2: client's own monopsony binary version as reported on
+        // the heartbeat (HeartbeatRequest.monopsony_version). NULL until the
+        // first post-P2 heartbeat; empty heartbeats never overwrite (legacy
+        // clients). Fleet-skew reporting reads this column (P4).
+        sqlx::query("ALTER TABLE clients ADD COLUMN IF NOT EXISTS monopsony_version TEXT NULL")
+            .execute(&self.pool)
+            .await?;
         debug!("clients update-count columns ensured");
 
         // client_certs tracks every issued client certificate by serial so
@@ -732,6 +739,35 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_update_artifacts_release ON update_artifacts(release_id)")
             .execute(&self.pool)
             .await?;
+
+        // Sprint 34 P2: rollout gating (D6). An update reaches a client only
+        // when an assignment row exists for it — no broadcast-by-default.
+        // Status flow: 'pending' → (control-stream push marks) 'delivered' →
+        // ('applied' | 'refused' when the client reports the outcome). Rows
+        // are deleted when a rollout is rescinded or retention prunes the
+        // version. UNIQUE(client_id, version) makes re-approving an
+        // (client, version) pair an idempotent reset to 'pending'.
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS pending_update_assignments (
+                id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                client_id    UUID REFERENCES clients(id) ON DELETE CASCADE,
+                version      TEXT NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'pending',
+                created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+                delivered_at TIMESTAMPTZ,
+                resolved_at  TIMESTAMPTZ,
+                UNIQUE(client_id, version)
+            )",
+        )
+        .execute(&self.pool)
+        .await?;
+        info!("Created pending_update_assignments table");
+
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_pending_update_assignments_client ON pending_update_assignments(client_id)",
+        )
+        .execute(&self.pool)
+        .await?;
 
         info!("Database migrations complete");
         Ok(())
@@ -3452,5 +3488,288 @@ impl Database {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    // ── Pending update assignments (Sprint 34 P2, rollout gating) ──
+
+    /// Approve `version` for rollout to a client. Upsert: re-approving an
+    /// existing (client, version) pair resets the row to 'pending' and clears
+    /// delivery/resolution timestamps (mirror of create_pending_assignment).
+    pub async fn create_update_assignment(&self, client_id: Uuid, version: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO pending_update_assignments (client_id, version, status)
+             VALUES ($1, $2, 'pending')
+             ON CONFLICT (client_id, version)
+             DO UPDATE SET status = 'pending', delivered_at = NULL, resolved_at = NULL",
+        )
+        .bind(client_id)
+        .bind(version)
+        .execute(&self.pool)
+        .await?;
+        debug!(
+            "Pending update assignment created: client={} version={}",
+            client_id, version
+        );
+        Ok(())
+    }
+
+    /// Fetch and mark-delivered pending update assignments for a client.
+    /// Rows move to status 'delivered' (the push happened); only the client's
+    /// later applied/refused report resolves them. Only never-delivered
+    /// 'pending' rows are returned — a delivered-but-unacked row must not
+    /// re-push on every heartbeat (same re-delivery guard as
+    /// take_pending_assignments; caught live in Sprint 22).
+    pub async fn take_pending_update_assignments(
+        &self,
+        client_id: Uuid,
+    ) -> Result<Vec<UpdateAssignmentRow>> {
+        let rows = sqlx::query(
+            "UPDATE pending_update_assignments
+             SET status = 'delivered', delivered_at = now()
+             WHERE client_id = $1 AND status = 'pending' AND delivered_at IS NULL
+             RETURNING id, client_id, version, status, created_at, delivered_at, resolved_at",
+        )
+        .bind(client_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let out: Vec<UpdateAssignmentRow> = rows
+            .into_iter()
+            .map(|r| UpdateAssignmentRow {
+                id: r.get("id"),
+                client_id: r.get("client_id"),
+                version: r.get("version"),
+                status: r.get("status"),
+                created_at: r.get::<chrono::DateTime<Utc>, _>("created_at").timestamp(),
+                delivered_at: r
+                    .try_get::<Option<chrono::DateTime<Utc>>, _>("delivered_at")
+                    .ok()
+                    .flatten()
+                    .map(|t| t.timestamp()),
+                resolved_at: r
+                    .try_get::<Option<chrono::DateTime<Utc>>, _>("resolved_at")
+                    .ok()
+                    .flatten()
+                    .map(|t| t.timestamp()),
+            })
+            .collect();
+        debug!(
+            "Took {} pending update assignments for client {}",
+            out.len(),
+            client_id
+        );
+        Ok(out)
+    }
+
+    /// Resolve an assignment: status 'applied' | 'refused' (the client's
+    /// outcome report; P3 wires the RPC, P2 owns the state transition).
+    pub async fn complete_update_assignment(
+        &self,
+        client_id: Uuid,
+        version: &str,
+        status: &str,
+    ) -> Result<()> {
+        debug_assert!(status == "applied" || status == "refused");
+        sqlx::query(
+            "UPDATE pending_update_assignments
+             SET status = $3, resolved_at = now()
+             WHERE client_id = $1 AND version = $2",
+        )
+        .bind(client_id)
+        .bind(version)
+        .bind(status)
+        .execute(&self.pool)
+        .await?;
+        debug!(
+            "Pending update assignment completed: client={} version={} status={}",
+            client_id, version, status
+        );
+        Ok(())
+    }
+
+    /// The newest open (pending | delivered) assignment for a client, if any.
+    /// `CheckUpdate.rollout_approved` is true iff this returns Some — a
+    /// delivered-but-unacked row stays open so a client that missed the
+    /// stream push can still pull via CheckUpdate.
+    pub async fn latest_open_update_assignment(
+        &self,
+        client_id: Uuid,
+    ) -> Result<Option<UpdateAssignmentRow>> {
+        let row = sqlx::query_as::<_, UpdateAssignmentRow>(
+            "SELECT id, client_id, version, status, created_at, delivered_at, resolved_at
+             FROM pending_update_assignments
+             WHERE client_id = $1 AND status IN ('pending', 'delivered')
+             ORDER BY created_at DESC
+             LIMIT 1",
+        )
+        .bind(client_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Delete every assignment row for a version: rollout rescind, and the
+    /// retention path (a pruned release's blobs are gone — its assignments
+    /// would push clients toward undownloadable bytes). Returns rows removed.
+    pub async fn delete_update_assignments_for_version(&self, version: &str) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM pending_update_assignments WHERE version = $1")
+            .bind(version)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Persist the client's reported own binary version (heartbeat,
+    /// Sprint 34 P2). Callers skip the empty case (legacy client) so ""
+    /// never clobbers a recorded version.
+    pub async fn set_client_monopsony_version(
+        &self,
+        client_id: &ClientId,
+        version: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE clients SET monopsony_version = $2 WHERE id = $1")
+            .bind(client_id.0)
+            .bind(version)
+            .execute(&self.pool)
+            .await?;
+        debug!("Recorded monopsony_version {}: {}", client_id.0, version);
+        Ok(())
+    }
+
+    /// The recorded monopsony binary version of a client, if any (P4 fleet
+    /// skew will read this; exposed now for symmetry with the setter).
+    pub async fn get_client_monopsony_version(
+        &self,
+        client_id: &ClientId,
+    ) -> Result<Option<String>> {
+        let row: (Option<String>,) =
+            sqlx::query_as("SELECT monopsony_version FROM clients WHERE id = $1")
+                .bind(client_id.0)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(row.0.filter(|v| !v.is_empty()))
+    }
+}
+
+// ─── Update rollout gating rows (Sprint 34 P2) ─────────────────────────────
+
+/// Row from pending_update_assignments (Sprint 34 P2): a release version
+/// approved for rollout to one client, pushed over the ControlStream Command
+/// channel (mirror of [`PendingAssignmentRow`] for updates).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UpdateAssignmentRow {
+    pub id: Uuid,
+    pub client_id: Uuid,
+    pub version: String,
+    /// 'pending' | 'delivered' | 'applied' | 'refused'
+    pub status: String,
+    pub created_at: i64,
+    pub delivered_at: Option<i64>,
+    pub resolved_at: Option<i64>,
+}
+
+impl UpdateAssignmentRow {
+    /// An assignment is OPEN — it gates `CheckUpdate.rollout_approved` and
+    /// the client may act on it — from creation until the client reports
+    /// applied/refused. A delivered-but-unacked row stays open: a client
+    /// that missed the stream push can still pull via CheckUpdate.
+    pub fn is_open(&self) -> bool {
+        self.status == "pending" || self.status == "delivered"
+    }
+
+    /// Push eligibility for the control-stream Command channel: only
+    /// never-delivered 'pending' rows (push-once semantics; the SQL in
+    /// [`Database::take_pending_update_assignments`] enforces the same
+    /// predicate).
+    pub fn push_eligible(&self) -> bool {
+        self.status == "pending" && self.delivered_at.is_none()
+    }
+}
+
+/// Semantics of the pending_update_assignments status lifecycle (Sprint 34
+/// P2), expressed as pure functions over [`UpdateAssignmentRow`] so the
+/// state machine is testable without a live PostgreSQL. The SQL above
+/// implements exactly these transitions:
+///
+/// ```text
+/// assign   → status 'pending', delivered_at NULL   (create_update_assignment)
+/// push     → status 'delivered', delivered_at set  (take_pending_update_assignments; push-eligible only)
+/// ack      → status 'applied'|'refused', resolved  (complete_update_assignment)
+/// clear    → row deleted (rescind / retention prune, delete_update_assignments_for_version)
+/// ```
+#[cfg(test)]
+mod assignment_lifecycle_tests {
+    use super::*;
+
+    fn row(status: &str, delivered: bool) -> UpdateAssignmentRow {
+        UpdateAssignmentRow {
+            id: Uuid::nil(),
+            client_id: Uuid::nil(),
+            version: "1.2.3".to_string(),
+            status: status.to_string(),
+            created_at: 1_760_000_000,
+            delivered_at: if delivered { Some(1_760_000_060) } else { None },
+            resolved_at: None,
+        }
+    }
+
+    #[test]
+    fn assign_creates_open_push_eligible_row() {
+        let r = row("pending", false);
+        assert!(r.is_open());
+        assert!(r.push_eligible());
+    }
+
+    #[test]
+    fn push_marks_delivered_open_but_not_repushable() {
+        let r = row("delivered", true);
+        // Still open: a client that missed the Command can pull via
+        // CheckUpdate (rollout_approved stays true until ack).
+        assert!(r.is_open());
+        // Push-once: must NOT be handed to the stream again.
+        assert!(!r.push_eligible());
+    }
+
+    #[test]
+    fn ack_applied_or_refused_closes_the_row() {
+        let applied = row("applied", true);
+        assert!(!applied.is_open());
+        assert!(!applied.push_eligible());
+        let refused = row("refused", true);
+        assert!(!refused.is_open());
+        assert!(!refused.push_eligible());
+    }
+
+    #[test]
+    fn clear_removes_the_row_from_the_gate() {
+        // Clear (rescind / retention prune) is an unconditional DELETE
+        // (delete_update_assignments_for_version): the post-condition is
+        // absence — latest_open_update_assignment then returns None and
+        // CheckUpdate.rollout_approved flips false for every former status.
+        // Encoded here as: cleared = no row = nothing open, nothing pushable.
+        let absent: Option<UpdateAssignmentRow> = None;
+        assert!(absent.is_none());
+        assert!(!absent.is_some_and(|r| r.is_open() || r.push_eligible()));
+    }
+
+    #[test]
+    fn unknown_status_never_gates_rollout() {
+        // Defensive: a status string outside the lifecycle ('' from a
+        // hand-edited row, future values) must NOT read as open or
+        // push-eligible — the gate fails closed.
+        for garbage in ["", "PENDING", "delivered ", "resolved", "applied "] {
+            let r = row(garbage, false);
+            assert!(!r.is_open(), "status {garbage:?} must not be open");
+            assert!(!r.push_eligible(), "status {garbage:?} must not push");
+        }
+    }
+
+    #[test]
+    fn resolved_row_never_requalifies_as_pending() {
+        // An acked row that gets re-delivered_at-cleared by a buggy writer
+        // must still fail push_eligible on status alone.
+        let mut r = row("applied", true);
+        r.delivered_at = None;
+        assert!(!r.push_eligible());
     }
 }

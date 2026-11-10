@@ -26,6 +26,13 @@ service MonopsonyControl {
     rpc GetShadowRecipe(GetShadowRecipeRequest) returns (SignedShadowRecipe);
     rpc DownloadShadowAsset(DownloadShadowAssetRequest) returns (stream ShadowAssetChunk);
 
+    // Self-update distribution (Sprint 34 P2, decisions D1/D9): the server
+    // pulls each release once over the WAN, verifies + stores it, and serves
+    // stored blobs to paired clients over this mTLS surface. Distinct RPCs —
+    // NOT overloads of the shadow ones (D9: self-update has different fields).
+    rpc CheckUpdate(CheckUpdateRequest) returns (CheckUpdateResponse);
+    rpc DownloadUpdateAsset(DownloadUpdateAssetRequest) returns (stream UpdateAssetChunk);
+
     // Server-global recipe catalog (Sprint 22 Phase C, tracker-shaped edges)
     rpc ListShadowCatalog(ListShadowCatalogRequest) returns (ShadowCatalog);
     rpc ReportShadowScan(ShadowScanReport) returns (ShadowScanAck);
@@ -139,6 +146,12 @@ message HeartbeatRequest {
     // Sprint 29 B1 (grounding D3): update counts + reported distro/version,
     // attached when the client's local cache is fresh (absent = no data).
     UpdateReport update_report = 6;
+    // Sprint 34 P2: the client's own monopsony binary version
+    // (CARGO_PKG_VERSION of the monopsony-client package, e.g. "1.0.0-rc.2").
+    // Empty = legacy pre-P2 client; the server then skips persistence so ""
+    // never clobbers a recorded version (same rule as the empty-distro guard).
+    // Fleet-skew reporting is P4 — this phase only carries + stores the field.
+    string monopsony_version = 7;
 }
 
 message HeartbeatResponse {
@@ -599,4 +612,61 @@ message ResolveShadowStagingRequest {
 message ResolveShadowStagingResponse {
     bool resolved = 1;
     string message = 2;
+}
+
+// ── Self-update distribution (Sprint 34 P2) ──
+
+// Client asks the server whether a newer release is available for its binary
+// kind + platform. The request carries client_id so the server can apply the
+// per-caller rollout gate (D3/D6: an update reaches a client only when
+// assigned — no broadcast-by-default) and the standard revoked-cert check.
+message CheckUpdateRequest {
+    string client_id = 1;
+    string current_version = 2;  // running version, e.g. "1.0.0-rc.2"; empty = unknown
+    string binary = 3;           // release-contract kind: "client" | "server"
+    string platform = 4;         // release-contract platform, e.g. "linux-x86_64"
+}
+
+// One servable stored asset for (binary, platform).
+message UpdateAssetInfo {
+    string platform = 1;
+    string name = 2;    // release asset name, e.g. "monopsony-client-v1.1.0-linux-x86_64.tar.gz"
+    string sha256 = 3;  // hex digest of the stored blob (verified against SHA256SUMS at store time)
+    int64 size = 4;     // bytes
+}
+
+message CheckUpdateResponse {
+    string latest_version = 1;  // newest stored + complete release known ("" when none)
+    bool update_available = 2;  // latest > current AND servable for (binary, platform)
+    bool rollout_approved = 3;  // an open (pending|delivered) assignment row exists for the caller
+    // Servable assets for the requested (binary, platform); empty unless
+    // update_available. This list + latest_version + binary + platform are
+    // what the manifest signature covers.
+    repeated UpdateAssetInfo assets = 4;
+    string changelog_url = 5;
+    // Ed25519 (recipe-signing key path, D8) over the canonical manifest JSON:
+    //   {"assets":[{"name":..,"platform":..,"sha256":..,"size":..}...],
+    //    "binary":..,"platform":..,"version":..}
+    // serialized with serde_json (sorted BTreeMap keys, no whitespace). Empty
+    // = no signing key configured — skip-and-log server-side (P1 D7 posture);
+    // clients treat an empty signature per their trust policy (P3).
+    string manifest_sig = 6;
+    string manifest_key_id = 7;  // key id of the signing key ("" when unsigned)
+}
+
+message DownloadUpdateAssetRequest {
+    string client_id = 1;
+    string binary = 2;
+    string version = 3;
+    string platform = 4;
+}
+
+// Streaming chunk of a stored release tarball (shape mirrors ShadowAssetChunk
+// per D1). `sha256` is the FULL blob digest, repeated on every chunk so a
+// reassembling client can verify the complete stream.
+message UpdateAssetChunk {
+    bytes data = 1;
+    int64 offset = 2;
+    int64 total_size = 3;
+    string sha256 = 4;
 }

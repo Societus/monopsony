@@ -125,7 +125,7 @@ pub fn tarball_name(kind: &str, version: &str, platform: &str) -> String {
 }
 
 /// ShadowCache index package name for one binary kind.
-fn kind_package(kind: &str) -> String {
+pub fn kind_package(kind: &str) -> String {
     format!("monopsony-{kind}")
 }
 
@@ -212,15 +212,11 @@ impl UpdateDistributor {
     /// One poll cycle: choose the latest eligible release, skip if already
     /// stored complete, else fetch + verify + store, then apply retention.
     pub async fn poll_once(&self, own_version: &str) -> Result<PollOutcome> {
-        let releases = list_github_releases(
-            &self.config.repo,
-            self.github_token.as_deref(),
-            &self.http,
-        )
-        .await
-        .context("list GitHub releases")?;
-        let Some(release) = choose_latest_release(&releases, self.config.include_prerelease)
-        else {
+        let releases =
+            list_github_releases(&self.config.repo, self.github_token.as_deref(), &self.http)
+                .await
+                .context("list GitHub releases")?;
+        let Some(release) = choose_latest_release(&releases, self.config.include_prerelease) else {
             monopsony_common::metrics::update_release_fetched("none");
             return Ok(PollOutcome::NoRelease);
         };
@@ -264,10 +260,7 @@ impl UpdateDistributor {
     /// token (the `MONOPSONY_GITHUB_TOKEN` / `--github-token` path already
     /// wired through server main.rs).
     fn gh_request(&self, url: &str) -> reqwest::RequestBuilder {
-        let mut rb = self
-            .http
-            .get(url)
-            .header("User-Agent", USER_AGENT);
+        let mut rb = self.http.get(url).header("User-Agent", USER_AGENT);
         if let Some(token) = &self.github_token {
             rb = rb.header("Authorization", format!("Bearer {token}"));
         }
@@ -276,11 +269,7 @@ impl UpdateDistributor {
 
     /// Download one release asset by name; `None` when the release does not
     /// carry it (or GitHub 404s the download).
-    async fn download_asset_opt(
-        &self,
-        release: &GhRelease,
-        name: &str,
-    ) -> Result<Option<Vec<u8>>> {
+    async fn download_asset_opt(&self, release: &GhRelease, name: &str) -> Result<Option<Vec<u8>>> {
         let Some(url) = release
             .assets
             .iter()
@@ -366,15 +355,21 @@ impl UpdateDistributor {
             }
             Err(e @ SumsSigError::Invalid(_)) => {
                 monopsony_common::metrics::update_signature_verify("fail_fail_closed");
-                bail!("SHA256SUMS signature verification failed ({e:?}) — release {} not stored", release.tag_name);
+                bail!(
+                    "SHA256SUMS signature verification failed ({e:?}) — release {} not stored",
+                    release.tag_name
+                );
             }
         }
 
-        let sums_text = std::str::from_utf8(&sums_bytes)
-            .context("SHA256SUMS is not valid UTF-8")?;
+        let sums_text =
+            std::str::from_utf8(&sums_bytes).context("SHA256SUMS is not valid UTF-8")?;
         let sums = parse_sha256_sums(sums_text);
         if sums.is_empty() {
-            bail!("SHA256SUMS on release {} parsed to zero entries", release.tag_name);
+            bail!(
+                "SHA256SUMS on release {} parsed to zero entries",
+                release.tag_name
+            );
         }
 
         for kind in BINARY_KINDS {
@@ -477,6 +472,28 @@ impl UpdateDistributor {
                             .await;
                     }
                 }
+                // Sprint 34 P2: a pruned release's blobs are gone — its open
+                // rollout assignments would push clients toward bytes that no
+                // longer download. Clear them with the release.
+                match self
+                    .db
+                    .delete_update_assignments_for_version(&version)
+                    .await
+                {
+                    Ok(cleared) if cleared > 0 => {
+                        warn!(
+                            version = %version,
+                            cleared,
+                            "update retention: cleared rollout assignments for pruned release"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(
+                        version = %version,
+                        error = %e,
+                        "update retention: failed to clear assignments for pruned release"
+                    ),
+                }
                 pruned += 1;
                 debug!("update retention: pruned release {version}");
             }
@@ -508,7 +525,9 @@ pub async fn run_poll_loop(
         if distributor.enabled_now().await {
             match distributor.poll_once(&own_version).await {
                 Ok(PollOutcome::Fetched(v)) => info!("update distributor: stored {v}"),
-                Ok(PollOutcome::AlreadyCached(v)) => debug!("update distributor: {v} already cached"),
+                Ok(PollOutcome::AlreadyCached(v)) => {
+                    debug!("update distributor: {v} already cached")
+                }
                 Ok(PollOutcome::NoRelease) => debug!("update distributor: no releases published"),
                 Err(e) => warn!("update distributor poll failed: {e:#}"),
             }
