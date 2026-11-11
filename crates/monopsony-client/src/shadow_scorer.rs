@@ -177,6 +177,18 @@ fn recipe_name_basename(name: &str) -> String {
     name.to_lowercase()
 }
 
+/// Canonical form of a config path for comparison: trailing slashes are
+/// stripped, and an all-slash path collapses to the root `"/"`. So
+/// `/var/lib/sonarr/` and `/var/lib/sonarr` are the same path.
+fn normalize_config_path(p: &str) -> &str {
+    let trimmed = p.trim_end_matches('/');
+    if trimmed.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
 /// T4.4: compare locally detected config paths (existing findings) against the
 /// peer recipe's `config_paths`. Returns `(agree, comment)`.
 #[allow(dead_code)]
@@ -191,9 +203,12 @@ pub fn config_agreement(
         .collect();
 
     let agree = !local_existing.is_empty()
-        && local_existing
-            .iter()
-            .any(|p| peer_config_paths.iter().any(|q| q == p));
+        && local_existing.iter().any(|p| {
+            let local_path = normalize_config_path(p);
+            peer_config_paths
+                .iter()
+                .any(|q| normalize_config_path(q) == local_path)
+        });
 
     let comment = if agree {
         format!(
@@ -548,6 +563,37 @@ mod tests {
         let (agree, comment) = config_agreement(&local, &peer);
         assert!(!agree);
         assert!(comment.contains("no local config findings"));
+    }
+
+    // config_agreement: trailing-slash variants of the same path agree.
+    #[test]
+    fn config_agreement_agrees_ignoring_trailing_slash() {
+        let local = vec![ConfigFinding {
+            path: "/var/lib/sonarr".into(),
+            source: ConfigSource::Conventional,
+            exists: true,
+            confidence: Confidence::Medium,
+        }];
+        let peer = vec!["/etc/sonarr/config.xml".into(), "/var/lib/sonarr/".into()];
+        let (agree, comment) = config_agreement(&local, &peer);
+        assert!(agree);
+        assert!(comment.contains("agree"));
+    }
+
+    // config_agreement: genuinely different paths still disagree after
+    // canonicalization (negative control).
+    #[test]
+    fn config_agreement_disagrees_on_different_paths_after_canonicalization() {
+        let local = vec![ConfigFinding {
+            path: "/var/lib/sonarr/".into(),
+            source: ConfigSource::Conventional,
+            exists: true,
+            confidence: Confidence::Medium,
+        }];
+        let peer = vec!["/var/lib/sonarr/data/".into(), "/".into()];
+        let (agree, comment) = config_agreement(&local, &peer);
+        assert!(!agree);
+        assert!(comment.contains("differ"));
     }
 
     // preferred_detect_command: local probe failed + peer has command → prefer peer.
