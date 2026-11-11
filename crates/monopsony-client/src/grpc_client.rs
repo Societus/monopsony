@@ -997,7 +997,6 @@ impl MonopsonyGrpcClient {
     // through anyhow, same as register()/heartbeat() above.
 
     /// List shadow packages registered for this client.
-    #[allow(dead_code)]
     pub async fn list_shadow_packages(
         &mut self,
         client_id: &str,
@@ -1684,8 +1683,12 @@ mod tests {
             sha256: digest.clone(),
             size: tarball.len() as i64,
         };
-        let payload =
-            build_update_manifest_payload(version, "client", platform, std::slice::from_ref(&manifest_asset));
+        let payload = build_update_manifest_payload(
+            version,
+            "client",
+            platform,
+            std::slice::from_ref(&manifest_asset),
+        );
         let sig = base64::engine::general_purpose::STANDARD.encode(sk.sign(&payload).to_bytes());
         let wire = UpdateAssetInfo {
             name: manifest_asset.name,
@@ -1984,6 +1987,15 @@ mod update_mock {
             &self,
             _request: Request<RegisterRequest>,
         ) -> Result<Response<RegisterResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+
+        // Sprint 34 P4a: outcome reports are a client→server call; the mock
+        // (a STAND-IN SERVER) has no rollout bookkeeping to update.
+        async fn report_update_outcome(
+            &self,
+            _request: Request<ReportUpdateOutcomeRequest>,
+        ) -> Result<Response<ReportUpdateOutcomeResponse>, Status> {
             Err(Status::unimplemented("mock"))
         }
 

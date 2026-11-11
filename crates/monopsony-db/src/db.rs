@@ -3561,19 +3561,24 @@ impl Database {
         Ok(out)
     }
 
-    /// Resolve an assignment: status 'applied' | 'refused' (the client's
-    /// outcome report; P3 wires the RPC, P2 owns the state transition).
+    /// Resolve an OPEN assignment: status 'applied' | 'refused' (the client's
+    /// outcome report; P4a wires the callers — the heartbeat version funnel
+    /// and the ReportUpdateOutcome RPC). Only rows still in
+    /// 'pending'|'delivered' transition: a re-ack is a no-op and a late
+    /// 'refused' can never flip an 'applied'. Returns the number of rows
+    /// resolved (0 = nothing open matched).
     pub async fn complete_update_assignment(
         &self,
         client_id: Uuid,
         version: &str,
         status: &str,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         debug_assert!(status == "applied" || status == "refused");
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE pending_update_assignments
              SET status = $3, resolved_at = now()
-             WHERE client_id = $1 AND version = $2",
+             WHERE client_id = $1 AND version = $2
+               AND status IN ('pending', 'delivered')",
         )
         .bind(client_id)
         .bind(version)
@@ -3581,10 +3586,64 @@ impl Database {
         .execute(&self.pool)
         .await?;
         debug!(
-            "Pending update assignment completed: client={} version={} status={}",
-            client_id, version, status
+            "Pending update assignment completed: client={} version={} status={} ({} rows)",
+            client_id,
+            version,
+            status,
+            result.rows_affected()
         );
-        Ok(())
+        Ok(result.rows_affected())
+    }
+
+    /// Every OPEN (pending | delivered) assignment for a client, oldest
+    /// first. The heartbeat version funnel (P4a) walks these to resolve
+    /// applied targets; a client can hold several when versions ship faster
+    /// than its heartbeat cadence.
+    pub async fn list_open_update_assignments(
+        &self,
+        client_id: Uuid,
+    ) -> Result<Vec<UpdateAssignmentRow>> {
+        let rows = sqlx::query_as::<_, UpdateAssignmentRow>(
+            "SELECT id, client_id, version, status, created_at, delivered_at, resolved_at
+             FROM pending_update_assignments
+             WHERE client_id = $1 AND status IN ('pending', 'delivered')
+             ORDER BY created_at ASC",
+        )
+        .bind(client_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// All assignment rows, newest first — the rollout/ack state view the
+    /// dashboard (P4a REST) renders. `limit` bounds the scan.
+    pub async fn list_update_assignments(&self, limit: i64) -> Result<Vec<UpdateAssignmentRow>> {
+        let rows = sqlx::query_as::<_, UpdateAssignmentRow>(
+            "SELECT id, client_id, version, status, created_at, delivered_at, resolved_at
+             FROM pending_update_assignments
+             ORDER BY created_at DESC, id DESC
+             LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Every client's recorded monopsony binary version (P4a): (id, hostname,
+    /// version) — version None/empty until the client's first P2+-era
+    /// heartbeat. All `clients` rows are returned; presence of a row IS
+    /// paired/registered (the table has no status column).
+    pub async fn list_client_monopsony_versions(
+        &self,
+    ) -> Result<Vec<(Uuid, String, Option<String>)>> {
+        let rows = sqlx::query_as::<_, (Uuid, String, Option<String>)>(
+            "SELECT id, hostname, monopsony_version FROM clients
+             ORDER BY registered_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     /// The newest open (pending | delivered) assignment for a client, if any.

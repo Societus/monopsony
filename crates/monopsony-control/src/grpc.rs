@@ -29,11 +29,12 @@ use monopsony_common::proto::monopsony::{
     ListShadowCatalogRequest, ListShadowPackagesRequest, ListShadowStagingRequest,
     QueryShadowRegistryRequest, QueryShadowRegistryResponse, RegisterRequest, RegisterResponse,
     RegisterShadowPackageRequest, RenewClientCertRequest, RenewClientCertResponse,
-    ResolveShadowStagingRequest, ResolveShadowStagingResponse, RevokeClientCertRequest,
-    RevokeClientCertResponse, RollbackShadowUpdateRequest, ServerMessage, ShadowAssetChunk,
-    ShadowCatalog, ShadowCatalogEntry, ShadowPackageInfo, ShadowPackageList, ShadowRegistryMatch,
-    ShadowScanAck, ShadowScanReport, ShadowStagingInfo, ShadowStagingList, ShadowUpdateList,
-    ShadowUpdateResult, SignedShadowRecipe, SyncRequest, UnregisterShadowPackageRequest,
+    ReportUpdateOutcomeRequest, ReportUpdateOutcomeResponse, ResolveShadowStagingRequest,
+    ResolveShadowStagingResponse, RevokeClientCertRequest, RevokeClientCertResponse,
+    RollbackShadowUpdateRequest, ServerMessage, ShadowAssetChunk, ShadowCatalog,
+    ShadowCatalogEntry, ShadowPackageInfo, ShadowPackageList, ShadowRegistryMatch, ShadowScanAck,
+    ShadowScanReport, ShadowStagingInfo, ShadowStagingList, ShadowUpdateList, ShadowUpdateResult,
+    SignedShadowRecipe, SyncRequest, UnregisterShadowPackageRequest,
     UnregisterShadowPackageResponse, UpdateAssetChunk, UpdateAssetInfo,
 };
 
@@ -289,6 +290,24 @@ fn is_strictly_newer(candidate: &str, current: &str) -> bool {
         (Some(a), Some(b)) => a > b,
         _ => false,
     }
+}
+
+/// Cross-crate comparator over the release-contract version subset (P4a):
+/// `None` when either side is outside the subset, else semver-§11 Ordering.
+/// The ack funnel and the admin self-apply guard MUST use this — the same
+/// comparator that decides what clients are offered decides what counts as
+/// converged, so the two gates can never disagree on edge shapes.
+pub fn contract_version_cmp(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    Some(contract_version_precedence(a)?.cmp(&contract_version_precedence(b)?))
+}
+
+/// P4a ack decision: does a reported binary version satisfy an open
+/// assignment's target? True iff both parse and reported >= target (equal
+/// counts — a re-push of the same version must still ack). Unparseable
+/// input fails closed: the assignment stays open for the explicit RPC.
+fn assignment_satisfied_by(reported_version: &str, target: &str) -> bool {
+    contract_version_cmp(reported_version, target)
+        .is_some_and(|ord| ord != std::cmp::Ordering::Less)
 }
 
 /// The release to offer a client on `current_version`: the newest
@@ -614,6 +633,47 @@ impl MonopsonyGrpc {
                     error = %e,
                     "Failed to persist monopsony_version"
                 );
+            }
+
+            // Sprint 34 P4a: rollout ack funnel — a client whose reported
+            // binary version has reached an open assignment's target is
+            // 'applied' without any explicit report (the version channel IS
+            // the ack; the daemon exits for finalize, so a same-process RPC
+            // report is not always possible). Refusals travel the explicit
+            // ReportUpdateOutcome RPC; nothing here can produce one. Resolve
+            // errors are logged, never propagated — heartbeat must not fail
+            // because bookkeeping did.
+            match self.db.list_open_update_assignments(client_id.0).await {
+                Ok(rows) => {
+                    for row in rows {
+                        if assignment_satisfied_by(&req.monopsony_version, &row.version) {
+                            match self
+                                .db
+                                .complete_update_assignment(client_id.0, &row.version, "applied")
+                                .await
+                            {
+                                Ok(n) if n > 0 => info!(
+                                    client_id = %req.client_id,
+                                    version = %row.version,
+                                    reported = %req.monopsony_version,
+                                    "Update assignment marked applied via heartbeat version funnel"
+                                ),
+                                Ok(_) => {}
+                                Err(e) => warn!(
+                                    client_id = %req.client_id,
+                                    version = %row.version,
+                                    error = %e,
+                                    "Failed to resolve update assignment via heartbeat funnel"
+                                ),
+                            }
+                        }
+                    }
+                }
+                Err(e) => warn!(
+                    client_id = %req.client_id,
+                    error = %e,
+                    "Failed to list open update assignments for ack funnel"
+                ),
             }
         }
 
@@ -2146,6 +2206,62 @@ impl MonopsonyControl for MonopsonyGrpc {
 
         Ok(Response::new(Box::pin(output)))
     }
+
+    /// Sprint 34 P4a: explicit rollout-outcome report (applied | refused).
+    /// 'applied' usually arrives via the heartbeat version funnel instead;
+    /// this RPC is the channel for refusals (only observable client-side)
+    /// and for clients that want to ack deterministically. Only an OPEN
+    /// (pending|delivered) row transitions — `resolved` answers whether one
+    /// did.
+    async fn report_update_outcome(
+        &self,
+        request: Request<ReportUpdateOutcomeRequest>,
+    ) -> Result<Response<ReportUpdateOutcomeResponse>, Status> {
+        let req = request.into_inner();
+        monopsony_common::metrics::grpc_request("report_update_outcome");
+        let client_id = ClientId::parse(&req.client_id)
+            .map_err(|e| Status::invalid_argument(format!("Invalid client ID: {e}")))?;
+        self.check_client_revoked(&client_id).await?;
+
+        if req.version.is_empty() {
+            return Err(Status::invalid_argument("version is required"));
+        }
+        let status = match req.outcome.as_str() {
+            "applied" => "applied",
+            "refused" => "refused",
+            other => {
+                return Err(Status::invalid_argument(format!(
+                    "outcome must be \"applied\" or \"refused\", got {other:?}"
+                )));
+            }
+        };
+
+        let resolved = self
+            .db
+            .complete_update_assignment(client_id.0, &req.version, status)
+            .await
+            .map_err(|e| Status::internal(format!("DB error resolving update assignment: {e}")))?;
+        if resolved > 0 {
+            info!(
+                client_id = %req.client_id,
+                version = %req.version,
+                outcome = %status,
+                from_version = %req.from_version,
+                detail = %req.detail,
+                "Update assignment resolved via client outcome report"
+            );
+        } else {
+            debug!(
+                client_id = %req.client_id,
+                version = %req.version,
+                "No open assignment matched the outcome report"
+            );
+        }
+        Ok(Response::new(ReportUpdateOutcomeResponse {
+            resolved: resolved > 0,
+        }))
+    }
+
     async fn list_shadow_catalog(
         &self,
         request: Request<ListShadowCatalogRequest>,
@@ -2888,6 +3004,58 @@ mod tests {
                 "{garbage:?} must be unparseable"
             );
         }
+    }
+
+    #[test]
+    fn contract_version_cmp_matches_precedence_ordering() {
+        use std::cmp::Ordering;
+        assert_eq!(
+            contract_version_cmp("1.1.0", "1.0.0"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            contract_version_cmp("1.0.0-rc.2", "1.0.0-rc.1"),
+            Some(Ordering::Greater)
+        );
+        // Release sorts above any prerelease of the same core.
+        assert_eq!(
+            contract_version_cmp("1.0.0", "1.0.0-rc.2"),
+            Some(Ordering::Greater)
+        );
+        assert_eq!(
+            contract_version_cmp("1.0.0", "1.0.0"),
+            Some(Ordering::Equal)
+        );
+        // Build metadata never affects precedence (semver §11.4).
+        assert_eq!(
+            contract_version_cmp("1.0.0+git.abc", "1.0.0"),
+            Some(Ordering::Equal)
+        );
+        // 'v' prefix tolerated exactly as the distribution gate tolerates it.
+        assert_eq!(
+            contract_version_cmp("v1.1.0", "1.1.0"),
+            Some(Ordering::Equal)
+        );
+        // Unparseable side fails closed.
+        assert_eq!(contract_version_cmp("garbage", "1.0.0"), None);
+        assert_eq!(contract_version_cmp("1.0.0", ""), None);
+    }
+
+    #[test]
+    fn assignment_satisfied_by_ack_semantics() {
+        // Strictly newer and equal both ack (a re-pushed same version must ack).
+        assert!(assignment_satisfied_by("1.1.0", "1.0.0"));
+        assert!(assignment_satisfied_by("1.0.0", "1.0.0"));
+        // Prerelease steps ack upward only.
+        assert!(assignment_satisfied_by("1.0.0-rc.2", "1.0.0-rc.1"));
+        assert!(!assignment_satisfied_by("1.0.0-rc.1", "1.0.0-rc.2"));
+        // Never backwards.
+        assert!(!assignment_satisfied_by("0.9.9", "1.0.0"));
+        // Fail closed on garbage/empty reports: the assignment stays open
+        // for the explicit ReportUpdateOutcome RPC.
+        assert!(!assignment_satisfied_by("", "1.0.0"));
+        assert!(!assignment_satisfied_by("garbage", "1.0.0"));
+        assert!(!assignment_satisfied_by("1.0.0", "garbage"));
     }
 
     #[test]

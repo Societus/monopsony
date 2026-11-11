@@ -32,6 +32,12 @@ service MonopsonyControl {
     // NOT overloads of the shadow ones (D9: self-update has different fields).
     rpc CheckUpdate(CheckUpdateRequest) returns (CheckUpdateResponse);
     rpc DownloadUpdateAsset(DownloadUpdateAssetRequest) returns (stream UpdateAssetChunk);
+    // Sprint 34 P4a: explicit rollout-outcome report. 'applied' normally
+    // resolves server-side via the heartbeat version funnel (a client whose
+    // reported monopsony_version reaches its assigned target is applied
+    // without any explicit call); refusals are only observable client-side,
+    // so they travel here. outcome is "applied" | "refused".
+    rpc ReportUpdateOutcome(ReportUpdateOutcomeRequest) returns (ReportUpdateOutcomeResponse);
 
     // Server-global recipe catalog (Sprint 22 Phase C, tracker-shaped edges)
     rpc ListShadowCatalog(ListShadowCatalogRequest) returns (ShadowCatalog);
@@ -669,4 +675,21 @@ message UpdateAssetChunk {
     int64 offset = 2;
     int64 total_size = 3;
     string sha256 = 4;
+}
+
+// Sprint 34 P4a: the client's verdict on one rollout assignment. Resolves the
+// open (pending|delivered) row for (client_id, version) to applied|refused.
+// version is the ASSIGNED TARGET version, not the client's running version.
+message ReportUpdateOutcomeRequest {
+    string client_id = 1;
+    string version = 2;
+    string outcome = 3;       // "applied" | "refused"
+    string from_version = 4;  // client's version before the attempt ("" unknown)
+    string detail = 5;        // human-readable cause (refusal reason, etc.)
+}
+
+message ReportUpdateOutcomeResponse {
+    // True iff an open assignment row was found and transitioned. False =
+    // nothing open matched (already resolved, or never assigned).
+    bool resolved = 1;
 }
