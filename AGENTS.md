@@ -284,7 +284,9 @@ The server's HTTP proxy is the most complete module. It:
 - Dashboard SPA frontend for pairing approval + enrollment key manager (P4 UI — backend API complete)
 
 ## Pairing v2 (Sprint 28) — SECURITY-CRITICAL NOTES
-Plan: `docs/plans/2026-10-17-pairing-v2-sunshine-pin.md` (P0–P7 complete, uncommitted).
+Plan: `docs/plans/2026-10-17-pairing-v2-sunshine-pin.md` (P0–P7 COMPLETE + LANDED:
+P0 1fc18fa, P1 1bc95d0, P2/P4/P5 b823d80, P3/P5/P6 183d2aa, P7 f4ce1fc, follow-ups
+8361c51 — the former "uncommitted" line was stale; supersession proven via git log).
 Security docs: `docs/pairing-security.md` — read before touching pairing code.
 
 - **Three client flows** on `pair`: `--code` (legacy, LAN-only), `--pin` (v2 Sunshine:
