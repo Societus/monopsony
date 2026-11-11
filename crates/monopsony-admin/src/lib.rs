@@ -321,11 +321,23 @@ pub fn admin_router(state: AdminState) -> Router {
             "/api/v1/mirrors/:distro/status",
             get(mirrors::handle_mirror_status),
         )
-        // Update distribution (Sprint 34 P1)
+        // Update distribution (Sprint 34 P1) + rollout/self-apply (P4a)
         .route("/api/v1/updates", get(updates::handle_list_updates))
         .route(
             "/api/v1/updates/check",
             post(updates::handle_trigger_update_check),
+        )
+        .route(
+            "/api/v1/updates/rollout",
+            post(updates::handle_create_rollout),
+        )
+        .route(
+            "/api/v1/updates/rollouts",
+            get(updates::handle_list_rollouts),
+        )
+        .route(
+            "/api/v1/updates/self-apply",
+            post(updates::handle_self_apply),
         )
         // Tracker
         .route(

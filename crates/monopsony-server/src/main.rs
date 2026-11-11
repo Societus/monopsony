@@ -232,6 +232,20 @@ enum SelfUpdateMode {
     Check,
     /// Download and apply the latest update (atomic swap + health check)
     Apply,
+    /// Phase 2 of a staged self-apply (Sprint 34 P4a): spawned detached by
+    /// the admin `POST /api/v1/updates/self-apply` endpoint; swaps the
+    /// staged binary, restarts via detected init, health-gates, rolls back
+    /// on failure. Not an operator command (same shape as the client's).
+    #[command(hide = true)]
+    Finalize {
+        /// Path to the finalize command JSON (passed by spawn_detached_finalize)
+        #[arg(long)]
+        command_file: PathBuf,
+    },
+    /// Restore the newest self-update backup over the current binary and
+    /// restart the service (operator recovery tool).
+    #[command(hide = true)]
+    Rollback,
 }
 
 #[tokio::main]

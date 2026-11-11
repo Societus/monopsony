@@ -2452,6 +2452,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "mime_guess",
+ "monopsony-client",
  "monopsony-common",
  "monopsony-control",
  "monopsony-db",

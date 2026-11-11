@@ -130,6 +130,104 @@ pub async fn run_self_update(cmd: crate::SelfUpdateMode) -> anyhow::Result<()> {
                 }
             }
         }
+
+        crate::SelfUpdateMode::Finalize { command_file } => {
+            // Phase 2 of the staged self-apply (Sprint 34 P4a) — spawned
+            // detached by the admin self-apply endpoint; PID-guarded so a
+            // second finalize cannot race the first. Mirrors the client
+            // binary's finalize arm (same machinery, server unit).
+            let current_exe =
+                std::env::current_exe().context("Failed to get current executable path")?;
+            let install_dir = current_exe
+                .parent()
+                .context("current binary has no parent directory")?
+                .to_path_buf();
+
+            let _guard = match monopsony_client::self_update::acquire_finalize_guard(&install_dir) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("MONOPSONY SELF-UPDATE FINALIZE: {e:#}");
+                    std::process::exit(4);
+                }
+            };
+
+            let cmd = match monopsony_client::self_update::read_finalize_command(&command_file) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!(
+                        "MONOPSONY SELF-UPDATE FINALIZE: cannot read {}: {e:#}",
+                        command_file.display()
+                    );
+                    std::process::exit(4);
+                }
+            };
+
+            match monopsony_client::self_update::run_finalize(
+                &cmd,
+                &current_exe,
+                monopsony_client::self_update::RestartAction::DetectedInit,
+            )
+            .await
+            {
+                Ok(monopsony_client::self_update::UpdateOutcome::Success) => {
+                    println!(
+                        "Finalize committed: {} -> {} — service restarted and healthy.",
+                        cmd.from_version, cmd.to_version
+                    );
+                    let _ = std::fs::remove_file(&command_file);
+                }
+                Ok(monopsony_client::self_update::UpdateOutcome::RolledBack(reason)) => {
+                    eprintln!(
+                        "MONOPSONY SELF-UPDATE FINALIZE ROLLED BACK: {reason} — previous \
+                         binary restored and service restarted."
+                    );
+                    let _ = std::fs::remove_file(&command_file);
+                    std::process::exit(5);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "MONOPSONY SELF-UPDATE FINALIZE FAILED: {e:#} — the previous binary \
+                         is untouched on disk; inspect monopsony-self-update-finalize.log"
+                    );
+                    std::process::exit(4);
+                }
+            }
+        }
+
+        crate::SelfUpdateMode::Rollback => {
+            let current_exe =
+                std::env::current_exe().context("Failed to get current executable path")?;
+            let install_dir = current_exe
+                .parent()
+                .context("current binary has no parent directory")?
+                .to_path_buf();
+            match monopsony_client::self_update::rollback_latest_backup(&current_exe, &install_dir)
+            {
+                Ok(backup) => {
+                    println!(
+                        "Restored {} over {} — restarting service via {}.",
+                        backup.display(),
+                        current_exe.display(),
+                        monopsony_client::self_update::detect_init_system().label()
+                    );
+                    let unit = monopsony_client::self_update::unit_for(
+                        monopsony_client::self_update::detect_init_system(),
+                        BinaryKind::Server,
+                    );
+                    if let Err(e) = monopsony_client::self_update::restart_service_unit(unit) {
+                        eprintln!(
+                            "MONOPSONY SELF-UPDATE: rollback restore succeeded but the \
+                             service restart failed: {e:#} — restart {unit} MANUALLY"
+                        );
+                        std::process::exit(4);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("MONOPSONY SELF-UPDATE ROLLBACK FAILED: {e:#}");
+                    std::process::exit(4);
+                }
+            }
+        }
     }
 
     Ok(())
