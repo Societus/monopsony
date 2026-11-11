@@ -18,6 +18,7 @@
   import LinkIcon from 'lucide-svelte/icons/link';
   import KeyRound from 'lucide-svelte/icons/key-round';
   import Circle from 'lucide-svelte/icons/circle';
+  import CircleArrowUp from 'lucide-svelte/icons/circle-arrow-up';
   import Logo from 'lucide-svelte/icons/boxes';
   import Lock from 'lucide-svelte/icons/lock';
 
@@ -94,6 +95,7 @@
     { href: 'security', label: 'Security', icon: Shield },
     { href: 'pairing', label: 'Pairing', icon: LinkIcon },
     { href: 'enrollment-keys', label: 'Enrollment Keys', icon: KeyRound },
+    { href: 'updates', label: 'Updates', icon: CircleArrowUp },
     { href: 'clients', label: 'Clients', icon: Users },
   ];
 

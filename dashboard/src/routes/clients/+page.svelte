@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api } from '$lib/api/client';
-  import type { ClientInfo, ShadowContext, ReleaseGuideResponse } from '$lib/api/types';
+  import type { ClientInfo, ShadowContext, ReleaseGuideResponse, UpdatesListResponse } from '$lib/api/types';
   import { formatTimestamp } from '$lib/utils/format';
+  import { isLegacyVersion, releasesBehind } from '$lib/utils/version';
   import Users from 'lucide-svelte/icons/users';
   import RefreshCw from 'lucide-svelte/icons/refresh-cw';
   import Circle from 'lucide-svelte/icons/circle';
@@ -12,6 +13,14 @@
   let clients = $state<ClientInfo[]>([]);
   let loading = $state(true);
   let error = $state('');
+
+  // Sprint 34 P4b: heartbeat-reported monopsony versions (fleet version
+  // column + skew badge). Joined from GET /updates/rollouts by client id;
+  // degrades to an em-dash column when the updates endpoints are
+  // unavailable (no-DB mode).
+  let fleetVersions = $state<Record<string, string>>({});
+  let versionDataAvailable = $state(false);
+  let storedVersions = $state<string[]>([]);
 
   // Sprint 29 Phase 4: rendered upgrade-guide state, keyed by client id.
   // The guide is display-only text rendered by the server — nothing executes.
@@ -40,6 +49,32 @@
     } finally {
       loading = false;
     }
+    // Fleet version data (Sprint 34 P4b) — joined from the updates
+    // endpoints so this page stays read-only over the heartbeat funnel.
+    try {
+      const state = await api.updates.rollouts();
+      const map: Record<string, string> = {};
+      for (const row of state.fleet) {
+        map[row.client_id] = row.monopsony_version;
+      }
+      fleetVersions = map;
+      versionDataAvailable = true;
+    } catch {
+      fleetVersions = {};
+      versionDataAvailable = false;
+    }
+    try {
+      const res = (await api.updates.list()) as Partial<UpdatesListResponse> & {
+        error?: string;
+      };
+      storedVersions = res.error ? [] : (res.releases ?? []).map((r) => r.version);
+    } catch {
+      storedVersions = [];
+    }
+  }
+
+  function fleetVersion(id: string): string {
+    return fleetVersions[id] ?? '';
   }
 
   async function loadShadowContext(id: string) {
@@ -150,6 +185,7 @@
           <tr class="border-b text-left" style="border-color: var(--color-border-default); color: var(--color-text-muted);">
             <th class="px-4 py-2 font-medium">Hostname</th>
             <th class="px-4 py-2 font-medium">OS</th>
+            <th class="px-4 py-2 font-medium">Version</th>
             <th class="px-4 py-2 font-medium">Updates</th>
             <th class="px-4 py-2 font-medium">Registered</th>
             <th class="px-4 py-2 font-medium">Last Seen</th>
@@ -162,6 +198,22 @@
             <tr class="table-row border-b" style="border-color: var(--color-border-default);">
               <td class="px-4 py-2.5 font-medium">{client.hostname}</td>
               <td class="px-4 py-2.5">{client.os}</td>
+              <td class="px-4 py-2.5">
+                {#if !versionDataAvailable}
+                  <span class="text-xs" style="color: var(--color-text-muted);">&mdash;</span>
+                {:else if isLegacyVersion(fleetVersion(client.id))}
+                  <!-- Sprint 34 P4b: pre-P2 clients report 0/nothing — render
+                       "legacy", never the raw 0; unknown is not lagging, so
+                       no skew badge (mirrors the self-apply guard buckets). -->
+                  <span class="text-xs" style="color: var(--color-text-muted);">legacy</span>
+                {:else}
+                  {@const behind = releasesBehind(fleetVersion(client.id), storedVersions)}
+                  <span class="font-mono text-xs">{fleetVersion(client.id)}</span>
+                  {#if behind !== null && behind >= 2}
+                    <span class="badge badge-warning ml-1">skew: {behind} behind</span>
+                  {/if}
+                {/if}
+              </td>
               <td class="px-4 py-2.5">
                 {#if client.updates}
                   <div class="text-xs">
@@ -278,7 +330,7 @@
             </tr>
             {#if expanded[client.id]}
               <tr>
-                <td colspan="7" class="px-4 py-3" id={'shadow-panel-' + client.id} style="background: var(--color-bg-subtle, transparent);">
+                <td colspan="8" class="px-4 py-3" id={'shadow-panel-' + client.id} style="background: var(--color-bg-subtle, transparent);">
                   {#if ctxLoading[client.id]}
                     <div class="text-xs" style="color: var(--color-text-muted);">Loading shadow context...</div>
                   {:else if ctxError[client.id]}

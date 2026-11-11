@@ -18,6 +18,9 @@ import type {
   FeatureFlags, MonetizationConfig,
   PendingPairRequest, PairApproveResponse, PairAuditEntry,
   EnrollmentKey, CreateEnrollmentKeyRequest, CreateEnrollmentKeyResponse,
+  UpdatesListResponse, UpdateCheckResponse, RolloutsResponse,
+  CreateRolloutRequest, CreateRolloutResponse,
+  SelfApplyRequest, SelfApplyResponse,
 } from './types';
 
 const BASE = import.meta.env.VITE_API_BASE || '/api/v1';
@@ -54,7 +57,14 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    throw new Error(body.message || body.reason || body.error || `HTTP ${res.status}`);
+    // status/body ride the error so structured failure bodies (e.g. the
+    // self-apply 409 guard conflict) stay readable at the call site.
+    const err = new Error(
+      body.message || body.reason || body.error || `HTTP ${res.status}`
+    ) as Error & { status?: number; body?: unknown };
+    err.status = res.status;
+    err.body = body;
+    throw err;
   }
 
   return res.json();
@@ -183,7 +193,24 @@ export const api = {
     monetization: {
       get: () => request<MonetizationConfig>('/features/monetization'),
       update: (config: MonetizationConfig) =>
-        request<{ success: boolean }>('/features/monetization', { method: 'PUT', body: JSON.stringify(config) }),
+        request<MonetizationConfig>('/features/monetization', { method: 'PUT', body: JSON.stringify(config) }),
     },
+  },
+
+  // Update distribution + rollout/self-apply (Sprint 34 P1/P4a/P4b).
+  updates: {
+    list: () => request<UpdatesListResponse>('/updates'),
+    check: () => request<UpdateCheckResponse>('/updates/check', { method: 'POST' }),
+    rollouts: () => request<RolloutsResponse>('/updates/rollouts'),
+    createRollout: (req: CreateRolloutRequest) =>
+      request<CreateRolloutResponse>('/updates/rollout', {
+        method: 'POST',
+        body: JSON.stringify(req),
+      }),
+    selfApply: (req: SelfApplyRequest) =>
+      request<SelfApplyResponse>('/updates/self-apply', {
+        method: 'POST',
+        body: JSON.stringify(req),
+      }),
   },
 };

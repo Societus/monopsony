@@ -332,3 +332,113 @@ export interface MonetizationConfig {
   v4v_enabled: boolean;
   v4v_default_boost_sats: number | null;
 }
+
+// ─── Update distribution / rollout / self-apply (Sprint 34 P1/P4a) ───
+
+/** One stored release row (GET /api/v1/updates) — newest fetch first. */
+export interface UpdateRelease {
+  version: string;
+  prerelease: boolean;
+  fetched_at: string;
+  changelog_url: string | null;
+  assets_complete: boolean;
+  /** Platforms with a stored monopsony-server artifact (contract: 4). */
+  server_platforms: string[];
+  /** Platforms with a stored monopsony-client artifact (contract: 4). */
+  client_platforms: string[];
+  artifact_count: number;
+}
+
+export interface UpdatesListResponse {
+  releases: UpdateRelease[];
+}
+
+/** POST /api/v1/updates/check — out-of-band distributor poll trigger. */
+export interface UpdateCheckResponse {
+  success: boolean;
+  message: string;
+}
+
+export type RolloutStatus = 'pending' | 'delivered' | 'applied' | 'refused';
+
+/** One assignment row of the rollout/ack state view. */
+export interface RolloutAssignment {
+  client_id: string;
+  hostname: string;
+  version: string;
+  status: RolloutStatus;
+  created_at: string;
+  delivered_at: string | null;
+  resolved_at: string | null;
+}
+
+/** Heartbeat-reported monopsony version for one client (fleet column input). */
+export interface FleetClientVersion {
+  client_id: string;
+  hostname: string;
+  /** Empty string = never reported (pre-P2/legacy client). */
+  monopsony_version: string;
+}
+
+export interface RolloutsResponse {
+  server_version: string;
+  assignments: RolloutAssignment[];
+  fleet: FleetClientVersion[];
+}
+
+export interface CreateRolloutRequest {
+  version: string;
+  /** Explicit target client ids; empty when `all` is true. */
+  client_ids?: string[];
+  /** Roll out to every registered client. */
+  all?: boolean;
+}
+
+export interface CreateRolloutResponse {
+  version: string;
+  assigned: number;
+  client_ids: string[];
+}
+
+export interface SelfApplyRequest {
+  version: string;
+  /** Operator override for the fleet-convergence guard. */
+  override_guard?: boolean;
+}
+
+/** 200 staged — the detached finalize will swap, restart and health-gate. */
+export interface SelfApplyStaged {
+  staged: true;
+  from_version: string;
+  to_version: string;
+  guard_overridden: boolean;
+  note: string;
+}
+
+/** 200 no-op — already running the target or a newer version. */
+export interface SelfApplyNoop {
+  staged: false;
+  reason: string;
+  from_version?: string;
+  to_version?: string;
+}
+
+export type SelfApplyResponse = SelfApplyStaged | SelfApplyNoop;
+
+/** One fleet row inside a guard-conflict body. */
+export interface GuardClientRow {
+  client_id: string;
+  hostname: string;
+  monopsony_version: string;
+}
+
+/** 409 guard body — fleet-convergence guard refused without override. */
+export interface SelfApplyGuardConflict {
+  guard_triggered: true;
+  override_required: true;
+  error: string;
+  target_version: string;
+  lagging_clients: GuardClientRow[];
+  unknown_clients: GuardClientRow[];
+  converged_clients: GuardClientRow[];
+}
