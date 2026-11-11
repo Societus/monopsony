@@ -1,0 +1,62 @@
+# Shadow package recipe: authentik-style-example
+# SYNTHETIC fixture for the Sprint-31 item-7 adopt exercise. Exemplifies the
+# "container-style" recipe shape observed on the fleet (Alpine ct/1904):
+#   * [install] method = "script" — the package is deployed by a compose
+#     script, not by monopsony's extract/build machinery.
+#   * config_paths = the host-side BIND ROOTS (compose mounts), not files —
+#     this is the roadmap's "config_paths = bind roots".
+#   * NO native init-system service: the container runtime supervises the
+#     processes; [install].service is therefore absent. Downstream code must
+#     treat empty `service` as legitimate, not as missing data.
+#   * downgrade_unsafe = true — authentik-style apps run forward-only DB
+#     migrations; a downgrade bricks the instance (north-star §5.5).
+#     NOTE: this flag is a TOP-LEVEL ShadowRecipe field and must sit BEFORE
+#     the first table header — a bare key after [notifications] would land
+#     inside that table and be silently dropped by the strict parser.
+#
+# Updates: `docker compose pull && docker compose up -d` inside the deploy
+# dir. New upstream env/flag surface lands in .env / compose.yaml — the
+# update-time diff engine (Sprint 32 Phase 3, wired Sprint 31 2B) surfaces
+# those changes against the registered recipe.
+
+# Top-level recipe flag (see header note): refuse downgrades for this package.
+downgrade_unsafe = true
+
+[package]
+name = "authentik-style-example"
+description = "Container-style adopt fixture: compose-deployed SSO with bind-root config"
+homepage = "https://goauthentik.io"
+source_type = "github_release"
+source_url = "https://github.com/goauthentik/authentik"
+
+[install]
+method = "script"
+target_dir = "/opt/authentik-example"
+# Host-visible single source of truth for the deployment (compose file).
+install_paths = ["/opt/authentik-example/docker-compose.yml"]
+# Bind roots mounted into the containers — the package's real config surface.
+config_paths = [
+  "/opt/authentik-example/.env",
+  "/opt/authentik-example/media",
+  "/opt/authentik-example/custom-templates",
+]
+backup_old = false          # containers own their rollback; host files are configs, not artifacts
+# No `service` key: container-managed, no systemd/OpenRC unit exists.
+
+# Post-update sanity: the compose-deployed web tier must answer.
+[install.health_check]
+type = "port"
+port = 9000
+timeout_secs = 120          # image pull + container start can be slow on first update
+
+[script]
+update = "cd /opt/authentik-example && docker compose pull && docker compose up -d"
+
+[version]
+# The running container reports its version; no host binary to probe.
+detect_command = "docker compose -f /opt/authentik-example/docker-compose.yml exec -T server ak version 2>/dev/null"
+detect_pattern = '(\\d+\\.\\d+\\.\\d+)'
+
+[notifications]
+changelog_url = "https://github.com/goauthentik/authentik/releases/tag/version%2F{version}"
+notes = "Fixture only. Updates run compose pull/up; forward-only migrations make downgrades unsafe (downgrade_unsafe = true)."

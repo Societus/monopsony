@@ -1668,6 +1668,11 @@ async fn handle_remote_assignment(
         .unwrap_or("")
         .to_string();
     let (install_paths, service_name) = shadow_cli::extract_install_fields(&recipe_toml);
+    // Sprint 31 (2B): the row mirrors the recipe like the register --recipe
+    // path (I2) — config_paths from the recipe, binary_sha256 per the Q5
+    // ELF-only probe rule (compose/script/bind roots stay honestly empty).
+    let config_paths = shadow_cli::extract_config_paths(&recipe_toml);
+    let binary_sha256 = elf_only_sha256(&install_paths);
     // Sprint 27 Part B: an assignment that passed every policy gate and is
     // being registered counts as one update-pipeline attempt.
     update_health.record_attempt(chrono::Utc::now().timestamp());
@@ -1683,9 +1688,9 @@ async fn handle_remote_assignment(
             &source_url,
             &recipe_toml,
             &install_paths,
-            &[], // config_paths: not consumed from the pushed recipe
+            &config_paths,
             &service_name,
-            "",    // binary_sha256: not probed on the heartbeat path
+            &binary_sha256,
             false, // mask_from_pm: opt-in only
         )
         .await
@@ -4132,15 +4137,27 @@ async fn run_shadow_package(
             // automatic restore-from-backup on failure.
             //
             // Sprint 32 Phase 3: go through the diffing wrapper so recipe
-            // requirement changes land in the same update log. GAP (recorded,
-            // per hub decision 4): the client has NO local store of the
-            // previously registered/adopted recipe (Sprint 30 persistence is
-            // server-side only; recipes are fetched via gRPC), so previous is
-            // always None today — zero diff warnings until a loadable
-            // accessor lands. Do not invent new persistence here.
+            // requirement changes land in the same update log.
+            //
+            // Sprint 31 (2B): the previously registered/adopted recipe comes
+            // from the server's per-client row — the register/adopt bytes
+            // are persisted server-side and returned by list_shadow_packages
+            // (row field `recipe_path`, a historic misnomer). A failed fetch
+            // or unparsable bytes must never block the update:
+            // previous = None keeps the pre-2B behavior.
+            let previous_recipe = match client.list_shadow_packages(&client_id).await {
+                Ok(rows) => previous_recipe_from_rows(&rows, &name),
+                Err(e) => {
+                    eprintln!(
+                        "WARNING: could not list registered shadow packages ({}); skipping recipe diff",
+                        e
+                    );
+                    None
+                }
+            };
             let outcome = shadow_executor::execute_update_with_diff(
                 &recipe,
-                None,
+                previous_recipe.as_ref(),
                 &update.latest_version,
                 &asset_url,
                 &http,
@@ -4320,6 +4337,13 @@ async fn run_shadow_package(
                 })
                 .unwrap_or_default();
             let (install_paths, service_name) = shadow_cli::extract_install_fields(&recipe_toml);
+            // Sprint 31 (2B): the row mirrors the recipe like the register
+            // --recipe path (I2) — config_paths from the recipe,
+            // binary_sha256 per the Q5 ELF-only probe rule (a compose-file
+            // install_paths entry stays honestly empty; that is valid, not
+            // drift).
+            let config_paths = shadow_cli::extract_config_paths(&recipe_toml);
+            let binary_sha256 = elf_only_sha256(&install_paths);
 
             // 2. Confirm the local install actually exists before adopting:
             //    install-path existence + detect_command version probe.
@@ -4360,9 +4384,9 @@ async fn run_shadow_package(
                     &source_url,
                     &recipe_toml,
                     &install_paths,
-                    &[], // config_paths: not adopted from recipe install config_paths
+                    &config_paths,
                     &service_name,
-                    "",    // binary_sha256: not probed on the adopt path
+                    &binary_sha256,
                     false, // mask_from_pm: opt-in only
                 )
                 .await?;
@@ -4391,6 +4415,49 @@ async fn run_shadow_package(
         }
     }
     Ok(())
+}
+
+/// Sprint 31 (2B, Q5 rule): sha256 of the first ELF binary among the
+/// install paths; non-ELF entries (compose files, scripts, bind roots) stay
+/// honestly empty — `binary_sha256` means ELF content only, so an empty
+/// value on a script/compose recipe is valid, not drift. Unreadable paths
+/// are skipped, never an error.
+fn elf_only_sha256(install_paths: &[String]) -> String {
+    for path in install_paths {
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if detect::parse_elf_header(&bytes[..bytes.len().min(20)]).is_some() {
+            return detect::sha256_hex(&bytes);
+        }
+    }
+    String::new()
+}
+
+/// Sprint 31 (2B): map the registered row for `name` to the strict previous
+/// recipe. The row's `recipe_path` field carries the registered TOML bytes
+/// (historic misnomer — the server stores register's recipe_toml there).
+/// Absent row or unparsable bytes → None so the diff is skipped; this must
+/// never block the update.
+fn previous_recipe_from_rows(
+    rows: &[monopsony_common::proto::monopsony::ShadowPackageInfo],
+    name: &str,
+) -> Option<monopsony_common::shadow_types::ShadowRecipe> {
+    let registered_toml = rows
+        .iter()
+        .find(|row| row.name == name)
+        .map(|row| row.recipe_path.clone())?;
+    match toml::from_str(&registered_toml) {
+        Ok(parsed) => Some(parsed),
+        Err(e) => {
+            eprintln!(
+                "WARNING: stored recipe for '{}' did not parse ({}); skipping recipe diff",
+                name, e
+            );
+            None
+        }
+    }
 }
 
 async fn connect_shadow(
@@ -5279,5 +5346,155 @@ mod client_config_server_tests {
 
     fn path_exists(p: &str) -> bool {
         std::path::Path::new(p).exists()
+    }
+}
+
+#[cfg(test)]
+mod s31_recipe_metadata_tests {
+    use super::{detect, elf_only_sha256, previous_recipe_from_rows, shadow_cli};
+    use monopsony_common::proto::monopsony::ShadowPackageInfo;
+    use monopsony_common::shadow_types::{InstallMethod, ShadowRecipe};
+
+    /// The shipped fixture bytes — tests pin them so an accidental edit to
+    /// the recipe shape fails here first (Q9: in-repo fixture, pinned bytes).
+    const FIXTURE_TOML: &str = include_str!("../../../recipes/shadow/authentik-style-example.toml");
+
+    fn fixture_row() -> ShadowPackageInfo {
+        ShadowPackageInfo {
+            name: "authentik-style-example".to_string(),
+            // Historic misnomer: this proto field carries the registered
+            // recipe TOML bytes, not a path.
+            recipe_path: FIXTURE_TOML.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fixture_strict_parses_and_carries_container_shape() {
+        // The fixture must survive the STRICT ShadowRecipe parse (what the
+        // update-dispatch previous-recipe wiring uses), not just the lenient
+        // extractors.
+        let recipe: ShadowRecipe = toml::from_str(FIXTURE_TOML).expect("fixture must strict-parse");
+        assert_eq!(recipe.package.name, "authentik-style-example");
+        assert_eq!(recipe.install.method, InstallMethod::Script);
+        assert_eq!(
+            recipe.install.service, None,
+            "no service key: container-managed (Q8)"
+        );
+        assert!(
+            recipe.downgrade_unsafe,
+            "top-level downgrade_unsafe flag must survive the strict parse"
+        );
+        assert_eq!(
+            recipe.install.health_check.expect("port check").port,
+            Some(9000)
+        );
+        assert!(
+            recipe
+                .script
+                .as_ref()
+                .expect("compose-pull script")
+                .update
+                .contains("compose pull"),
+            "[script] update drives the compose pull/up flow"
+        );
+    }
+
+    #[test]
+    fn fixture_extractors_yield_bind_roots_in_order_and_empty_service() {
+        let (install_paths, service) = shadow_cli::extract_install_fields(FIXTURE_TOML);
+        assert_eq!(
+            install_paths,
+            vec!["/opt/authentik-example/docker-compose.yml".to_string()],
+            "compose file is the only install path"
+        );
+        assert_eq!(service, "", "absent service key extracts as empty (Q8)");
+        let config_paths = shadow_cli::extract_config_paths(FIXTURE_TOML);
+        assert_eq!(
+            config_paths,
+            vec![
+                "/opt/authentik-example/.env".to_string(),
+                "/opt/authentik-example/media".to_string(),
+                "/opt/authentik-example/custom-templates".to_string(),
+            ],
+            "bind roots extracted in recipe order (2B row-metadata shape)"
+        );
+    }
+
+    #[test]
+    fn elf_only_sha256_hashes_elf_and_skips_non_elf() {
+        let dir = tempfile::tempdir().unwrap();
+        // Minimal 20-byte ELF header (same shape as detect.rs's elf_bytes).
+        let mut elf = vec![0x7fu8, b'E', b'L', b'F', 2, 1, 1, 3];
+        elf.extend_from_slice(&[0u8; 8]);
+        elf.extend_from_slice(&[2, 0]); // e_type = ET_EXEC
+        elf.extend_from_slice(&[0x3e, 0]); // e_machine = x86_64
+        let elf_path = dir.path().join("binary");
+        std::fs::write(&elf_path, &elf).unwrap();
+        let compose_path = dir.path().join("docker-compose.yml");
+        std::fs::write(&compose_path, "services:\n  server: {}\n").unwrap();
+
+        // Q5 rule: the ELF entry hashes; the compose entry stays "" (valid,
+        // not drift).
+        assert_eq!(
+            elf_only_sha256(&[compose_path.display().to_string()]),
+            "",
+            "compose file install_paths yields empty binary_sha256"
+        );
+        assert_eq!(
+            elf_only_sha256(&[elf_path.display().to_string()]),
+            detect::sha256_hex(&elf),
+            "ELF install path hashes to the file digest"
+        );
+        // Mixed: first ELF entry wins, non-ELF entries skipped.
+        assert_eq!(
+            elf_only_sha256(&[
+                compose_path.display().to_string(),
+                elf_path.display().to_string(),
+            ]),
+            detect::sha256_hex(&elf)
+        );
+        // Unreadable paths are skipped, never an error.
+        assert_eq!(
+            elf_only_sha256(&["/nonexistent/path/binary".to_string()]),
+            ""
+        );
+        assert_eq!(elf_only_sha256(&[]), "");
+    }
+
+    #[test]
+    fn previous_recipe_absent_row_is_none() {
+        let rows = vec![ShadowPackageInfo {
+            name: "something-else".to_string(),
+            ..Default::default()
+        }];
+        assert!(
+            previous_recipe_from_rows(&rows, "authentik-style-example").is_none(),
+            "no matching row → None (diff skipped)"
+        );
+        assert!(previous_recipe_from_rows(&[], "x").is_none());
+    }
+
+    #[test]
+    fn previous_recipe_present_row_strict_parses() {
+        let rows = vec![fixture_row()];
+        let parsed = previous_recipe_from_rows(&rows, "authentik-style-example")
+            .expect("registered bytes must parse");
+        assert_eq!(parsed.package.name, "authentik-style-example");
+        assert_eq!(parsed.install.method, InstallMethod::Script);
+        assert!(parsed.downgrade_unsafe);
+    }
+
+    #[test]
+    fn previous_recipe_unparsable_bytes_are_none_not_error() {
+        let rows = vec![ShadowPackageInfo {
+            name: "authentik-style-example".to_string(),
+            recipe_path: "### not toml at all [[[".to_string(),
+            ..Default::default()
+        }];
+        assert!(
+            previous_recipe_from_rows(&rows, "authentik-style-example").is_none(),
+            "garbage registered bytes → None + warn, never blocks the update"
+        );
     }
 }

@@ -21,6 +21,10 @@ pub struct ScanPaths {
     pub system_units: Vec<PathBuf>,
     pub user_units: Vec<PathBuf>,
     pub init_d: Vec<PathBuf>,
+    /// OpenRC runlevel directories (`/etc/runlevels` on Alpine). An init.d
+    /// script with an entry under any of these is enabled (Sprint 31 1A);
+    /// an absent entry keeps the match at Guess confidence.
+    pub runlevels: Vec<PathBuf>,
     pub proc_dir: Option<PathBuf>,
     /// Injectible package-manager ownership probe. `None` (default/tests
     /// without an override) falls back to the real `probe_pm_ownership`.
@@ -44,11 +48,14 @@ impl ScanPaths {
         }
         let mut init_d = vec![PathBuf::from("/etc/init.d")];
         init_d.retain(|p| p.is_dir());
+        let mut runlevels = vec![PathBuf::from("/etc/runlevels")];
+        runlevels.retain(|p| p.is_dir());
         let proc_dir = Some(PathBuf::from("/proc"));
         Self {
             system_units,
             user_units,
             init_d,
+            runlevels,
             proc_dir,
             pm_probe: Some(probe_pm_ownership),
         }
@@ -118,8 +125,11 @@ pub struct ConfigFinding {
 pub struct ServiceMatch {
     pub unit_name: String,
     pub unit_path: String,
-    /// How the match was made: "execstart-path", "execstart-basename",
-    /// "proc-exe", or "sysv".
+    /// How the match was made: "execstart" (systemd unit ExecStart=),
+    /// "proc-exe" (/proc/<pid>/exe with a systemd slice unit), "container"
+    /// (/proc/<pid>/exe inside a container cgroup scope — `unit_name` then
+    /// holds the short container id and `unit_path` is prefixed with the
+    /// engine name), "openrc", or "sysv" (/etc/init.d script).
     pub method: String,
     pub confidence: Confidence,
     /// PID matched via /proc/<pid>/exe (proc-exe method only).
@@ -357,11 +367,8 @@ fn capitalize_first(s: &str) -> String {
 /// binary is available on the host. A definitive owned/unowned answer →
 /// `Some(true)`/`Some(false)`; no package-manager binary found → `None`.
 fn probe_pm_ownership(path: &Path) -> Option<bool> {
-    const PROBES: &[(&str, &[&str])] = &[
-        ("dpkg", &["-S"]),
-        ("rpm", &["-qf"]),
-        ("pacman", &["-Qo"]),
-    ];
+    const PROBES: &[(&str, &[&str])] =
+        &[("dpkg", &["-S"]), ("rpm", &["-qf"]), ("pacman", &["-Qo"])];
     for &(pm, args) in PROBES {
         let mut cmd = std::process::Command::new(pm);
         cmd.args(args).arg(path);
@@ -380,14 +387,10 @@ fn probe_pm_ownership(path: &Path) -> Option<bool> {
 /// Name of the package manager available on this host (dpkg/rpm/pacman order),
 /// used to label `pm-managed` draft comments. No process is spawned.
 fn pm_name() -> Option<&'static str> {
-    ["dpkg", "rpm", "pacman"]
-        .into_iter()
-        .find(|pm| {
-            std::env::var_os("PATH")
-                .is_some_and(|path| {
-                    std::env::split_paths(&path).any(|dir| dir.join(pm).is_file())
-                })
-        })
+    ["dpkg", "rpm", "pacman"].into_iter().find(|pm| {
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(pm).is_file()))
+    })
 }
 
 fn looks_like_path(s: &str) -> bool {
@@ -490,19 +493,49 @@ pub async fn match_service(
                 if !matched {
                     continue;
                 }
-                let unit = cgroup_unit(&entry.path());
-                return Ok(Some(ServiceMatch {
-                    unit_name: unit.unwrap_or_default(),
-                    unit_path: format!("/proc/{}/exe", pid),
-                    method: "proc-exe".to_string(),
-                    confidence: Confidence::Medium,
-                    pid: Some(pid),
-                }));
+                // Sprint 31 (1A): classify the cgroup before claiming a unit.
+                // A systemd slice yields the unit name; a container scope
+                // yields the short container id; neither means we must NOT
+                // claim an empty unit (the authentik empty-service bug) —
+                // the OpenRC/SysV tiers below still run for this binary.
+                let cgroup = std::fs::read_to_string(entry.path().join("cgroup")).ok();
+                if let Some(contents) = cgroup.as_deref() {
+                    if let Some(unit) = cgroup_unit(contents) {
+                        return Ok(Some(ServiceMatch {
+                            unit_name: unit,
+                            unit_path: format!("/proc/{}/exe", pid),
+                            method: "proc-exe".to_string(),
+                            confidence: Confidence::Medium,
+                            pid: Some(pid),
+                        }));
+                    }
+                    if let Some((engine, id)) = container_scope(contents) {
+                        let engine = container_engine_hint().unwrap_or(engine);
+                        return Ok(Some(ServiceMatch {
+                            unit_name: id,
+                            unit_path: format!("{}:/proc/{}/exe", engine, pid),
+                            method: "container".to_string(),
+                            confidence: Confidence::Guess,
+                            pid: Some(pid),
+                        }));
+                    }
+                }
+                // No systemd unit and no container marker: fall through to
+                // the init-script tiers instead of registering an empty
+                // service name. Other pids still get their chance first.
             }
         }
     }
 
-    // 3. SysV fallback: /etc/init.d/* mentioning the path or basename.
+    // 3. OpenRC/SysV fallback: /etc/init.d/* mentioning the path or basename.
+    // Sprint 31 (1A): the script content already in memory classifies the
+    // init system — an openrc-run/runscript shebang or a depend() block is
+    // OpenRC (shebang is authoritative even where systemd coexists), anything
+    // else keeps the historical "sysv" label. Enablement is read from the
+    // filesystem: a /etc/runlevels/<rl>/<name> entry lifts the match to
+    // Medium; an unenabled script stays as a Guess so it is never silently
+    // skipped. unit_name is the bare suffix-free script name, matching what
+    // the Sprint 32 OpenRC renderer writes on the install side.
     for dir in &scan.init_d {
         let mut entries: Vec<PathBuf> = match std::fs::read_dir(dir) {
             Ok(rd) => rd.flatten().map(|e| e.path()).collect(),
@@ -522,14 +555,25 @@ pub async fn match_service(
                             .any(|tok| tok.rsplit('/').next() == Some(basename.as_str())))
             });
             if hit {
+                let unit_name = script
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let method = if is_openrc_script(&contents) {
+                    "openrc"
+                } else {
+                    "sysv"
+                };
+                let confidence = if runlevel_enabled(&scan.runlevels, &unit_name) {
+                    Confidence::Medium
+                } else {
+                    Confidence::Guess
+                };
                 return Ok(Some(ServiceMatch {
-                    unit_name: script
-                        .file_name()
-                        .map(|f| f.to_string_lossy().to_string())
-                        .unwrap_or_default(),
+                    unit_name,
                     unit_path: script.display().to_string(),
-                    method: "sysv".to_string(),
-                    confidence: Confidence::Medium,
+                    method: method.to_string(),
+                    confidence,
                     pid: None,
                 }));
             }
@@ -541,9 +585,8 @@ pub async fn match_service(
     Ok(None)
 }
 
-/// Read /proc/<pid>/cgroup and pull the systemd unit name out of it.
-fn cgroup_unit(proc_entry: &Path) -> Option<String> {
-    let contents = std::fs::read_to_string(proc_entry.join("cgroup")).ok()?;
+/// Pull the systemd unit name out of /proc/<pid>/cgroup content.
+fn cgroup_unit(contents: &str) -> Option<String> {
     for line in contents.lines() {
         // e.g. 0::/system.slice/foo.service
         if let Some(idx) = line.find("system.slice/") {
@@ -554,6 +597,90 @@ fn cgroup_unit(proc_entry: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// Sprint 31 (1A): detect a container cgroup scope in /proc/<pid>/cgroup
+/// content. Returns (engine, short container id) when a line carries one of
+/// the known container scope prefixes; `None` for systemd slices and
+/// unparseable content, so callers fall through instead of mislabeling.
+fn container_scope(contents: &str) -> Option<(&'static str, String)> {
+    const MARKERS: &[(&str, &str)] = &[
+        ("libpod-", "podman"),
+        ("docker-", "docker"),
+        ("containerd-", "containerd"),
+        ("crio-", "crio"),
+    ];
+    for line in contents.lines() {
+        for (marker, engine) in MARKERS {
+            if let Some(idx) = line.find(marker) {
+                let rest = &line[idx + marker.len()..];
+                let id = rest.split('.').next().unwrap_or("");
+                if !id.is_empty() {
+                    // Short id: the 12-char form `podman ps` reports.
+                    let short: String = id.chars().take(12).collect();
+                    return Some((engine, short));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Sprint 31 (1A): engine identity from on-disk marker files, used when the
+/// cgroup scope names a different runtime layer than the engine itself
+/// (e.g. containerd-managed podman). Marker presence alone never claims a
+/// container — it only refines the engine of an existing scope match.
+fn container_engine_hint() -> Option<&'static str> {
+    if Path::new("/run/.containerenv").exists() {
+        return Some("podman");
+    }
+    if Path::new("/.dockerenv").exists() {
+        return Some("docker");
+    }
+    None
+}
+
+/// Sprint 31 (1A): classify an /etc/init.d script as OpenRC. An
+/// openrc-run/runscript shebang or a depend() block means OpenRC (the
+/// shebang is authoritative even where systemd coexists); anything else is
+/// treated as plain SysV.
+fn is_openrc_script(contents: &str) -> bool {
+    if let Some(shebang) = contents.lines().next() {
+        if shebang.starts_with("#!")
+            && (shebang.contains("openrc-run") || shebang.contains("runscript"))
+        {
+            return true;
+        }
+    }
+    contents
+        .lines()
+        .any(|l| l.trim_start().starts_with("depend()"))
+}
+
+/// Sprint 31 (1A): is the init script enabled? An entry named `<name>` under
+/// any runlevel directory means rc-update manages it. The configured dirs may
+/// be `/etc/runlevels` itself (children = boot/default/…) or individual
+/// runlevel dirs — both layouts are checked. Missing/unreadable dirs simply
+/// yield false — the match stays at Guess, never an error.
+fn runlevel_enabled(runlevels: &[PathBuf], name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    for dir in runlevels {
+        if dir.join(name).exists() {
+            return true;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for level in rd.flatten() {
+            let level_path = level.path();
+            if level_path.is_dir() && level_path.join(name).exists() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Sprint 31 I5: strip trailing '/' (except bare "/") so a UnitArg value
@@ -705,7 +832,8 @@ pub async fn detect_with_scan(
     let name = name_hint
         .map(|s| s.to_string())
         .unwrap_or_else(|| basename_of(path));
-    let config_findings = discover_configs(&name, service.as_ref(), unit_user.as_deref(), scan).await?;
+    let config_findings =
+        discover_configs(&name, service.as_ref(), unit_user.as_deref(), scan).await?;
 
     Ok(DetectReport {
         path_arg,
@@ -738,9 +866,7 @@ fn basename_of(p: &Path) -> String {
 /// Strip a trailing ".git" (case-insensitive) from a source URL basename so
 /// "https://github.com/owner/foo.git" yields repo basename "foo".
 fn strip_git_suffix(name: &str) -> &str {
-    if name.len() >= 4
-        && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".git")
-    {
+    if name.len() >= 4 && name.as_bytes()[name.len() - 4..].eq_ignore_ascii_case(b".git") {
         &name[..name.len() - 4]
     } else {
         name
@@ -800,7 +926,11 @@ pub fn render_draft_toml(
     // Name confidence: recipe name matching the source repo basename
     // (case-insensitive) is real evidence; otherwise convention only.
     let name_conf = source_url
-        .and_then(|url| Path::new(url).file_name().map(|f| f.to_string_lossy().to_string()))
+        .and_then(|url| {
+            Path::new(url)
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+        })
         .map(|repo_basename| {
             let repo_base = strip_git_suffix(&repo_basename);
             if recipe_name.to_lowercase() == repo_base.to_lowercase() {
@@ -857,27 +987,89 @@ pub fn render_draft_toml(
             svc.confidence.as_str(),
             svc.method
         ));
-        out.push_str(&format!(
-            "# pre_update = \"systemctl stop {}\" # confidence: {}\n",
-            svc.unit_name,
-            svc.confidence.as_str()
-        ));
-        out.push_str(&format!(
-            "# post_update = \"systemctl start {}\" # confidence: {}\n",
-            svc.unit_name,
-            svc.confidence.as_str()
-        ));
-        out.push_str(&format!(
-            "# health_check = \"<fill in>\" # confidence: guess (verify against service {})\n",
-            svc.unit_name
-        ));
+        // Sprint 31 (1A): lifecycle hints follow the matched init system —
+        // never a hint with an empty unit name, and never systemctl for a
+        // non-execstart method.
+        if !svc.unit_name.is_empty() {
+            match svc.method.as_str() {
+                "execstart" => {
+                    out.push_str(&format!(
+                        "# pre_update = \"systemctl stop {}\" # confidence: {}\n",
+                        svc.unit_name,
+                        svc.confidence.as_str()
+                    ));
+                    out.push_str(&format!(
+                        "# post_update = \"systemctl start {}\" # confidence: {}\n",
+                        svc.unit_name,
+                        svc.confidence.as_str()
+                    ));
+                }
+                "openrc" => {
+                    out.push_str(&format!(
+                        "# pre_update = \"rc-service {} stop\" # confidence: {}\n",
+                        svc.unit_name,
+                        svc.confidence.as_str()
+                    ));
+                    out.push_str(&format!(
+                        "# post_update = \"rc-service {} start\" # confidence: {}\n",
+                        svc.unit_name,
+                        svc.confidence.as_str()
+                    ));
+                    // Q3: an unenabled script (no runlevel entry) registers at
+                    // Guess and carries its own enable hint so it is never
+                    // silently skipped.
+                    if svc.confidence == Confidence::Guess {
+                        out.push_str(&format!(
+                            "# rc-update add {} default to enable\n",
+                            svc.unit_name
+                        ));
+                    }
+                }
+                "sysv" => {
+                    out.push_str(&format!(
+                        "# pre_update = \"/etc/init.d/{} stop\" # confidence: {}\n",
+                        svc.unit_name,
+                        svc.confidence.as_str()
+                    ));
+                    out.push_str(&format!(
+                        "# post_update = \"/etc/init.d/{} start\" # confidence: {}\n",
+                        svc.unit_name,
+                        svc.confidence.as_str()
+                    ));
+                    out.push_str(
+                        "# NOTE: sysv has no supervisor restart; verify the service manually.\n",
+                    );
+                }
+                "container" => {
+                    // The runtime supervises the process; there is no init
+                    // unit to stop/start. A bare engine restart is the honest
+                    // placeholder until Sprint 32 P2 lands wrapper discovery
+                    // (compose/quadlet units).
+                    let engine = svc.unit_path.split(':').next().unwrap_or("podman");
+                    out.push_str(&format!(
+                        "# restart_hint = \"{} restart {}\" # confidence: guess (placeholder)\n",
+                        engine, svc.unit_name
+                    ));
+                    out.push_str(
+                        "# NOTE: wrapper discovery (compose/quadlet units) is Sprint 32 P2.\n",
+                    );
+                }
+                _ => {}
+            }
+            out.push_str(&format!(
+                "# health_check = \"<fill in>\" # confidence: guess (verify against service {})\n",
+                svc.unit_name
+            ));
+        }
     }
 
     // config_paths: only paths confirmed to exist are uncommented. I5 T1.3: when the
     // unit runs as a non-root user, /root/* findings were already demoted to Guess —
     // exclude them so they never become uncommented config_paths.
     let root_demoted = report.unit_user.as_deref().is_some_and(|u| u != "root");
-    let existing: Vec<&ConfigFinding> = report.config_findings.iter()
+    let existing: Vec<&ConfigFinding> = report
+        .config_findings
+        .iter()
         .filter(|f| f.exists && !(root_demoted && f.path.starts_with("/root/")))
         .collect();
     if !existing.is_empty() {
@@ -903,7 +1095,11 @@ pub fn render_draft_toml(
     }
     // Nonexistent conventional suggestions → comment lines only. I5 T1.3: demoted-but-existing
     // /root/* paths (non-root unit) still surface as suggestion comments so they never vanish.
-    for f in report.config_findings.iter().filter(|f| !f.exists || (root_demoted && f.path.starts_with("/root/"))) {
+    for f in report
+        .config_findings
+        .iter()
+        .filter(|f| !f.exists || (root_demoted && f.path.starts_with("/root/")))
+    {
         out.push_str(&format!(
             "# suggestion (confidence: guess): \"{}\"\n",
             f.path
@@ -1014,6 +1210,7 @@ mod tests {
             system_units: units,
             user_units: vec![],
             init_d: vec![],
+            runlevels: vec![],
             proc_dir: None,
             pm_probe: None,
         }
@@ -1072,7 +1269,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(svc.unit_name, "foo.service");
-        let findings = discover_configs("foo", Some(&svc), None, &scan).await.unwrap();
+        let findings = discover_configs("foo", Some(&svc), None, &scan)
+            .await
+            .unwrap();
         let found = findings
             .iter()
             .find(|f| f.path == conf.display().to_string())
@@ -1169,10 +1368,18 @@ mod tests {
         assert!(toml.contains("source_type = \"github_release\""));
         assert!(toml.contains("source_url = \"https://github.com/owner/foo\""));
 
-        let toml = render_draft_toml(&draft_report(), "foo", Some("https://github.com/owner/foo.git"));
+        let toml = render_draft_toml(
+            &draft_report(),
+            "foo",
+            Some("https://github.com/owner/foo.git"),
+        );
         assert!(toml.contains("source_type = \"git_release\""));
 
-        let toml = render_draft_toml(&draft_report(), "foo", Some("https://pkgs.example.com/stable"));
+        let toml = render_draft_toml(
+            &draft_report(),
+            "foo",
+            Some("https://pkgs.example.com/stable"),
+        );
         assert!(toml.contains("source_type = \"direct_url\""));
 
         // No source → REPLACE_ME placeholder kept, typed direct_url.
@@ -1183,30 +1390,36 @@ mod tests {
 
     #[test]
     fn draft_toml_source_confidence_follows_source() {
-        let with_source = render_draft_toml(&draft_report(), "foo", Some("https://github.com/owner/foo"));
-        assert!(with_source
-            .contains("source_type = \"github_release\" # confidence: medium"));
+        let with_source =
+            render_draft_toml(&draft_report(), "foo", Some("https://github.com/owner/foo"));
+        assert!(with_source.contains("source_type = \"github_release\" # confidence: medium"));
         assert!(with_source
             .contains("source_url = \"https://github.com/owner/foo\" # confidence: medium"));
 
         let without = render_draft_toml(&draft_report(), "foo", None);
-        assert!(without
-            .contains("source_type = \"direct_url\" # confidence: guess"));
-        assert!(without
-            .contains("source_url = \"REPLACE_ME\" # confidence: guess"));
+        assert!(without.contains("source_type = \"direct_url\" # confidence: guess"));
+        assert!(without.contains("source_url = \"REPLACE_ME\" # confidence: guess"));
     }
 
     #[test]
     fn draft_toml_name_confidence_repo_basename_match() {
         // Case-insensitive basename match, trailing .git stripped → medium.
-        let toml = render_draft_toml(&draft_report(), "Foo", Some("https://github.com/owner/foo.git"));
+        let toml = render_draft_toml(
+            &draft_report(),
+            "Foo",
+            Some("https://github.com/owner/foo.git"),
+        );
         assert!(toml.contains("name = \"Foo\" # confidence: medium"));
 
         let toml = render_draft_toml(&draft_report(), "foo", Some("https://github.com/OWNER/Foo"));
         assert!(toml.contains("name = \"foo\" # confidence: medium"));
 
         // No match → guess.
-        let toml = render_draft_toml(&draft_report(), "bar", Some("https://github.com/owner/foo.git"));
+        let toml = render_draft_toml(
+            &draft_report(),
+            "bar",
+            Some("https://github.com/owner/foo.git"),
+        );
         assert!(toml.contains("name = \"bar\" # confidence: guess"));
 
         // No source → guess (kills the arbitrary source_url.is_some() proxy).
@@ -1225,12 +1438,13 @@ mod tests {
             pid: None,
         });
         let toml = render_draft_toml(&report, "foo", None);
-        assert!(toml
-            .contains("service = \"foo.service\" # confidence: medium (matched via execstart)"));
-        assert!(toml
-            .contains("# pre_update = \"systemctl stop foo.service\" # confidence: medium"));
-        assert!(toml
-            .contains("# post_update = \"systemctl start foo.service\" # confidence: medium"));
+        assert!(
+            toml.contains("service = \"foo.service\" # confidence: medium (matched via execstart)")
+        );
+        assert!(toml.contains("# pre_update = \"systemctl stop foo.service\" # confidence: medium"));
+        assert!(
+            toml.contains("# post_update = \"systemctl start foo.service\" # confidence: medium")
+        );
         assert!(toml.contains(
             "# health_check = \"<fill in>\" # confidence: guess (verify against service foo.service)"
         ));
@@ -1243,10 +1457,9 @@ mod tests {
     #[test]
     fn draft_toml_replace_me_header() {
         let without = render_draft_toml(&draft_report(), "foo", None);
-        assert!(without.contains(
-            "# registration requires --source while source_url is REPLACE_ME"
-        ));
-        let with_source = render_draft_toml(&draft_report(), "foo", Some("https://github.com/owner/foo"));
+        assert!(without.contains("# registration requires --source while source_url is REPLACE_ME"));
+        let with_source =
+            render_draft_toml(&draft_report(), "foo", Some("https://github.com/owner/foo"));
         assert!(!with_source.contains("registration requires --source"));
     }
 
@@ -1286,6 +1499,7 @@ mod tests {
             system_units: vec![],
             user_units: vec![],
             init_d: vec![],
+            runlevels: vec![],
             proc_dir: None,
             pm_probe,
         }
@@ -1383,7 +1597,10 @@ mod tests {
         let exec = format!("/opt/sonarr/Sonarr --data={}", data_dir.display());
         std::fs::write(
             &unit,
-            format!("[Unit]\nDescription=sonarr\n[Service]\nExecStart={}\n", exec),
+            format!(
+                "[Unit]\nDescription=sonarr\n[Service]\nExecStart={}\n",
+                exec
+            ),
         )
         .unwrap();
         let scan = scan_with(vec![tmp.path().to_path_buf()]);
@@ -1409,9 +1626,7 @@ mod tests {
         let first_conventional = findings
             .iter()
             .position(|f| f.source == ConfigSource::Conventional);
-        assert!(
-            first_conventional.map(|c| c > unit_arg_pos).unwrap_or(true)
-        );
+        assert!(first_conventional.map(|c| c > unit_arg_pos).unwrap_or(true));
     }
 
     // --- T1.3: user-aware search space ---
@@ -1454,11 +1669,13 @@ mod tests {
             .iter()
             .position(|f| f.path == "/root/.config/Sonarr")
             .unwrap();
-        assert!(root_pos
-            > findings
-                .iter()
-                .position(|f| f.path == "/var/lib/sonarr")
-                .unwrap());
+        assert!(
+            root_pos
+                > findings
+                    .iter()
+                    .position(|f| f.path == "/var/lib/sonarr")
+                    .unwrap()
+        );
     }
 
     // --- I5: config_paths slash-dedup + /root demotion in the renderer ---
@@ -1506,13 +1723,17 @@ mod tests {
             confidence: Confidence::Guess,
         }];
         let toml = render_draft_toml(&report, "sonarr", None);
-        assert!(toml.lines().any(|l| l.starts_with("config_paths") && l.contains("/root/.config/Sonarr")));
+        assert!(toml
+            .lines()
+            .any(|l| l.starts_with("config_paths") && l.contains("/root/.config/Sonarr")));
         assert!(!toml.contains("# suggestion (confidence: guess): \"/root/.config/Sonarr\""));
 
         // unit_user = None → same behavior.
         report.unit_user = None;
         let toml2 = render_draft_toml(&report, "sonarr", None);
-        assert!(toml2.lines().any(|l| l.starts_with("config_paths") && l.contains("/root/.config/Sonarr")));
+        assert!(toml2
+            .lines()
+            .any(|l| l.starts_with("config_paths") && l.contains("/root/.config/Sonarr")));
         assert!(!toml2.contains("# suggestion (confidence: guess): \"/root/.config/Sonarr\""));
     }
 
@@ -1528,13 +1749,9 @@ mod tests {
         )
         .unwrap();
         let scan = scan_with(vec![tmp.path().to_path_buf()]);
-        let report = detect_with_scan(
-            Path::new("/opt/sonarr/Sonarr"),
-            Some("sonarr"),
-            &scan,
-        )
-        .await
-        .unwrap();
+        let report = detect_with_scan(Path::new("/opt/sonarr/Sonarr"), Some("sonarr"), &scan)
+            .await
+            .unwrap();
         assert_eq!(report.unit_user, Some("sonarr".to_string()));
         assert_eq!(
             report.exec_args,
@@ -1547,5 +1764,280 @@ mod tests {
             report.service.as_ref().map(|s| s.unit_name.as_str()),
             Some("sonarr.service")
         );
+    }
+
+    // --- Sprint 31 (1A): OpenRC classification + container marker ---
+
+    fn service_scan(
+        init_d: Vec<PathBuf>,
+        runlevels: Vec<PathBuf>,
+        proc_dir: Option<PathBuf>,
+    ) -> ScanPaths {
+        ScanPaths {
+            system_units: vec![],
+            user_units: vec![],
+            init_d,
+            runlevels,
+            proc_dir,
+            pm_probe: None,
+        }
+    }
+
+    fn write_init_script(dir: &Path, name: &str, contents: &str) -> PathBuf {
+        let p = dir.join(name);
+        std::fs::write(&p, contents).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    fn fake_pid(proc_dir: &Path, pid: u32, exe_target: &str, cgroup: &str) {
+        let pid_dir = proc_dir.join(pid.to_string());
+        std::fs::create_dir_all(&pid_dir).unwrap();
+        std::os::unix::fs::symlink(exe_target, pid_dir.join("exe")).unwrap();
+        std::fs::write(pid_dir.join("cgroup"), cgroup).unwrap();
+    }
+
+    #[tokio::test]
+    async fn init_script_openrc_shebang_classifies_openrc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let init_d = tmp.path().join("init.d");
+        std::fs::create_dir_all(&init_d).unwrap();
+        let script = write_init_script(
+            &init_d,
+            "sshd",
+            "#!/sbin/openrc-run\n\ncommand=/usr/sbin/sshd\ncommand_args=\"-D\"\n\ndepend() {\n\tuse logger\n}\n",
+        );
+        let scan = service_scan(vec![init_d], vec![], None);
+        let m = match_service(None, Path::new("/usr/sbin/sshd"), None, &scan)
+            .await
+            .unwrap()
+            .expect("init.d basename match");
+        assert_eq!(m.method, "openrc");
+        // Bare suffix-free name — round-trips into `rc-service` and matches
+        // the Sprint 32 OpenRC renderer's write-side convention.
+        assert_eq!(m.unit_name, "sshd");
+        assert_eq!(m.unit_path, script.display().to_string());
+        // No runlevel dirs scanned → unenabled → Guess (never silently
+        // skipped — the match itself is still returned).
+        assert_eq!(m.confidence, Confidence::Guess);
+    }
+
+    #[tokio::test]
+    async fn init_script_depend_block_classifies_openrc() {
+        // Q6: a script whose shebang is not openrc-run but which carries a
+        // depend() block is OpenRC by content.
+        let tmp = tempfile::tempdir().unwrap();
+        let init_d = tmp.path().join("init.d");
+        std::fs::create_dir_all(&init_d).unwrap();
+        write_init_script(
+            &init_d,
+            "sshd",
+            "#!/bin/sh\n\ncommand=/usr/sbin/sshd\n\ndepend() {\n\tneed net\n}\n",
+        );
+        let scan = service_scan(vec![init_d], vec![], None);
+        let m = match_service(None, Path::new("/usr/sbin/sshd"), None, &scan)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.method, "openrc");
+    }
+
+    #[tokio::test]
+    async fn init_script_plain_sh_stays_sysv() {
+        let tmp = tempfile::tempdir().unwrap();
+        let init_d = tmp.path().join("init.d");
+        std::fs::create_dir_all(&init_d).unwrap();
+        write_init_script(
+            &init_d,
+            "foo",
+            "#!/bin/sh\ncase \"$1\" in\n  start) /opt/bin/foo ;;\nesac\n",
+        );
+        let scan = service_scan(vec![init_d], vec![], None);
+        let m = match_service(None, Path::new("/opt/bin/foo"), None, &scan)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.method, "sysv");
+        assert_eq!(m.unit_name, "foo");
+        assert_eq!(m.confidence, Confidence::Guess);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn init_script_openrc_runlevel_entry_lifts_to_medium() {
+        let tmp = tempfile::tempdir().unwrap();
+        let init_d = tmp.path().join("init.d");
+        std::fs::create_dir_all(&init_d).unwrap();
+        let script = write_init_script(
+            &init_d,
+            "sshd",
+            "#!/sbin/openrc-run\ncommand=/usr/sbin/sshd\n",
+        );
+        let runlevels = tmp.path().join("runlevels");
+        let default = runlevels.join("default");
+        std::fs::create_dir_all(&default).unwrap();
+        std::os::unix::fs::symlink(&script, default.join("sshd")).unwrap();
+        let scan = service_scan(vec![init_d], vec![runlevels], None);
+        let m = match_service(None, Path::new("/usr/sbin/sshd"), None, &scan)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.method, "openrc");
+        assert_eq!(m.confidence, Confidence::Medium);
+        // Same tree without the runlevel entry → back to Guess.
+        std::fs::remove_file(default.join("sshd")).unwrap();
+        let m = match_service(None, Path::new("/usr/sbin/sshd"), None, &scan)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.confidence, Confidence::Guess);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proc_exe_systemd_slice_still_claims_unit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_dir = tmp.path().join("proc");
+        fake_pid(
+            &proc_dir,
+            4242,
+            "/opt/sonarr/Sonarr",
+            "0::/system.slice/sonarr.service\n",
+        );
+        let scan = service_scan(vec![], vec![], Some(proc_dir));
+        let m = match_service(None, Path::new("/opt/sonarr/Sonarr"), None, &scan)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.method, "proc-exe");
+        assert_eq!(m.unit_name, "sonarr.service");
+        assert_eq!(m.confidence, Confidence::Medium);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proc_exe_without_slice_or_container_claims_nothing() {
+        // Authentik regression: a /proc exe match whose cgroup has no
+        // system.slice unit and no container scope must NOT claim an empty
+        // service name — the init-script tiers run instead (None here).
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_dir = tmp.path().join("proc");
+        fake_pid(&proc_dir, 4242, "/usr/sbin/authentik", "0::/\n");
+        let scan = service_scan(vec![], vec![], Some(proc_dir));
+        let m = match_service(None, Path::new("/usr/sbin/authentik"), None, &scan)
+            .await
+            .unwrap();
+        assert!(m.is_none(), "empty-name service claim must not happen");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proc_exe_libpod_scope_yields_container_short_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proc_dir = tmp.path().join("proc");
+        fake_pid(
+            &proc_dir,
+            99,
+            "/usr/sbin/authentik",
+            "0::/libpod-3fa9c4d1e5b6a7a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6071829.scope\n",
+        );
+        let scan = service_scan(vec![], vec![], Some(proc_dir));
+        let m = match_service(None, Path::new("/usr/sbin/authentik"), None, &scan)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.method, "container");
+        // Short id: the 12-char form the engine CLI reports.
+        assert_eq!(m.unit_name, "3fa9c4d1e5b6");
+        assert_eq!(m.confidence, Confidence::Guess);
+        // Engine identity rides in unit_path (Q4); the exact engine name
+        // depends on host marker files, so only the shape is pinned here.
+        assert!(
+            m.unit_path.ends_with(":/proc/99/exe"),
+            "unit_path must carry engine prefix + proc path, got {}",
+            m.unit_path
+        );
+    }
+
+    #[test]
+    fn draft_toml_lifecycle_hints_follow_method() {
+        let cases = [
+            ("execstart", "# pre_update = \"systemctl stop u\""),
+            ("openrc", "# pre_update = \"rc-service u stop\""),
+            ("sysv", "# pre_update = \"/etc/init.d/u stop\""),
+        ];
+        for (method, expected_pre) in cases {
+            let mut report = draft_report();
+            report.service = Some(ServiceMatch {
+                unit_name: "u".into(),
+                unit_path: "/tmp/u".into(),
+                method: method.into(),
+                confidence: Confidence::Medium,
+                pid: None,
+            });
+            let toml = render_draft_toml(&report, "foo", None);
+            assert!(
+                toml.contains(expected_pre),
+                "method {}: expected '{}' in draft",
+                method,
+                expected_pre
+            );
+        }
+    }
+
+    #[test]
+    fn draft_toml_openrc_never_emits_systemctl_and_carries_enable_hint() {
+        let mut report = draft_report();
+        report.service = Some(ServiceMatch {
+            unit_name: "sshd".into(),
+            unit_path: "/etc/init.d/sshd".into(),
+            method: "openrc".into(),
+            confidence: Confidence::Guess,
+            pid: None,
+        });
+        let toml = render_draft_toml(&report, "sshd", None);
+        assert!(toml.contains("# pre_update = \"rc-service sshd stop\""));
+        assert!(toml.contains("# post_update = \"rc-service sshd start\""));
+        // Q3: unenabled script → Guess + explicit enable comment.
+        assert!(toml.contains("# rc-update add sshd default to enable"));
+        assert!(!toml.contains("systemctl"));
+    }
+
+    #[test]
+    fn draft_toml_container_hint_is_placeholder_not_systemctl() {
+        let mut report = draft_report();
+        report.service = Some(ServiceMatch {
+            unit_name: "3fa9c4d1e5b6".into(),
+            unit_path: "podman:/proc/99/exe".into(),
+            method: "container".into(),
+            confidence: Confidence::Guess,
+            pid: Some(99),
+        });
+        let toml = render_draft_toml(&report, "authentik", None);
+        assert!(toml.contains("# restart_hint = \"podman restart 3fa9c4d1e5b6\""));
+        assert!(toml.contains("Sprint 32 P2"));
+        assert!(!toml.contains("systemctl"));
+    }
+
+    #[test]
+    fn draft_toml_never_emits_lifecycle_hint_with_empty_unit_name() {
+        let mut report = draft_report();
+        report.service = Some(ServiceMatch {
+            unit_name: String::new(),
+            unit_path: "/proc/1/exe".into(),
+            method: "proc-exe".into(),
+            confidence: Confidence::Medium,
+            pid: Some(1),
+        });
+        let toml = render_draft_toml(&report, "foo", None);
+        for line in toml.lines() {
+            assert!(
+                !line.starts_with("# pre_update")
+                    && !line.starts_with("# post_update")
+                    && !line.starts_with("# health_check"),
+                "empty unit name leaked into a lifecycle hint: {}",
+                line
+            );
+        }
     }
 }
