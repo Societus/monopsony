@@ -26,6 +26,7 @@
 
   let authLoaded = $state(false);
   let currentPath = $state('');
+  let serverVersion = $state('');
 
   // Check auth status on mount and on route changes
   async function checkAuth() {
@@ -69,6 +70,12 @@
 
   onMount(() => {
     checkAuth();
+
+    // Sidebar version label — same source the updates panel uses
+    // (/updates/rollouts server_version). Empty renders as "—".
+    api.updates.rollouts()
+      .then((res) => { serverVersion = res.server_version; })
+      .catch(() => { serverVersion = ''; });
 
     // Re-check auth when route changes
     const unsubscribe = page.subscribe((p) => {
@@ -158,7 +165,7 @@
 
       <!-- Version -->
       <div class="px-4 py-3 text-xs" style="color: var(--color-text-muted);">
-        v1.0.0-rc1
+        {serverVersion ? `v${serverVersion}` : '—'}
       </div>
     </aside>
 
