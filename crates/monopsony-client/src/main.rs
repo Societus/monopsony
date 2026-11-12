@@ -2431,7 +2431,6 @@ async fn run_daemon(
         ..Default::default()
     };
 
-    info!("Local proxy listening on {}", listen_addr);
     info!("Heartbeat and inventory sync running in background");
 
     // Oracle floor store (Sprint 21 fleet loop): load floors.json from the

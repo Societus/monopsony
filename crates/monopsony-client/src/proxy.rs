@@ -1076,7 +1076,28 @@ pub async fn run_proxy(
     floor_store: Option<std::sync::Arc<std::sync::RwLock<crate::floor_guard::FloorStore>>>,
     hit_counter: Option<std::sync::Arc<crate::hit_counter::HitCounter>>,
 ) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(listen_addr).await?;
+    // Single bind owner: this is the ONLY production bind of the local proxy
+    // port, performed once per daemon. A collision is therefore always a
+    // second PROCESS on the same host — another client daemon, or a local
+    // monopsony-server whose mirror router defaults to the same port — so
+    // name it in the error and the crash-loop diagnoses itself instead of
+    // surfacing a bare "os error 48".
+    let listener = match tokio::net::TcpListener::bind(listen_addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            return Err(anyhow::anyhow!(
+                "local proxy bind {} failed: address already in use — another process is \
+                 listening there (a second monopsony-client daemon, or a local \
+                 monopsony-server whose mirror router defaults to the same port); \
+                 stop that process or pass a distinct --proxy-addr",
+                listen_addr
+            ));
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e)
+                .context(format!("local proxy bind {} failed", listen_addr)));
+        }
+    };
     run_proxy_with_listener(
         listener,
         config,
@@ -1206,6 +1227,47 @@ mod tests {
         assert_eq!(c.timeout_ms, 30_000);
         assert_eq!(c.retry_deadline_ms, 300_000);
         assert_eq!(c.retry_backoff_initial_ms, 2_000);
+    }
+
+    #[tokio::test]
+    async fn bind_conflict_error_names_address_and_remedy() {
+        // An actively-listening socket makes the production bind path fail
+        // with AddrInUse on every platform — the m2mini crash shape, where a
+        // second daemon on the same host already held the default port.
+        let holder = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = holder.local_addr().unwrap();
+        let pin = std::sync::Arc::new(crate::pin_verify::PinState::new(
+            None,
+            std::env::temp_dir().join("monopsony-bind-conflict-test-events"),
+        ));
+        let err = run_proxy(
+            addr,
+            ProxyConfig::default(),
+            pin,
+            None,
+            "warn".to_string(),
+            0,
+            None,
+            None,
+        )
+        .await
+        .expect_err("bind must fail while another socket holds the address");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains(&addr.to_string()),
+            "error must name the bind address: {}",
+            msg
+        );
+        assert!(
+            msg.contains("already in use"),
+            "error must name the conflict: {}",
+            msg
+        );
+        assert!(
+            msg.contains("--proxy-addr"),
+            "error must carry the remedy: {}",
+            msg
+        );
     }
 
     #[tokio::test]
