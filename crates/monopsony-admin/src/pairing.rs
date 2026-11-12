@@ -1737,6 +1737,170 @@ mod tests {
         let entry = store.get(&id).unwrap();
         assert_eq!(entry.status, PendingPairStatus::Approved);
     }
+
+    /// DEF-2 regression: enrollment must bind the enroll response client_id,
+    /// the issued cert, and the `clients` row to the SAME id
+    /// (registration-at-collection). The shipped bug minted a random id for
+    /// the cert + response while register_client created the row under its
+    /// own uuid — the client's stored identity then had no row, heartbeats
+    /// silently no-op'd, and shadow scans hit the clients-id FK.
+    /// Requires a reachable PostgreSQL via MONOPSONY_TEST_DATABASE_URL
+    /// (DATABASE_URL accepted as fallback); skips when absent so CI without
+    /// a database stays green.
+    #[tokio::test]
+    async fn test_enroll_lifecycle_binds_row_to_enrolled_identity() {
+        let db_url = match std::env::var("MONOPSONY_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+        {
+            Ok(url) => url,
+            Err(_) => {
+                eprintln!("skipping: MONOPSONY_TEST_DATABASE_URL not set");
+                return;
+            }
+        };
+        let db = match monopsony_db::Database::connect(&db_url).await {
+            Ok(db) => std::sync::Arc::new(db),
+            Err(e) => {
+                eprintln!("skipping: test database unreachable: {}", e);
+                return;
+            }
+        };
+        // Idempotent (IF NOT EXISTS / additive ALTERs): safe against both a
+        // bare database and the deployed bench schema.
+        db.run_migrations().await.expect("run_migrations failed");
+
+        // Unique hostname so ON CONFLICT(hostname) never coalesces with a
+        // row from a previous run or the live fleet.
+        let hostname = format!("def2-lifecycle-{}", Uuid::new_v4());
+        let plaintext_key = format!("mopk-def2-test-{}", Uuid::new_v4());
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(plaintext_key.as_bytes());
+        let key_hash = hex::encode(hasher.finalize());
+        let key_id = db
+            .create_enrollment_key(&key_hash, "def2-lifecycle-test", 1, None)
+            .await
+            .expect("create_enrollment_key failed");
+
+        let dir = tempfile::tempdir().unwrap();
+        let ca_cert_path = dir.path().join("ca.crt");
+        let ca_key_path = dir.path().join("ca.key");
+        let tls_manager = std::sync::Arc::new(
+            crate::TlsManager::load_or_create(&ca_cert_path, &ca_key_path).unwrap(),
+        );
+        let state = crate::AdminState {
+            db: Some(db.clone()),
+            cache_dir: dir.path().to_path_buf(),
+            shadow_manager: None,
+            mirror_manager: None,
+            tls_manager,
+            config_path: dir.path().join("config.toml"),
+            dashboard_config: std::sync::Arc::new(crate::DashboardConfig::default()),
+            trusted_proxies: crate::auth::TrustedProxies::from_config(&Vec::new()),
+            tailscale: std::sync::Arc::new(crate::auth::TailscaleDetector::new()),
+            grpc_addr: "127.0.0.1:50051".to_string(),
+            ws_url: None,
+            pairing_manager: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            pairing_task: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
+            sessions: std::sync::Arc::new(crate::auth::SessionStore::new()),
+            rate_limits: std::sync::Arc::new(crate::rate_limit::AdminRateLimits::from_config(
+                20.0, 40, 5, 15,
+            )),
+            pending_pairs: std::sync::Arc::new(tokio::sync::Mutex::new(PendingPairStore::new())),
+            mirror_verify_key: [0u8; 32],
+            oracle_last_update: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            oracle_delta: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            update_check_signal: None,
+        };
+
+        // Possession proof: deterministic throwaway keypair signing the
+        // enroll domain string, exactly as the client does.
+        use ed25519_dalek::{Signer, SigningKey};
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let signature = signing_key.sign(b"monopsony-enroll-v1");
+
+        let body = serde_json::json!({
+            "enrollment_key": plaintext_key,
+            "ephemeral_pubkey": hex::encode(signing_key.verifying_key().to_bytes()),
+            "signature": hex::encode(signature.to_bytes()),
+            "claimed_hostname": hostname,
+            "claimed_os": "linux",
+            "claimed_os_version": "test",
+            "package_managers": ["pacman"],
+        });
+
+        use tower::ServiceExt;
+        let router = axum::Router::new()
+            .route(
+                "/api/v1/pair/enroll",
+                axum::routing::post(handle_pair_enroll),
+            )
+            .with_state(state);
+        let req = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/v1/pair/enroll")
+            .header("content-type", "application/json")
+            .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                12345,
+            ))))
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::CREATED);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let enrolled_id = json["client_id"].as_str().expect("client_id in response");
+        let cid = monopsony_common::ClientId::parse(enrolled_id).expect("valid client_id");
+
+        // THE regression: the response id must be a REAL row (the old code
+        // returned a minted uuid with no row behind it).
+        let row = db
+            .get_client(&cid)
+            .await
+            .expect("get_client failed")
+            .expect("clients row must exist for the enrolled identity");
+        assert_eq!(row.hostname, hostname);
+        // Cert binding: the issued serial is attached to THIS row.
+        assert!(
+            row.cert_serial
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+            "cert serial must be bound to the enrolled row"
+        );
+
+        // Daemon-contact half of the lifecycle: heartbeat + version funnel
+        // must land on the SAME row (fleet flip / version reporting).
+        db.heartbeat(&cid).await.expect("heartbeat failed");
+        db.set_client_monopsony_version(&cid, "9.9.9-def2")
+            .await
+            .expect("set_client_monopsony_version failed");
+        let recorded = db
+            .get_client_monopsony_version(&cid)
+            .await
+            .expect("get_client_monopsony_version failed");
+        assert_eq!(recorded.as_deref(), Some("9.9.9-def2"));
+
+        // Cleanup: no def2 bench seeds left behind. Audit rows are
+        // append-only by design and stay.
+        let _ = sqlx::query("DELETE FROM client_certs WHERE client_id = $1")
+            .bind(cid.0)
+            .execute(db.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM clients WHERE id = $1")
+            .bind(cid.0)
+            .execute(db.pool())
+            .await;
+        let _ = sqlx::query("DELETE FROM enrollment_keys WHERE id = $1")
+            .bind(key_id)
+            .execute(db.pool())
+            .await;
+    }
 }
 
 /// GET /api/v1/pair/audit — list pairing approval/deny audit history (auth,
@@ -1892,10 +2056,35 @@ pub async fn handle_pair_enroll(
             .into_response();
     }
 
-    // 3. Issue the cert (key-bound: same generate path as collect) and
-    //    register the client.
-    let client_id = uuid::Uuid::new_v4().to_string();
-    let (cert_serial, client_cert, client_key) = match state.tls_manager.generate_client_cert(&client_id)
+    // 3. Register FIRST — the DB row id is the single source of truth, the
+    //    same order as the v1 listener and the v2 collect handler: the cert
+    //    identity and the enroll response must bind to the registered row
+    //    id. Minting a fresh id here instead diverges the client's stored
+    //    identity from its row — heartbeats silently no-op, shadow scans hit
+    //    the clients-id FK, and the fleet version flip never lands.
+    let cid = match db
+        .register_client(
+            &req.claimed_hostname,
+            &req.claimed_os,
+            &req.claimed_os_version,
+            &req.package_managers,
+        )
+        .await
+    {
+        Ok(cid) => cid,
+        Err(e) => {
+            warn!("Failed to register client during enroll: {}", e);
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "failed to register client"})),
+            )
+                .into_response();
+        }
+    };
+
+    let (cert_serial, client_cert, client_key) = match state
+        .tls_manager
+        .generate_client_cert(&cid.to_string())
     {
         Ok(result) => result,
         Err(e) => {
@@ -1917,31 +2106,11 @@ pub async fn handle_pair_enroll(
             state.tls_manager.client_cert_validity_days() as i64 * 86_400,
         );
 
-    match db
-        .register_client(
-            &req.claimed_hostname,
-            &req.claimed_os,
-            &req.claimed_os_version,
-            &req.package_managers,
-        )
-        .await
-    {
-        Ok(cid) => {
-            let _ = db.record_pairing(&cid, issued_at).await;
-            let _ = db.update_client_cert_serial(&cid, &cert_serial).await;
-            let _ = db
-                .insert_client_cert(&cert_serial, &cid, issued_at, expires_at)
-                .await;
-        }
-        Err(e) => {
-            warn!("Failed to register client during enroll: {}", e);
-            return (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "failed to register client"})),
-            )
-                .into_response();
-        }
-    }
+    let _ = db.record_pairing(&cid, issued_at).await;
+    let _ = db.update_client_cert_serial(&cid, &cert_serial).await;
+    let _ = db
+        .insert_client_cert(&cert_serial, &cid, issued_at, expires_at)
+        .await;
 
     // 4. Bump the use counter.
     if let Err(e) = db.increment_enrollment_key_use(&key.id).await {
@@ -1962,7 +2131,7 @@ pub async fn handle_pair_enroll(
         .await;
 
     info!(
-        client_id = %client_id,
+        client_id = %cid,
         key_id = %key.id,
         label = %key.label,
         source_ip = %addr.ip(),
@@ -1973,7 +2142,7 @@ pub async fn handle_pair_enroll(
         axum::http::StatusCode::CREATED,
         Json(serde_json::json!({
             "enrolled": true,
-            "client_id": client_id,
+            "client_id": cid.to_string(),
             "client_cert_pem": String::from_utf8_lossy(&client_cert_pem),
             "client_key_pem": String::from_utf8_lossy(&client_key_pem),
             "ca_cert_pem": String::from_utf8_lossy(&ca_cert_pem),
