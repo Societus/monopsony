@@ -308,7 +308,7 @@ async fn ingest_peer_blacklists(
 }
 
 /// Derive the server origin (scheme://host:port) from a peer mirror endpoint
-/// like `http://host:3129/mirror/<distro>`.
+/// like `http://host:3129/<distro>`.
 fn peer_origin(endpoint: &str) -> Option<String> {
     let rest = endpoint
         .strip_prefix("http://")
@@ -417,13 +417,13 @@ mod tests {
         // cross_check_distro (sample[i] -> peers[i % len]) yields exactly one
         // match + one divergence regardless of mtime/readdir sample order.
         let honest = spawn_test_peer(vec![
-            ("/mirror/testdistro/InRelease", "trusted bytes".to_string()),
-            ("/mirror/testdistro/core.db", "database bytes".to_string()),
+            ("/testdistro/InRelease", "trusted bytes".to_string()),
+            ("/testdistro/core.db", "database bytes".to_string()),
         ])
         .await;
         let poisoned = spawn_test_peer(vec![
-            ("/mirror/testdistro/InRelease", "EVIL INRELEASE".to_string()),
-            ("/mirror/testdistro/core.db", "EVIL DATABASE".to_string()),
+            ("/testdistro/InRelease", "EVIL INRELEASE".to_string()),
+            ("/testdistro/core.db", "EVIL DATABASE".to_string()),
         ])
         .await;
 
@@ -565,11 +565,11 @@ mod tests {
     #[test]
     fn peer_origin_derivation() {
         assert_eq!(
-            peer_origin("http://host:3129/mirror/archlinux").as_deref(),
+            peer_origin("http://host:3129/archlinux").as_deref(),
             Some("http://host:3129")
         );
         assert_eq!(
-            peer_origin("https://host/mirror/debian").as_deref(),
+            peer_origin("https://host/debian").as_deref(),
             Some("https://host")
         );
         assert_eq!(peer_origin("ftp://host/x"), None);
@@ -627,7 +627,7 @@ mod tests {
                 .await
                 .unwrap();
         });
-        format!("http://{}/mirror/testdistro", addr)
+        format!("http://{}/testdistro", addr)
     }
 
     /// Spawn a fake tracker answering /discover with the given peer endpoints.

@@ -1232,30 +1232,56 @@ async fn get_peers(State(state): State<MirrorState>) -> impl IntoResponse {
     let configs = state.manager.list_configs().await;
     let banned = state.manager.banned_mirror_ids().await;
 
-    // Build peer entries from local mirror configs, excluding peers this
-    // server holds an active ban for (enforcement point: get_peers filter).
-    let peers: Vec<PeerEntry> = configs
-        .iter()
-        .filter_map(|c| {
+    // Peer-exchange endpoints are consumed verbatim by peers and clients
+    // (cross-check joins relative paths onto them), so they come ONLY from
+    // the operator-configured public base URL. The bind address is never a
+    // valid endpoint source (§1.5-1): with the knob unset the peer list is
+    // served EMPTY with a warning — never hostname-derived garbage. The
+    // blacklist plane below is independent and still served.
+    let public_base =
+        monopsony_common::config::normalized_public_base(state.public_base_url.as_deref());
+    let mut peers = Vec::new();
+    if let Some(base) = &public_base {
+        for c in &configs {
             let Some(mirror_id) = peer_mirror_id(&hostname(), &c.distro) else {
                 debug!(
                     distro = c.distro,
                     "excluding peer from peers response: id outside canonical allowlist"
                 );
-                return None;
+                continue;
             };
             if banned.contains(&mirror_id) {
                 debug!(mirror_id, "excluding blacklisted peer from peers response");
-                return None;
+                continue;
             }
             let expires = chrono::Utc::now() + chrono::Duration::hours(1);
-            Some(PeerEntry {
+            peers.push(PeerEntry {
                 mirror_id,
-                endpoint: format!("http://{}:3129/mirror/{}", hostname(), c.distro),
+                endpoint: format!("{}/{}", base, c.distro),
                 expires_at: expires.to_rfc3339(),
+            });
+        }
+    } else {
+        // Warn only when mirrors would actually have been advertised; an
+        // empty mirror list legitimately serves an empty peer list.
+        let admissible = configs
+            .iter()
+            .filter(|c| {
+                peer_mirror_id(&hostname(), &c.distro)
+                    .map(|id| !banned.contains(&id))
+                    .unwrap_or(false)
             })
-        })
-        .collect();
+            .count();
+        if admissible > 0 {
+            warn!(
+                mirrors = admissible,
+                "Peers envelope served without peer entries: [mirror] public_base_url \
+                 is not configured — set the routable public base URL \
+                 (scheme://host[:port]) in server.toml; a bind-derived address \
+                 is never advertised"
+            );
+        }
+    }
 
     let peer_list = PeerList {
         source: "local".to_string(),
@@ -1294,6 +1320,11 @@ pub struct MirrorState {
     /// Operator Ed25519 key for the peers envelope signature (optional —
     /// unsigned peers responses remain valid).
     pub signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
+    /// Operator-configured public base URL of the mirror HTTP server
+    /// (`[mirror] public_base_url`, `scheme://host[:port]`, no path). When
+    /// unset, the peers envelope serves NO peer entries — a bind address is
+    /// never advertised (docs/plans/2026-11-12-single-port-hosting.md §1.5-1).
+    pub public_base_url: Option<String>,
 }
 
 impl MirrorState {
@@ -1302,12 +1333,20 @@ impl MirrorState {
             manager: Arc::new(manager),
             mirror_dir,
             signing_key: None,
+            public_base_url: None,
         }
     }
 
     /// Attach the operator signing key for the peers envelope signature.
     pub fn with_signing_key(mut self, key: Arc<ed25519_dalek::SigningKey>) -> Self {
         self.signing_key = Some(key);
+        self
+    }
+
+    /// Attach the routable public base URL advertised in peer-exchange
+    /// endpoints (`[mirror] public_base_url`).
+    pub fn with_public_base_url(mut self, base: Option<String>) -> Self {
+        self.public_base_url = base;
         self
     }
 }
@@ -2718,7 +2757,8 @@ mod tests {
 
         let envelope_key = blacklist_test_key(4);
         let state = MirrorState::new(mgr, dir.path().to_path_buf())
-            .with_signing_key(Arc::new(envelope_key.clone()));
+            .with_signing_key(Arc::new(envelope_key.clone()))
+            .with_public_base_url(Some("http://peers.example.com".to_string()));
         let value = get_peers_response(state).await;
 
         // Blacklist array carries the verified entry.
@@ -2746,8 +2786,12 @@ mod tests {
             "envelope signature must verify over the canonical document"
         );
 
-        // Peers list still present (both mirrors unbanned).
-        assert_eq!(value["peers"].as_array().unwrap().len(), 2);
+        // Peers list still present (both mirrors unbanned); endpoints join
+        // the public base with the distro — no /mirror/ prefix, no bind host.
+        let peers = value["peers"].as_array().unwrap();
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0]["endpoint"], "http://peers.example.com/archlinux");
+        assert_eq!(peers[1]["endpoint"], "http://peers.example.com/debian");
     }
 
     #[tokio::test]
@@ -2759,12 +2803,40 @@ mod tests {
         let ban = signed_ban(&format!("{}-archlinux", hostname()), 1, &key);
         mgr.merge_peer_blacklist(vec![ban]).await;
 
-        let state = MirrorState::new(mgr, dir.path().to_path_buf());
+        let state = MirrorState::new(mgr, dir.path().to_path_buf())
+            .with_public_base_url(Some("http://peers.example.com".to_string()));
         let value = get_peers_response(state).await;
 
         let peers = value["peers"].as_array().unwrap();
         assert_eq!(peers.len(), 1, "banned mirror excluded from served peers");
         assert_eq!(peers[0]["mirror_id"], format!("{}-debian", hostname()));
+    }
+
+    /// No public_base_url ⇒ NO peer entries are served (a bind-derived
+    /// endpoint is never advertised), while the signed blacklist plane —
+    /// endpoint-independent — still travels on the envelope.
+    #[tokio::test]
+    async fn peers_entries_omitted_when_public_base_url_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = blacklist_test_key(9);
+        let mgr = peers_test_manager(dir.path(), &key).await;
+        // Give the store a verified entry so the test proves the blacklist
+        // plane survives the peer-entry skip.
+        let ban = signed_ban("poisonedhost-archlinux", 1, &key);
+        mgr.merge_peer_blacklist(vec![ban.clone()]).await;
+
+        let state = MirrorState::new(mgr, dir.path().to_path_buf());
+        let value = get_peers_response(state).await;
+
+        let peers = value["peers"].as_array().unwrap();
+        assert!(
+            peers.is_empty(),
+            "no peer entry may be served without [mirror] public_base_url"
+        );
+        let entries: Vec<BlacklistEntry> =
+            serde_json::from_value(value["blacklist"].clone()).unwrap();
+        assert_eq!(entries.len(), 1, "blacklist plane unaffected by the skip");
+        assert_eq!(entries[0], ban);
     }
 
     #[tokio::test]

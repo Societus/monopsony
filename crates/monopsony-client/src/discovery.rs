@@ -523,7 +523,7 @@ mod tests {
     /// required transport+score and failed every peers response.
     #[test]
     fn mirror_peer_entry_parses_without_transport_or_score() {
-        let body = r#"{"source":"local","peers":[{"mirror_id":"host-arch","endpoint":"http://host:3129/mirror/arch","expires_at":"2026-10-31T18:00:00+00:00"}]}"#;
+        let body = r#"{"source":"local","peers":[{"mirror_id":"host-arch","endpoint":"http://host:3129/arch","expires_at":"2026-10-31T18:00:00+00:00"}]}"#;
         let parsed: PeerExchangeResponse = serde_json::from_str(body).unwrap();
         assert_eq!(parsed.peers.len(), 1);
         assert!(parsed.blacklist.is_empty());
@@ -609,7 +609,7 @@ mod tests {
     fn row(mirror_id: &str) -> DiscoveredMirror {
         DiscoveredMirror {
             mirror_id: mirror_id.to_string(),
-            endpoint: "http://h:3129/mirror/arch".to_string(),
+            endpoint: "http://h:3129/arch".to_string(),
             transport: "http".to_string(),
             packages: None,
             last_sync: None,
@@ -667,7 +667,7 @@ mod tests {
     fn mirror_fixture(mirror_id: &str) -> DiscoveredMirror {
         DiscoveredMirror {
             mirror_id: mirror_id.to_string(),
-            endpoint: format!("http://{}.example:3129/mirror/arch", mirror_id),
+            endpoint: format!("http://{}.example:3129/arch", mirror_id),
             transport: "http".to_string(),
             packages: None,
             last_sync: None,
