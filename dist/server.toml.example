@@ -113,6 +113,16 @@ bind = "0.0.0.0:3128"
 # Type: u64
 # cross_check_timeout_secs = 30
 
+# Public base URL of the mirror HTTP server as routable by consumers,
+# announced to trackers and advertised in the peers envelope
+# (/.well-known/monopsony/peers): scheme://host[:port] with NO path suffix
+# (the mirror router serves /:distro/*path). The bind address
+# (--mirror-addr) is NEVER announced — without this knob the announce loop
+# skips announcements and the peers envelope serves no peer entries, each
+# logging a warning instead of publishing a non-routable endpoint.
+# Type: string (optional)
+# public_base_url = "https://mirror.example.com:3129"
+
 # ============================================================================
 # Peer-exchange blacklist propagation
 # ============================================================================

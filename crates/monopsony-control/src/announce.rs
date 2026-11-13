@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, error, info, warn};
 
+use monopsony_common::config::normalized_public_base;
 use monopsony_common::peer_blacklist::{canonical_json, BlacklistEntry};
 use monopsony_mirror::MirrorManager;
 
@@ -64,7 +65,11 @@ fn announce_canonical_bytes(payload: &AnnouncePayload) -> Option<Vec<u8>> {
 pub struct TrackerAnnouncer {
     manager: Arc<MirrorManager>,
     tracker_urls: Vec<String>,
-    mirror_addr: String,
+    /// Operator-configured public base URL of the mirror HTTP server
+    /// (`[mirror] public_base_url`, `scheme://host[:port]`, no path). When
+    /// unset, announce rounds are skipped — a bind address is never
+    /// advertised (docs/plans/2026-11-12-single-port-hosting.md §1.5-1).
+    public_base_url: Option<String>,
     interval_secs: u64,
     server_id: String,
     /// Operator Ed25519 key (shadow signing.key). When present, announces
@@ -79,7 +84,7 @@ impl TrackerAnnouncer {
     pub fn new(
         manager: Arc<MirrorManager>,
         tracker_urls: Vec<String>,
-        mirror_addr: String,
+        public_base_url: Option<String>,
         interval_secs: u64,
     ) -> Self {
         let server_id = std::env::var("HOSTNAME")
@@ -93,7 +98,7 @@ impl TrackerAnnouncer {
         Self {
             manager,
             tracker_urls,
-            mirror_addr,
+            public_base_url,
             interval_secs: interval_secs.max(60),
             server_id,
             signing_key: None,
@@ -133,11 +138,6 @@ impl TrackerAnnouncer {
             return;
         }
 
-        let configs = self.manager.list_configs().await;
-
-        // Only announce public mirrors
-        let public_configs: Vec<_> = configs.iter().filter(|c| c.public).collect();
-
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .build();
@@ -150,75 +150,93 @@ impl TrackerAnnouncer {
             }
         };
 
+        // Announce rounds need an operator-configured public base URL. The
+        // bind address is never a valid endpoint source (§1.5-1): announcing
+        // it would publish a non-routable URL, so the round is skipped with
+        // a warning. Blacklist ingestion below still runs.
+        let public_base = normalized_public_base(self.public_base_url.as_deref());
         let mut public_count = 0usize;
-        for config in public_configs {
-            public_count += 1;
-            let endpoint = format!("http://{}:3129/mirror/{}", self.mirror_addr, config.distro);
-            let mut payload = AnnouncePayload {
-                mirror_id: format!("{}-{}", self.server_id, config.distro),
-                distro: config.distro.clone(),
-                transport: vec!["http".to_string()],
-                endpoints: vec![endpoint],
-                capacity_bytes: None,
-                bandwidth_bps: None,
-                uptime_seconds: None,
-                packages: Some(config.total_bytes),
-                last_sync: config.last_sync.map(|ts| ts.to_string()),
-                lat_lon: None,
-                stats: None,
-                operator_npub: None,
-                operator_signature: None,
-                display_name: None,
-                payment_pointer: None,
-            };
+        if let Some(base) = &public_base {
+            let configs = self.manager.list_configs().await;
 
-            // Sign the announce when the operator key is available
-            // (prerequisite 2 — the tracker rejects unsigned announces in
-            // token/jwt modes).
-            if let Some(key) = &self.signing_key {
-                use ed25519_dalek::Signer;
-                payload.operator_npub = Some(hex::encode(key.verifying_key().as_bytes()));
-                if let Some(bytes) = announce_canonical_bytes(&payload) {
-                    payload.operator_signature = Some(hex::encode(key.sign(&bytes).to_bytes()));
-                } else {
-                    warn!(
-                        distro = %config.distro,
-                        "announce payload failed to canonicalize; sending unsigned"
-                    );
-                }
-            }
+            // Only announce public mirrors
+            let public_configs: Vec<_> = configs.iter().filter(|c| c.public).collect();
 
-            for tracker_url in &self.tracker_urls {
-                let announce_url = format!("{}/announce", tracker_url.trim_end_matches('/'));
-                let result = client.post(&announce_url).json(&payload).send().await;
+            for config in public_configs {
+                public_count += 1;
+                let endpoint = format!("{}/{}", base, config.distro);
+                let mut payload = AnnouncePayload {
+                    mirror_id: format!("{}-{}", self.server_id, config.distro),
+                    distro: config.distro.clone(),
+                    transport: vec!["http".to_string()],
+                    endpoints: vec![endpoint],
+                    capacity_bytes: None,
+                    bandwidth_bps: None,
+                    uptime_seconds: None,
+                    packages: Some(config.total_bytes),
+                    last_sync: config.last_sync.map(|ts| ts.to_string()),
+                    lat_lon: None,
+                    stats: None,
+                    operator_npub: None,
+                    operator_signature: None,
+                    display_name: None,
+                    payment_pointer: None,
+                };
 
-                match result {
-                    Ok(resp) => {
-                        let status = resp.status();
-                        if status.is_success() {
-                            debug!("Announced {} to {}", config.distro, tracker_url);
-                        } else {
-                            warn!(
-                                "Tracker {} returned {} for {}",
-                                tracker_url, status, config.distro
-                            );
-                        }
-                    }
-                    Err(e) => {
+                // Sign the announce when the operator key is available
+                // (prerequisite 2 — the tracker rejects unsigned announces in
+                // token/jwt modes).
+                if let Some(key) = &self.signing_key {
+                    use ed25519_dalek::Signer;
+                    payload.operator_npub = Some(hex::encode(key.verifying_key().as_bytes()));
+                    if let Some(bytes) = announce_canonical_bytes(&payload) {
+                        payload.operator_signature = Some(hex::encode(key.sign(&bytes).to_bytes()));
+                    } else {
                         warn!(
-                            "Failed to announce {} to {}: {}",
-                            config.distro, tracker_url, e
+                            distro = %config.distro,
+                            "announce payload failed to canonicalize; sending unsigned"
                         );
                     }
                 }
-            }
-        }
 
-        info!(
-            "Announced {} public mirrors to {} tracker(s)",
-            public_count,
-            self.tracker_urls.len()
-        );
+                for tracker_url in &self.tracker_urls {
+                    let announce_url = format!("{}/announce", tracker_url.trim_end_matches('/'));
+                    let result = client.post(&announce_url).json(&payload).send().await;
+
+                    match result {
+                        Ok(resp) => {
+                            let status = resp.status();
+                            if status.is_success() {
+                                debug!("Announced {} to {}", config.distro, tracker_url);
+                            } else {
+                                warn!(
+                                    "Tracker {} returned {} for {}",
+                                    tracker_url, status, config.distro
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to announce {} to {}: {}",
+                                config.distro, tracker_url, e
+                            );
+                        }
+                    }
+                }
+            }
+
+            info!(
+                "Announced {} public mirrors to {} tracker(s)",
+                public_count,
+                self.tracker_urls.len()
+            );
+        } else {
+            warn!(
+                "Tracker announce skipped: [mirror] public_base_url is not configured — \
+                 set the routable public base URL (scheme://host[:port]) in server.toml; \
+                 a bind-derived address is never announced"
+            );
+        }
 
         // Ingest the tracker's signed blacklist export (Approach A
         // propagation source) and surface own-bans operator-visibly.
@@ -298,6 +316,7 @@ impl TrackerAnnouncer {
 mod tests {
     use super::*;
     use ed25519_dalek::Signer;
+    use std::sync::Mutex;
 
     /// The canonical bytes must exclude the signature field and stay stable
     /// across sign → verify reconstruction.
@@ -307,7 +326,7 @@ mod tests {
             mirror_id: "host-archlinux".to_string(),
             distro: "archlinux".to_string(),
             transport: vec!["http".to_string()],
-            endpoints: vec!["http://host:3129/mirror/archlinux".to_string()],
+            endpoints: vec!["http://host:3129/archlinux".to_string()],
             capacity_bytes: None,
             bandwidth_bps: None,
             uptime_seconds: None,
@@ -347,7 +366,7 @@ mod tests {
             mirror_id: "host-archlinux".to_string(),
             distro: "archlinux".to_string(),
             transport: vec!["http".to_string()],
-            endpoints: vec!["http://host:3129/mirror/archlinux".to_string()],
+            endpoints: vec!["http://host:3129/archlinux".to_string()],
             capacity_bytes: None,
             bandwidth_bps: None,
             uptime_seconds: None,
@@ -365,5 +384,87 @@ mod tests {
         evil.distro = "evil".to_string();
         let tampered = announce_canonical_bytes(&evil).unwrap();
         assert_ne!(original, tampered);
+    }
+
+    /// Spawn a minimal tracker mock on an ephemeral port; returns its base
+    /// URL and a handle to the announce payloads it received.
+    async fn spawn_mock_tracker() -> (String, Arc<Mutex<Vec<Value>>>) {
+        let received: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let capture = received.clone();
+        let app = axum::Router::new().route(
+            "/announce",
+            axum::routing::post(
+                move |axum::extract::Json(payload): axum::extract::Json<Value>| {
+                    let capture = capture.clone();
+                    async move {
+                        capture.lock().unwrap().push(payload);
+                        axum::http::StatusCode::OK
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app.into_make_service()).await;
+        });
+        (url, received)
+    }
+
+    async fn manager_with_public_mirror(tag: &str) -> Arc<MirrorManager> {
+        let manager = Arc::new(MirrorManager::new(
+            std::env::temp_dir().join(format!("monopsony-announce-test-{}", tag)),
+            None,
+        ));
+        let config = monopsony_mirror::mirror::MirrorConfig {
+            distro: "archlinux".to_string(),
+            public: true,
+            ..Default::default()
+        };
+        manager.upsert_config(config).await;
+        manager
+    }
+
+    /// No public_base_url ⇒ the round is skipped entirely: even with a
+    /// PUBLIC mirror configured, nothing is announced (a bind-derived
+    /// endpoint is never published).
+    #[tokio::test]
+    async fn announce_round_skipped_when_public_base_url_unset() {
+        let (tracker_url, received) = spawn_mock_tracker().await;
+        let manager = manager_with_public_mirror("unset").await;
+
+        let announcer = TrackerAnnouncer::new(manager, vec![tracker_url], None, 60);
+        announcer.announce_all().await;
+
+        assert!(
+            received.lock().unwrap().is_empty(),
+            "no announce may be published without [mirror] public_base_url"
+        );
+    }
+
+    /// The announced endpoint joins the normalized base with the distro —
+    /// no trailing-slash doubling and no /mirror/ path prefix.
+    #[tokio::test]
+    async fn announce_endpoint_joins_public_base_with_distro() {
+        let (tracker_url, received) = spawn_mock_tracker().await;
+        let manager = manager_with_public_mirror("base").await;
+
+        let announcer = TrackerAnnouncer::new(
+            manager,
+            vec![tracker_url],
+            Some("http://m.example.com:3129/".to_string()),
+            60,
+        );
+        announcer.announce_all().await;
+
+        let received = received.lock().unwrap();
+        assert_eq!(received.len(), 1, "exactly one announce expected");
+        let endpoints = received[0]["endpoints"].as_array().unwrap();
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0], "http://m.example.com:3129/archlinux");
+        assert!(
+            !endpoints[0].as_str().unwrap().contains("/mirror/"),
+            "endpoint must not carry the /mirror/ prefix"
+        );
     }
 }

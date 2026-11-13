@@ -972,7 +972,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Start mirror sync + HTTP router (using shared mirror manager)
     let mirror_handle = if let Some(ref mm) = shared_mirror_manager {
-        let mut mirror_state = mirror::MirrorState::new((**mm).clone(), mirror_dir.clone());
+        let mut mirror_state = mirror::MirrorState::new((**mm).clone(), mirror_dir.clone())
+            .with_public_base_url(mirror_integrity_cfg.public_base_url.clone());
         if let Some(key) = &operator_signing_key {
             mirror_state = mirror_state.with_signing_key(key.clone());
         }
@@ -1022,7 +1023,7 @@ async fn main() -> anyhow::Result<()> {
                 let mut announcer = announce::TrackerAnnouncer::new(
                     mm.clone(),
                     urls,
-                    args.mirror_addr.clone(),
+                    mirror_integrity_cfg.public_base_url.clone(),
                     args.tracker_interval,
                 )
                 .with_blacklist_trusted(peer_blacklist_cfg.trusted_operators.clone());

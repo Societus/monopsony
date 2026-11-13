@@ -164,9 +164,10 @@ impl Default for IntegrityConfig {
     }
 }
 
-/// Mirror sync integrity ([mirror] section). Per-mirror `hash_policy` and
-/// `trusted_keys` live in mirrors.toml; this section supplies the server-wide
-/// defaults and the cross-mirror comparison knobs.
+/// Mirror sync integrity + public advertisement ([mirror] section).
+/// Per-mirror `hash_policy` and `trusted_keys` live in mirrors.toml; this
+/// section supplies the server-wide defaults, the cross-mirror comparison
+/// knobs, and the public base URL announced to trackers.
 ///
 /// Manual Default (NOT derive) — derive(Default) bypasses per-field serde
 /// defaults when the whole [mirror] section is absent (see IntegrityConfig).
@@ -188,6 +189,13 @@ pub struct MirrorIntegrityConfig {
     /// Per-peer-fetch timeout in seconds. Default: 30.
     #[serde(default = "default_mirror_cross_check_timeout")]
     pub cross_check_timeout_secs: u64,
+    /// Public base URL of the mirror HTTP server as routable by consumers,
+    /// announced to trackers and advertised in the peers envelope:
+    /// `scheme://host[:port]`, no path suffix (the mirror router serves
+    /// `/:distro/*path`). Optional — when unset the announce loop skips
+    /// announcements and the peers envelope serves no peer entries rather
+    /// than publishing a bind-derived endpoint. Default: None.
+    pub public_base_url: Option<String>,
 }
 
 fn default_mirror_hash_policy() -> String {
@@ -213,8 +221,22 @@ impl Default for MirrorIntegrityConfig {
             cross_check_enabled: default_mirror_cross_check_enabled(),
             cross_check_sample: default_mirror_cross_check_sample(),
             cross_check_timeout_secs: default_mirror_cross_check_timeout(),
+            public_base_url: None,
         }
     }
+}
+
+/// Normalize the configured public base URL (`[mirror] public_base_url`):
+/// surrounding whitespace trimmed, trailing slashes stripped, unset/blank
+/// ⇒ None. `None` means "no routable public base configured" — consumers
+/// (tracker announce, peers envelope) then skip endpoint publication rather
+/// than advertising a bind-derived URL (docs/plans/2026-11-12-single-port-
+/// hosting.md §1.5-1). Shared by monopsony-control (announce) and
+/// monopsony-mirror (get_peers).
+pub fn normalized_public_base(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|base| !base.is_empty())
+        .map(|base| base.trim_end_matches('/').to_string())
 }
 
 /// Peer-exchange blacklist propagation ([peer_blacklist] section,
@@ -1479,6 +1501,31 @@ impl ClientConfig {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Trailing slashes (one or many) and surrounding whitespace are stripped;
+    /// unset or blank config resolves to None (endpoint publication skipped).
+    #[test]
+    fn public_base_normalization_strips_slashes_and_blank_is_none() {
+        assert_eq!(normalized_public_base(None), None);
+        assert_eq!(normalized_public_base(Some("")), None);
+        assert_eq!(normalized_public_base(Some("   ")), None);
+        assert_eq!(
+            normalized_public_base(Some("http://m.example.com")),
+            Some("http://m.example.com".to_string())
+        );
+        assert_eq!(
+            normalized_public_base(Some("http://m.example.com/")),
+            Some("http://m.example.com".to_string())
+        );
+        assert_eq!(
+            normalized_public_base(Some("https://m.example.com:3129//")),
+            Some("https://m.example.com:3129".to_string())
+        );
+        assert_eq!(
+            normalized_public_base(Some(" http://m.example.com/ ")),
+            Some("http://m.example.com".to_string())
+        );
+    }
 
     #[test]
     fn test_config_error_includes_path_to_missing_field() {
