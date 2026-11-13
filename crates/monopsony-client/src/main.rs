@@ -3017,8 +3017,10 @@ async fn run_pair_enroll(
         .map_err(|e| anyhow::anyhow!("CA fingerprint check failed: {}", e))?;
     crate::trust::store_ca_fingerprint(cert_dir, &ca_fingerprint)?;
 
-    // 5. Save certificates
-    save_pair_result(cert_dir, &client_id, &certs, "", None, &[])?;
+    // 5. Save certificates + endpoints derived from the paired address
+    // (same rule the v2 pin path applies — DEF-2b: the enroll path used to
+    // persist empty endpoints, crash-looping the headless daemon).
+    save_pair_result(cert_dir, &client_id, &certs, server, None, &[])?;
 
     info!(
         client_id = %client_id,
@@ -3030,14 +3032,48 @@ async fn run_pair_enroll(
     Ok(())
 }
 
+/// Derive the daemon's control-plane (gRPC) address from the address the
+/// client paired against: strip any http(s):// scheme, keep the host, use
+/// gRPC port 50051. The dashboard/pairing port (:3130) is the admin HTTP
+/// API, not gRPC. This is the single endpoint derivation shared by the v2
+/// pin and enrollment-key pair paths; the legacy code path keeps the
+/// server-reported `grpc_addr` from its PairResponse instead. Rejects
+/// input with an empty host so a pair flow can never persist an unusable
+/// endpoint (DEF-2b).
+fn derive_grpc_addr(paired_addr: &str) -> anyhow::Result<String> {
+    let host = paired_addr
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .unwrap_or(paired_addr);
+    if host.is_empty() {
+        anyhow::bail!(
+            "cannot derive gRPC address: paired address {:?} has no host",
+            paired_addr
+        );
+    }
+    Ok(format!("{}:50051", host))
+}
+
+/// Shared cert + endpoint persistence for the v2 pair flows (pin and
+/// enrollment-key). `paired_addr` is the dashboard/pairing address exactly
+/// as given on the command line; the control-plane `grpc_addr` is derived
+/// from it via [`derive_grpc_addr`]. Endpoints are derived BEFORE any disk
+/// write, so an unusable paired address aborts the pair fail-closed instead
+/// of leaving certs whose server.json sends the daemon into a discovery
+/// crash-loop (DEF-2b).
 fn save_pair_result(
     cert_dir: &Path,
     client_id: &str,
     certs: &grpc_client::ClientCerts,
-    grpc_addr: &str,
+    paired_addr: &str,
     ws_url: Option<String>,
     mirror_verify_key: &[u8],
 ) -> anyhow::Result<()> {
+    let grpc_addr = derive_grpc_addr(paired_addr)?;
+
     certs.save_atomic(cert_dir)?;
     std::fs::write(cert_dir.join("client_id"), client_id)?;
 
@@ -3058,10 +3094,14 @@ fn save_pair_result(
         );
     }
 
+    // Persist server connection info so the daemon can find the server
+    // without --server or mDNS. ws_url stays null — the HTTP enroll/pin
+    // flows never negotiate a tunnel; only the legacy ws:// pair path
+    // carries one.
     let server_info = serde_json::json!({
         "grpc_addr": grpc_addr,
         "ws_url": ws_url,
-        "paired_addr": "",
+        "paired_addr": paired_addr,
         "paired_at": chrono::Utc::now().to_rfc3339(),
     });
     std::fs::write(
@@ -3212,34 +3252,16 @@ async fn run_pair_v2(
         .map_err(|e| anyhow::anyhow!("CA fingerprint check failed: {}", e))?;
     crate::trust::store_ca_fingerprint(cert_dir, &ca_fingerprint)?;
 
-    // 8. Save certificates
-    save_pair_result(cert_dir, &client_id, &certs, "", None, &[])?;
+    // 8. Save certificates + endpoints derived from the paired address
+    // (single derivation shared with the enroll path — the empty-then-
+    // overwrite double write previously below is gone with it).
+    save_pair_result(cert_dir, &client_id, &certs, server, None, &[])?;
 
     info!(
         client_id = %client_id,
         ca_fingerprint = %ca_fingerprint,
         "Pairing v2 complete — CA fingerprint TOFU-pinned"
     );
-
-    // Persist server connection info (mirrors legacy pairing) so the daemon
-    // can find the server without --server or mDNS. Derive the gRPC address
-    // from the paired host — same host, gRPC port 50051; the pairing port
-    // (:3130) is the dashboard API, not gRPC.
-    let host = server
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split(':')
-        .next()
-        .unwrap_or(server);
-    let server_info = serde_json::json!({
-        "grpc_addr": format!("{}:50051", host),
-        "paired_addr": server,
-        "paired_at": chrono::Utc::now().to_rfc3339(),
-    });
-    std::fs::write(
-        cert_dir.join("server.json"),
-        serde_json::to_string_pretty(&server_info)?,
-    )?;
 
     println!("Pairing complete! Client ID: {}", client_id);
     println!("CA fingerprint (TOFU-pinned): {}", ca_fingerprint);
@@ -5345,6 +5367,164 @@ mod client_config_server_tests {
 
     fn path_exists(p: &str) -> bool {
         std::path::Path::new(p).exists()
+    }
+}
+
+#[cfg(test)]
+mod pair_endpoint_persist_tests {
+    use super::{derive_grpc_addr, run_pair_enroll, save_pair_result};
+    use crate::grpc_client::ClientCerts;
+
+    /// DEF-2b test 1: enrollment-key pairing against a mock enroll endpoint
+    /// persists server.json with the DERIVED control-plane grpc_addr (host
+    /// of --server + :50051) and the paired addr exactly as given — never
+    /// the empty-endpoint shape that sent headless daemons into a
+    /// discovery crash-loop.
+    #[tokio::test]
+    async fn enroll_pair_persists_derived_endpoints() {
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
+
+        let cert_pem_for_route = cert_pem.clone();
+        let key_pem_for_route = key_pem.clone();
+        let app = axum::Router::new().route(
+            "/api/v1/pair/enroll",
+            axum::routing::post(move || {
+                let cert_pem = cert_pem_for_route.clone();
+                let key_pem = key_pem_for_route.clone();
+                async move {
+                    axum::Json(serde_json::json!({
+                        "enrolled": true,
+                        "client_id": "00000000-0000-0000-0000-0000000000d1",
+                        "client_cert_pem": cert_pem,
+                        "client_key_pem": key_pem,
+                        "ca_cert_pem": cert_pem,
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app.into_make_service()).await.unwrap();
+        });
+
+        let cert_dir = tempfile::tempdir().unwrap();
+        let server = addr.to_string();
+
+        run_pair_enroll(
+            &server,
+            "mopk-test-key",
+            "def2b-test-host",
+            &["pacman".to_string()],
+            cert_dir.path(),
+        )
+        .await
+        .expect("enroll pair must succeed against the mock server");
+
+        let info: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(cert_dir.path().join("server.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            info["grpc_addr"].as_str().unwrap(),
+            "127.0.0.1:50051",
+            "grpc_addr must be the derived control-plane address, non-empty"
+        );
+        assert_eq!(
+            info["paired_addr"].as_str().unwrap(),
+            server.as_str(),
+            "paired_addr must be the --server input exactly as given"
+        );
+        assert!(info["ws_url"].is_null(), "no tunnel was negotiated");
+        assert!(!info["paired_at"].as_str().unwrap().is_empty());
+    }
+
+    /// DEF-2b test 2 (regression): empty/whitespace/scheme-only paired
+    /// addresses are rejected by the derivation helper, and
+    /// save_pair_result aborts BEFORE any cert state lands — the
+    /// `{"grpc_addr": "", "paired_addr": ""}` shape can never be written.
+    #[test]
+    fn empty_paired_addr_rejected_before_anything_persists() {
+        for bad in ["", "   ", "http://", "https://", "::"] {
+            assert!(
+                derive_grpc_addr(bad).is_err(),
+                "derive_grpc_addr({:?}) must reject an empty host",
+                bad
+            );
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let certs = ClientCerts {
+            client_cert_pem: b"-----BEGIN CERTIFICATE-----".to_vec(),
+            client_key_pem: b"key".to_vec(),
+            ca_cert_pem: b"ca".to_vec(),
+        };
+        let err = save_pair_result(dir.path(), "cid", &certs, "", None, &[]).unwrap_err();
+        assert!(err.to_string().contains("no host"));
+
+        assert!(
+            !dir.path().join("server.json").exists(),
+            "server.json must not exist after a failed endpoint derivation"
+        );
+        assert!(
+            !dir.path().join("client.crt").exists(),
+            "certs must not be saved when the paired address is unusable"
+        );
+    }
+
+    /// DEF-2b test 3 (legacy-path parity): the shared derivation reproduces
+    /// the rule the working v2 pin path has always applied — host of the
+    /// paired address + gRPC port 50051 — and save_pair_result persists
+    /// exactly those endpoint fields. Both v2 flows route through the same
+    /// helper, so their persisted endpoint fields are equivalent by
+    /// construction for the same --server input.
+    #[test]
+    fn enroll_and_pin_endpoints_match_legacy_pin_rule() {
+        // The historical run_pair_v2 rule, kept verbatim as the spec:
+        // strip scheme, take the host, append the gRPC port.
+        let legacy_pin_rule = |server: &str| -> String {
+            let host = server
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .split(':')
+                .next()
+                .unwrap_or(server);
+            format!("{}:50051", host)
+        };
+
+        let certs = ClientCerts {
+            client_cert_pem: b"-----BEGIN CERTIFICATE-----".to_vec(),
+            client_key_pem: b"key".to_vec(),
+            ca_cert_pem: b"ca".to_vec(),
+        };
+        for input in [
+            "10.10.20.58:3130",
+            "http://10.10.20.58:3130",
+            "https://10.10.20.58:3130",
+            "10.10.20.58",
+        ] {
+            let derived = derive_grpc_addr(input).unwrap();
+            assert_eq!(
+                derived,
+                legacy_pin_rule(input),
+                "derivation must reuse the legacy pin rule for {:?}",
+                input
+            );
+            assert_eq!(derived, "10.10.20.58:50051");
+
+            let dir = tempfile::tempdir().unwrap();
+            save_pair_result(dir.path(), "cid", &certs, input, None, &[]).unwrap();
+            let info: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.path().join("server.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(info["grpc_addr"].as_str().unwrap(), legacy_pin_rule(input));
+            assert_eq!(info["paired_addr"].as_str().unwrap(), input);
+            assert!(info["ws_url"].is_null());
+        }
     }
 }
 
