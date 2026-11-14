@@ -82,7 +82,7 @@ Arches: x86_64, aarch64 (musl-static binary).
           apt, dnf, nix, ...)
 
        monopsony-tracker
-       :3130 (HTTP tracker)
+       :3132 (HTTP tracker)
        SQLite
 ```
 

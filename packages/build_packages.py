@@ -20,7 +20,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 STAGING = os.path.join(SCRIPT_DIR, "staging")
 BUILD = os.path.join(SCRIPT_DIR, "build")
-VERSION = "1.0.0-rc2"
+VERSION = "1.1.0"
 ARCH = sys.argv[1] if len(sys.argv) > 1 else "x86_64"
 DEB_ARCH = "arm64" if ARCH == "aarch64" else "amd64"
 
@@ -51,7 +51,7 @@ def build_deb():
     # --- control.tar.gz ---
     control_text = (
         "Package: monopsony-client\n"
-        "Version: 1.0.0-rc2\n"
+        "Version: 1.1.0\n"
         "Section: net\n"
         "Priority: optional\n"
         f"Architecture: {DEB_ARCH}\n"

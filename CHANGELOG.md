@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] — 2026-11-13
+
+### Added
+
+- Server-mediated client updates (Sprint 34 P0–P4): update distributor (poll, verify, ShadowCache store, admin REST), `CheckUpdate`/`DownloadUpdateAsset` gRPC streaming with rollout gating, server-first client self-update (asset provider, staged two-phase self-apply, policy knobs), guarded self-apply + rollout outcome reporting over the wire, and a dashboard updates panel with rollout creator and fleet version-skew view
+- Shadow staging + client approval (Sprint 29): centralized updates + OS-release readiness, admin staging endpoint for catalog recipes, client `view`/`accept` flow with staged-recipe signature verification
+- Container recipe adoption + OpenRC detection tier (Sprint 31)
+- OCI registry on :3131 — blob upload path, S3 manifests, tag index, tagless auto-version (Sprint 25 S2/S3)
+- Signed blacklist trust plane: peer-exchange blacklist entry format with pinned-key verification, tracker announce signatures + ownership binding, mirror gossip ingestion over peer exchange with `[peer_blacklist]` config, client discovery blacklist trust gate + config fallback + `downgrade_unsafe` refusal
+- Mirror sync integrity: GPG metadata verify, cross-mirror hash check, per-mirror `hash_policy` knob
+- Prometheus alert rules + Grafana overview dashboard (Sprint 24)
+- Admin cert lifecycle surfaces: client cert listing + fleet-wide revocation audit endpoints, cert status UI + enrollment-key manager
+- macOS menu bar: Content-Caching toggle via osascript admin wrapper; update-scan button cut per Wave B bench verdict
+
+### Changed
+
+- sqlx 0.9.0 + rusqlite 0.37: AssertSqlSafe wrappers, unified libsqlite3-sys, sqlx never-type-fallback future-incompat resolved
+- Tracker default bind moved from `0.0.0.0:3130` to `0.0.0.0:3132` — :3130 is the server admin-dashboard default, so co-hosted server+tracker deployments collided at startup. Upgrade hazard: re-launching a tracker without an explicit `--addr` now binds :3132, so announce consumers must follow unless they already pass an explicit `--tracker-url` (servers always do — the break surface is the tracker process itself, not fleet clients); pin `--addr` to keep the old port. Tracker bind failures now name the address and likely holder instead of a bare `os error 98`
+- Dashboard sidebar version label fed from `/updates/rollouts` instead of a build-time constant
+- Dropped unwired `cache_pins` DB layer; the pin file is the sole source of truth
+
+### Fixed
+
+- Self-update asset selection matches the real release CI naming `monopsony-{server,client}-v<VERSION>-{platform}.tar.gz` (Sprint 34 P0)
+- `pair --admin-user/--admin-pass` authenticates a dashboard session first and carries the login cookie into pair/init
+- Pairing-v2 enroll registers the client before cert issuance; enrollment-key pair persists server endpoints into `server.json`
+- Client daemon: self-diagnosing `AddrInUse` error + honest proxy bind logging (pre-bind success claim removed)
+- `shadow_scorer` config_agreement path canonicalization
+- Tracker announce advertises `public_base_url` endpoints; peers-envelope endpoint advertisement parity
+- docker-compose.yml tracker block: passed `--database-url` (not a tracker flag — the tracker is SQLite-backed), so uncommenting it failed at argument parse; now uses `--db` with a persistent volume and the :3132 default
+
 ## [1.0.0-rc2] — 2026-10-17
 
 ### Added
@@ -137,6 +168,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Interactive bash installer with OS detection and PostgreSQL setup
 - systemd and OpenRC service units
 
+[1.1.0]: https://base.societus.club/societus/monopsony/releases/tag/v1.1.0
 [1.0.0-rc2]: https://base.societus.club/societus/monopsony/releases/tag/v1.0.0-rc2
 [1.0.0-rc1]: https://base.societus.club/societus/monopsony/releases/tag/v1.0.0-rc1
 [0.1.0-rc1]: https://base.societus.club/societus/monopsony/releases/tag/v0.1.0-rc1

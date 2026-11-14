@@ -1,8 +1,8 @@
 PORTNAME=	monopsony-client
-PORTVERSION=	1.0.0.rc2
+PORTVERSION=	1.1.0
 PORTREVISION=	0
 CATEGORIES=	net
-MASTER_SITES=	https://base.societus.club/societus/monopsony/releases/download/v${PORTVERSION:R}/
+MASTER_SITES=	https://base.societus.club/societus/monopsony/releases/download/v${PORTVERSION}/
 
 MAINTAINER=	packaging@societus.club
 COMMENT=	Monopsony client daemon - local HTTP proxy and package manager integration

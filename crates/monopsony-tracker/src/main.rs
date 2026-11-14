@@ -1237,8 +1237,9 @@ async fn handle_report_with_auto_blacklist(
     about = "Monopsony mirror discovery tracker"
 )]
 struct Cli {
-    /// Address to bind (default 0.0.0.0:3130)
-    #[arg(long, default_value = "0.0.0.0:3130")]
+    /// Address to bind (default 0.0.0.0:3132 — moved from :3130 in 1.1.0,
+    /// which is the server admin dashboard's default)
+    #[arg(long, default_value = "0.0.0.0:3132")]
     addr: SocketAddr,
     /// SQLite database path (default: tracker.db in current directory)
     #[arg(long, default_value = "tracker.db")]
@@ -1295,6 +1296,28 @@ fn open_mode_startup_warning(auth_mode: &TrackerAuthMode) -> Option<String> {
          --api-keys for anything beyond local testing."
             .to_string(),
     )
+}
+
+/// Bind the tracker's only production listen socket. A collision is always
+/// a second PROCESS on the same host — another monopsony-tracker, or — on
+/// the pre-1.1.0 default :3130 — the monopsony-server admin dashboard — so
+/// name the address and the likely holders instead of surfacing a bare
+/// "Address already in use (os error 98)" (mirrors the client proxy's
+/// DEF-1 self-diagnosis).
+async fn bind_tracker_listener(addr: SocketAddr) -> anyhow::Result<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => Ok(l),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => Err(anyhow::anyhow!(
+            "tracker bind {} failed: address already in use — another process is \
+             listening there (a second monopsony-tracker, or — on the pre-1.1.0 \
+             default :3130 — the monopsony-server admin dashboard); stop that \
+             process or pass a distinct --addr",
+            addr
+        )),
+        Err(e) => Err(
+            anyhow::Error::new(e).context(format!("tracker bind {} failed", addr))
+        ),
+    }
 }
 
 #[tokio::main]
@@ -1479,7 +1502,7 @@ async fn main() -> anyhow::Result<()> {
 
     let app = protected.merge(open).with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(cli.addr).await?;
+    let listener = bind_tracker_listener(cli.addr).await?;
     info!(
         "Monopsony tracker listening on {} (auth={})",
         cli.addr, cli.auth_mode
@@ -3514,5 +3537,45 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM blacklist", params![], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0, "rejected entries must not persist");
+    }
+
+    /// Finding 1 (1.1.0): the clap default moved to :3132 — the old :3130 is
+    /// the server admin dashboard's default, so naive server+tracker
+    /// co-hosting collided at startup.
+    #[test]
+    fn tracker_cli_default_addr_is_3132() {
+        let cli = Cli::parse_from(["monopsony-tracker"]);
+        assert_eq!(
+            cli.addr.to_string(),
+            "0.0.0.0:3132",
+            "tracker default bind must be 0.0.0.0:3132"
+        );
+    }
+
+    /// Rider on the same bind site (DEF-1 pattern): a bind collision names
+    /// the address and the likely second process instead of surfacing a
+    /// bare "os error 98".
+    #[tokio::test]
+    async fn tracker_bind_addr_in_use_error_names_address_and_holder() {
+        let first = bind_tracker_listener("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let addr = first.local_addr().unwrap();
+        let err = bind_tracker_listener(addr)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("address already in use"),
+            "error must state the failure: {err}"
+        );
+        assert!(
+            err.contains(&addr.to_string()),
+            "error must name the colliding address {addr}: {err}"
+        );
+        assert!(
+            err.contains("monopsony-tracker"),
+            "error must name the tracker as the likely holder: {err}"
+        );
     }
 }

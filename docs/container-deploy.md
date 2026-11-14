@@ -175,7 +175,42 @@ monopsony-client pair --server YOUR_HOST_IP:50051
 ### Tracker (optional)
 
 Uncomment the `tracker` service in `docker-compose.yml` to enable mirror
-federation. The tracker runs on port 3130.
+federation. The tracker runs on port 3132 (moved from :3130 in 1.1.0 —
+:3130 is the admin dashboard's default).
+
+## Cloudflare (Tunnels / orange-cloud proxying)
+
+**gRPC control plane: leave Cloudflare's Network → gRPC toggle OFF.** The
+control plane (:50051) requires client certificates at the TLS accept path
+(mTLS is always on), and Cloudflare terminates TLS at its edge — no client
+certificate reaches the server, so every handshake fails regardless of the
+toggle. Reach the control plane through Cloudflare via the WebSocket tunnel
+instead (`[grpc] ws_url = "wss://monopsony.example.com/ws/tunnel"`), or
+keep it off Cloudflare entirely (Tailscale, WireGuard, or terminate TLS
+on-host with your own reverse proxy).
+
+**OCI registry (:3131): keep it off Cloudflare.** Cloudflare caps request
+bodies at 100 MB on Free/Pro plans, which breaks container-image blob
+pushes.
+
+**Dashboard behind Cloudflare: rewrite `X-Forwarded-For` (mandatory).**
+Cloudflare preserves an attacker-supplied `X-Forwarded-For` and appends the
+real client IP, so the origin sees `forged, real-client` and monopsony's
+leftmost extraction picks the forged value. The FINAL proxy in the chain
+must overwrite XFF from Cloudflare's `CF-Connecting-IP` header (which CF
+sets to the real client and strips inbound), and `[dashboard]
+trusted_proxies` must list only that final proxy:
+
+- nginx: `proxy_set_header X-Forwarded-For $http_cf_connecting_ip;`
+- Caddy: `header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}`
+- Traefik: headers middleware `customRequestHeaders.X-Forwarded-For` bound
+  the same way
+
+Without the rewrite, per-IP rate limiting, login lockout, and observed-IP
+display are attacker-controllable behind Cloudflare. (The mirror router
+:3129 and OCI registry :3131 ignore XFF entirely — behind any proxy their
+per-IP rate buckets collapse to one bucket per proxy IP, so size their
+limits as a global budget in this posture.)
 
 ## Building from Source (without compose)
 

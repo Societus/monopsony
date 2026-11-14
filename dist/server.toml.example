@@ -170,6 +170,12 @@ bind = "0.0.0.0:50051"
 # directly.
 # Type: string (wss:// or ws:// URL, optional)
 # ws_url = "wss://monopsony.example.com/ws/tunnel"
+#
+# Cloudflare's Network → gRPC toggle must stay OFF: the control plane
+# requires client certificates at the TLS accept path, and Cloudflare's
+# edge termination strips them — every gRPC handshake fails. Front the
+# control plane through Cloudflare via ws_url above, or terminate TLS
+# on-host / use `tailscale serve`.
 
 # ============================================================================
 # PostgreSQL Database

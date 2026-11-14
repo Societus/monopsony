@@ -67,21 +67,23 @@ services:
     # Podman rootless: uncomment to map host user into container
     # userns: keep-id
 
-  # Optional: Tracker for mirror federation
+  # Optional: Tracker for mirror federation. SQLite-backed — it needs no
+  # database service. Default bind is 0.0.0.0:3132 (1.1.0 moved it off
+  # :3130, which is the admin dashboard's default).
   # tracker:
   #   build:
   #     context: .
   #     dockerfile: Dockerfile
   #   entrypoint: ["monopsony-tracker"]
-  #   command: ["--database-url", "postgres://monopsony:${POSTGRES_PASSWORD:-monopsony}@db:5432/monopsony"]
+  #   command: ["--db", "/data/tracker.db", "--addr", "0.0.0.0:3132"]
   #   ports:
-  #     - "3130:3130"
+  #     - "3132:3132"
+  #   volumes:
+  #     - tracker-data:/data
   #   restart: unless-stopped
-  #   depends_on:
-  #     db:
-  #       condition: service_healthy
 
 volumes:
   db-data:
   cache-data:
   lib-data:
+  tracker-data:

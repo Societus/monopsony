@@ -1,5 +1,5 @@
 Name: monopsony-client
-Version: 1.0.0-rc2
+Version: 1.1.0
 Release: 1%{?dist}
 Summary: Monopsony client daemon — local HTTP proxy and package manager integration
 License: MIT
@@ -61,5 +61,8 @@ rm -rf %{buildroot}
 %license %{_licensedir}/monopsony-client/LICENSE
 
 %changelog
+* Fri Nov 13 2026 Monopsony Project <packaging@societus.club> - 1.1.0-1
+- Version bump to 1.1.0
+
 * Thu Oct 17 2026 Monopsony Project <packaging@societus.club> - 1.0.0-rc2-1
 - Initial RPM package for monopsony-client 1.0.0-rc2

@@ -2,7 +2,7 @@
 # Build: makepkg -srci   Install: pacman -U monopsony-client-*.pkg.tar.zst
 
 pkgname=monopsony-client
-pkgver=1.0.0_rc2
+pkgver=1.1.0
 pkgrel=1
 pkgdesc="Monopsony client daemon — local HTTP proxy and package manager integration for the Monopsony caching proxy"
 arch=('x86_64' 'aarch64')

@@ -29,7 +29,7 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Pinned fallback when the latest-release lookup fails (no network / API down).
 # Must match the newest tagged release: bump when cutting releases.
-readonly VERSION_FALLBACK="1.0.0-rc2"
+readonly VERSION_FALLBACK="1.1.0"
 # Release artifacts are hosted on the PUBLIC GitHub mirror — the Forgejo
 # instance is internal (forward-auth gated) and cannot serve curl|bash.
 readonly DOWNLOAD_BASE="https://github.com/Societus/monopsony/releases/download"
@@ -2461,7 +2461,7 @@ main() {
             --version)
                 shift
                 if [[ -z "${1:-}" ]]; then
-                    error "--version requires a value (e.g. 1.0.0-rc2)."
+                    error "--version requires a value (e.g. 1.1.0)."
                     exit 1
                 fi
                 MONOPSONY_VERSION="$1"

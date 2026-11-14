@@ -9,7 +9,7 @@ The tracker is a discovery service (similar to BitTorrent's tracker protocol). M
 ## Running
 
 ```bash
-# Basic (open auth, default port 3130)
+# Basic (open auth, default port 3132)
 monopsony-tracker
 
 # With token auth
@@ -22,14 +22,14 @@ monopsony-tracker --auth-mode jwt --jwt-issuers "trustbroker"
 monopsony-tracker --v4v-enabled
 
 # Custom bind and DB path
-monopsony-tracker --addr 0.0.0.0:3130 --db /var/lib/monopsony/tracker.db
+monopsony-tracker --addr 127.0.0.1:3132 --db /var/lib/monopsony/tracker.db
 ```
 
 ### CLI Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--addr` | `0.0.0.0:3130` | Bind address |
+| `--addr` | `0.0.0.0:3132` | Bind address |
 | `--db` | `tracker.db` | SQLite database path |
 | `--stale-timeout` | `7200` | Purge mirrors older than N seconds |
 | `--v4v-enabled` | `false` | Enable V4V bounty/governance tables |

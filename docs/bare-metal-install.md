@@ -91,8 +91,10 @@ See `monopsony-client configure --help` for package-manager-specific options.
 The dashboard and API are plain HTTP — no WebSocket needed. Set up your
 reverse proxy to forward to the dashboard port (3130).
 
-**Important:** Ensure your reverse proxy forwards `X-Forwarded-For` so
-rate limiting and IP extraction work correctly.
+**Important:** With a single reverse proxy, forwarding `X-Forwarded-For`
+is enough — the proxy appends the client IP and monopsony reads it.
+Behind Cloudflare this is NOT enough — the final proxy must *overwrite*
+XFF; see the mandatory rewrite below.
 
 For public-facing deployments, enable mandatory login:
 
@@ -106,9 +108,36 @@ always_require_login = true
 
 - The proxy (port 3128) and gRPC (port 50051) should NOT be exposed
   through the tunnel. Only tunnel the dashboard port (3130).
-- gRPC + mTLS does not work through Cloudflare's TLS termination.
-  Use Tailscale, WireGuard, or direct LAN for client-server gRPC.
+- Leave the Cloudflare **Network → gRPC** toggle OFF: the control plane
+  requires client certificates at TLS termination, and Cloudflare's edge
+  termination strips them — every gRPC handshake fails. Terminate TLS
+  on-host or use `tailscale serve`; clients behind a tunnel connect via
+  the WebSocket relay instead (`[grpc] ws_url = "wss://…/ws/tunnel"`).
+- Keep the OCI registry (port 3131) off Cloudflare too — Cloudflare caps
+  request bodies at 100 MB (Free/Pro), breaking image blob pushes.
 - The cache proxy (port 3128) should only be accessible on the LAN.
+
+### Mandatory: rewrite X-Forwarded-For behind Cloudflare
+
+If a Cloudflare-proxied hostname reaches monopsony through one of your own
+reverse proxies (CF → nginx/Caddy/Traefik → server), the final proxy MUST
+overwrite `X-Forwarded-For` with Cloudflare's `CF-Connecting-IP` header.
+Cloudflare preserves attacker-supplied `X-Forwarded-For` values and appends
+the real client IP, so the origin sees `forged, real-client` — and
+monopsony's leftmost extraction picks the forged value, making per-IP rate
+limiting, login lockout, and observed-IP display attacker-controllable.
+The overwrite must happen at the LAST proxy in the chain:
+
+- nginx: `proxy_set_header X-Forwarded-For $http_cf_connecting_ip;`
+- Caddy: `header_up X-Forwarded-For {http.request.header.CF-Connecting-IP}`
+- Traefik: headers middleware `customRequestHeaders.X-Forwarded-For` bound
+  the same way
+
+Then `[dashboard] trusted_proxies` must list ONLY that final proxy — never
+Cloudflare's edge ranges (their hop is not a client source). Behind any
+proxy, the mirror router (:3129) and OCI registry (:3131) keep keying their
+rate buckets on the direct peer — one bucket per proxy IP — so size those
+rate limits as a global budget in this posture.
 
 ## Configuration Reference
 
