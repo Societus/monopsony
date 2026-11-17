@@ -132,10 +132,11 @@ fn scan_entry_inner(entry_name: &str, recipe_toml: &str) -> Result<ScanFinding, 
     Ok(finding)
 }
 
-/// Run a version detect command via `bash -c` (2s timeout), returning the
-/// first `X.Y` / `X.Y.Z` match in stdout.
+/// Run a version detect command via `/bin/sh -c` (2s timeout), returning the
+/// first `X.Y` / `X.Y.Z` match in stdout. POSIX sh, not bash: detection must
+/// work on bash-less hosts (alpine fleet boxes, CI containers).
 pub async fn run_detect(command: &str, workdir: Option<&Path>) -> Option<String> {
-    let mut cmd = tokio::process::Command::new("bash");
+    let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")
         .arg(command)
         .stdout(std::process::Stdio::piped())

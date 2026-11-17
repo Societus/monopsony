@@ -17,7 +17,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.forgejo/actions/setup-rust
+      - name: Verify baked toolchain (setup-rust inlined; v13.2.1 runner cannot resolve local composite actions)
+        run: |
+          command -v cargo >/dev/null || { echo "FATAL: cargo missing from runner image"; exit 1; }
+          cargo --version && rustc --version
       - name: Cache cargo registry & target
         uses: actions/cache@v4
         continue-on-error: true
@@ -43,7 +46,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.forgejo/actions/setup-rust
+      - name: Verify baked toolchain (setup-rust inlined; v13.2.1 runner cannot resolve local composite actions)
+        run: |
+          command -v cargo >/dev/null || { echo "FATAL: cargo missing from runner image"; exit 1; }
+          cargo --version && rustc --version
       - name: Cache cargo registry & target
         uses: actions/cache@v4
         continue-on-error: true
@@ -65,9 +71,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.forgejo/actions/setup-rust
-        with:
-          components: clippy
+      - name: Verify baked toolchain (setup-rust inlined; v13.2.1 runner cannot resolve local composite actions)
+        run: |
+          command -v cargo >/dev/null || { echo "FATAL: cargo missing from runner image"; exit 1; }
+          cargo --version && rustc --version
       - name: Cache cargo registry & target
         uses: actions/cache@v4
         continue-on-error: true
@@ -90,9 +97,11 @@ jobs:
     needs: [check, test, clippy]
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.forgejo/actions/setup-rust
-        with:
-          target: x86_64-unknown-linux-musl
+      - name: Verify baked toolchain + musl target (setup-rust inlined; v13.2.1 runner cannot resolve local composite actions)
+        run: |
+          command -v cargo >/dev/null || { echo "FATAL: cargo missing from runner image"; exit 1; }
+          rustup target list --installed | grep -q x86_64-unknown-linux-musl || { echo "FATAL: musl target missing"; exit 1; }
+          cargo --version && rustc --version
       - name: Build dashboard (rust-embed requires dashboard/build/)
         run: |
           cd dashboard
@@ -123,9 +132,11 @@ jobs:
     needs: [check, test, clippy]
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.forgejo/actions/setup-rust
-        with:
-          target: aarch64-unknown-linux-musl
+      - name: Verify baked toolchain + aarch64 target (setup-rust inlined; v13.2.1 runner cannot resolve local composite actions)
+        run: |
+          command -v cargo >/dev/null || { echo "FATAL: cargo missing from runner image"; exit 1; }
+          rustup target list --installed | grep -q aarch64-unknown-linux-musl || { echo "FATAL: aarch64 target missing"; exit 1; }
+          cargo --version && rustc --version
       - name: Build dashboard (rust-embed requires dashboard/build/)
         run: |
           cd dashboard
@@ -165,9 +176,12 @@ jobs:
     needs: [check]
     steps:
       - uses: actions/checkout@v4
-      - uses: ./.forgejo/actions/setup-rust
-      - name: Install cargo-cyclonedx
-        run: cargo install cargo-cyclonedx
+      - name: Verify baked toolchain (setup-rust inlined; v13.2.1 runner cannot resolve local composite actions)
+        run: |
+          command -v cargo >/dev/null || { echo "FATAL: cargo missing from runner image"; exit 1; }
+          cargo --version && rustc --version
+      - name: Verify cargo-cyclonedx (baked in runner image)
+        run: cargo cyclonedx --version
       - run: cargo cyclonedx --all --format json --describe binaries
       - uses: actions/upload-artifact@v3
         with:

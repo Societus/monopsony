@@ -430,9 +430,20 @@ mod tests {
 
     #[test]
     fn test_url_to_cache_key() {
-        // pacman backend matches archlinux.org → key starts with "pacman/"
-        let key = url_to_cache_key("https://repo.archlinux.org/os/x86_64/linux-6.1.pkg.tar.zst");
-        assert!(key.starts_with("pacman/"));
+        // pacman backend matches archlinux.org → key starts with "pacman/". On
+        // hosts without a pacman backend (alpine CI) the generic fallback key
+        // applies instead — assert whichever path this host takes.
+        let url = "https://repo.archlinux.org/os/x86_64/linux-6.1.pkg.tar.zst";
+        let key = url_to_cache_key(url);
+        use monopsony_common::package_manager::get_available_backends;
+        let pacman_active = get_available_backends()
+            .iter()
+            .any(|b| b.upstream_url_patterns().iter().any(|p| p.matches(url)));
+        if pacman_active {
+            assert!(key.starts_with("pacman/"));
+        } else {
+            assert!(key.starts_with("other/repo.archlinux.org/"));
+        }
         assert!(key.contains("linux-6.1.pkg.tar.zst"));
     }
 

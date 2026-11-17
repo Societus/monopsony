@@ -1543,8 +1543,14 @@ mod tests {
 
     #[tokio::test]
     async fn detect_pm_managed_real_probe_unowned() {
-        // No probe injected → falls back to probe_pm_ownership. pacman is
-        // available on this host, so a nonexistent path yields Some(false).
+        // No probe injected → falls back to probe_pm_ownership, which needs a
+        // real dpkg/rpm/pacman on the host. Hosts with none of the three
+        // (alpine CI containers) have nothing to probe → skip, not fail.
+        if pm_name().is_none() {
+            eprintln!("skipping: no dpkg/rpm/pacman on host");
+            return;
+        }
+        // pacman is available on this host, so a nonexistent path yields Some(false).
         let report = detect_with_scan(
             Path::new("/nonexistent/path/binary"),
             None,
@@ -1566,12 +1572,17 @@ mod tests {
         let toml = render_draft_toml(&none, "foo", None);
         assert!(!toml.lines().any(|l| l.starts_with("# pm-managed:")));
 
-        // Some(false) → unowned shadow-candidate line.
+        // Some(false) → unowned shadow-candidate line. The pm label renders
+        // only when the host HAS a package manager (alpine CI: omitted).
         let mut unowned = base.clone();
         unowned.pm_managed = Some(false);
         let toml = render_draft_toml(&unowned, "foo", None);
-        assert!(toml.contains("# pm-managed: no (unowned by"));
-        assert!(toml.contains("shadow candidate"));
+        if pm_name().is_some() {
+            assert!(toml.contains("# pm-managed: no (unowned by"));
+            assert!(toml.contains("shadow candidate"));
+        } else {
+            assert!(!toml.lines().any(|l| l.starts_with("# pm-managed:")));
+        }
         if let Some(pm) = host_pm {
             assert!(toml.contains(&format!("unowned by {pm}")));
         }
@@ -1580,7 +1591,11 @@ mod tests {
         let mut owned = base.clone();
         owned.pm_managed = Some(true);
         let toml = render_draft_toml(&owned, "foo", None);
-        assert!(toml.contains("# pm-managed: yes (owned by"));
+        if pm_name().is_some() {
+            assert!(toml.contains("# pm-managed: yes (owned by"));
+        } else {
+            assert!(!toml.lines().any(|l| l.starts_with("# pm-managed:")));
+        }
         if let Some(pm) = host_pm {
             assert!(toml.contains(&format!("owned by {pm}")));
         }
